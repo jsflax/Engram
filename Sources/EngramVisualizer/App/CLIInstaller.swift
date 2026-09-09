@@ -23,6 +23,17 @@ enum CLIInstaller {
         let fm = FileManager.default
         guard fm.fileExists(atPath: cliDir.path) else { return }
 
+        // Independent of Claude and of the CLI version stamp: retry after a
+        // user installs Codex/Python, even when Engram itself is up to date.
+        // Interpreter discovery and config I/O must not block app startup.
+        // Schedule after any binary replacement below, so a fresh install's
+        // memory command exists before the Codex registration is validated.
+        defer {
+            DispatchQueue.global(qos: .utility).async {
+                syncCodexSupport(from: cliDir)
+            }
+        }
+
         let installedVersion = (try? String(contentsOfFile: versionFile, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -132,6 +143,54 @@ enum CLIInstaller {
     }
 
     // MARK: - Sync Daemon
+
+    /// Deploy the same payload as the shell installer, then delegate owned
+    /// hook merging to its shared Python installer. The installer is
+    /// idempotent and preserves user hooks, config, state, and backups.
+    private static func syncCodexSupport(from cliDir: URL) {
+        let fm = FileManager.default
+        let source = cliDir.appendingPathComponent("codex")
+        guard fm.fileExists(atPath: source.appendingPathComponent("install_codex_support.sh").path) else {
+            return
+        }
+        let destination = URL(fileURLWithPath: installDir).appendingPathComponent("codex")
+        do {
+            guard let files = fm.enumerator(at: source,
+                                            includingPropertiesForKeys: [.isRegularFileKey],
+                                            options: [.skipsHiddenFiles]) else {
+                throw InstallError.missingBundledBinary("codex")
+            }
+            for case let file as URL in files {
+                guard try file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else {
+                    continue
+                }
+                let relativePath = String(file.path.dropFirst(source.path.count + 1))
+                let target = destination.appendingPathComponent(relativePath)
+                if fm.contentsEqual(atPath: file.path, andPath: target.path) { continue }
+                try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data(contentsOf: file).write(to: target, options: .atomic)
+            }
+
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+            proc.arguments = [destination.appendingPathComponent("install_codex_support.sh").path, "install"]
+            proc.environment = cleanEnv()
+            let output = Pipe()
+            proc.standardOutput = output
+            proc.standardError = output
+            try proc.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            let message = String(decoding: data.suffix(4096), as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !message.isEmpty { NSLog("Engram Codex installer: %@", message) }
+            if proc.terminationStatus != 0 {
+                NSLog("Engram Codex installer exited %d; retrying on next app launch", proc.terminationStatus)
+            }
+        } catch {
+            NSLog("Engram Codex installation failed; retrying on next app launch: %@", String(describing: error))
+        }
+    }
 
     private static let daemonLabel = "io.engram.sync"
     private static let daemonPlistPath = NSHomeDirectory() + "/Library/LaunchAgents/io.engram.sync.plist"

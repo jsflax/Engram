@@ -10,7 +10,8 @@ A local MCP server that gives AI coding agents persistent, semantic memory acros
 curl -sL https://raw.githubusercontent.com/jsflax/Engram/main/scripts/install.sh | bash
 ```
 
-This downloads the pre-built binary, registers the MCP server, and configures Claude Code — takes a few seconds.
+This downloads the pre-built binaries and configures Claude Code. When Codex and
+Python 3.11+ are installed, it also registers Codex's Engram MCP and session learner.
 
 To build from source instead:
 
@@ -21,6 +22,57 @@ cd Engram
 ```
 
 Start a new Claude Code session — memory tools are immediately available.
+
+### Codex session learning
+
+Codex's native `Stop`, `PreCompact`, and `SessionEnd` hooks queue an incremental
+session learner. Source installs, release downloads, and Engram app upgrades all
+install the same runtime. Open `/hooks` in the Codex CLI and review/trust the three
+Engram hooks before they can execute. An upgrade that changes a hook definition
+requires another review. Existing hooks, MCP settings, and notifications survive.
+The integration is tested with Codex CLI 0.153.4; older versions without native
+hooks and `--ignore-user-config` must be upgraded.
+
+The learner uses your signed-in Codex account and selected model/reasoning effort,
+so automatic learning consumes Codex usage. It sends a bounded excerpt of visible
+user/assistant messages to that model, then calls your local Engram MCP to recall
+and store useful findings. It excludes hidden reasoning, tool output, and inherited
+fork history. Common credential patterns are redacted; this is not a general
+secret detector. New memories are private and include their source session ID.
+The current learner supports a local **stdio** memory MCP, not a remote HTTP MCP.
+
+One learner runs at a time, with a 10-minute limit, at most 12 memory calls and
+five writes per batch. An independent MCP gateway enforces the limits and checks
+write receipts. Successful transcript ranges are checkpointed so repeated hooks
+do not learn them again. Failures preserve the cursor and impose a five-minute
+backoff. A wakeup processes at most four batches (24,000 visible characters each)
+from one pending source; longer backlogs wait for the next source event or a manual
+retry. A short `Stop` excerpt waits for more content; compaction and session end
+also process short excerpts. The original Codex turn never waits for learning.
+
+To retry installation after installing Python or Codex:
+
+```bash
+bash ~/.claude/bin/codex/install_codex_support.sh install
+```
+
+Inspect actual completion and pending sessions, or resume one pending source:
+
+```bash
+python3 ~/.claude/bin/codex/codex_learner.py status
+python3 ~/.claude/bin/codex/codex_learner.py retry --session-id SESSION_ID
+```
+
+Use a Python 3.11+ interpreter for these commands. Private state and write receipts
+live in `~/.codex/engram-learner/` (`CODEX_HOME` is respected). `events.jsonl` records
+queueing separately from completion; `runs/*/run.json` records verified writes or
+the failure reason. Failed runs retain private diagnostics. Successful runs discard
+their provider transcript. Local budgets can be lowered in `settings.json` using
+`wall_seconds`, `max_tool_calls`, `max_writes`, and `max_runs_per_worker`.
+
+To disable only Codex learning, untrust its Engram hooks in `/hooks`, or run
+`bash ~/.claude/bin/codex/install_codex_support.sh uninstall`. Uninstall removes
+only unchanged Engram-owned registrations and keeps memories, cursors, and backups.
 
 ### Engram Visualizer
 
@@ -41,7 +93,7 @@ Claude Code has built-in memory via `MEMORY.md` files. Here's why Engram is bett
 | **Maintenance** | Append-only text that gets stale | `update`, `merge`, `forget`, auto-expiring memories, conflict detection |
 | **Structure** | Flat text, no relationships | Knowledge graph — connect memories with typed edges, traverse on recall |
 | **Continuity** | No session awareness | Episodic memory, task checkpoints, clustering + consolidation |
-| **Privacy** | Plain text files | Local SQLite + on-device embeddings (MiniLM-L6). Nothing leaves your machine |
+| **Privacy** | Plain text files | Local SQLite + on-device embeddings (MiniLM-L6); optional Codex learning sends visible excerpts to the selected model |
 
 **The one-liner:** MEMORY.md is 200 lines of flat text that gets stale. Engram is a vector database that scales, searches semantically, and self-maintains.
 

@@ -100,6 +100,11 @@ jobs:
       - name: Validate performance report parser
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_profile*.py'
 
+      - name: Validate Codex session learner and installers
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_codex*.py'
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -p 'test_codex*.py'
+
       - name: Build CLI release binaries
         run: swift build -c release
 
@@ -188,6 +193,7 @@ jobs:
           cp -R .build/release/SwiftLM_SwiftLM.bundle "$CLI_DIR/"
           cp agents/*.md "$AGENTS_DIR/"
           cp -R skills "$CLI_DIR/skills"
+          bash scripts/package_codex_learner.sh "$CLI_DIR/codex"
 
           sign() {
             codesign --force --sign "Developer ID Application" \
@@ -237,6 +243,7 @@ jobs:
           cp -R .build/release/SwiftLM_SwiftLM.bundle staging/
           cp agents/*.md staging/agents/
           cp -R skills staging/skills
+          bash scripts/package_codex_learner.sh staging/codex
           cd staging && tar czf ../engram-macos-arm64.tar.gz *
 
       - name: Create DMG

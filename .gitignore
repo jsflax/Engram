@@ -22,3 +22,5 @@ gpu-forces.log
 gpu_crash.txt
 vec0_logs.txt
 Packages/
+__pycache__/
+*.py[cod]

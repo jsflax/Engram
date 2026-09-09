@@ -31,6 +31,7 @@ if [ "$1" = "--from-source" ]; then
     cp -R .build/release/Engram_EngramKit.bundle "$INSTALL_DIR/"
     cp -R .build/release/swift-transformers_Hub.bundle "$INSTALL_DIR/"
     cp -R .build/release/SwiftLM_SwiftLM.bundle "$INSTALL_DIR/"
+    bash "$REPO_DIR/scripts/package_codex_learner.sh" "$INSTALL_DIR/codex"
     # Re-sign binaries — linker-signed ad-hoc binaries can be rejected by macOS Taskgated
     codesign --force --sign - "$INSTALL_DIR/memory"
     codesign --force --sign - "$INSTALL_DIR/memory-hooks"
@@ -50,13 +51,19 @@ else
 
     echo "From: $DOWNLOAD_URL"
     curl -sL "$DOWNLOAD_URL" | tar xz -C "$INSTALL_DIR"
-    # Re-sign binaries — linker-signed ad-hoc binaries can be rejected by macOS Taskgated
-    codesign --force --sign - "$INSTALL_DIR/memory"
-    codesign --force --sign - "$INSTALL_DIR/memory-hooks"
-    codesign --force --sign - "$INSTALL_DIR/memory-sync"
+    # Preserve release signatures: the sync daemon needs its Developer ID
+    # identity for keychain access when launched without a visible prompt.
 fi
 
 echo "Installed to $INSTALL_DIR"
+
+# Codex setup is independent of Claude CLI availability. Its immutable runtime
+# lives in CODEX_HOME; keep this payload for upgrades and owned-only uninstall.
+if [ -f "$INSTALL_DIR/codex/install_codex_support.sh" ]; then
+    bash "$INSTALL_DIR/codex/install_codex_support.sh" install || true
+else
+    echo "Codex session learner: unavailable in this release payload."
+fi
 
 # Ensure parent dir exists
 mkdir -p "$HOME/.claude"

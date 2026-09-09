@@ -5,6 +5,16 @@ INSTALL_DIR="$HOME/.claude/bin"
 
 echo "Uninstalling memory server..."
 
+# Remove only Engram-owned Codex hooks before deleting their installer. The
+# helper deliberately preserves learned state, backups, and unrelated hooks.
+if [ -f "$INSTALL_DIR/codex/install_codex_support.sh" ]; then
+    if bash "$INSTALL_DIR/codex/install_codex_support.sh" uninstall; then
+        rm -rf "$INSTALL_DIR/codex"
+    else
+        echo "Keeping Codex installer payload so removal can be retried."
+    fi
+fi
+
 # Deregister from Claude Code
 env -u CLAUDECODE claude mcp remove memory 2>/dev/null || true
 

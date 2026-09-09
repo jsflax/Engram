@@ -6,6 +6,25 @@ All notable changes to Engram are documented in this file.
 
 ## [Unreleased]
 
+## [0.14.5] - 2026-09-09
+
+### Added
+- **Automatic Codex session learning.** Native Stop, PreCompact, and SessionEnd
+  hooks enqueue visible conversation excerpts for a serialized learner using the
+  signed-in Codex account. Fork boundaries, incremental cursors, recursion guards,
+  and independently verified MCP receipts prevent inherited-history replay and
+  false reports of successful memory capture. New memories are private and carry
+  source-session provenance; each batch has fixed time and tool budgets.
+- **Codex setup ships with every installer.** Source installs, signed CLI
+  downloads, and GUI upgrades share the same ownership-aware installer. Python
+  3.11+ and a native-hook-capable Codex CLI are required. Users review exact hook
+  definitions through Codex `/hooks`; other hooks, notifications, and custom MCP
+  settings are preserved. Status and retry commands expose pending or failed work.
+
+### Fixed
+- Download installation preserves Developer ID signatures instead of replacing
+  them with ad-hoc signatures, retaining the release's keychain identity.
+
 ## [0.14.4] - 2026-09-09
 
 ### Performance
