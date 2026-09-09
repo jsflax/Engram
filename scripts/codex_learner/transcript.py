@@ -46,6 +46,7 @@ class RolloutMetadata:
     mtime_ns: int
     device: int
     inode: int
+    hook_session_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -72,9 +73,11 @@ def _string(value: Any) -> str | None:
 def inspect_rollout(path: str | Path) -> RolloutMetadata:
     """Inspect only the first complete metadata record, never its instructions.
 
-    Recent subagents can put the parent's ID in ``session_id`` and their own ID
-    in ``id``. The latter is canonical. Later inherited ``session_meta`` records
-    must not override it.
+    Subagents can put the logical root session's ID in ``session_id`` and their
+    own thread ID in ``id``. For nested agents the logical root can differ from
+    the immediate parent. Preserve the former as ``hook_session_id`` while the
+    latter remains canonical. Later inherited ``session_meta`` records must not
+    override either identity.
     """
     rollout = Path(path)
     with rollout.open("rb") as stream:
@@ -144,6 +147,7 @@ def _inspect_stream(path: Path, stream: BinaryIO) -> RolloutMetadata:
         mtime_ns=stat.st_mtime_ns,
         device=stat.st_dev,
         inode=stat.st_ino,
+        hook_session_id=_string(payload.get("session_id")),
     )
 
 

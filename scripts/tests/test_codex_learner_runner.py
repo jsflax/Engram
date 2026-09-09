@@ -85,6 +85,19 @@ class RunnerTests(unittest.TestCase):
     def request(self, **extra):
         return runner.validate_request(self.payload(**extra), self.root)
 
+    def child_rollout(self, child_id="child-123", logical_id="parent-123", parent_id="parent-123", *, boundary=True, source=None):
+        path = self.base / ("child-fixture-" + str(len(list(self.base.glob("child-fixture-*.jsonl")))) + ".jsonl")
+        metadata = {"id": child_id, "session_id": logical_id, "forked_from_id": parent_id,
+                    "cwd": str(self.base), "source": source if source is not None else
+                    {"subagent": {"thread_spawn": {"parent_thread_id": parent_id}}}}
+        if boundary:
+            metadata["subagent_history_start_ordinal"] = 3
+        records = [native_record("session_meta", metadata, 0),
+                   user_message("Inherited parent decision that must be excluded.", 1),
+                   user_message("New finding from " + child_id + ".", 3)]
+        path.write_bytes(b"".join(json.dumps(item).encode() + b"\n" for item in records))
+        return path
+
     def state(self):
         return runner.load_json(self.root / "sessions" / (self.sid + ".json"))
 
@@ -181,8 +194,11 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(runner.process_request(self.root, request, self.config, invoke=invoke), "succeeded")
         self.assertEqual(self.state()["offset"], self.path.stat().st_size)
         self.assertEqual(self.state()["status"], "succeeded")
+        successful_state = self.state()
         self.assertEqual(runner.process_request(self.root, request, self.config, invoke=invoke), "no_change")
         self.assertEqual(len(seen), 1)
+        self.assertEqual(self.state()["last_run"], successful_state["last_run"])
+        self.assertEqual(self.state()["last_success_at"], successful_state["last_success_at"])
 
     def test_failure_preserves_cursor_and_dedup_state_then_backoff(self):
         request = self.request()
@@ -277,6 +293,89 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(runner.process_request(self.root, self.request(), self.config, invoke=invoke), "succeeded")
         self.assertNotIn("Inherited", seen[0])
         self.assertIn("New fork", seen[0])
+
+    def test_subagent_parent_aliased_hook_uses_canonical_child_identity(self):
+        path = self.child_rollout()
+        request = self.request(session_id="parent-123", transcript_path=str(path), agent_id="child-123")
+        self.assertEqual(request["session_id"], "child-123")
+        self.assertEqual(request["hook_session_id"], "parent-123")
+        excerpts = []
+
+        def invoke(*args):
+            excerpts.append(args[3].text)
+            return self.success()
+
+        self.assertEqual(runner.process_request(self.root, request, self.config, invoke=invoke), "succeeded")
+        self.assertNotIn("Inherited", excerpts[0])
+        self.assertIn("New finding from child-123", excerpts[0])
+        state = runner.load_json(self.root / "sessions" / "child-123.json")
+        self.assertEqual(state["session_id"], "child-123")
+        self.assertEqual(state["hook_session_id"], "parent-123")
+        self.assertFalse((self.root / "sessions" / "parent-123.json").exists())
+
+    def test_nested_subagent_accepts_logical_root_or_immediate_parent_alias(self):
+        path = self.child_rollout(child_id="grandchild", logical_id="root-123", parent_id="intermediate-123")
+        for alias in ("root-123", "intermediate-123"):
+            with self.subTest(alias=alias):
+                request = self.request(session_id=alias, transcript_path=str(path), agent_id="grandchild")
+                self.assertEqual(request["session_id"], "grandchild")
+                self.assertEqual(request["hook_session_id"], alias)
+
+    def test_sibling_subagent_hooks_have_separate_queues_and_cursors(self):
+        paths = {child: self.child_rollout(child_id=child) for child in ("sibling-one", "sibling-two")}
+        for child, path in paths.items():
+            self.assertTrue(runner.enqueue(self.root, self.payload(session_id="parent-123", transcript_path=str(path), agent_id=child), spawn=False))
+        queued = sorted((self.root / "pending").glob("*.json"))
+        self.assertEqual([path.stem for path in queued], ["sibling-one", "sibling-two"])
+        seen = {}
+
+        def invoke(root, run_dir, request, excerpt, config):
+            seen[request["session_id"]] = excerpt.text
+            return self.success()
+
+        first = runner.load_json(queued[0])
+        second = runner.load_json(queued[1])
+        self.assertEqual(runner.process_request(self.root, first, self.config, invoke=invoke), "succeeded")
+        self.assertFalse((self.root / "sessions" / "sibling-two.json").exists())
+        self.assertEqual(runner.process_request(self.root, second, self.config, invoke=invoke), "succeeded")
+        for child, path in paths.items():
+            state = runner.load_json(self.root / "sessions" / (child + ".json"))
+            self.assertEqual(state["offset"], path.stat().st_size)
+            self.assertIn("New finding from " + child, seen[child])
+            self.assertNotIn("Inherited", seen[child])
+        self.assertFalse((self.root / "sessions" / "parent-123.json").exists())
+
+    def test_subagent_wrong_hook_parent_or_agent_identity_is_rejected(self):
+        path = self.child_rollout()
+        for extra in ({"session_id": "unrelated-parent"},
+                      {"session_id": "parent-123", "agent_id": "different-child"},
+                      {"session_id": "child-123", "agent_id": "different-child"}):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                self.request(transcript_path=str(path), **extra)
+
+    def test_top_level_fork_cannot_claim_parent_aliased_hook(self):
+        path = self.child_rollout(source="vscode")
+        with self.assertRaises(ValueError):
+            self.request(session_id="parent-123", transcript_path=str(path))
+
+    def test_subagent_alias_requires_verified_fork_boundary(self):
+        path = self.child_rollout(boundary=False)
+        with self.assertRaises(ValueError):
+            self.request(session_id="parent-123", transcript_path=str(path))
+
+    def test_subagent_alias_requires_source_spawn_parent(self):
+        for source in ({"subagent": {}}, {"subagent": {"thread_spawn": {}}}):
+            with self.subTest(source=source):
+                path = self.child_rollout(source=source)
+                with self.assertRaises(ValueError):
+                    self.request(session_id="parent-123", transcript_path=str(path))
+
+    def test_invalid_canonical_child_id_cannot_become_queue_path(self):
+        path = self.child_rollout(child_id="../escape")
+        with self.assertRaises(ValueError):
+            self.request(session_id="parent-123", transcript_path=str(path))
+        self.assertFalse(runner.enqueue(self.root, self.payload(session_id="parent-123", transcript_path=str(path)), spawn=False))
+        self.assertFalse((self.root / "pending").exists())
 
     def test_replaced_rollout_between_enqueue_and_first_run_is_rejected(self):
         request = self.request()

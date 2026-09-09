@@ -6,7 +6,7 @@ All notable changes to Engram are documented in this file.
 
 ## [Unreleased]
 
-## [0.14.5] - 2026-09-09
+## [0.14.6] - 2026-09-09
 
 ### Added
 - **Automatic Codex session learning.** Native Stop, PreCompact, and SessionEnd
@@ -22,8 +22,19 @@ All notable changes to Engram are documented in this file.
   settings are preserved. Status and retry commands expose pending or failed work.
 
 ### Fixed
+- Subagent compaction hooks are bound to the child transcript even when Codex
+  supplies the parent session ID. Explicit subagent metadata and a known history
+  boundary are required; siblings retain separate cursors and inherited history
+  remains excluded. Ordinary forked roots cannot use this identity exception.
+- A later hook with no new visible content preserves the prior successful run's
+  receipt and timestamp in learner status.
 - Download installation preserves Developer ID signatures instead of replacing
   them with ad-hoc signatures, retaining the release's keychain identity.
+
+## [0.14.5] - 2026-09-09
+
+Unpublished validation candidate, superseded by 0.14.6 after checking native
+subagent hook identity handling.
 
 ## [0.14.4] - 2026-09-09
 

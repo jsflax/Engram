@@ -125,11 +125,27 @@ def validate_request(payload: dict, root: Path) -> dict:
     if not path.is_file() or st.st_uid != os.getuid():
         raise ValueError("transcript_not_owned_regular_file")
     meta = inspect_rollout(str(path))
-    if meta.session_id != sid:
+    agent_id = payload.get("agent_id")
+    if agent_id is not None and agent_id != meta.session_id:
         raise ValueError("transcript_session_mismatch")
+    if meta.session_id != sid:
+        # Native subagent hooks carry the parent/logical session ID while their
+        # transcript belongs to the child. Bind to the child's canonical ID only
+        # when its own metadata proves that relationship and an inherited-history
+        # boundary. A manually forked root cannot use this exception.
+        source = meta.source if isinstance(meta.source, dict) else {}
+        subagent = source.get("subagent")
+        spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+        parent = spawn.get("parent_thread_id") if isinstance(spawn, dict) else None
+        aliases = {meta.parent_session_id, meta.hook_session_id}
+        if (not isinstance(parent, str) or not parent or not meta.fork_boundary_known
+                or sid not in aliases
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", meta.session_id)):
+            raise ValueError("transcript_session_mismatch")
     if "engram-session-learner" in str(meta.source):
         raise ValueError("learner_transcript")
-    return {"session_id": sid, "transcript_path": str(path), "cwd": meta.cwd or payload.get("cwd"),
+    return {"session_id": meta.session_id, "hook_session_id": sid,
+            "transcript_path": str(path), "cwd": meta.cwd or payload.get("cwd"),
             "model": payload.get("model"), "event": event, "turn_id": payload.get("turn_id"),
             "requested_at": utc(), "size_bytes": st.st_size, "mtime_ns": st.st_mtime_ns,
             "device": st.st_dev, "inode": st.st_ino, "request_id": uuid.uuid4().hex}
@@ -143,7 +159,9 @@ def enqueue(root: Path, payload: dict, *, spawn: bool = True) -> bool:
     try:
         request = validate_request(payload, root)
     except (ValueError, OSError) as exc:
-        event_log(root, "rejected", reason=str(exc)[:160])
+        supplied_id = payload.get("session_id")
+        safe_id = supplied_id if isinstance(supplied_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", supplied_id) else None
+        event_log(root, "rejected", hook_session_id=safe_id, reason=str(exc)[:160])
         return False
     sid = request["session_id"]
     with lock_file(root / "enqueue.lock"):
@@ -456,21 +474,22 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=run_codex
                            recent_messages=state.get("recent_messages"), current_turn_id=state.get("current_turn_id"))
     if (excerpt.metadata.session_id, excerpt.metadata.device, excerpt.metadata.inode) != (sid, meta.device, meta.inode):
         raise ValueError("transcript_replaced_during_read")
-    next_state = {"session_id": sid, "transcript_path": str(path), "offset": excerpt.next_offset,
+    next_state = {"session_id": sid, "hook_session_id": request.get("hook_session_id", sid),
+                  "transcript_path": str(path), "offset": excerpt.next_offset,
                   "recent_messages": excerpt.recent_messages, "current_turn_id": excerpt.current_turn_id,
                   "device": meta.device, "inode": meta.inode, "updated_at": utc()}
     if excerpt.blocked_reason and not excerpt.text:
         event_log(root, "blocked", session_id=sid, reason=excerpt.blocked_reason, offset=offset)
         return "blocked"
     if not excerpt.text:
-        atomic_json(state_path, {**next_state, "status": "no_visible_content"})
+        atomic_json(state_path, {**state, **next_state, "status": "no_visible_content"})
         return "more" if excerpt.has_more else "no_change"
     if len(excerpt.text) < config["min_chars"] and request["event"] == "Stop" and not excerpt.has_more:
         event_log(root, "deferred_short", session_id=sid, chars=len(excerpt.text))
         return "deferred"
     digest = hashlib.sha256(excerpt.text.encode()).hexdigest()
     if digest == state.get("last_excerpt_sha256"):
-        atomic_json(state_path, {**next_state, "status": "duplicate", "last_excerpt_sha256": digest})
+        atomic_json(state_path, {**state, **next_state, "status": "duplicate", "last_excerpt_sha256": digest})
         return "more" if excerpt.has_more else "no_change"
     run_dir = private_dir(root / "runs" / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex))
     try:

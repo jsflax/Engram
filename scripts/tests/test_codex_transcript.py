@@ -192,11 +192,38 @@ class TranscriptTests(unittest.TestCase):
                    message("assistant", "new child result", ordinal=6))
         excerpt = read_excerpt(self.path)
         self.assertEqual(excerpt.metadata.session_id, "child-123")
+        self.assertEqual(excerpt.metadata.hook_session_id, "parent")
         self.assertEqual(excerpt.metadata.cwd, "/tmp/project")
         self.assertEqual(excerpt.metadata.parent_session_id, "parent")
         self.assertEqual(excerpt.message_count, 2)
         self.assertNotIn("inherited", excerpt.text)
         self.assertEqual(excerpt.diagnostics["inherited_records"], 3)
+
+    def test_root_metadata_retains_hook_identity_separately(self):
+        self.write(meta(session_id="child-123"), message("user", "Root decision."))
+        metadata = inspect_rollout(self.path)
+        self.assertEqual(metadata.session_id, "child-123")
+        self.assertEqual(metadata.hook_session_id, "child-123")
+        self.assertIsNone(metadata.parent_session_id)
+        self.write(meta(), message("user", "Legacy root decision."))
+        self.assertIsNone(inspect_rollout(self.path).hook_session_id)
+
+    def test_nested_subagent_preserves_logical_root_and_immediate_parent(self):
+        header = meta(id="grandchild", session_id="logical-root", forked_from_id="immediate-parent",
+                      subagent_history_start_ordinal=5,
+                      source={"subagent": {"thread_spawn": {"parent_thread_id": "immediate-parent"}}})
+        header["ordinal"] = 0
+        inherited_meta = meta(id="immediate-parent", session_id="older-logical-root")
+        inherited_meta["ordinal"] = 1
+        self.write(header, inherited_meta, message("user", "Inherited private decision.", ordinal=2),
+                   message("assistant", "Grandchild's new finding.", ordinal=5))
+        excerpt = read_excerpt(self.path)
+        self.assertEqual(excerpt.metadata.session_id, "grandchild")
+        self.assertEqual(excerpt.metadata.hook_session_id, "logical-root")
+        self.assertEqual(excerpt.metadata.parent_session_id, "immediate-parent")
+        self.assertEqual(excerpt.message_count, 1)
+        self.assertNotIn("Inherited", excerpt.text)
+        self.assertIn("Grandchild", excerpt.text)
 
     def test_paginated_fork_never_opens_history_base(self):
         header = meta(forked_from_id="parent", history_mode="paginated", forked_from_ordinal_exclusive=3021,

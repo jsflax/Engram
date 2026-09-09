@@ -40,6 +40,9 @@ and store useful findings. It excludes hidden reasoning, tool output, and inheri
 fork history. Common credential patterns are redacted; this is not a general
 secret detector. New memories are private and include their source session ID.
 The current learner supports a local **stdio** memory MCP, not a remote HTTP MCP.
+Subagent compaction events use separate child cursors even when Codex supplies
+the parent session ID; the mapping requires explicit child metadata and a known
+boundary separating inherited messages.
 
 One learner runs at a time, with a 10-minute limit, at most 12 memory calls and
 five writes per batch. An independent MCP gateway enforces the limits and checks
