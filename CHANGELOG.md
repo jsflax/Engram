@@ -6,7 +6,7 @@ All notable changes to Engram are documented in this file.
 
 ## [Unreleased]
 
-## [0.14.6] - 2026-09-09
+## [0.14.7] - 2026-09-09
 
 ### Added
 - **Automatic Codex session learning.** Native Stop, PreCompact, and SessionEnd
@@ -28,8 +28,15 @@ All notable changes to Engram are documented in this file.
   remains excluded. Ordinary forked roots cannot use this identity exception.
 - A later hook with no new visible content preserves the prior successful run's
   receipt and timestamp in learner status.
+- Learners distinguish primary write receipts from automatically linked memory
+  IDs when reporting completion, preserving strict independent receipt checks.
 - Download installation preserves Developer ID signatures instead of replacing
   them with ad-hoc signatures, retaining the release's keychain identity.
+
+## [0.14.6] - 2026-09-09
+
+Unpublished validation candidate, superseded by 0.14.7 after a live check exposed
+ambiguous instructions for reporting automatically linked memory IDs.
 
 ## [0.14.5] - 2026-09-09
 

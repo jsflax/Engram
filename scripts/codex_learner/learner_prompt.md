@@ -21,8 +21,9 @@ for meaningful relationships, not arbitrary linkage. Skip memory-system usage
 itself unless the excerpt contains a real integration finding. If everything is
 already represented or unimportant, make no writes. If the MCP fails, report a
 failure; do not claim success. Return the requested JSON result with only actual
-memory IDs and a short non-sensitive summary. For stored, include every memory
-ID returned by successful remember/update/connect calls (both endpoints of a
-connection); for no_new_memories, return an empty ID list and make no writes.
-The runner independently checks
-tool results before accepting the excerpt as processed.
+memory IDs and a short non-sensitive summary. For stored, list only the primary
+ID in each successful "Stored memory (id: ...)" or "Updated memory (id: ...)"
+receipt, plus both endpoints of any explicit successful connect call. Do not
+include IDs mentioned in recall results, memory text, or automatic linking notes.
+For no_new_memories, return an empty ID list and make no writes. The runner
+independently checks tool results before accepting the excerpt as processed.
