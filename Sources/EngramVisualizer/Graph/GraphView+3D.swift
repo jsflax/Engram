@@ -40,17 +40,21 @@ extension GraphView {
             embeddingProjection.invalidate()
 
             let nodeIds = renderStore.visibleNodeIds
-            embeddingProjection.loadEmbeddings(for: nodeIds, from: lattice)
+            let reference = lattice.sendableReference
+            let initialPositions = forcePositionSnapshot3D
             let nodeScale = max(1.0, sqrt(Float(nodeIds.count) / 30.0))
             let spread = max(Float(viewSize.width), Float(viewSize.height)) * 1.2 * nodeScale
 
             withAnimation(.easeInOut(duration: 0.8)) { transitionProgress = 1.0 }
 
             Task {
-                await embeddingProjection.computeProjection3D(
+                guard config.layoutMode == .embedding else { return }
+                guard await embeddingProjection.loadEmbeddings(for: nodeIds, from: reference),
+                      config.layoutMode == .embedding else { return }
+                guard await embeddingProjection.computeProjection3D(
                     nodeIds: nodeIds, spread: spread,
-                    initialPositions: forcePositionSnapshot3D
-                )
+                    initialPositions: initialPositions
+                ), config.layoutMode == .embedding else { return }
                 var topics: [UUID: String] = [:]
                 var projects: [UUID: String] = [:]
                 var labels: [UUID: String] = [:]
@@ -68,6 +72,7 @@ extension GraphView {
             if !currentPositions.isEmpty {
                 simulation3D.setPositions(currentPositions)
             }
+            embeddingProjection.invalidate()
             simulation3D.isActive = true
             config.showVoids = false
 

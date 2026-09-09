@@ -33,6 +33,8 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     private var frameCentroids: [String: SIMD3<Float>] = [:]
     private var simIndexByNodeIndex: [Int] = []
     private var simIndexTopologyVersion: UInt64 = .max
+    private var cachedPositionVersion: UInt64 = .max
+    private var centroidPositionVersion: UInt64 = .max
 
     init(registry: GalaxyRegistry) {
         self.registry = registry
@@ -52,6 +54,7 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     /// Flat positions parallel to `nodes`, refreshed once per tick from the
     /// unified simulation's flat arrays (no UUID hashing on access).
     var positionArray: [SIMD3<Float>] { framePositionArray }
+    var positionVersion: UInt64 { registry?.unifiedSimulation.positionVersion ?? 0 }
 
     var glowingNodes: [UUID: Float] { frameGlowing }
 
@@ -91,16 +94,10 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         guard let registry else { return }
 
         // Drain pending updates from all galaxies
-        let drainConfig = DrainConfig(
-            hiddenProjects: [],
-            hiddenRelations: [],
-            timeFilter: nil,
-            is3D: true,
-            soundEnabled: false,
-            notificationsEnabled: false
-        )
+        let drainConfig = registry.currentDrainConfig
+        let perGalaxyBudget = 0.002 / Double(max(1, registry.galaxies.count))
         for galaxy in registry.galaxies.values {
-            galaxy.drainPendingUpdate(config: drainConfig)
+            galaxy.drainPendingUpdate(config: drainConfig, workBudget: perGalaxyBudget)
         }
 
         // Tick unified simulation
@@ -114,7 +111,9 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         if currentTopology != lastTopologyVersion {
             lastTopologyVersion = currentTopology
             rebuildSnapshots()
+            #if ENGRAM_INSTRUMENTATION
             print("[adapter] topology v\(currentTopology): \(cachedNodes.count) nodes, \(cachedEdges.count) edges, mergedEdges=\(registry.mergedEdges.count), positions=\(registry.mergedPositions.count)")
+            #endif
         }
 
         // Rebuild color map if needed
@@ -136,9 +135,9 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         let sim = registry.unifiedSimulation
 
         // positionArray via flat sim arrays + a topology-cached index map.
-        let px = sim.posX, py = sim.posY, pz = sim.posZ
         let n = cachedNodes.count
-        if simIndexByNodeIndex.count != n || simIndexTopologyVersion != lastTopologyVersion {
+        let indicesChanged = simIndexByNodeIndex.count != n || simIndexTopologyVersion != lastTopologyVersion
+        if indicesChanged {
             var idToSim = [UUID: Int](minimumCapacity: sim.nodeIds.count)
             for (si, id) in sim.nodeIds.enumerated() { idToSim[id] = si }
             simIndexByNodeIndex = cachedNodes.map { idToSim[$0.id] ?? -1 }
@@ -147,13 +146,16 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         if framePositionArray.count != n {
             framePositionArray = [SIMD3<Float>](repeating: .zero, count: n)
         }
-        simIndexByNodeIndex.withUnsafeBufferPointer { simIdx in
-            for i in 0..<n {
-                let si = simIdx[i]
-                if si >= 0 && si < px.count {
-                    framePositionArray[i] = SIMD3<Float>(px[si], py[si], pz[si])
+        if indicesChanged || cachedPositionVersion != sim.positionVersion {
+            let px = sim.posX, py = sim.posY, pz = sim.posZ
+            simIndexByNodeIndex.withUnsafeBufferPointer { simIdx in
+                for i in 0..<n {
+                    let si = simIdx[i]
+                    framePositionArray[i] = si >= 0 && si < px.count ?
+                        SIMD3<Float>(px[si], py[si], pz[si]) : .zero
                 }
             }
+            cachedPositionVersion = sim.positionVersion
         }
 
         // Glow elapsed times — one Date() call, one dict build per frame.
@@ -175,15 +177,18 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         // color map, and positions together, and folding them into one scan
         // keeps the per-30-frame cost at O(n).
         frameCounter &+= 1
-        if frameCentroids.isEmpty || lastTopologyVersion != centroidsTopologyVersion
-            || frameCounter % 30 == 0 {
-            let positions = registry.mergedPositions
+        let isLoading = registry.galaxies.values.contains { $0.isDrainingInitialSnapshot }
+        let topologyNeedsCentroids = lastTopologyVersion != centroidsTopologyVersion
+            && (!isLoading || frameCentroids.isEmpty || frameCounter % 30 == 0)
+        if topologyNeedsCentroids
+            || (frameCounter % 30 == 0 && centroidPositionVersion != sim.positionVersion) {
             let nodeToGalaxy = registry.nodeToGalaxy
             var sums: [String: (sum: SIMD3<Float>, count: Int)] = [:]
             // (galaxyId|project) → accumulator; galaxyId → extent accumulator.
             var clusterSums: [String: (galaxy: String, project: String, sum: SIMD3<Float>, count: Int)] = [:]
-            for node in cachedNodes {
-                guard let pos = positions[node.id] else { continue }
+            for (index, node) in cachedNodes.enumerated() {
+                guard simIndexByNodeIndex[index] >= 0 else { continue }
+                let pos = framePositionArray[index]
                 let entry = sums[node.project] ?? (.zero, 0)
                 sums[node.project] = (entry.sum + pos, entry.count + 1)
                 let galaxy = nodeToGalaxy[node.id] ?? "personal"
@@ -203,8 +208,9 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
             var galaxyCounts: [String: Int] = [:]
             var galaxyProjectCounts: [String: [String: Int]] = [:]
             let galaxyCenters = registry.galaxies.mapValues { $0.worldCenter }
-            for node in cachedNodes {
-                guard let pos = positions[node.id] else { continue }
+            for (index, node) in cachedNodes.enumerated() {
+                guard simIndexByNodeIndex[index] >= 0 else { continue }
+                let pos = framePositionArray[index]
                 let galaxy = nodeToGalaxy[node.id] ?? "personal"
                 let key = "\(galaxy)|\(node.project)"
                 if let centroid = clusterCentroids[key] {
@@ -238,6 +244,7 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
                     parentGalaxyId: galaxy.parentGalaxyId)
             }
             centroidsTopologyVersion = lastTopologyVersion
+            centroidPositionVersion = sim.positionVersion
         }
     }
     private var centroidsTopologyVersion: UInt64 = .max
@@ -254,8 +261,25 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         guard let registry else { return }
 
         let mergedHubs = registry.mergedHubs
-        cachedNodes = registry.mergedNodes.map { node in
-            RKNodeSnapshot(
+        let nodes = registry.mergedNodes
+        // During loading the graph normally grows by appending. Validate the
+        // entire old prefix, including metadata, before reusing its snapshots;
+        // count growth alone cannot rule out a simultaneous edit/replacement.
+        let canAppendNodes = nodes.count >= cachedNodes.count
+            && cachedNodes.indices.allSatisfy { index in
+                let old = cachedNodes[index], node = nodes[index]
+                return old.id == node.id && old.project == node.project
+                    && old.topic == node.topic && old.label == node.label
+                    && old.content == node.content && old.importance == node.importance
+                    && old.createdAt == node.createdAt && old.lastAccessedAt == node.lastAccessedAt
+                    && old.isHub == mergedHubs.contains(node.id)
+            }
+        if !canAppendNodes { cachedNodes.removeAll(keepingCapacity: true) }
+        if cachedNodes.capacity < nodes.count {
+            cachedNodes.reserveCapacity(max(nodes.count, max(64, cachedNodes.capacity * 2)))
+        }
+        for node in nodes.dropFirst(cachedNodes.count) {
+            cachedNodes.append(RKNodeSnapshot(
                 id: node.id,
                 project: node.project,
                 topic: node.topic,
@@ -265,19 +289,32 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
                 isHub: mergedHubs.contains(node.id),
                 createdAt: node.createdAt,
                 lastAccessedAt: node.lastAccessedAt
-            )
+            ))
         }
 
-        cachedEdges = registry.mergedEdges.map { edge in
-            RKEdgeSnapshot(
+        let edges = registry.mergedEdges
+        let canAppendEdges = edges.count >= cachedEdges.count
+            && cachedEdges.indices.allSatisfy { index in
+                let old = cachedEdges[index], edge = edges[index]
+                return old.id == edge.id && old.sourceId == edge.sourceId
+                    && old.targetId == edge.targetId && old.relation == edge.relation
+            }
+        if !canAppendEdges { cachedEdges.removeAll(keepingCapacity: true) }
+        if cachedEdges.capacity < edges.count {
+            cachedEdges.reserveCapacity(max(edges.count, max(64, cachedEdges.capacity * 2)))
+        }
+        for edge in edges.dropFirst(cachedEdges.count) {
+            cachedEdges.append(RKEdgeSnapshot(
                 id: edge.id,
                 sourceId: edge.sourceId,
                 targetId: edge.targetId,
                 relation: edge.relation
-            )
+            ))
         }
 
-        cachedHubs = mergedHubs
+        // Do not pin the mutable render store's Set storage via this cache or
+        // LOD's retained prior hub set while the next loading batch inserts.
+        cachedHubs = Set(mergedHubs.map { $0 })
     }
 
     private func rebuildColorMap() {
@@ -295,24 +332,9 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     private func syncGlowState() {
         guard let registry else { return }
 
-        // Recall glows
-        let currentGlows = registry.mergedGlowingNodes
-        // Add new glows
-        for (id, date) in currentGlows where glowStartTimes[id] == nil {
-            glowStartTimes[id] = date
-        }
-        // Remove expired glows (not in registry anymore)
-        for id in glowStartTimes.keys where currentGlows[id] == nil {
-            glowStartTimes.removeValue(forKey: id)
-        }
-
-        // New node glows
-        let currentNew = registry.mergedNewNodeGlows
-        for (id, date) in currentNew where newNodeStartTimes[id] == nil {
-            newNodeStartTimes[id] = date
-        }
-        for id in newNodeStartTimes.keys where currentNew[id] == nil {
-            newNodeStartTimes.removeValue(forKey: id)
-        }
+        // Preserve restarted timestamps as well as membership. A second recall
+        // during an active glow must restart the animation immediately.
+        glowStartTimes = registry.mergedGlowingNodes
+        newNodeStartTimes = registry.mergedNewNodeGlows
     }
 }

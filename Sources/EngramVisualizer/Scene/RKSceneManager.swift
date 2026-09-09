@@ -111,7 +111,7 @@ final class RKSceneManager {
         // Camera update
         camera.pollKeyboard(dt: dt)
         if let orbitRate = Self.harnessOrbitRate {
-            camera.lookRotate(deltaAz: orbitRate * dt * .pi / 180, deltaEl: 0)
+            camera.targetAzimuth += orbitRate * dt * .pi / 180
         }
         camera.updateCamera(dt: dt)
         if let exitAfter = Self.harnessExitAfterFrames {
@@ -159,11 +159,12 @@ final class RKSceneManager {
             alpha: sim.alpha, damping: 0.78, maxSpeed: 12.0
         )
         sim.topologyDirtyForGPU = false
+        let nodeOrderVersion = sim.nodeOrderVersion
 
         // Async dispatch — GPU runs force compute while CPU/renderer continue.
         // Results applied next frame via completion handler. Never blocks main thread.
         engine.encodeForcePass(queue: rkScene.commandQueue, snapshot: snapshot) { result in
-            sim.applyGPUForces(result)
+            sim.applyGPUForces(result, expectedNodeOrderVersion: nodeOrderVersion)
         }
     }
 

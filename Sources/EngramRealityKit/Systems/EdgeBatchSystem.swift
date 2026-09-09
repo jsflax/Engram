@@ -17,23 +17,18 @@ public final class EdgeBatchSystem {
     private static let indicesPerEdge = sides * 6 // 36
 
     private var staging: [BatchVertex] = []
-    /// Pre-allocated staging buffer for texture blit (macOS 26+).
-    private var texStagingBuffer: MTLBuffer?
-    private var texStagingCapacity: Int = 0
-    private var lastInstanceCount: Int = -1
+    /// A buffer remains leased until its GPU blit completes.
+    private let textureUploads = BoundedUploadPool<any MTLBuffer>()
+    private var instanceValues = EdgeInstanceValueCache()
 
     // Stable instance-slot assignment — see NodeBatchSystem: keeps per-slot
     // color and transform associated per EDGE across frames of LOD churn.
-    private var slotForEdge: [Int: Int] = [:]
-    private var slotHighWater = 0
-    private var freeSlots: [Int] = []
-    private var slotsTopologyVersion: UInt64 = .max
+    private var slots = StableInstanceSlots()
+    private var textureData: [SIMD4<Float16>] = []
+    private let renderCache = BatchRenderCache()
 
-    /// Cached node→project mapping — rebuilt only on topology change.
-    private var cachedNodeProject: [UUID: String] = [:]
-    /// Cached node UUID→positionArray index mapping — rebuilt only on topology change.
-    private var nodeIdToIndex: [UUID: Int] = [:]
-    private var lastTopologyVersion: UInt64 = 0
+    private var nodeLookup = EdgeNodeLookupCache()
+    private var lastTopologyVersion: UInt64 = .max
 
     /// Precomputed sin/cos for 6-sided cylinder (same every frame).
     private static let sideAngles: [(c: Float, s: Float)] = (0..<sides).map { i in
@@ -51,18 +46,35 @@ public final class EdgeBatchSystem {
         scaleFactor: Float,
         commandBuffer: MTLCommandBuffer? = nil
     ) {
-        if #available(macOS 26, *) {
-            updateWithMeshInstances(
-                scene: scene, dataProvider: dataProvider,
-                visibleSet: visibleSet, scaleFactor: scaleFactor,
-                commandBuffer: commandBuffer
-            )
-        } else {
-            updateCurrentApproach(
-                scene: scene, dataProvider: dataProvider,
-                visibleSet: visibleSet, scaleFactor: scaleFactor,
-                commandBuffer: commandBuffer
-            )
+        let state = BatchRenderState(
+            topology: dataProvider.topologyVersion, positions: dataProvider.positionVersion,
+            visibleIndices: visibleSet.visibleEdgeIndices, selection: dataProvider.selectedNode,
+            search: dataProvider.searchMatchIds, searchActive: dataProvider.isSearchActive,
+            colors: dataProvider.projectColorMap, scale: scaleFactor)
+        renderCache.update(state) {
+            let hasEdges = !visibleSet.visibleEdgeIndices.isEmpty
+            guard hasEdges else {
+                scene.edgeBatchEntity?.isEnabled = false
+                if #available(macOS 26, *) { scene.edgeTemplateEntity?.isEnabled = false }
+                return true
+            }
+            if #available(macOS 26, *) {
+                let updated = updateWithMeshInstances(
+                    scene: scene, dataProvider: dataProvider,
+                    visibleSet: visibleSet, scaleFactor: scaleFactor,
+                    commandBuffer: commandBuffer, frameState: state
+                )
+                if updated { scene.edgeTemplateEntity?.isEnabled = true }
+                return updated
+            } else {
+                let updated = updateCurrentApproach(
+                    scene: scene, dataProvider: dataProvider,
+                    visibleSet: visibleSet, scaleFactor: scaleFactor,
+                    commandBuffer: commandBuffer
+                )
+                if updated { scene.edgeBatchEntity?.isEnabled = true }
+                return updated
+            }
         }
     }
 
@@ -74,35 +86,30 @@ public final class EdgeBatchSystem {
         visibleSet: VisibleSet,
         scaleFactor: Float,
         commandBuffer: MTLCommandBuffer? = nil
-    ) {
+    ) -> Bool {
         let visibleCount = visibleSet.visibleEdgeIndices.count
-        guard visibleCount > 0 else { return }
+        guard visibleCount > 0 else { return true }
 
         LowLevelMeshFactory.ensureEdgeBatchMesh(scene: scene, capacity: visibleCount)
-        guard let mesh = scene.edgeBatchMesh else { return }
+        guard let mesh = scene.edgeBatchMesh else { return false }
 
         let edges = dataProvider.edges
-        let positions = dataProvider.positions
         let selectedNode = dataProvider.selectedNode
         let colorMap = dataProvider.projectColorMap
         let nodes = dataProvider.nodes
         let isSearchActive = dataProvider.isSearchActive
         let searchMatchIds = dataProvider.searchMatchIds
 
-        // Rebuild node→project and node→index caches only on topology change
+        // Extend validated append-only node prefixes without rebuilding maps.
         let topoVersion = dataProvider.topologyVersion
         if topoVersion != lastTopologyVersion {
             lastTopologyVersion = topoVersion
-            cachedNodeProject.removeAll(keepingCapacity: true)
-            nodeIdToIndex.removeAll(keepingCapacity: true)
-            for (i, node) in nodes.enumerated() {
-                cachedNodeProject[node.id] = node.project
-                nodeIdToIndex[node.id] = i
-            }
+            nodeLookup.update(nodes: nodes)
         }
-        let nodeProject = cachedNodeProject
+        let nodeProject = nodeLookup.projects
         let positionArray = dataProvider.positionArray
-        let idToIndex = nodeIdToIndex
+        let positions = positionArray.count == nodes.count ? [:] : dataProvider.positions
+        let idToIndex = nodeLookup.indices
 
         let totalVerts = scene.edgeBatchCapacity * Self.vertsPerEdge
         if staging.count < totalVerts {
@@ -186,13 +193,14 @@ public final class EdgeBatchSystem {
         }
 
         // GPU-synchronized write
-        guard let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer() else { return }
+        guard let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer() else { return false }
         let destBuffer = mesh.replace(bufferIndex: 0, using: cmdBuf)
         let dest = destBuffer.contents().bindMemory(to: BatchVertex.self, capacity: totalVerts)
         staging.withUnsafeBufferPointer { src in
             dest.update(from: src.baseAddress!, count: totalVerts)
         }
         if commandBuffer == nil { cmdBuf.commit() }
+        return true
     }
 
     // MARK: - macOS 26+: MeshInstanceCollection
@@ -206,130 +214,97 @@ public final class EdgeBatchSystem {
         dataProvider: SceneDataProvider,
         visibleSet: VisibleSet,
         scaleFactor: Float,
-        commandBuffer: MTLCommandBuffer? = nil
-    ) {
+        commandBuffer: MTLCommandBuffer? = nil,
+        frameState: BatchRenderState
+    ) -> Bool {
         let visibleCount = visibleSet.visibleEdgeIndices.count
-        guard visibleCount > 0 else { return }
+        guard visibleCount > 0 else { return true }
 
         // Ensure cylinder template entity and instance texture exist
         scene.ensureEdgeInstanceResources(capacity: visibleCount)
         guard let entity = scene.edgeTemplateEntity,
               let instanceData = scene.edgeInstanceData,
               let instanceTexture = scene.edgeInstanceTexture else {
-            return
+            return false
         }
-
         let edges = dataProvider.edges
-        let positions = dataProvider.positions
         let selectedNode = dataProvider.selectedNode
         let colorMap = dataProvider.projectColorMap
         let nodes = dataProvider.nodes
         let isSearchActive = dataProvider.isSearchActive
         let searchMatchIds = dataProvider.searchMatchIds
 
-        // Rebuild node→project and node→index caches only on topology change
+        // Extend validated append-only node prefixes without rebuilding maps.
         let topoVersion = dataProvider.topologyVersion
         if topoVersion != lastTopologyVersion {
             lastTopologyVersion = topoVersion
-            cachedNodeProject.removeAll(keepingCapacity: true)
-            nodeIdToIndex.removeAll(keepingCapacity: true)
-            for (i, node) in nodes.enumerated() {
-                cachedNodeProject[node.id] = node.project
-                nodeIdToIndex[node.id] = i
-            }
+            nodeLookup.update(nodes: nodes)
         }
-        let nodeProject = cachedNodeProject
+        let nodeProject = nodeLookup.projects
         let positionArray = dataProvider.positionArray
-        let idToIndex = nodeIdToIndex
+        let positions = positionArray.count == nodes.count ? [:] : dataProvider.positions
+        let idToIndex = nodeLookup.indices
 
         let texWidth = scene.edgeInstanceTextureWidth
-        var texData = [SIMD4<Float16>](repeating: .zero, count: texWidth)
+        let bytesPerRow = texWidth * MemoryLayout<SIMD4<Float16>>.stride
+        // Do not change transforms/slots while all staging buffers still have
+        // GPU readers. The render cache will retry this same frame state.
+        guard let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer(),
+              let upload = textureUploads.acquire(minimumCapacity: bytesPerRow, makeResource: {
+                  scene.device.makeBuffer(length: $0, options: .storageModeShared)
+              }) else { return false }
+        var uploadSubmitted = false
+        defer { if !uploadSubmitted { textureUploads.release(upload) } }
+
+        instanceValues.prepare(state: frameState, count: edges.count)
+        var texData = textureData
+        textureData = []
+        if texData.count != texWidth { texData = Array(repeating: .zero, count: texWidth) }
 
         // --- Stable slot maintenance (see NodeBatchSystem) ---
-        if dataProvider.topologyVersion != slotsTopologyVersion {
-            slotsTopologyVersion = dataProvider.topologyVersion
-            slotForEdge.removeAll(keepingCapacity: true)
-            freeSlots.removeAll(keepingCapacity: true)
-            slotHighWater = 0
-        }
         let capacity = instanceData.instanceCapacity
-        let visibleEdgeSet = Set(visibleSet.visibleEdgeIndices)
-        var freed: [Int] = []
-        slotForEdge = slotForEdge.filter { (edgeIdx, slot) in
-            if visibleEdgeSet.contains(edgeIdx) { return true }
-            freed.append(slot)
-            return false
-        }
-        freeSlots.append(contentsOf: freed)
-        var occupied = [Bool](repeating: false, count: min(slotHighWater, capacity))
-        var writes: [(slot: Int, edgeIdx: Int)] = []
-        writes.reserveCapacity(min(visibleCount, capacity))
-        for edgeIdx in visibleSet.visibleEdgeIndices {
-            let slot: Int
-            if let existing = slotForEdge[edgeIdx] {
-                slot = existing
-            } else if let reused = freeSlots.popLast() {
-                slot = reused
-                slotForEdge[edgeIdx] = reused
-            } else if slotHighWater < capacity {
-                slot = slotHighWater
-                slotHighWater += 1
-                slotForEdge[edgeIdx] = slot
-            } else {
-                continue
-            }
-            if slot < occupied.count { occupied[slot] = true }
-            writes.append((slot, edgeIdx))
-        }
-        let slotWrites = writes
-        let holes = occupied.enumerated().compactMap { $1 ? nil : $0 }
-        let usedCount = min(slotHighWater, capacity)
+        slots.update(indices: visibleSet.visibleEdgeIndices, topology: dataProvider.topologyVersion,
+                     capacity: capacity, idAtIndex: { edges[$0].id })
+        let slotWrites = slots.writes
+        let holes = slots.holes
+        let usedCount = slots.highWater
 
         instanceData.replaceMutableTransforms { transforms in
             for (slot, edgeIdx) in slotWrites {
                 let instanceIdx = slot
                 guard instanceIdx < transforms.count, instanceIdx < texData.count else { continue }
-                let edge = edges[edgeIdx]
-                let srcPos: SIMD3<Float>
-                let tgtPos: SIMD3<Float>
-                if let si = idToIndex[edge.sourceId], si < positionArray.count,
-                   let ti = idToIndex[edge.targetId], ti < positionArray.count {
-                    srcPos = positionArray[si]
-                    tgtPos = positionArray[ti]
-                } else {
-                    guard let sp = positions[edge.sourceId], let tp = positions[edge.targetId] else { continue }
-                    srcPos = sp; tgtPos = tp
+                let value = instanceValues.value(at: edgeIdx) {
+                    let edge = edges[edgeIdx]
+                    let srcPos: SIMD3<Float>
+                    let tgtPos: SIMD3<Float>
+                    if let si = idToIndex[edge.sourceId], si < positionArray.count,
+                       let ti = idToIndex[edge.targetId], ti < positionArray.count {
+                        srcPos = positionArray[si]
+                        tgtPos = positionArray[ti]
+                    } else {
+                        guard let sp = positions[edge.sourceId], let tp = positions[edge.targetId] else { return .hidden }
+                        srcPos = sp; tgtPos = tp
+                    }
+
+                    let transform = Self.cylinderTransform(
+                        from: srcPos * scaleFactor, to: tgtPos * scaleFactor, radius: scaleFactor)
+                    guard transform != matrix_identity_float4x4 else { return .hidden }
+
+                    let project = nodeProject[edge.sourceId]
+                    var color = colorMap[project ?? ""] ?? SIMD3<Float>(0.6, 0.6, 0.6)
+                    color = min(color * 1.4 + 0.15, SIMD3<Float>(repeating: 1.0))
+                    var alpha: Float = 0.35
+                    if let sel = selectedNode {
+                        alpha = edge.sourceId == sel || edge.targetId == sel ? 0.8 : 0.15
+                    }
+                    if isSearchActive && !searchMatchIds.contains(edge.sourceId) && !searchMatchIds.contains(edge.targetId) {
+                        alpha *= 0.2
+                    }
+                    return EdgeInstanceValueCache.Value(transform: transform, color: SIMD4<Float16>(
+                        Float16(color.x), Float16(color.y), Float16(color.z), Float16(alpha)))
                 }
-
-                let src = srcPos * scaleFactor
-                let tgt = tgtPos * scaleFactor
-                let radius: Float = 1.0 * scaleFactor
-
-                let transform = Self.cylinderTransform(
-                    from: src, to: tgt, radius: radius
-                )
-                guard transform != matrix_identity_float4x4 else { continue }
-                transforms[instanceIdx] = transform
-
-                // Per-instance color
-                let project = nodeProject[edge.sourceId]
-                var color = colorMap[project ?? ""] ?? SIMD3<Float>(0.6, 0.6, 0.6)
-                color = min(color * 1.4 + 0.15, SIMD3<Float>(repeating: 1.0))
-
-                var alpha: Float = 0.35
-                if let sel = selectedNode {
-                    if edge.sourceId == sel || edge.targetId == sel { alpha = 0.8 }
-                    else { alpha = 0.15 }
-                }
-                if isSearchActive {
-                    let srcMatch = searchMatchIds.contains(edge.sourceId)
-                    let tgtMatch = searchMatchIds.contains(edge.targetId)
-                    if !srcMatch && !tgtMatch { alpha *= 0.2 }
-                }
-
-                texData[instanceIdx] = SIMD4<Float16>(
-                    Float16(color.x), Float16(color.y), Float16(color.z), Float16(alpha)
-                )
+                transforms[instanceIdx] = value.transform
+                texData[instanceIdx] = value.color
             }
 
             // Zero departed slots (see NodeBatchSystem).
@@ -338,30 +313,29 @@ public final class EdgeBatchSystem {
                 if slot < texData.count { texData[slot] = .zero }
             }
         }
+        textureData = texData
 
         instanceData.instanceCount = usedCount
 
         // Update per-instance color texture
-        let bytesPerRow = texWidth * MemoryLayout<SIMD4<Float16>>.stride
-        if texStagingCapacity < bytesPerRow {
-            texStagingBuffer = scene.device.makeBuffer(length: bytesPerRow, options: .storageModeShared)
-            texStagingCapacity = bytesPerRow
-        }
-        if let stagingBuf = texStagingBuffer,
-           let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer() {
+        do {
             let texMTL = instanceTexture.replace(using: cmdBuf)
             texData.withUnsafeBytes { ptr in
-                stagingBuf.contents().copyMemory(from: ptr.baseAddress!, byteCount: bytesPerRow)
+                upload.resource.contents().copyMemory(from: ptr.baseAddress!, byteCount: bytesPerRow)
             }
-            let blit = cmdBuf.makeBlitCommandEncoder()!
+            guard let blit = cmdBuf.makeBlitCommandEncoder() else { return false }
             blit.copy(
-                from: stagingBuf, sourceOffset: 0,
+                from: upload.resource, sourceOffset: 0,
                 sourceBytesPerRow: bytesPerRow, sourceBytesPerImage: bytesPerRow,
                 sourceSize: MTLSize(width: texWidth, height: 1, depth: 1),
                 to: texMTL, destinationSlice: 0, destinationLevel: 0,
                 destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
             )
             blit.endEncoding()
+            cmdBuf.addCompletedHandler { [textureUploads, slot = upload.slot, generation = upload.generation] _ in
+                textureUploads.release(slot: slot, generation: generation)
+            }
+            uploadSubmitted = true
             if commandBuffer == nil { cmdBuf.commit() }
         }
 
@@ -373,7 +347,7 @@ public final class EdgeBatchSystem {
         // one (SIGSEGV, seen under near-camera orbit where the visible-edge
         // count changes every frame).
         if entity.components[MeshInstancesComponent.self] == nil {
-            guard let mesh = entity.model?.mesh else { return }
+            guard let mesh = entity.model?.mesh else { return false }
             do {
                 let comp = try MeshInstancesComponent(
                     mesh: mesh,
@@ -381,8 +355,9 @@ public final class EdgeBatchSystem {
                     bounds: LowLevelMeshFactory.batchMeshBounds
                 )
                 entity.components.set(comp)
-            } catch { return }
+            } catch { return false }
         }
+        return true
     }
 
     /// Build a 4×4 transform that places a unit cylinder between `src` and `tgt`.

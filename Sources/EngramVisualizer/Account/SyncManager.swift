@@ -279,6 +279,7 @@ final class SyncManager {
     }
     
     func connectSync(wssEndpoint: URL, authToken: String) {
+        guard !PerformanceLaunch.isIsolated else { return }
         Task {
             await actor.connectSync(wssEndpoint: wssEndpoint, authToken: authToken)
         }
@@ -295,6 +296,7 @@ final class SyncManager {
     /// personal spoke only when entitled, group spokes per membership, and
     /// idle when neither applies.
     func startDaemonIfSignedIn() {
+        guard !PerformanceLaunch.isIsolated else { return }
         CLIInstaller.startDaemon()
     }
     func disconnectSync() {
@@ -330,6 +332,7 @@ final class SyncManager {
     /// chain, so a stale directory costs a nice label, never visibility.
     /// Idempotent — reuses any lattice already open.
     func discoverGroupGalaxies() -> [GroupGalaxySpoke] {
+        guard !PerformanceLaunch.isIsolated else { return [] }
         let claudeDir = NSHomeDirectory() + "/.claude"
         let spokes = SyncService.discoverGroupSpokes(claudeDir: claudeDir)
         guard !spokes.isEmpty else { return [] }
@@ -426,6 +429,7 @@ final class SyncManager {
     var daemonHealth: DaemonHealth?
 
     func refreshDaemonHealth() {
+        guard !PerformanceLaunch.isIsolated else { return }
         let path = NSHomeDirectory() + "/.claude/sync-daemon-status.json"
         guard let data = FileManager.default.contents(atPath: path),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

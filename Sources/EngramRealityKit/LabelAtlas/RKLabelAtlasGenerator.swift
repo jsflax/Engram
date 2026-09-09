@@ -11,26 +11,38 @@ import Foundation
 /// into a texture atlas. Outputs TextureResource for RealityKit.
 @MainActor
 public final class RKLabelAtlasGenerator {
-    private let device: MTLDevice
-
     /// UV rects for each node label.
-    public private(set) var nodeRects: [UUID: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
+    public var nodeRects: [UUID: AtlasRect] { published?.nodeRects ?? [:] }
     /// UV rects for project labels.
-    public private(set) var projectRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
+    public var projectRects: [String: AtlasRect] { published?.projectRects ?? [:] }
     /// UV rects for topic labels.
-    public private(set) var topicRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
+    public var topicRects: [String: AtlasRect] { published?.topicRects ?? [:] }
     /// Aspect correction factor.
-    public private(set) var aspectCorrection: Float = 1.0
+    public var aspectCorrection: Float { published?.aspectCorrection ?? 1 }
     /// Atlas texture resource for RealityKit materials.
-    public private(set) var atlasTexture: TextureResource?
+    public var atlasTexture: TextureResource? { published?.texture }
+    /// Changes only when a complete texture and its matching coordinates land.
+    public private(set) var atlasVersion: UInt64 = 0
 
-    private var cachedNodeIds: Set<UUID> = []
-
-    public init(device: MTLDevice) {
-        self.device = device
+    private struct PublishedAtlas {
+        let texture: TextureResource
+        let nodeRects: [UUID: AtlasRect]
+        let projectRects: [String: AtlasRect]
+        let topicRects: [String: AtlasRect]
+        let aspectCorrection: Float
     }
 
-    /// Regenerate the label atlas for the given nodes and project/topic cluster names.
+    private var published: PublishedAtlas?
+    private lazy var builds = LabelAtlasBuildQueue(
+        rasterize: { request in AtlasRasterizer.render(request) },
+        publish: { [weak self] raster in self?.publish(raster) ?? false }
+    )
+
+    var needsAtlasRetry: Bool { builds.needsRetry }
+
+    public init(device: MTLDevice) {}
+
+    /// Queue an atlas build without blocking the frame on measurement or drawing.
     ///
     /// Project and topic labels are packed first (always visible), then node labels
     /// fill remaining space. This guarantees cluster labels are never crowded out
@@ -41,17 +53,62 @@ public final class RKLabelAtlasGenerator {
         projects: Set<String> = [],
         topics: Set<String> = []
     ) {
-        let entries = nodes.map { node in
-            AtlasEntry(id: node.id, label: node.label, isHub: hubs.contains(node.id))
+        builds.request(AtlasRequest(nodes: nodes, hubs: hubs, projects: projects, topics: topics))
+    }
+
+    public func invalidatePendingAtlas() {
+        builds.invalidate()
+    }
+
+    public func cancelPendingBuilds() {
+        builds.invalidate()
+    }
+
+    private func publish(_ raster: AtlasRaster) -> Bool {
+        guard let texture = try? TextureResource(image: raster.image, options: .init(semantic: .raw)) else {
+            return false
         }
+        // No suspension between texture creation and UV publication. Render
+        // systems observe either the entire old atlas or the entire new one.
+        published = PublishedAtlas(texture: texture, nodeRects: raster.nodeRects,
+                                   projectRects: raster.projectRects, topicRects: raster.topicRects,
+                                   aspectCorrection: raster.aspectCorrection)
+        atlasVersion &+= 1
+        return true
+    }
+}
 
-        // Skip if entries haven't changed
-        let newIds = Set(entries.map(\.id))
-        if newIds == cachedNodeIds && atlasTexture != nil { return }
-        cachedNodeIds = newIds
+public typealias AtlasRect = (u0: Float, v0: Float, u1: Float, v1: Float)
 
-        guard !entries.isEmpty else { return }
+struct AtlasRequest: Equatable, Sendable {
+    let entries: [AtlasEntry]
+    let projects: [String]
+    let topics: [String]
 
+    init(nodes: [RKNodeSnapshot], hubs: Set<UUID>, projects: Set<String>, topics: Set<String>) {
+        entries = nodes.map {
+            AtlasEntry(id: $0.id, label: $0.label, project: $0.project,
+                       topic: $0.topic, isHub: hubs.contains($0.id) || $0.isHub)
+        }
+        self.projects = projects.sorted()
+        self.topics = topics.sorted()
+    }
+}
+
+/// CGImage is immutable after creation; its CGContext and CoreText objects
+/// remain worker-local. The image and value dictionaries may cross executors.
+struct AtlasRaster: @unchecked Sendable {
+    let image: CGImage
+    let nodeRects: [UUID: AtlasRect]
+    let projectRects: [String: AtlasRect]
+    let topicRects: [String: AtlasRect]
+    let aspectCorrection: Float
+}
+
+enum AtlasRasterizer {
+    static func render(_ request: AtlasRequest) -> AtlasRaster? {
+        guard !Task.isCancelled else { return nil }
+        let entries = request.entries
         // Fonts
         let monoMedium = CTFontCreateWithName("SF Mono" as CFString, 14, nil)
         let monoBold = CTFontCreateWithName("SF Mono" as CFString, 16, nil)
@@ -69,7 +126,8 @@ public final class RKLabelAtlasGenerator {
             let ascent: CGFloat
         }
         var projLabels: [ClusterLabel] = []
-        for name in projects.sorted() {
+        for name in request.projects {
+            guard !Task.isCancelled else { return nil }
             let attrs: [NSAttributedString.Key: Any] = [.font: projFont, .foregroundColor: CGColor.white]
             let attrStr = NSAttributedString(string: name.uppercased(), attributes: attrs)
             let line = CTLineCreateWithAttributedString(attrStr)
@@ -80,7 +138,8 @@ public final class RKLabelAtlasGenerator {
 
         // --- Measure topic labels ---
         var topicLabels: [ClusterLabel] = []
-        for name in topics.sorted() {
+        for name in request.topics {
+            guard !Task.isCancelled else { return nil }
             let attrs: [NSAttributedString.Key: Any] = [.font: topicFont, .foregroundColor: CGColor.white]
             let attrStr = NSAttributedString(string: name, attributes: attrs)
             let line = CTLineCreateWithAttributedString(attrStr)
@@ -92,6 +151,7 @@ public final class RKLabelAtlasGenerator {
         // --- Measure node labels ---
         var labelInfos: [(entry: AtlasEntry, line: CTLine, width: CGFloat, height: CGFloat, ascent: CGFloat)] = []
         for entry in entries {
+            guard !Task.isCancelled else { return nil }
             let font = entry.isHub ? monoBold : monoMedium
             let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: CGColor.white]
             let attrStr = NSAttributedString(string: entry.label, attributes: attributes)
@@ -164,7 +224,7 @@ public final class RKLabelAtlasGenerator {
             bytesPerRow: bytesPerRow,
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return }
+        ) else { return nil }
         context.clear(CGRect(x: 0, y: 0, width: atlasW, height: atlasH))
 
         let uvW = Float(atlasW)
@@ -201,11 +261,9 @@ public final class RKLabelAtlasGenerator {
 
         // 1. Pack project labels first (highest priority)
         let (projRectMap, afterProjY) = drawClusterLabels(projLabels, startY: 0)
-        self.projectRects = projRectMap
 
         // 2. Pack topic labels next
         let (topicRectMap, afterTopicY) = drawClusterLabels(topicLabels, startY: afterProjY)
-        self.topicRects = topicRectMap
 
         // 3. Pack node labels in remaining space
         var nodeRectMap: [UUID: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
@@ -214,6 +272,7 @@ public final class RKLabelAtlasGenerator {
         var rowH: Int = 0
 
         for info in labelInfos {
+            guard !Task.isCancelled else { return nil }
             let w = Int(ceil(info.width + padding * 2))
             let h = Int(ceil(info.height + padding * 2))
 
@@ -234,24 +293,18 @@ public final class RKLabelAtlasGenerator {
             curX += w
             rowH = max(rowH, h)
         }
-        self.nodeRects = nodeRectMap
-        self.aspectCorrection = Float(atlasW) / Float(atlasH)
-
-        // Create TextureResource from CGContext's CGImage
-        guard let image = context.makeImage() else { return }
-
-        do {
-            let texture = try TextureResource(image: image, options: .init(semantic: .raw))
-            self.atlasTexture = texture
-        } catch {
-            // Fallback — atlas generation failed
-        }
+        guard !Task.isCancelled, let image = context.makeImage() else { return nil }
+        return AtlasRaster(image: image, nodeRects: nodeRectMap,
+                           projectRects: projRectMap, topicRects: topicRectMap,
+                           aspectCorrection: Float(atlasW) / Float(atlasH))
     }
 }
 
 /// Internal atlas entry for label generation.
-struct AtlasEntry {
+struct AtlasEntry: Equatable, Sendable {
     let id: UUID
     let label: String
+    let project: String
+    let topic: String
     let isHub: Bool
 }

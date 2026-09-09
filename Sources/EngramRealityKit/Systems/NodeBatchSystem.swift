@@ -27,11 +27,14 @@ struct BatchVertex {
 public final class NodeBatchSystem {
     /// Reusable staging array for buffer 1 — avoids per-frame allocation.
     private var instanceStaging: [LowLevelMeshFactory.NodeInstanceAttribs] = []
-    /// Pre-allocated staging buffer for texture blit (macOS 26+). Avoids per-frame MTLBuffer creation.
-    private var texStagingBuffer: MTLBuffer?
-    private var texStagingCapacity: Int = 0
-    /// Last instance count — update MeshInstancesComponent part only when this changes.
-    private var lastInstanceCount: Int = -1
+    /// GPU completion owns a lease; never overwrite an in-flight color upload.
+    private let textureUploads = BoundedUploadPool<any MTLBuffer>()
+    private let instanceUploadCache = NodeInstanceUploadCache()
+    private var instanceResources: [ObjectIdentifier] = []
+    // Retain the last generation until replacement is observed, preventing
+    // allocator address reuse from making a new resource look unchanged.
+    private var retainedInstanceResources: [AnyObject] = []
+    private var instanceResourceGeneration: UInt64 = 0
 
     // Stable instance-slot assignment (macOS-26 instanced path). A node keeps
     // its slot for as long as it stays visible, so the per-slot color texture
@@ -40,10 +43,13 @@ public final class NodeBatchSystem {
     // blit against RealityKit's internal instance-data upload — sequential
     // slot assignment made LOD churn re-pair every slot every frame, which
     // flashed random colors during camera traversal).
-    private var slotForNode: [Int: Int] = [:]
-    private var slotHighWater = 0
-    private var freeSlots: [Int] = []
-    private var slotsTopologyVersion: UInt64 = .max
+    private var slots = StableInstanceSlots()
+    private var visibleIndices: [Int] = []
+    private var previousNearNodes: [Int] = []
+    private var previousMidNodes: [Int] = []
+    private var previousFarNodes: [Int] = []
+    private var textureData: [SIMD4<Float16>] = []
+    private var renderCache = BatchRenderCache()
 
     public init() {}
 
@@ -57,17 +63,48 @@ public final class NodeBatchSystem {
         commandBuffer: MTLCommandBuffer? = nil
     ) {
         if #available(macOS 26, *) {
-            updateWithMeshInstances(
-                scene: scene, dataProvider: dataProvider,
-                visibleSet: visibleSet, animationTime: animationTime,
-                scaleFactor: scaleFactor, commandBuffer: commandBuffer
-            )
-        } else {
-            updateWithTwoBufferMesh(
-                scene: scene, dataProvider: dataProvider,
-                visibleSet: visibleSet, animationTime: animationTime,
-                scaleFactor: scaleFactor, commandBuffer: commandBuffer
-            )
+            observeInstanceResources(scene: scene)
+        }
+        if previousNearNodes != visibleSet.nearNodes || previousMidNodes != visibleSet.midNodes || previousFarNodes != visibleSet.farNodes {
+            previousNearNodes = visibleSet.nearNodes
+            previousMidNodes = visibleSet.midNodes
+            previousFarNodes = visibleSet.farNodes
+            visibleIndices.removeAll(keepingCapacity: true)
+            visibleIndices.append(contentsOf: visibleSet.nearNodes)
+            visibleIndices.append(contentsOf: visibleSet.midNodes)
+            visibleIndices.append(contentsOf: visibleSet.farNodes)
+        }
+        let state = BatchRenderState(
+            topology: dataProvider.topologyVersion, positions: dataProvider.positionVersion,
+            visibleIndices: visibleIndices, selection: dataProvider.selectedNode,
+            search: dataProvider.searchMatchIds, searchActive: dataProvider.isSearchActive,
+            colors: dataProvider.projectColorMap, scale: scaleFactor,
+            dying: dataProvider.dyingNodes, recall: dataProvider.glowingNodes,
+            arrival: dataProvider.newNodeGlows)
+        renderCache.update(state) {
+            let hasNodes = visibleSet.totalNodeCount > 0
+            guard hasNodes else {
+                scene.nodeBatchEntity?.isEnabled = false
+                if #available(macOS 26, *) { scene.nodeTemplateEntity?.isEnabled = false }
+                return true
+            }
+            if #available(macOS 26, *) {
+                let updated = updateWithMeshInstances(
+                    scene: scene, dataProvider: dataProvider,
+                    visibleSet: visibleSet, animationTime: animationTime,
+                    scaleFactor: scaleFactor, state: state, commandBuffer: commandBuffer
+                )
+                if updated { scene.nodeTemplateEntity?.isEnabled = true }
+                return updated
+            } else {
+                let updated = updateWithTwoBufferMesh(
+                    scene: scene, dataProvider: dataProvider,
+                    visibleSet: visibleSet, animationTime: animationTime,
+                    scaleFactor: scaleFactor, commandBuffer: commandBuffer
+                )
+                if updated { scene.nodeBatchEntity?.isEnabled = true }
+                return updated
+            }
         }
     }
 
@@ -83,16 +120,16 @@ public final class NodeBatchSystem {
         animationTime: Float,
         scaleFactor: Float,
         commandBuffer: MTLCommandBuffer? = nil
-    ) {
+    ) -> Bool {
         let visibleCount = visibleSet.totalNodeCount
-        guard visibleCount > 0 else { return }
+        guard visibleCount > 0 else { return true }
 
         LowLevelMeshFactory.ensureNodeBatchMesh(scene: scene, capacity: visibleCount)
-        guard let mesh = scene.nodeBatchMesh else { return }
+        guard let mesh = scene.nodeBatchMesh else { return false }
 
         let nodes = dataProvider.nodes
-        let positions = dataProvider.positions
         let positionArray = dataProvider.positionArray
+        let positions = positionArray.count == nodes.count ? [:] : dataProvider.positions
         let dyingNodes = dataProvider.dyingNodes
         let colorMap = dataProvider.projectColorMap
         let vps = scene.vertsPerSphere
@@ -184,7 +221,7 @@ public final class NodeBatchSystem {
         }
 
         // GPU-synchronized write to buffer 1 only (buffer 0 is static template)
-        guard let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer() else { return }
+        guard let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer() else { return false }
         let destBuffer = mesh.replace(bufferIndex: 1, using: cmdBuf)
         let dest = destBuffer.contents().bindMemory(
             to: LowLevelMeshFactory.NodeInstanceAttribs.self, capacity: totalVerts
@@ -193,9 +230,25 @@ public final class NodeBatchSystem {
             dest.update(from: src.baseAddress!, count: totalVerts)
         }
         if commandBuffer == nil { cmdBuf.commit() }
+        return true
     }
 
     // MARK: - macOS 26+: MeshInstanceCollection
+
+    @available(macOS 26, *)
+    private func observeInstanceResources(scene: EngramRealityScene, resetRenderCache: Bool = true) {
+        var objects: [AnyObject] = []
+        if let data = scene.nodeInstanceData { objects.append(data) }
+        if let texture = scene.nodeInstanceTexture { objects.append(texture) }
+        if let entity = scene.nodeTemplateEntity { objects.append(entity) }
+        let resources = objects.map(ObjectIdentifier.init)
+        if instanceResources != resources {
+            instanceResources = resources
+            retainedInstanceResources = objects
+            instanceResourceGeneration &+= 1
+            if resetRenderCache { renderCache = BatchRenderCache() }
+        }
+    }
 
     /// MeshInstanceCollection path: one sphere template mesh, N instance transforms.
     /// Per-instance visual data (color, alpha) stored in a LowLevelTexture sampled
@@ -207,22 +260,24 @@ public final class NodeBatchSystem {
         visibleSet: VisibleSet,
         animationTime: Float,
         scaleFactor: Float,
+        state: BatchRenderState,
         commandBuffer: MTLCommandBuffer? = nil
-    ) {
+    ) -> Bool {
         let visibleCount = visibleSet.totalNodeCount
-        guard visibleCount > 0 else { return }
+        guard visibleCount > 0 else { return true }
 
         // Ensure sphere template entity and instance texture exist
         scene.ensureNodeInstanceResources(capacity: visibleCount)
         guard let entity = scene.nodeTemplateEntity,
               let instanceData = scene.nodeInstanceData,
               let instanceTexture = scene.nodeInstanceTexture else {
-            return
+            return false
         }
+        observeInstanceResources(scene: scene, resetRenderCache: false)
 
         let nodes = dataProvider.nodes
-        let positions = dataProvider.positions
         let positionArray = dataProvider.positionArray
+        let positions = positionArray.count == nodes.count ? [:] : dataProvider.positions
         let dyingNodes = dataProvider.dyingNodes
         let colorMap = dataProvider.projectColorMap
         let glowingNodes = dataProvider.glowingNodes
@@ -231,71 +286,63 @@ public final class NodeBatchSystem {
         let searchMatchIds = dataProvider.searchMatchIds
         let isSearchActive = dataProvider.isSearchActive
 
-        // Build per-instance visual data for texture
         let texWidth = scene.nodeInstanceTextureWidth
-        var texData = [SIMD4<Float16>](repeating: .zero, count: texWidth)
 
         // --- Stable slot maintenance ---
-        // Node indices remap on topology change: reset the mapping.
-        if dataProvider.topologyVersion != slotsTopologyVersion {
-            slotsTopologyVersion = dataProvider.topologyVersion
-            slotForNode.removeAll(keepingCapacity: true)
-            freeSlots.removeAll(keepingCapacity: true)
-            slotHighWater = 0
-        }
         let capacity = instanceData.instanceCapacity
-        var visibleBits = [Bool](repeating: false, count: nodes.count)
-        for idx in visibleSet.nearNodes where idx < nodes.count { visibleBits[idx] = true }
-        for idx in visibleSet.midNodes where idx < nodes.count { visibleBits[idx] = true }
-        for idx in visibleSet.farNodes where idx < nodes.count { visibleBits[idx] = true }
-        // Free slots of nodes that left the visible set.
-        var freed: [Int] = []
-        slotForNode = slotForNode.filter { (nodeIndex, slot) in
-            if nodeIndex < visibleBits.count && visibleBits[nodeIndex] { return true }
-            freed.append(slot)
-            return false
-        }
-        freeSlots.append(contentsOf: freed)
-        var occupied = [Bool](repeating: false, count: min(slotHighWater, capacity))
-        // Assign slots up front (main-actor state; the transform closure below
-        // is nonisolated). writes = (slot, nodeIndex) in tier order.
-        var writes: [(slot: Int, nodeIndex: Int)] = []
-        writes.reserveCapacity(visibleCount)
-        func assignSlot(_ nodeIndex: Int) {
-            let slot: Int
-            if let existing = slotForNode[nodeIndex] {
-                slot = existing
-            } else if let reused = freeSlots.popLast() {
-                slot = reused
-                slotForNode[nodeIndex] = reused
-            } else if slotHighWater < capacity {
-                slot = slotHighWater
-                slotHighWater += 1
-                slotForNode[nodeIndex] = slot
-            } else {
-                return  // over budget — LOD already caps at capacity
+        slots.update(indices: visibleIndices, topology: dataProvider.topologyVersion,
+                     capacity: capacity, idAtIndex: { nodes[$0].id })
+        let slotWrites = slots.writes
+        let holes = slots.holes
+        let usedCount = slots.highWater
+
+        let uploaded = instanceUploadCache.update(
+            state: state, resourceGeneration: instanceResourceGeneration,
+            capacity: capacity, highWater: usedCount, writes: slotWrites, holes: holes
+        ) { updateTransforms, updateAppearance in
+            let bytesPerRow = texWidth * MemoryLayout<SIMD4<Float16>>.stride
+            var lease: BoundedUploadPool<any MTLBuffer>.Lease?
+            var uploadCommand: MTLCommandBuffer?
+            var handedOff = false
+            defer {
+                if !handedOff, let lease { textureUploads.release(lease) }
             }
-            if slot < occupied.count { occupied[slot] = true }
-            writes.append((slot, nodeIndex))
-        }
-        for idx in visibleSet.nearNodes { assignSlot(idx) }
-        for idx in visibleSet.midNodes { assignSlot(idx) }
-        for idx in visibleSet.farNodes { assignSlot(idx) }
-        let slotWrites = writes
-        let holes = occupied.enumerated().compactMap { $1 ? nil : $0 }
-        let usedCount = min(slotHighWater, capacity)
+            if updateAppearance {
+                guard let acquired = textureUploads.acquire(minimumCapacity: bytesPerRow, makeResource: {
+                    scene.device.makeBuffer(length: $0, options: .storageModeShared)
+                }) else { return false }
+                lease = acquired
+                guard let command = commandBuffer ?? scene.commandQueue.makeCommandBuffer() else { return false }
+                uploadCommand = command
+            }
 
-        // Write transforms synchronously (GPU-safe, no command buffer)
-        instanceData.replaceMutableTransforms { transforms in
-            func writeNode(slot: Int, nodeIndex: Int) {
-                guard slot < transforms.count, slot < texData.count else { return }
-                let instanceIdx = slot
+            // Replacement storage need not preserve previous contents. When
+            // geometry changes, write every occupied slot and every hole;
+            // otherwise avoid replacing/synchronizing the geometry at all.
+            if updateTransforms {
+                instanceData.replaceMutableTransforms { transforms in
+                    for write in slotWrites where write.slot < transforms.count {
+                        let node = nodes[write.index]
+                        let pos = write.index < positionArray.count ? positionArray[write.index] : (positions[node.id] ?? .zero)
+                        let radius: Float = (node.isHub ? 12 : 8) * scaleFactor
+                        var transform = simd_float4x4(diagonal: SIMD4<Float>(radius, radius, radius, 1))
+                        transform.columns.3 = SIMD4<Float>(pos * scaleFactor, 1)
+                        transforms[write.slot] = transform
+                    }
+                    for slot in holes where slot < transforms.count {
+                        transforms[slot] = simd_float4x4(diagonal: SIMD4<Float>(0, 0, 0, 1))
+                    }
+                }
+                instanceData.instanceCount = usedCount
+            }
+
+            guard updateAppearance, let lease, let cmdBuf = uploadCommand else { return true }
+            var texData = textureData
+            textureData = []
+            if texData.count != texWidth { texData = Array(repeating: .zero, count: texWidth) }
+            for write in slotWrites where write.slot < texData.count {
+                let nodeIndex = write.index
                 let node = nodes[nodeIndex]
-                let pos = nodeIndex < positionArray.count ? positionArray[nodeIndex] : (positions[node.id] ?? .zero)
-
-                let scaledPos = pos * scaleFactor
-                let baseRadius: Float = node.isHub ? 12.0 : 8.0
-                let radius = baseRadius * scaleFactor
                 var color = colorMap[node.project] ?? SIMD3<Float>(0.5, 0.5, 0.5)
 
                 if dyingNodes.contains(node.id) { color *= 0.3 }
@@ -317,45 +364,18 @@ public final class NodeBatchSystem {
                     packedState += 10.0
                 }
 
-                let s = simd_float4x4(diagonal: SIMD4<Float>(radius, radius, radius, 1.0))
-                let t = simd_float4x4(columns: (
-                    SIMD4<Float>(1, 0, 0, 0),
-                    SIMD4<Float>(0, 1, 0, 0),
-                    SIMD4<Float>(0, 0, 1, 0),
-                    SIMD4<Float>(scaledPos.x, scaledPos.y, scaledPos.z, 1)
-                ))
-                transforms[instanceIdx] = t * s
-
-                texData[instanceIdx] = SIMD4<Float16>(
+                texData[write.slot] = SIMD4<Float16>(
                     Float16(color.x), Float16(color.y), Float16(color.z), Float16(packedState)
                 )
             }
-
-            for w in slotWrites { writeNode(slot: w.slot, nodeIndex: w.nodeIndex) }
-
-            // Collapse holes left by departed nodes (robust to RealityKit
-            // re-reading stale slots): zero-scale transform renders nothing.
-            for slot in holes where slot < transforms.count {
-                transforms[slot] = simd_float4x4(diagonal: SIMD4<Float>(0, 0, 0, 1))
-                if slot < texData.count { texData[slot] = .zero }
-            }
-        }
-
-        instanceData.instanceCount = usedCount
-
-        // Update per-instance color texture via staging buffer + blit
-        let bytesPerRow = texWidth * MemoryLayout<SIMD4<Float16>>.stride
-        if texStagingCapacity < bytesPerRow {
-            texStagingBuffer = scene.device.makeBuffer(length: bytesPerRow, options: .storageModeShared)
-            texStagingCapacity = bytesPerRow
-        }
-        if let stagingBuf = texStagingBuffer,
-           let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer() {
+            for slot in holes where slot < texData.count { texData[slot] = .zero }
+            textureData = texData
+            let stagingBuf = lease.resource
             let texMTL = instanceTexture.replace(using: cmdBuf)
             texData.withUnsafeBytes { ptr in
                 stagingBuf.contents().copyMemory(from: ptr.baseAddress!, byteCount: bytesPerRow)
             }
-            let blit = cmdBuf.makeBlitCommandEncoder()!
+            guard let blit = cmdBuf.makeBlitCommandEncoder() else { return false }
             blit.copy(
                 from: stagingBuf, sourceOffset: 0,
                 sourceBytesPerRow: bytesPerRow, sourceBytesPerImage: bytesPerRow,
@@ -364,15 +384,21 @@ public final class NodeBatchSystem {
                 destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
             )
             blit.endEncoding()
+            let pool = textureUploads
+            let slot = lease.slot, generation = lease.generation
+            cmdBuf.addCompletedHandler { _ in pool.release(slot: slot, generation: generation) }
+            handedOff = true
             if commandBuffer == nil { cmdBuf.commit() }
+            return true
         }
+        guard uploaded else { return false }
 
         // Create MeshInstancesComponent exactly ONCE (see EdgeBatchSystem:
         // instanceData.instanceCount already drives the drawn count, and
         // recreating on count change races the render thread's draw-call
         // encode — use-after-free SIGSEGV under per-frame count churn).
         if entity.components[MeshInstancesComponent.self] == nil {
-            guard let mesh = entity.model?.mesh else { return }
+            guard let mesh = entity.model?.mesh else { return false }
             do {
                 let comp = try MeshInstancesComponent(
                     mesh: mesh,
@@ -381,8 +407,9 @@ public final class NodeBatchSystem {
                 )
                 entity.components.set(comp)
             } catch {
-                return
+                return false
             }
         }
+        return true
     }
 }

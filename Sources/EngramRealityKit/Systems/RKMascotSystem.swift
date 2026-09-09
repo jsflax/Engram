@@ -18,6 +18,17 @@ public final class RKMascotSystem {
     private var currentPositions: [String: SIMD3<Float>] = [:]
     private var currentYaws: [String: Float] = [:]
     private var mascotLoadingProjects: Set<String> = []
+    private struct Effects {
+        let arcaneCircle: Entity?
+        let conjureOrb: Entity?
+        let holoScreen: ModelEntity?
+    }
+    private var effects: [String: Effects] = [:]
+    private let graphIndex = MascotGraphIndex()
+    private let holoRequestCache = MascotHoloRequestCache()
+    private var holoTasks: [String: Task<Void, Never>] = [:]
+    private var preparedHoloImages: [String: (key: MascotHoloKey, image: CGImage)] = [:]
+    private var appliedHoloOpacities: [String: Float] = [:]
 
     /// Priority-comparable task type for mascot behavior.
     public enum MascotTask: Comparable {
@@ -47,9 +58,6 @@ public final class RKMascotSystem {
     private let patrolHoverDuration: Float = 8.0
     private let patrolSpeed: Float = 0.3
 
-    private var cachedActiveProjects = Set<String>()
-    private var cachedProjectsTopologyVersion: UInt64 = .max
-
     public init() {}
 
     public func update(
@@ -59,19 +67,13 @@ public final class RKMascotSystem {
         scaleFactor: Float
     ) {
         let colorMap = dataProvider.projectColorMap
-        let positions = dataProvider.positions
         let nodes = dataProvider.nodes
 
         // Determine which projects need mascots (projects with nodes).
         // Cached on topologyVersion — the inline set-build over every node
         // cost ~33ms/frame at 40k nodes.
-        if dataProvider.topologyVersion != cachedProjectsTopologyVersion {
-            var projects = Set<String>()
-            for node in nodes { projects.insert(node.project) }
-            cachedActiveProjects = projects
-            cachedProjectsTopologyVersion = dataProvider.topologyVersion
-        }
-        let activeProjects = cachedActiveProjects
+        graphIndex.update(nodes: nodes, topologyVersion: dataProvider.topologyVersion, provider: dataProvider)
+        let activeProjects = graphIndex.projects
 
         // Remove mascots for gone projects
         for (project, entity) in activeMascots where !activeProjects.contains(project) {
@@ -82,7 +84,16 @@ public final class RKMascotSystem {
             mascotStates.removeValue(forKey: project)
             taskQueues.removeValue(forKey: project)
             idleTimers.removeValue(forKey: project)
-            lastHoloNodeIds.removeValue(forKey: project)
+            patrolThresholds.removeValue(forKey: project)
+            animationTimes.removeValue(forKey: project)
+            currentPositions.removeValue(forKey: project)
+            currentYaws.removeValue(forKey: project)
+            effects.removeValue(forKey: project)
+            holoTasks.removeValue(forKey: project)?.cancel()
+            preparedHoloImages.removeValue(forKey: project)
+            holoRequestCache.remove(project)
+            holoOpacities.removeValue(forKey: project)
+            appliedHoloOpacities.removeValue(forKey: project)
         }
 
         // Create mascots for new projects
@@ -93,13 +104,19 @@ public final class RKMascotSystem {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let entity = await MascotEntityFactory.createMascotGroup(project: proj, tint: tint)
+                self.mascotLoadingProjects.remove(proj)
+                guard self.graphIndex.projects.contains(proj), self.activeMascots[proj] == nil else { return }
                 container.addChild(entity)
                 self.activeMascots[proj] = entity
                 self.mascotStates[proj] = .idle(.awake)
                 self.idleTimers[proj] = 0
                 self.patrolThresholds[proj] = Float.random(in: 12...30)
                 self.animationTimes[proj] = 0
-                self.mascotLoadingProjects.remove(proj)
+                self.effects[proj] = Effects(
+                    arcaneCircle: entity.children.first { $0.name == "ArcaneCircle" },
+                    conjureOrb: entity.children.first { $0.name == "ConjureOrb" },
+                    holoScreen: entity.children.first { $0.name == "HoloScreen" } as? ModelEntity
+                )
 
                 // Initial position near project centroid
                 if let centroid = dataProvider.projectCentroids[proj] {
@@ -121,8 +138,11 @@ public final class RKMascotSystem {
                 state: state,
                 dt: dt,
                 nodes: nodes,
-                positions: positions,
-                scaleFactor: scaleFactor
+                positionAtIndex: { index in
+                    let flat = dataProvider.positionArray
+                    if flat.count == nodes.count { return flat[index] }
+                    return dataProvider.positions[nodes[index].id]
+                }
             )
             mascotStates[project] = newState
 
@@ -131,10 +151,12 @@ public final class RKMascotSystem {
 
             // Update entity transform
             if let pos = currentPositions[project] {
-                entity.position = pos * scaleFactor
+                let scaled = pos * scaleFactor
+                if entity.position != scaled { entity.position = scaled }
             }
             let yaw = currentYaws[project] ?? 0
-            entity.orientation = simd_quatf(angle: yaw, axis: SIMD3(0, 1, 0))
+            let orientation = simd_quatf(angle: yaw, axis: SIMD3(0, 1, 0))
+            if entity.orientation.vector != orientation.vector { entity.orientation = orientation }
 
             // Update MascotComponent
             var comp = entity.components[MascotComponent.self] ?? MascotComponent(project: project)
@@ -146,7 +168,12 @@ public final class RKMascotSystem {
             entity.components.set(comp)
 
             // Toggle child effects + update holo texture
-            updateEffectVisibility(entity: entity, state: newState, dt: dt, project: project, nodes: nodes)
+            // Prewarm during travel, before the existing 1.5-second hover delay.
+            // Texture replacement stays asynchronous and does not alter visibility.
+            if case .patrol(let nodeId, _) = newState, let holo = effects[project]?.holoScreen {
+                updateHoloTexture(entity: holo, nodeId: nodeId, nodes: nodes, project: project)
+            }
+            updateEffectVisibility(state: newState, dt: dt, project: project, nodes: nodes)
         }
     }
 
@@ -157,8 +184,7 @@ public final class RKMascotSystem {
         state: MascotBehavior,
         dt: Float,
         nodes: [RKNodeSnapshot],
-        positions: [UUID: SIMD3<Float>],
-        scaleFactor: Float
+        positionAtIndex: (Int) -> SIMD3<Float>?
     ) -> MascotBehavior {
         switch state {
         case .idle(let sub):
@@ -168,12 +194,11 @@ public final class RKMascotSystem {
 
             if timer > threshold {
                 // Pick a random node in this project to patrol to
-                let projectNodes = nodes.filter { $0.project == project }
-                if let target = projectNodes.randomElement(),
-                   let pos = positions[target.id] {
+                if let index = graphIndex.indicesByProject[project]?.randomElement(),
+                   let pos = positionAtIndex(index) {
                     idleTimers[project] = 0
                     patrolThresholds[project] = Float.random(in: 12...30)
-                    return .patrol(targetId: target.id, targetPos: pos)
+                    return .patrol(targetId: nodes[index].id, targetPos: pos)
                 }
             }
 
@@ -311,7 +336,7 @@ public final class RKMascotSystem {
 
     // MARK: - Effect Visibility
 
-    private func updateEffectVisibility(entity: Entity, state: MascotBehavior, dt: Float, project: String, nodes: [RKNodeSnapshot]) {
+    private func updateEffectVisibility(state: MascotBehavior, dt: Float, project: String, nodes: [RKNodeSnapshot]) {
         let wantsArcane: Bool
         let wantsOrb: Bool
         let wantsHolo: Bool
@@ -340,43 +365,41 @@ public final class RKMascotSystem {
             wantsHolo = false
         }
 
+        if let nodeId = hoverNodeId, let holo = effects[project]?.holoScreen {
+            updateHoloTexture(entity: holo, nodeId: nodeId, nodes: nodes, project: project)
+        }
+        let textureReady = hoverNodeId.map { holoRequestCache.isReady(nodeID: $0, for: project) } ?? true
+
         // Holo fade: delay 1.5s, then fade in over 0.4s; fade out over 0.25s
         let holoDelay: Float = 1.5
         let timeUntilDepart = patrolHoverDuration - hoverTimer
-        let holoReady = wantsHolo && hoverTimer >= holoDelay && timeUntilDepart > 1.0
+        let holoReady = wantsHolo && textureReady && hoverTimer >= holoDelay && timeUntilDepart > 1.0
         let currentOpacity = holoOpacities[project] ?? 0
         let targetOpacity: Float = holoReady ? 1.0 : 0.0
         let fadeSpeed: Float = holoReady ? 2.5 : 4.0
         let newOpacity = currentOpacity + (targetOpacity - currentOpacity) * min(dt * fadeSpeed, 1.0)
         holoOpacities[project] = newOpacity
 
-        // Find child entities by name
-        for child in entity.children {
-            switch child.name {
-            case "ArcaneCircle": child.isEnabled = wantsArcane
-            case "ConjureOrb": child.isEnabled = wantsOrb
-            case "HoloScreen":
-                let holoVisible = newOpacity > 0.01
-                child.isEnabled = holoVisible
-                if let modelEntity = child as? ModelEntity {
-                    // Render texture when hovering at a new node
-                    if let nodeId = hoverNodeId {
-                        updateHoloTexture(entity: modelEntity, nodeId: nodeId, nodes: nodes, project: project)
-                    }
-                    // Apply fade opacity
-                    if holoVisible {
-                        updateHoloOpacity(entity: modelEntity, opacity: newOpacity)
-                    }
-                }
-            default: break
+        if let circle = effects[project]?.arcaneCircle, circle.isEnabled != wantsArcane {
+            circle.isEnabled = wantsArcane
+        }
+        if let orb = effects[project]?.conjureOrb, orb.isEnabled != wantsOrb {
+            orb.isEnabled = wantsOrb
+        }
+        if let holo = effects[project]?.holoScreen {
+            // A new target must never display the previous node's retained card
+            // while its asynchronous replacement is still being prepared.
+            let holoVisible = newOpacity > 0.01 && textureReady
+            if holo.isEnabled != holoVisible { holo.isEnabled = holoVisible }
+            if holoVisible, appliedHoloOpacities[project] != newOpacity {
+                updateHoloOpacity(entity: holo, opacity: newOpacity)
+                appliedHoloOpacities[project] = newOpacity
             }
         }
     }
 
     // MARK: - Holo Texture
 
-    /// Last node ID the holo texture was rendered for, per project.
-    private var lastHoloNodeIds: [String: UUID] = [:]
     /// Current holo screen opacity per project (0–1), for fade in/out.
     private var holoOpacities: [String: Float] = [:]
 
@@ -387,11 +410,13 @@ public final class RKMascotSystem {
     }
 
     private func updateHoloTexture(entity: ModelEntity, nodeId: UUID, nodes: [RKNodeSnapshot], project: String) {
-        // Only regenerate when visiting a new node
-        if lastHoloNodeIds[project] == nodeId { return }
-        lastHoloNodeIds[project] = nodeId
-
-        guard let node = nodes.first(where: { $0.id == nodeId }) else { return }
+        guard let index = graphIndex.indexByID[nodeId], index < nodes.count else {
+            holoTasks.removeValue(forKey: project)?.cancel()
+            preparedHoloImages.removeValue(forKey: project)
+            holoRequestCache.remove(project)
+            return
+        }
+        let node = nodes[index]
 
         let info = HoloTextureRenderer.NodeInfo(
             content: node.content,
@@ -402,18 +427,66 @@ public final class RKMascotSystem {
             lastAccessedAt: node.lastAccessedAt
         )
 
-        guard let cgImage = HoloTextureRenderer.render(info: info) else { return }
-
-        do {
-            let texResource = try TextureResource(image: cgImage, options: .init(semantic: .color))
-            var mat = UnlitMaterial()
-            mat.color = .init(tint: .white, texture: .init(texResource))
-            mat.blending = .transparent(opacity: .init(floatLiteral: 1.0))
-            mat.faceCulling = .none
-            entity.model?.materials = [mat]
-        } catch {
-            // Texture generation failed — leave existing material
+        let key = MascotHoloKey(nodeID: nodeId, info: info)
+        let token: UInt64
+        switch holoRequestCache.request(key, for: project) {
+        case .none: return
+        case .cancel:
+            holoTasks.removeValue(forKey: project)?.cancel()
+            preparedHoloImages.removeValue(forKey: project)
+            return
+        case .render(let requestToken):
+            token = requestToken
         }
+        holoTasks.removeValue(forKey: project)?.cancel()
+        let preparedImage = preparedHoloImages[project].flatMap { $0.key == key ? $0.image : nil }
+        if preparedImage == nil { preparedHoloImages.removeValue(forKey: project) }
+        holoTasks[project] = Task { @MainActor [weak self, weak entity] in
+            // One pending task per project; canceled actor-queued requests exit
+            // before rasterizing. Keep the last successful texture until ready.
+            let raster = if let preparedImage { preparedImage }
+                         else { await HoloTextureRenderer.shared.render(info: info) }
+            guard let image = raster, !Task.isCancelled else {
+                self?.finishFailedHoloRequest(token, project: project)
+                return
+            }
+            guard let entity, self?.holoRequestCache.isCurrent(token, for: project) == true,
+                  self?.effects[project]?.holoScreen === entity else { return }
+            // Retain at most one prepared bitmap per project across a failed
+            // texture upload, so the bounded retry does not rerasterize it.
+            self?.preparedHoloImages[project] = (key, image)
+            do {
+                let texture = try await TextureResource(image: image, options: .init(semantic: .color))
+                guard let self, !Task.isCancelled, self.holoRequestCache.isCurrent(token, for: project),
+                      self.effects[project]?.holoScreen === entity else { return }
+                guard entity.model != nil else {
+                    self.finishFailedHoloRequest(token, project: project)
+                    return
+                }
+                let opacity = self.holoOpacities[project] ?? 0
+                var material = UnlitMaterial()
+                material.color = .init(tint: .white, texture: .init(texture))
+                material.blending = .transparent(opacity: .init(floatLiteral: opacity))
+                material.faceCulling = .none
+                entity.model?.materials = [material]
+                self.appliedHoloOpacities[project] = opacity
+                self.holoRequestCache.complete(token, for: project)
+                self.holoTasks.removeValue(forKey: project)
+                self.preparedHoloImages.removeValue(forKey: project)
+            } catch {
+                self?.finishFailedHoloRequest(token, project: project)
+            }
+        }
+    }
+
+    private func finishFailedHoloRequest(_ token: UInt64, project: String) {
+        guard holoRequestCache.isCurrent(token, for: project) else { return }
+        holoRequestCache.failed(token, for: project)
+        holoTasks.removeValue(forKey: project)
+    }
+
+    deinit {
+        for task in holoTasks.values { task.cancel() }
     }
 
     /// Enqueue a task for a project's mascot.

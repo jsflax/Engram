@@ -11,6 +11,8 @@ import Lattice
 @Observable
 @MainActor
 final class MockGraphProvider: SceneDataProvider {
+    private var random = PreviewRandomGenerator()
+
     private(set) var nodes: [RKNodeSnapshot] = []
     private(set) var edges: [RKEdgeSnapshot] = []
     private(set) var hubs: Set<UUID> = []
@@ -18,10 +20,11 @@ final class MockGraphProvider: SceneDataProvider {
     // Lazy passthrough to the sim's on-demand dict — reading this triggers a
     // one-time build only if a consumer (hitTest/teleport) actually needs it.
     var positions: [UUID: SIMD3<Float>] { simulation.positions }
+    var positionVersion: UInt64 { simulation.positionVersion }
     /// Cached flat position array — built from sim arrays, avoids 23K UUID dict lookups per frame.
     private(set) var positionArray: [SIMD3<Float>] = []
     /// Maps nodes[i].id → simulation index for O(1) position lookup.
-    private var nodeToSimIndex: [UUID: Int] = [:]
+    @ObservationIgnored private var nodeToSimIndex: [UUID: Int] = [:]
     var glowingNodes: [UUID: Float] = [:]
     var newNodeGlows: [UUID: Float] = [:]
     var dyingNodes: Set<UUID> = []
@@ -31,6 +34,8 @@ final class MockGraphProvider: SceneDataProvider {
     var isSearchActive: Bool = false
     var projectCentroids: [String: SIMD3<Float>] = [:]
     private(set) var topologyVersion: UInt64 = 0
+    @ObservationIgnored private let nebulaCache = SingleGalaxyNebulaCache()
+    var nebulaClusters: [RKNebulaCluster] { nebulaCache.clusters(for: self) }
 
     // MARK: - Multi-Galaxy State
     private(set) var projectToGalaxy: [String: String] = [:]
@@ -74,6 +79,8 @@ final class MockGraphProvider: SceneDataProvider {
     private var nodeIds: [UUID] = []
     private var simIndexByNodeIndex: [Int] = []
     private var simIndexTopologyVersion: UInt64 = .max
+    private var cachedPositionVersion: UInt64 = .max
+    private var cachedPositionTopology: UInt64 = .max
     private var tickSubFrame: UInt64 = 0
 
     static let shared: MockGraphProvider = .init()
@@ -137,9 +144,15 @@ final class MockGraphProvider: SceneDataProvider {
         }
     }
 
+    private func nextID() -> UUID {
+        let b = (0..<16).map { _ in UInt8.random(in: .min ... .max, using: &random) }
+        return UUID(uuid: (b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                           b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]))
+    }
+
     /// Pick a project index weighted by `projectDefs.weight`.
     private func weightedProjectIndex() -> Int {
-        let r = Float.random(in: 0..<1)
+        let r = Float.random(in: 0..<1, using: &random)
         var cum: Float = 0
         for (i, def) in projectDefs.enumerated() {
             cum += def.weight
@@ -173,9 +186,10 @@ final class MockGraphProvider: SceneDataProvider {
                     alpha: sim.alpha, damping: 0.78, maxSpeed: 12.0
                 )
                 sim.topologyDirtyForGPU = false
+                let nodeOrderVersion = sim.nodeOrderVersion
 
                 engine.encodeForcePass(queue: queue, snapshot: snapshot) { [weak self] result in
-                    sim.applyGPUForces(result)
+                    sim.applyGPUForces(result, expectedNodeOrderVersion: nodeOrderVersion)
                     // Log separation quality periodically
                     if sim.framesSinceWake % 60 == 1 || sim.isSettled {
                         self?.logSeparation(sim: sim)
@@ -201,22 +215,32 @@ final class MockGraphProvider: SceneDataProvider {
         let px = simulation.posX, py = simulation.posY, pz = simulation.posZ
         let n = nodes.count
         if simIndexByNodeIndex.count != n || simIndexTopologyVersion != topologyVersion {
-            nodeToSimIndex.removeAll(keepingCapacity: true)
-            for (si, id) in simulation.nodeIds.enumerated() { nodeToSimIndex[id] = si }
-            simIndexByNodeIndex = nodes.map { nodeToSimIndex[$0.id] ?? -1 }
+            // Build privately: repeated mutations of an observable dictionary
+            // add unnecessary bookkeeping to the first 40k-node scene update.
+            var mapping = nodeToSimIndex
+            nodeToSimIndex = [:]
+            mapping.removeAll(keepingCapacity: true)
+            mapping.reserveCapacity(simulation.nodeCount)
+            for (si, id) in simulation.nodeIds.enumerated() { mapping[id] = si }
+            simIndexByNodeIndex = nodes.map { mapping[$0.id] ?? -1 }
+            nodeToSimIndex = mapping
             simIndexTopologyVersion = topologyVersion
         }
-        if positionArray.count != n { positionArray = [SIMD3<Float>](repeating: .zero, count: n) }
-        let pxc = px.count
-        positionArray.withUnsafeMutableBufferPointer { out in
-            simIndexByNodeIndex.withUnsafeBufferPointer { simIdx in
-                px.withUnsafeBufferPointer { xb in
-                    py.withUnsafeBufferPointer { yb in
-                        pz.withUnsafeBufferPointer { zb in
-                            for i in 0..<n {
-                                let si = Int(simIdx[i])
-                                if si >= 0 && si < pxc {
-                                    out[i] = SIMD3<Float>(xb[si], yb[si], zb[si])
+        if cachedPositionVersion != positionVersion || cachedPositionTopology != topologyVersion {
+            cachedPositionVersion = positionVersion
+            cachedPositionTopology = topologyVersion
+            if positionArray.count != n { positionArray = [SIMD3<Float>](repeating: .zero, count: n) }
+            let pxc = px.count
+            positionArray.withUnsafeMutableBufferPointer { out in
+                simIndexByNodeIndex.withUnsafeBufferPointer { simIdx in
+                    px.withUnsafeBufferPointer { xb in
+                        py.withUnsafeBufferPointer { yb in
+                            pz.withUnsafeBufferPointer { zb in
+                                for i in 0..<n {
+                                    let si = Int(simIdx[i])
+                                    if si >= 0 && si < pxc {
+                                        out[i] = SIMD3<Float>(xb[si], yb[si], zb[si])
+                                    }
                                 }
                             }
                         }
@@ -267,7 +291,7 @@ final class MockGraphProvider: SceneDataProvider {
         }
 
         // Recompute centroids occasionally
-        if Int.random(in: 0..<60) == 0 {
+        if Int.random(in: 0..<60, using: &random) == 0 {
             computeCentroids()
         }
     }
@@ -295,14 +319,14 @@ final class MockGraphProvider: SceneDataProvider {
 
         // --- Generate nodes with weighted project distribution ---
         for i in 0..<nodeCount {
-            let id = UUID()
+            let id = nextID()
             let pIdx = weightedProjectIndex()
             let def = projectDefs[pIdx]
             let project = def.name
-            let topic = def.topics.randomElement()!
+            let topic = def.topics.randomElement(using: &random)!
             // Skew importance: hubs get 4-5, most nodes 1-3
             let isHub = i % 15 == 0
-            let importance = isHub ? Int.random(in: 4...5) : Int.random(in: 1...3)
+            let importance = isHub ? Int.random(in: 4...5, using: &random) : Int.random(in: 1...3, using: &random)
 
             newNodes.append(RKNodeSnapshot(
                 id: id, project: project, topic: topic,
@@ -322,7 +346,7 @@ final class MockGraphProvider: SceneDataProvider {
                 // Chain within topic
                 for i in 1..<members.count {
                     newEdges.append(RKEdgeSnapshot(
-                        id: UUID(), sourceId: members[i - 1], targetId: members[i], relation: "relates_to"
+                        id: nextID(), sourceId: members[i - 1], targetId: members[i], relation: "relates_to"
                     ))
                     edgePairs.append((members[i - 1], members[i]))
                 }
@@ -341,7 +365,7 @@ final class MockGraphProvider: SceneDataProvider {
                 for k in 0..<bridgeCount {
                     let src = a[k % a.count], tgt = b[k % b.count]
                     newEdges.append(RKEdgeSnapshot(
-                        id: UUID(), sourceId: src, targetId: tgt, relation: "part_of"
+                        id: nextID(), sourceId: src, targetId: tgt, relation: "part_of"
                     ))
                     edgePairs.append((src, tgt))
                 }
@@ -351,14 +375,14 @@ final class MockGraphProvider: SceneDataProvider {
         // --- Cross-project edges (sparse, keep clusters separated) ---
         let crossCount = max(nodeCount / 25, 3)
         for _ in 0..<crossCount {
-            let i = Int.random(in: 0..<newNodes.count)
-            var j = Int.random(in: 0..<newNodes.count)
+            let i = Int.random(in: 0..<newNodes.count, using: &random)
+            var j = Int.random(in: 0..<newNodes.count, using: &random)
             // Ensure cross-project
             while newNodes[j].project == newNodes[i].project && newNodes.count > 1 {
-                j = Int.random(in: 0..<newNodes.count)
+                j = Int.random(in: 0..<newNodes.count, using: &random)
             }
             newEdges.append(RKEdgeSnapshot(
-                id: UUID(), sourceId: newNodes[i].id, targetId: newNodes[j].id, relation: "derived_from"
+                id: nextID(), sourceId: newNodes[i].id, targetId: newNodes[j].id, relation: "derived_from"
             ))
             edgePairs.append((newNodes[i].id, newNodes[j].id))
         }
@@ -400,9 +424,9 @@ final class MockGraphProvider: SceneDataProvider {
         for (galaxy, nodeSet) in galaxyNodeIds {
             guard let center = galaxyCenters[galaxy] else { continue }
             for id in nodeSet {
-                let r = Float.random(in: 80...180)
-                let angle = Float.random(in: 0..<(.pi * 2))
-                let phi = Float.random(in: -0.5...0.5)
+                let r = Float.random(in: 80...180, using: &random)
+                let angle = Float.random(in: 0..<(.pi * 2), using: &random)
+                let phi = Float.random(in: -0.5...0.5, using: &random)
                 galaxyPositions[id] = center + SIMD3<Float>(
                     cos(angle) * cos(phi) * r,
                     sin(angle) * cos(phi) * r,
@@ -590,9 +614,9 @@ final class MockGraphProvider: SceneDataProvider {
         for (galaxy, nodeSet) in galaxyNodeIds {
             guard let center = galaxyCenters[galaxy] else { continue }
             for id in nodeSet {
-                let r = Float.random(in: 80...400)
-                let angle = Float.random(in: 0..<(.pi * 2))
-                let phi = Float.random(in: -0.5...0.5)
+                let r = Float.random(in: 80...400, using: &random)
+                let angle = Float.random(in: 0..<(.pi * 2), using: &random)
+                let phi = Float.random(in: -0.5...0.5, using: &random)
                 galaxyPositions[id] = center + SIMD3<Float>(
                     cos(angle) * cos(phi) * r,
                     sin(angle) * cos(phi) * r,
@@ -625,20 +649,20 @@ final class MockGraphProvider: SceneDataProvider {
         let pIdx = weightedProjectIndex()
         let def = projectDefs[pIdx]
         let project = def.name
-        let topic = def.topics.randomElement()!
-        let id = UUID()
+        let topic = def.topics.randomElement(using: &random)!
+        let id = nextID()
 
         let node = RKNodeSnapshot(
             id: id, project: project, topic: topic,
-            label: "\(topic)_new_\(nodes.count)", importance: Int.random(in: 1...3), isHub: false
+            label: "\(topic)_new_\(nodes.count)", importance: Int.random(in: 1...3, using: &random), isHub: false
         )
         nodes.append(node)
         nodeIds.append(id)
 
         // Wire to a random same-project node
-        if let peer = nodes.filter({ $0.project == project && $0.id != id }).randomElement() {
+        if let peer = nodes.filter({ $0.project == project && $0.id != id }).randomElement(using: &random) {
             edges.append(RKEdgeSnapshot(
-                id: UUID(), sourceId: peer.id, targetId: id, relation: "relates_to"
+                id: nextID(), sourceId: peer.id, targetId: id, relation: "relates_to"
             ))
             simulation.addEdge(from: peer.id, to: id)
         }
@@ -652,7 +676,7 @@ final class MockGraphProvider: SceneDataProvider {
     /// Migrate a random project to the other galaxy. Returns (project, targetGalaxy) on success.
     @discardableResult
     func migrateRandomProject() -> (project: String, targetGalaxy: String)? {
-        guard let project = projectDefs.randomElement()?.name,
+        guard let project = projectDefs.randomElement(using: &random)?.name,
               let currentGalaxy = projectToGalaxy[project] else { return nil }
         let targetGalaxy = currentGalaxy == "personal" ? "synced" : "personal"
         projectToGalaxy[project] = targetGalaxy
@@ -985,5 +1009,19 @@ final class MockGraphProvider: SceneDataProvider {
 
     private func writeSettledSignal() {
         FileManager.default.createFile(atPath: "\(instrumentLogPath)-settled", contents: nil)
+    }
+}
+
+/// SplitMix64 makes profiling fixtures repeatable with PREVIEW_SEED.
+private struct PreviewRandomGenerator: RandomNumberGenerator {
+    private var state: UInt64 = ProcessInfo.processInfo.environment["PREVIEW_SEED"]
+        .flatMap(UInt64.init) ?? UInt64.random(in: .min ... .max)
+
+    mutating func next() -> UInt64 {
+        state &+= 0x9e3779b97f4a7c15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xbf58476d1ce4e5b9
+        z = (z ^ (z >> 27)) &* 0x94d049bb133111eb
+        return z ^ (z >> 31)
     }
 }

@@ -27,6 +27,7 @@ struct RenderUpdate: Sendable {
     var bulkEdges: (allEdges: [UUID: EdgeData],
                     pkToGid: [Int64: UUID],
                     byNode: [UUID: [EdgeData]])?
+    var bulkEdgeCounts: [UUID: Int]?
     var bulkNodeBatches: [[(pk: Int64, node: NodeData)]] = []
     var clusterGroups: [[UUID]]?
     var finalize: Bool = false  // recomputeDerivedData + wake sim + mark loaded
@@ -34,7 +35,7 @@ struct RenderUpdate: Sendable {
     var isEmpty: Bool {
         insertedNodes.isEmpty && updatedNodes.isEmpty && removedNodePks.isEmpty &&
         insertedEdges.isEmpty && updatedEdges.isEmpty && removedEdgeGids.isEmpty &&
-        bulkEdges == nil && bulkNodeBatches.isEmpty && clusterGroups == nil && !finalize
+        bulkEdges == nil && bulkEdgeCounts == nil && bulkNodeBatches.isEmpty && clusterGroups == nil && !finalize
     }
 }
 
@@ -47,6 +48,35 @@ struct DrainConfig: Sendable {
     let is3D: Bool
     let soundEnabled: Bool
     let notificationsEnabled: Bool
+}
+
+/// Built during the same bounded slices that insert initial nodes. A reference
+/// type keeps nested dictionary/array mutation in-place across those slices.
+@MainActor
+private final class InitialLoadDerivedData {
+    var isValid: Bool
+    var expectedTopology: UInt64
+    let hiddenProjects: Set<String>
+    let hiddenRelations: Set<String>
+    let timeFilter: Date?
+    var projects: Set<String> = []
+    var topics: [String: (topic: String, project: String, ids: [UUID])] = [:]
+    var relationCounts: [String: Int] = [:]
+    var countedSelfEdges: Set<UUID> = []
+
+    init(store: GraphRenderStore, config: DrainConfig) {
+        isValid = store.allNodes.isEmpty && store.nodes.isEmpty
+        expectedTopology = store.topologyVersion
+        hiddenProjects = config.hiddenProjects
+        hiddenRelations = config.hiddenRelations
+        timeFilter = config.timeFilter
+    }
+
+    func validate(store: GraphRenderStore, config: DrainConfig) {
+        isValid = isValid && expectedTopology == store.topologyVersion
+            && hiddenProjects == config.hiddenProjects && hiddenRelations == config.hiddenRelations
+            && timeFilter == config.timeFilter
+    }
 }
 
 /// Encapsulates one complete graph data pipeline: Lattice + RenderStore + Simulation + EmbeddingProjection.
@@ -73,6 +103,7 @@ actor Galaxy: Identifiable {
     /// Reference to the unified simulation owned by GalaxyRegistry.
     /// Set during register(). All node/edge ops go through this.
     @MainActor weak var simulation3D: ForceSimulation3D?
+    @MainActor weak var registry: GalaxyRegistry?
 
 
     /// Lock-protected update buffer — written by Galaxy actor, drained by MainActor.
@@ -131,6 +162,10 @@ actor Galaxy: Identifiable {
 
     @MainActor var isLoaded = false
     @MainActor var isInitialLoad = true
+    @MainActor private var loadingUpdate: RenderUpdate?
+    @MainActor private var loadingBatchIndex = 0
+    @MainActor private var initialDerivedData: InitialLoadDerivedData?
+    @MainActor var isDrainingInitialSnapshot: Bool { loadingUpdate != nil }
 
     /// Actor-isolated in-flight flag for loadData. The `isLoaded` guard alone
     /// is racy: it hops to MainActor (a suspension point), so two callers —
@@ -156,6 +191,7 @@ actor Galaxy: Identifiable {
     /// Set up live Lattice observers. Callbacks push raw data into pendingUpdate —
     /// all filtering (hidden projects/relations, time) happens during drain via DrainConfig.
     func startObservers() {
+        guard !Task.isCancelled else { return }
         // Sign-out (or any teardown) can invalidate the lattice while the
         // initial load is still in flight — observers just don't start.
         // Crashing here took the app down when signing out mid-load.
@@ -225,11 +261,19 @@ actor Galaxy: Identifiable {
             }
         }
     }
+
+    func stopObservers() {
+        nodeObserver?.cancel()
+        edgeObserver?.cancel()
+        nodeObserver = nil
+        edgeObserver = nil
+    }
     
     /// Load all data from a galaxy's Lattice into its renderStore + simulation.
     /// Reads ALL data — visual filtering (hiddenProjects, etc.) happens during
     /// drain via DrainConfig. Only `nodeFilter` (structural partition) is applied here.
     func loadData() async {
+        guard !Task.isCancelled else { return }
         // Guard against duplicate loads (onAppear + syncManager.didConnect can
         // both fire). loadInFlight is checked/set synchronously on the actor
         // — airtight; the isLoaded check alone suspends and lets both through.
@@ -241,6 +285,7 @@ actor Galaxy: Identifiable {
         let batchSize = 50
         let ref = latticeRef
         let nodeFilter = nodeFilter
+        let projectResolver = projectResolver
 
         guard let bgLattice = ref.resolve() else { return }
 
@@ -249,11 +294,10 @@ actor Galaxy: Identifiable {
         var edgePkToGlobalId: [Int64: UUID] = [:]
         var edgesByNode: [UUID: [EdgeData]] = [:]
         for e in bgLattice.objects(MemoryEdge.self) {
-            guard let pk = e.primaryKey, let gid = e.globalId else { continue }
-            let ed = EdgeData(id: gid, sourceId: e.sourceGlobalId,
-                              targetId: e.targetGlobalId, relation: e.relation.rawValue)
-            allEdges[gid] = ed
-            edgePkToGlobalId[pk] = gid
+            guard !Task.isCancelled else { return }
+            guard let (pk, ed) = Self.snapshotEdge(e) else { continue }
+            allEdges[ed.id] = ed
+            edgePkToGlobalId[pk] = ed.id
             edgesByNode[ed.sourceId, default: []].append(ed)
             edgesByNode[ed.targetId, default: []].append(ed)
         }
@@ -262,23 +306,21 @@ actor Galaxy: Identifiable {
         let finalEdges = allEdges
         let finalPkToGid = edgePkToGlobalId
         let finalByNode = edgesByNode
+        let finalEdgeCounts = edgesByNode.mapValues(\.count)
         edgePkToGidLock.withLock { $0 = finalPkToGid }
         pendingUpdate.withLock {
             $0.bulkEdges = (finalEdges, finalPkToGid, finalByNode)
+            $0.bulkEdgeCounts = finalEdgeCounts
         }
 
         // 2. Read nodes in batches — all off MainActor
         var nodeBatch: [(pk: Int64, node: NodeData)] = []
+        var allProjects = Set<String>()
         for m in bgLattice.objects(Memory.self) {
-            guard let gid = m.globalId, let pk = m.primaryKey else { continue }
-            if let filter = nodeFilter, !filter(m) { continue }
-            nodeBatch.append((pk, NodeData(
-                id: gid, project: displayProject(m), topic: m.topic,
-                label: extractLabel(content: m.content, topic: m.topic),
-                content: m.content,
-                createdAt: m.createdAt, lastAccessedAt: m.lastAccessedAt,
-                importance: m.importance
-            )))
+            guard !Task.isCancelled else { return }
+            guard let record = Self.snapshotNode(m, filter: nodeFilter, projectResolver: projectResolver) else { continue }
+            allProjects.insert(record.node.project)
+            nodeBatch.append(record)
             if nodeBatch.count >= batchSize {
                 let batch = nodeBatch
                 nodeBatch = []
@@ -299,39 +341,77 @@ actor Galaxy: Identifiable {
         // them concurrently over multi-GB DBs is what pushed the SQLite page
         // cache to ~1GB and into transient OOM (crash 2026-08-05). Nodes and
         // edges above still load fully in parallel; only this tail is gated.
-        var allProjects = Set<String>()
-        for batch in pendingUpdate.withLock({ $0.bulkNodeBatches }) {
-            for (_, node) in batch { allProjects.insert(node.project) }
-        }
         let projects = allProjects
         let finalClusters = await ClusterPassGate.shared.run { [ref] in
             guard let lat = ref.resolve() else { return [[UUID]]() }
             var clusters: [[UUID]] = []
             for project in projects {
+                guard !Task.isCancelled else { return [[UUID]]() }
                 clusters.append(contentsOf: findMemoryClusters(
                     in: lat, project: project,
                     minClusterSize: 2, neighborLimit: 20).clusters)
             }
             return clusters
         }
+        guard !Task.isCancelled else { return }
         pendingUpdate.withLock { $0.clusterGroups = finalClusters }
+    }
+
+    /// Scope the hydrated scalar cache to one row. This replaces one SQL read
+    /// per property without retaining an all-model snapshot (and embeddings).
+    nonisolated static func snapshotNode(
+        _ memory: Memory,
+        filter: (@Sendable (Memory) -> Bool)? = nil,
+        projectResolver: (@Sendable (UUID?, String) -> String)? = nil
+    ) -> (pk: Int64, node: NodeData)? {
+        memory.withMaterializedReads {
+            guard let gid = memory.globalId, let pk = memory.primaryKey else { return nil }
+            if let filter, !filter(memory) { return nil }
+            let project = projectResolver?(memory.authorUserId, memory.project) ?? memory.project
+            let content = memory.content
+            let topic = memory.topic
+            return (pk, NodeData(
+                id: gid, project: project, topic: topic,
+                label: extractLabel(content: content, topic: topic), content: content,
+                createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
+                importance: memory.importance
+            ))
+        }
+    }
+
+    nonisolated static func snapshotEdge(_ edge: MemoryEdge) -> (pk: Int64, edge: EdgeData)? {
+        edge.withMaterializedReads {
+            guard let pk = edge.primaryKey, let gid = edge.globalId else { return nil }
+            return (pk, EdgeData(id: gid, sourceId: edge.sourceGlobalId,
+                                 targetId: edge.targetGlobalId, relation: edge.relation.rawValue))
+        }
     }
     
     // MARK: insert node batch
-    @MainActor func insertNodeBatch(_ batch: [NodeData], config: DrainConfig) {
+    @MainActor func insertNodeBatch(_ batch: [NodeData], config: DrainConfig,
+                                   deriveInitialData: Bool = false) {
         let store = renderStore
         let sim3D = simulation3D
+        // An out-of-band insert during loading is not part of the snapshot's
+        // append sequence. Reconcile normally at the end in that rare case.
+        if !deriveInitialData { initialDerivedData?.isValid = false }
+        let derived = deriveInitialData && initialDerivedData?.isValid == true ? initialDerivedData : nil
 
         for nd in batch {
             store.allNodes[nd.id] = nd
+            derived?.projects.insert(nd.project)
 
             let visible = !config.hiddenProjects.contains(nd.project) &&
                 (config.timeFilter == nil || nd.createdAt <= config.timeFilter!)
-            guard visible else { continue }
+            guard visible, !store.visibleNodeIds.contains(nd.id) else { continue }
 
             store.nodes.append(nd)
             store.nodeById[nd.id] = nd
             store.visibleNodeIds.insert(nd.id)
+            if let derived, nd.topic != "general", nd.topic != "episode" {
+                let key = "\(nd.project)|\(nd.topic)"
+                derived.topics[key, default: (topic: nd.topic, project: nd.project, ids: [])].ids.append(nd.id)
+            }
 
             if config.is3D {
                 sim3D?.addNode(nd.id, project: nd.project, topic: nd.topic, galaxyId: self.id)
@@ -341,6 +421,14 @@ actor Galaxy: Identifiable {
             for edge in store.edgesByNode[nd.id] ?? [] {
                 let otherId = edge.sourceId == nd.id ? edge.targetId : edge.sourceId
                 guard store.visibleNodeIds.contains(otherId) else { continue }
+                // Non-self edges reach this branch once, when their second
+                // endpoint is inserted. Self-edges appear twice in adjacency.
+                // Counts intentionally include hidden relations, as the full
+                // reconciliation does, while still excluding hidden endpoints.
+                if let derived,
+                   edge.sourceId != edge.targetId || derived.countedSelfEdges.insert(edge.id).inserted {
+                    derived.relationCounts[edge.relation, default: 0] += 1
+                }
                 guard !config.hiddenRelations.contains(edge.relation) else { continue }
                 if !store.filteredEdgeIds.contains(edge.id) {
                     store.filteredEdgeIds.insert(edge.id)
@@ -373,88 +461,107 @@ actor Galaxy: Identifiable {
 
     // MARK: - Render Update Drain
 
-    /// Drain all pending updates atomically on MainActor. Called once per frame
-    /// from renderTick, before simulation tick. Ensures store + simulation are
-    /// always consistent — no partial states visible to the render pipeline.
-    ///
-    /// Bulk data (initial load) is held until `finalize` arrives — this guarantees
-    /// all galaxies are registered and world layout is final before any nodes are
-    /// positioned, preventing center-of-origin clustering when galaxies register
-    /// asynchronously.
+    /// Apply complete batches within a small frame budget. Each batch updates
+    /// both the render store and simulation before yielding to the renderer.
+    /// Live changes wait behind the initial snapshot, so a deletion cannot be
+    /// undone by an older bulk row on a subsequent frame.
     @MainActor
-    func drainPendingUpdate(config: DrainConfig) {
-        // Peek: if there's bulk data but no finalize yet, leave it for next frame.
-        // This ensures all galaxies are registered (and world layout computed)
-        // before any bulk node positions are assigned.
-        let hasBulk = pendingUpdate.withLock { !$0.bulkNodeBatches.isEmpty || $0.bulkEdges != nil }
-        let hasFinalize = pendingUpdate.withLock { $0.finalize }
-        if hasBulk && !hasFinalize {
-            // Only drain incremental changes (observer inserts/updates/deletes),
-            // NOT bulk data. Bulk waits for finalize.
-            let incremental = pendingUpdate.withLock { u -> RenderUpdate in
-                var partial = RenderUpdate()
-                partial.insertedNodes = u.insertedNodes; u.insertedNodes = []
-                partial.updatedNodes = u.updatedNodes; u.updatedNodes = []
-                partial.removedNodePks = u.removedNodePks; u.removedNodePks = []
-                partial.insertedEdges = u.insertedEdges; u.insertedEdges = []
-                partial.updatedEdges = u.updatedEdges; u.updatedEdges = []
-                partial.removedEdgeGids = u.removedEdgeGids; u.removedEdgeGids = []
-                return partial
-            }
-            if !incremental.isEmpty {
-                applyIncrementalUpdate(incremental,
-                                       config: config)
-            }
-            return
-        }
-
-        // Full drain — finalize is present or no bulk data
-        let update = pendingUpdate.withLock { u -> RenderUpdate in
-            let copy = u; u = .init(); return copy
-        }
-        guard !update.isEmpty else { return }
-
+    func drainPendingUpdate(config: DrainConfig, workBudget: TimeInterval = 0.002) {
+        let deadline = CFAbsoluteTimeGetCurrent() + workBudget
         let store = renderStore
-
-        // Bulk edges (initial load)
-        if let bulk = update.bulkEdges {
-            store.allEdges = bulk.allEdges
-            store.edgePkToGlobalId = bulk.pkToGid
-            store.edgesByNode = bulk.byNode
+        if loadingUpdate == nil {
+            let update = pendingUpdate.withLock { u -> RenderUpdate? in
+                let hasBulk = !u.bulkNodeBatches.isEmpty || u.bulkEdges != nil
+                guard !hasBulk || u.finalize else { return nil }
+                guard !u.isEmpty else { return nil }
+                let copy = u
+                u = .init()
+                return copy
+            }
+            guard let update else { return }
+            if update.finalize {
+                loadingUpdate = update
+                loadingBatchIndex = 0
+                initialDerivedData = InitialLoadDerivedData(store: store, config: config)
+                if let bulk = update.bulkEdges {
+                    store.allEdges = bulk.allEdges
+                    store.edgePkToGlobalId = bulk.pkToGid
+                    store.edgesByNode = bulk.byNode
+                }
+                // The real loader prepared these counts off-main. The fallback
+                // supports synthetic producers without changing their contract.
+                store.edgeCountByNode = update.bulkEdgeCounts ?? store.edgesByNode.mapValues(\.count)
+            } else {
+                applyIncrementalUpdate(update, config: config)
+                if let clusters = update.clusterGroups { store.clusterGroups = clusters }
+                return
+            }
         }
 
-        // Bulk node batches (initial load) — only processed when finalize is present,
-        // so simulation3D.center is already at the final world position.
-        if !update.bulkNodeBatches.isEmpty {
-            let totalNodes = update.bulkNodeBatches.reduce(0) { $0 + $1.count }
-            print("DRAIN: galaxy=\(id) processing \(totalNodes) bulk nodes, sim.center=\(simulation3D?.center ?? .zero), worldCenter=\(worldCenter)")
+        guard let update = loadingUpdate else { return }
+        initialDerivedData?.validate(store: store, config: config)
+        // The single-galaxy merge borrows the store's buffers. Release those
+        // redundant references while mutating, or the first 50-row batch pays
+        // for copying the entire accumulated graph and exhausts this budget.
+        if let registry {
+            registry.withReleasedSingleGalaxySnapshot(for: self) {
+                drainInitialSnapshot(update, config: config, deadline: deadline)
+            }
+        } else {
+            drainInitialSnapshot(update, config: config, deadline: deadline)
         }
-        for batch in update.bulkNodeBatches {
+    }
+
+    @MainActor
+    private func drainInitialSnapshot(_ update: RenderUpdate, config: DrainConfig, deadline: CFAbsoluteTime) {
+        let store = renderStore
+        var insertedBatch = false
+        while loadingBatchIndex < update.bulkNodeBatches.count {
+            let batch = update.bulkNodeBatches[loadingBatchIndex]
             var nodes: [NodeData] = []
             nodes.reserveCapacity(batch.count)
             for (pk, node) in batch {
                 store.pkToGlobalId[pk] = node.id
                 nodes.append(node)
             }
-            insertNodeBatch(nodes, config: config)
+            insertNodeBatch(nodes, config: config, deriveInitialData: true)
+            loadingBatchIndex += 1
+            insertedBatch = true
+            if CFAbsoluteTimeGetCurrent() >= deadline { break }
         }
+        if insertedBatch { store.bumpTopology() }
+        initialDerivedData?.expectedTopology = store.topologyVersion
+        guard loadingBatchIndex == update.bulkNodeBatches.count else { return }
 
-        // Incremental changes
+        // Incrementals captured with this finalized envelope must precede
+        // aggregate publication, just like the original atomic drain. Inserts
+        // remain deferred/coalesced; immediate edits/deletes invalidate the
+        // bulk accumulator before final metadata and indexes are reconciled.
         applyIncrementalUpdate(update, config: config)
+        initialDerivedData?.validate(store: store, config: config)
 
-        // Finalize (end of initial load)
-        if update.finalize {
+        // The ordinary initial path has already derived its metadata within
+        // the bounded insertion slices. External filtering/topology edits
+        // invalidate that accumulator and retain the full reconciliation path.
+        if let derived = initialDerivedData, derived.isValid {
+            ensureProjectColors(derived.projects)
+            store.relationCounts = derived.relationCounts.sorted(by: { $0.key < $1.key })
+            store.topicGroups = derived.topics.values.filter { $0.ids.count >= 2 }
+                .map { TopicGroupInfo(topic: $0.topic, project: $0.project, ids: $0.ids) }
+        } else {
+            // A structural edit to a hidden row can temporarily add it to the
+            // lookup without making it visible. Restore all derived indexes,
+            // not just statistics, on this rare mixed-update fallback.
             recomputeDerivedData()
-            store.bumpTopology()
-            if config.is3D { simulation3D?.wake() }
-            isInitialLoad = false
-            isLoaded = true
         }
-
-        // Cluster groups (computed off MainActor, applied here)
-        if let clusters = update.clusterGroups {
-            store.clusterGroups = clusters
-        }
+        store.bumpTopology()
+        if config.is3D { simulation3D?.wake() }
+        isInitialLoad = false
+        isLoaded = true
+        loadingUpdate = nil
+        loadingBatchIndex = 0
+        initialDerivedData = nil
+        if let clusters = update.clusterGroups { store.clusterGroups = clusters }
     }
 
     @MainActor
@@ -466,15 +573,13 @@ actor Galaxy: Identifiable {
         for (pk, node) in update.updatedNodes {
             handleNodeUpdate(pk: pk, node: node, config: config)
         }
-        for pk in update.removedNodePks {
-            handleNodeDelete(pk, config: config)
-        }
+        handleNodeDeletes(Set(update.removedNodePks), config: config)
         for (pk, edge) in update.insertedEdges {
             store.edgePkToGlobalId[pk] = edge.id
             handleEdgeInsert(edge, config: config)
         }
         for edge in update.updatedEdges {
-            handleEdgeUpdate(edge)
+            handleEdgeUpdate(edge, config: config)
         }
         for gid in update.removedEdgeGids {
             handleEdgeDelete(gid)
@@ -489,7 +594,9 @@ actor Galaxy: Identifiable {
             let capturedConfig = config
             store.pendingNodeFlush = Task { @MainActor in
                 await Task.yield()
-                flushPendingNodeInserts(config: capturedConfig)
+                guard !Task.isCancelled else { store.pendingNodeFlush = nil; return }
+                // A filter can change while the coalesced insert yields.
+                flushPendingNodeInserts(config: registry?.currentDrainConfig ?? capturedConfig)
                 store.pendingNodeFlush = nil
             }
         }
@@ -559,7 +666,7 @@ actor Galaxy: Identifiable {
         let structuralChange = old.project != node.project ||
             old.topic != node.topic ||
             old.importance != node.importance ||
-            old.label != node.label
+            old.label != node.label || old.content != node.content
         if !structuralChange {
             // Access-only change: update dicts (O(1)), skip O(n) array scan.
             // nodes[] array gets stale lastAccessedAt but that field doesn't affect
@@ -573,40 +680,62 @@ actor Galaxy: Identifiable {
         if let idx = store.nodes.firstIndex(where: { $0.id == gid }) {
             store.nodes[idx] = node
         }
+        if store.colorMap[node.project] == nil {
+            store.colorMap[node.project] = node.project == "global" ? .gray :
+                GraphView.goldenAngleColor(at: max(0, store.colorMap.count - 1))
+        }
+        store.bumpTopology()
     }
     
     @MainActor func handleNodeDelete(_ pk: Int64, config: DrainConfig) {
+        handleNodeDeletes([pk], config: config)
+    }
+
+    @MainActor private func handleNodeDeletes(_ pks: Set<Int64>, config: DrainConfig) {
+        guard !pks.isEmpty else { return }
         let soundEnabled = config.soundEnabled
         let t0 = CFAbsoluteTimeGetCurrent()
         defer { ObserverAccumulator.shared.record("nodeDelete", ms: (CFAbsoluteTimeGetCurrent() - t0) * 1000.0) }
         let store = renderStore
-        guard let gid = store.pkToGlobalId[pk] else { return }
+        // A just-inserted row may still be waiting for its deferred flush and
+        // therefore have no pkToGlobalId entry yet. Cancel it before lookup.
+        store.pendingNodeInserts.removeAll { pks.contains($0.pk) }
+        let gids = Set(pks.compactMap { store.pkToGlobalId[$0] })
+        guard !gids.isEmpty else { return }
 
         // Notify mascot fleet before removing — capture position for absorb animation
-        if let nodeData = store.allNodes[gid] {
-            let lastPos = simulation3D?.positions[gid]
-            mascotFleet?.onNodeDeleted(nodeId: gid, project: nodeData.project, lastPosition: lastPos)
+        if let mascotFleet {
+            let positions = simulation3D?.positions ?? [:]
+            for gid in gids {
+                if let nodeData = store.allNodes[gid] {
+                    mascotFleet.onNodeDeleted(nodeId: gid, project: nodeData.project, lastPosition: positions[gid])
+                }
+            }
         }
 
-        store.pkToGlobalId.removeValue(forKey: pk)
-        store.allNodes.removeValue(forKey: gid)
-        store.glowingNodes.removeValue(forKey: gid)
-        store.newNodeGlows.removeValue(forKey: gid)
-        let removedEdgeIds = Set(store.edges.filter { $0.sourceId == gid || $0.targetId == gid }.map(\.id))
+        for pk in pks { store.pkToGlobalId.removeValue(forKey: pk) }
+        for gid in gids {
+            store.allNodes.removeValue(forKey: gid)
+            store.glowingNodes.removeValue(forKey: gid)
+            store.newNodeGlows.removeValue(forKey: gid)
+            store.nodeById.removeValue(forKey: gid)
+        }
+        let removedEdgeIds = Set(store.edges.lazy.filter { gids.contains($0.sourceId) || gids.contains($0.targetId) }.map(\.id))
         store.filteredEdgeIds.subtract(removedEdgeIds)
-        store.visibleNodeIds.remove(gid)
-        // Note: ForceSimulation3D doesn't support surgical remove — it rebuilds via updateGraph().
-        // The node disappears from render data immediately; simulation catches up on next rebuild.
-        store.nodes.removeAll { $0.id == gid }
-        store.nodeById.removeValue(forKey: gid)
-        store.edges.removeAll { $0.sourceId == gid || $0.targetId == gid }
-        store.hubs.remove(gid)
+        store.visibleNodeIds.subtract(gids)
+        if config.is3D {
+            if let registry { registry.reconcileSimulationOwnership(for: gids) }
+            else { simulation3D?.removeNodes(gids) }
+        }
+        store.nodes.removeAll { gids.contains($0.id) }
+        store.edges.removeAll { removedEdgeIds.contains($0.id) }
+        store.hubs.subtract(gids)
         store.bumpTopology()
         if !isInitialLoad && soundEnabled {
             DispatchQueue.global(qos: .utility).async { GraphView.removeSound?.play() }
         }
         store.clusterGroups = store.clusterGroups.compactMap { cluster in
-            let filtered = cluster.filter { $0 != gid }
+            let filtered = cluster.filter { !gids.contains($0) }
             return filtered.count >= 2 ? filtered : nil
         }
     }
@@ -615,7 +744,17 @@ actor Galaxy: Identifiable {
     func flushPendingNodeInserts(config: DrainConfig) {
         let t0 = CFAbsoluteTimeGetCurrent()
         let store = renderStore
-        let entries = store.pendingNodeInserts
+        var entries: [(pk: Int64, node: NodeData)] = []
+        var indexByPK: [Int64: Int] = [:]
+        // Updates may arrive while an insert is deferred. Keep the latest row
+        // for each PK without changing the first insertion's stable order.
+        for entry in store.pendingNodeInserts {
+            if let index = indexByPK[entry.pk] { entries[index] = entry }
+            else {
+                indexByPK[entry.pk] = entries.count
+                entries.append(entry)
+            }
+        }
         store.pendingNodeInserts.removeAll(keepingCapacity: true)
         guard !entries.isEmpty else { return }
 
@@ -623,13 +762,22 @@ actor Galaxy: Identifiable {
         let flushStart = CFAbsoluteTimeGetCurrent()
         #endif
 
-        var bumpedTopology = false
+        var addedVisibleNode = false
 
         for (pk, node) in entries {
             let gid = node.id
             store.pkToGlobalId[pk] = gid
             store.allNodes[gid] = node
             store.newNodeGlows[gid] = Date()
+            // Even a hidden project's first row must expose a project entry
+            // in the sidebar so it can subsequently be made visible.
+            if store.colorMap[node.project] == nil {
+                if node.project == "global" { store.colorMap[node.project] = .gray }
+                else {
+                    let idx = store.colorMap.count - (store.colorMap["global"] == nil ? 0 : 1)
+                    store.colorMap[node.project] = GraphView.goldenAngleColor(at: idx)
+                }
+            }
 
             let visible = !config.hiddenProjects.contains(node.project) &&
                 (config.timeFilter == nil || node.createdAt <= config.timeFilter!)
@@ -665,15 +813,13 @@ actor Galaxy: Identifiable {
                 }
             }
 
-            if store.colorMap[node.project] == nil && node.project != "global" {
-                let idx = store.colorMap.count - 1
-                store.colorMap[node.project] = GraphView.goldenAngleColor(at: idx)
-            }
-            bumpedTopology = true
+            addedVisibleNode = true
         }
 
-        if bumpedTopology {
-            store.bumpTopology()
+        // Hidden inserts still change allNodes, which backs panel totals and
+        // per-project counts. Publish one revision without making them visible.
+        store.bumpTopology()
+        if addedVisibleNode {
             if !isInitialLoad && config.soundEnabled {
                 DispatchQueue.global(qos: .utility).async { GraphView.addSound?.play() }
             }
@@ -689,7 +835,7 @@ actor Galaxy: Identifiable {
         }
         if let f = flushTimingFile {
             let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
-            let line = "\(ts),\(id),\(entries.count),\(String(format: "%.2f", flushMs)),\(store.edges.count),\(bumpedTopology)\n"
+            let line = "\(ts),\(id),\(entries.count),\(String(format: "%.2f", flushMs)),\(store.edges.count),true\n"
             fputs(line, f)
             fflush(f)
         }
@@ -705,14 +851,17 @@ actor Galaxy: Identifiable {
             let capturedConfig = config
             store.pendingEdgeFlush = Task { @MainActor in
                 await Task.yield()
-                flushPendingEdgeInserts(config: capturedConfig)
+                guard !Task.isCancelled else { store.pendingEdgeFlush = nil; return }
+                flushPendingEdgeInserts(config: registry?.currentDrainConfig ?? capturedConfig)
                 store.pendingEdgeFlush = nil
             }
         }
     }
 
-    @MainActor func handleEdgeUpdate(_ data: EdgeData) {
+    @MainActor func handleEdgeUpdate(_ data: EdgeData, config: DrainConfig) {
         let store = renderStore
+        // Updating an edge whose insert has not flushed supersedes that old row.
+        store.pendingEdgeInserts.removeAll { $0.edge.id == data.id }
         let old = store.allEdges[data.id]
         store.allEdges[data.id] = data
         // Only scan the edges array when structural fields changed (relation, endpoints).
@@ -722,28 +871,59 @@ actor Galaxy: Identifiable {
             old!.sourceId != data.sourceId ||
             old!.targetId != data.targetId
         if structuralChange {
-            if let idx = store.edges.firstIndex(where: { $0.id == data.id }) {
-                store.edges[idx] = data
+            store.edges.removeAll { $0.id == data.id }
+            store.filteredEdgeIds.remove(data.id)
+            if let old {
+                store.edgesByNode[old.sourceId]?.removeAll { $0.id == data.id }
+                store.edgesByNode[old.targetId]?.removeAll { $0.id == data.id }
+                store.edgeCountByNode[old.sourceId] = max(0, (store.edgeCountByNode[old.sourceId] ?? 0) - 1)
+                store.edgeCountByNode[old.targetId] = max(0, (store.edgeCountByNode[old.targetId] ?? 0) - 1)
+                removeUnownedSimulationEdge(from: old.sourceId, to: old.targetId)
             }
+            store.edgesByNode[data.sourceId, default: []].append(data)
+            store.edgesByNode[data.targetId, default: []].append(data)
+            store.edgeCountByNode[data.sourceId, default: 0] += 1
+            store.edgeCountByNode[data.targetId, default: 0] += 1
+            if let old, old.relation == "part_of",
+               !(store.edgesByNode[old.targetId] ?? []).contains(where: { $0.relation == "part_of" && $0.targetId == old.targetId }) {
+                store.hubs.remove(old.targetId)
+            }
+            if data.relation == "part_of" { store.hubs.insert(data.targetId) }
+            if store.visibleNodeIds.contains(data.sourceId), store.visibleNodeIds.contains(data.targetId),
+               !config.hiddenRelations.contains(data.relation) {
+                store.edges.append(data)
+                store.filteredEdgeIds.insert(data.id)
+                if config.is3D { simulation3D?.addEdge(from: data.sourceId, to: data.targetId) }
+            }
+            store.bumpTopology()
         }
     }
 
     @MainActor func handleEdgeDelete(_ gid: UUID) {
         let store = renderStore
-        if let old = store.allEdges[gid] {
-            // Note: ForceSimulation3D doesn't support surgical removeEdge — see removeNode note.
+        store.pendingEdgeInserts.removeAll { $0.edge.id == gid }
+        if let old = store.allEdges.removeValue(forKey: gid) {
             store.filteredEdgeIds.remove(gid)
             store.edges.removeAll { $0.id == gid }
             store.edgesByNode[old.sourceId]?.removeAll { $0.id == gid }
             store.edgesByNode[old.targetId]?.removeAll { $0.id == gid }
+            removeUnownedSimulationEdge(from: old.sourceId, to: old.targetId)
             store.edgeCountByNode[old.sourceId, default: 1] -= 1
             store.edgeCountByNode[old.targetId, default: 1] -= 1
             if old.relation == "part_of" {
-                let stillHub = store.allEdges.values.contains { $0.id != gid && $0.relation == "part_of" && $0.targetId == old.targetId }
+                let stillHub = (store.edgesByNode[old.targetId] ?? []).contains { $0.relation == "part_of" && $0.targetId == old.targetId }
                 if !stillHub { store.hubs.remove(old.targetId) }
             }
         }
-        store.allEdges.removeValue(forKey: gid)
+        store.bumpTopology()
+    }
+
+    @MainActor private func removeUnownedSimulationEdge(from source: UUID, to target: UUID) {
+        if let registry {
+            registry.removeSimulationEdgeIfUnowned(from: source, to: target)
+        } else if !renderStore.edges.contains(where: { $0.sourceId == source && $0.targetId == target }) {
+            simulation3D?.removeEdge(from: source, to: target)
+        }
     }
     
     @MainActor func flushPendingEdgeInserts(config: DrainConfig) {
@@ -806,25 +986,18 @@ actor Galaxy: Identifiable {
         #endif
     }
     
-    @MainActor func recomputeDerivedData() {
+    @MainActor func recomputeDerivedData(rebuildVisibleIndex: Bool = true) {
         let store = renderStore
 
         // Color map
-        let projects = Set(store.allNodes.values.map(\.project)).sorted()
-        if store.colorMap["global"] == nil {
-            store.colorMap["global"] = .gray
-        }
-        for project in projects {
-            if project == "global" { continue }
-            if store.colorMap[project] == nil {
-                let idx = store.colorMap.count - 1
-                store.colorMap[project] = GraphView.goldenAngleColor(at: idx)
-            }
-        }
+        ensureProjectColors(Set(store.allNodes.values.map(\.project)))
 
-        // Visible node IDs
-        store.visibleNodeIds = Set(store.nodes.map(\.id))
-        store.nodeById = Dictionary(store.nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
+        // Initial insertion maintains both indexes atomically with the sim.
+        // Filtering/migration callers still request the full reconciliation.
+        if rebuildVisibleIndex {
+            store.visibleNodeIds = Set(store.nodes.map(\.id))
+            store.nodeById = Dictionary(store.nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
+        }
 
         // Relation counts
         let nodeIds = store.visibleNodeIds
@@ -840,21 +1013,42 @@ actor Galaxy: Identifiable {
         for node in store.nodes {
             guard node.topic != "general", node.topic != "episode" else { continue }
             let key = "\(node.project)|\(node.topic)"
-            var entry = groups[key] ?? (topic: node.topic, project: node.project, ids: [])
-            entry.ids.append(node.id)
-            groups[key] = entry
+            // Mutate through Dictionary's in-place accessor. Extracting a
+            // local tuple copies its growing UUID array on every append.
+            groups[key, default: (topic: node.topic, project: node.project, ids: [])].ids.append(node.id)
         }
         store.topicGroups = groups.values
             .filter { $0.ids.count >= 2 }
             .map { TopicGroupInfo(topic: $0.topic, project: $0.project, ids: $0.ids) }
 
         // Per-node edge counts
-        var edgeCounts: [UUID: Int] = [:]
-        for edge in store.allEdges.values {
-            edgeCounts[edge.sourceId, default: 0] += 1
-            edgeCounts[edge.targetId, default: 0] += 1
+        if rebuildVisibleIndex {
+            var edgeCounts: [UUID: Int] = [:]
+            for edge in store.allEdges.values {
+                edgeCounts[edge.sourceId, default: 0] += 1
+                edgeCounts[edge.targetId, default: 0] += 1
+            }
+            store.edgeCountByNode = edgeCounts
+        } else {
+            // Initial adjacency contains every edge once per endpoint (twice
+            // for a self-edge), exactly matching the full count semantics.
+            store.edgeCountByNode = store.edgesByNode.mapValues(\.count)
         }
-        store.edgeCountByNode = edgeCounts
+    }
+
+    @MainActor private func ensureProjectColors(_ projects: Set<String>) {
+        let store = renderStore
+        if store.colorMap["global"] == nil {
+            store.colorMap["global"] = .gray
+        }
+        for project in projects.sorted() {
+            if project == "global" { continue }
+            if store.colorMap[project] == nil {
+                let idx = store.colorMap.count - 1
+                store.colorMap[project] = GraphView.goldenAngleColor(at: idx)
+            }
+        }
+
     }
     
     @MainActor private func recomputeStatsOnly() {
@@ -873,9 +1067,7 @@ actor Galaxy: Identifiable {
         for node in store.nodes {
             guard node.topic != "general", node.topic != "episode" else { continue }
             let key = "\(node.project)|\(node.topic)"
-            var entry = groups[key] ?? (topic: node.topic, project: node.project, ids: [])
-            entry.ids.append(node.id)
-            groups[key] = entry
+            groups[key, default: (topic: node.topic, project: node.project, ids: [])].ids.append(node.id)
         }
         store.topicGroups = groups.values
             .filter { $0.ids.count >= 2 }

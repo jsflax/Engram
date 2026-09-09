@@ -14,12 +14,35 @@ public final class LabelBatchSystem {
 
     private var lastAtlasVersion: UInt64 = 0
     private var lastAtlasFrame: UInt64 = 0
+    private var atlasInvalidation = LabelAtlasInvalidation()
     private var labelStaging: [BatchVertex] = []
+    private var lastFrameState: LabelFrameState?
+
+    /// Labels have no clock-driven animation. Reuse their mesh until one of
+    /// the actual geometry, visibility, or appearance inputs changes.
+    private struct LabelFrameState: Equatable {
+        let topologyVersion: UInt64
+        let positionVersion: UInt64
+        let atlasVersion: UInt64
+        let visibleLabels: [Int]
+        let cameraPosition: SIMD3<Float>
+        let cameraRight: SIMD3<Float>
+        let cameraUp: SIMD3<Float>
+        let scaleFactor: Float
+        let selectedNode: UUID?
+        let searchIsActive: Bool
+        let searchMatches: Set<UUID>
+        let colors: [String: SIMD3<Float>]
+        let projectCentroids: [String: SIMD3<Float>]
+        var capacity: Int
+    }
 
     // Cached cluster data — recomputed every N frames instead of every frame
     private var cachedProjectMaxY: [String: Float] = [:]
     private var cachedTopicSums: [String: (sum: SIMD3<Float>, count: Int, project: String, maxY: Float)] = [:]
     private var lastClusterFrame: UInt64 = 0
+    private var clusterPositionVersion: UInt64?
+    private var clusterTopologyVersion: UInt64?
     private let clusterRescanInterval: UInt64 = 10
 
     // Project/topic sets cached on topologyVersion. Building
@@ -71,15 +94,16 @@ public final class LabelBatchSystem {
         let topicCount = projectTopicSets(dataProvider).topics.count
         let totalLabelCount = visibleCount + projCount + topicCount
         mark("counts")
-        if frameCount % 120 == 0 {
+        if sectionStats && frameCount % 120 == 0 {
             print("[labels] frame=\(frameCount) visibleNodes=\(visibleCount) projects=\(projCount) topics=\(topicCount) totalNodes=\(dataProvider.nodes.count) projRects=\(scene.labelAtlasGenerator.projectRects.count) topicRects=\(scene.labelAtlasGenerator.topicRects.count) atlasFrame=\(lastAtlasFrame)")
         }
-        guard totalLabelCount > 0 else { return }
-
-        // Regenerate atlas if topology changed (debounced), or on first frame with data
-        let hasNodes = !dataProvider.nodes.isEmpty
-        let needsInitialAtlas = lastAtlasFrame == 0 && hasNodes
-        if (topologyChanged || needsInitialAtlas) && (frameCount - lastAtlasFrame) > 60 || needsInitialAtlas {
+        if atlasInvalidation.observe(version: dataProvider.topologyVersion) {
+            scene.labelAtlasGenerator.invalidatePendingAtlas()
+        }
+        if scene.labelAtlasGenerator.needsAtlasRetry {
+            atlasInvalidation.markDirty()
+        }
+        if totalLabelCount > 0 && atlasInvalidation.shouldRequest(frame: frameCount) {
             let (projects, topics) = projectTopicSets(dataProvider)
             scene.labelAtlasGenerator.regenerateAtlas(
                 nodes: dataProvider.nodes,
@@ -88,22 +112,21 @@ public final class LabelBatchSystem {
                 topics: topics
             )
             lastAtlasFrame = frameCount
-
-            // Update material with new atlas texture
-            if let texture = scene.labelAtlasGenerator.atlasTexture,
-               let labelEntity = scene.labelBatchEntity {
-                let mat = MaterialFactory.makeLabelMaterial(device: scene.device, atlasTexture: texture)
-                labelEntity.model?.materials = [mat]
-            }
         }
 
         mark("atlas")
-        LowLevelMeshFactory.ensureLabelBatchMesh(scene: scene, capacity: totalLabelCount)
-        guard let mesh = scene.labelBatchMesh else { return }
-
+        // No label can be drawn until the first background atlas is ready.
+        // Avoid allocating an empty mesh and scanning every cluster on the
+        // same cold frame as the node/edge resources. Existing atlases remain
+        // visible while their replacement is being rasterized.
+        guard totalLabelCount > 0, scene.labelAtlasGenerator.atlasTexture != nil else {
+            scene.labelBatchEntity?.isEnabled = false
+            lastFrameState = nil
+            return
+        }
         let nodes = dataProvider.nodes
-        let positions = dataProvider.positions
         let positionArray = dataProvider.positionArray
+        let positions: [UUID: SIMD3<Float>] = positionArray.count == nodes.count ? [:] : dataProvider.positions
         let atlasRects = scene.labelAtlasGenerator.nodeRects
         let aspectCorrection = scene.labelAtlasGenerator.aspectCorrection
         let selectedNode = dataProvider.selectedNode
@@ -124,6 +147,33 @@ public final class LabelBatchSystem {
             camRight = SIMD3<Float>(1, 0, 0)
             camUp = SIMD3<Float>(0, 1, 0)
         }
+
+        let needsClusterRescan = clusterTopologyVersion != dataProvider.topologyVersion
+            || (clusterPositionVersion != dataProvider.positionVersion
+                && frameCount &- lastClusterFrame >= clusterRescanInterval)
+        var frameState = LabelFrameState(
+            topologyVersion: dataProvider.topologyVersion,
+            positionVersion: dataProvider.positionVersion,
+            atlasVersion: scene.labelAtlasGenerator.atlasVersion,
+            visibleLabels: visibleSet.visibleLabelIndices,
+            cameraPosition: camPos, cameraRight: camRight, cameraUp: camUp,
+            scaleFactor: scaleFactor, selectedNode: selectedNode,
+            searchIsActive: isSearchActive, searchMatches: searchMatchIds,
+            colors: colorMap, projectCentroids: dataProvider.projectCentroids,
+            capacity: scene.labelBatchCapacity)
+        let needsMesh = scene.labelBatchMesh == nil || scene.labelBatchEntity?.model == nil
+            || scene.labelBatchCapacity < totalLabelCount
+        guard frameState != lastFrameState || needsClusterRescan || needsMesh else { return }
+
+        // Obtain upload resources before changing a visible entity/material.
+        // A failed allocation keeps the complete old texture + UVs on screen
+        // and leaves the frame state uncommitted so unchanged input retries.
+        guard let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer(),
+              LowLevelMeshFactory.ensureLabelBatchMesh(scene: scene, capacity: totalLabelCount),
+              let mesh = scene.labelBatchMesh,
+              scene.labelBatchEntity?.model != nil,
+              scene.labelBatchCapacity >= totalLabelCount else { return }
+        frameState.capacity = scene.labelBatchCapacity
 
         let totalVerts = scene.labelBatchCapacity * Self.vertsPerLabel
         if labelStaging.count < totalVerts {
@@ -182,14 +232,16 @@ public final class LabelBatchSystem {
         }
 
         mark("visloop")
-        // Compute per-project max Y + topic sums (throttled — every 10 frames or on topology change)
-        if frameCount - lastClusterFrame >= clusterRescanInterval
-            || cachedProjectMaxY.isEmpty || topologyChanged {
+        // Moving clusters are throttled, while a settled scene reuses its
+        // aggregates indefinitely. Metadata changes invalidate immediately.
+        if needsClusterRescan {
             lastClusterFrame = frameCount
+            clusterPositionVersion = dataProvider.positionVersion
+            clusterTopologyVersion = dataProvider.topologyVersion
             cachedProjectMaxY.removeAll(keepingCapacity: true)
             cachedTopicSums.removeAll(keepingCapacity: true)
-            for node in nodes {
-                guard let pos = positions[node.id] else { continue }
+            for (index, node) in nodes.enumerated() {
+                guard let pos = index < positionArray.count ? positionArray[index] : positions[node.id] else { continue }
                 cachedProjectMaxY[node.project] = max(
                     cachedProjectMaxY[node.project] ?? -Float.greatestFiniteMagnitude, pos.y)
                 let entry = cachedTopicSums[node.topic] ?? (.zero, 0, node.project, -Float.greatestFiniteMagnitude)
@@ -202,7 +254,7 @@ public final class LabelBatchSystem {
         // Project cluster labels — large, floating above top of cluster
         // Much larger than node labels and visible from across the scene
         let projRects = scene.labelAtlasGenerator.projectRects
-        if frameCount % 120 == 0 && !dataProvider.projectCentroids.isEmpty {
+        if sectionStats && frameCount % 120 == 0 && !dataProvider.projectCentroids.isEmpty {
             print("[labels] projCentroids=\(Array(dataProvider.projectCentroids.keys)) projRects=\(Array(projRects.keys)) staging=\(labelStaging.count) instanceIdx=\(instanceIdx)")
         }
         for (project, centroid) in dataProvider.projectCentroids {
@@ -283,13 +335,23 @@ public final class LabelBatchSystem {
         }
 
         // GPU-synchronized write
-        guard let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer() else { return }
         let destBuffer = mesh.replace(bufferIndex: 0, using: cmdBuf)
         let dest = destBuffer.contents().bindMemory(to: BatchVertex.self, capacity: totalVerts)
         labelStaging.withUnsafeBufferPointer { src in
             dest.update(from: src.baseAddress!, count: totalVerts)
         }
+        // Bind only after the matching UV upload has been encoded. No actor
+        // suspension can expose a new texture with the previous atlas's UVs.
+        if scene.labelAtlasGenerator.atlasVersion != lastAtlasVersion,
+           let texture = scene.labelAtlasGenerator.atlasTexture,
+           let labelEntity = scene.labelBatchEntity {
+            labelEntity.model?.materials = [MaterialFactory.makeLabelMaterial(
+                device: scene.device, atlasTexture: texture)]
+            lastAtlasVersion = scene.labelAtlasGenerator.atlasVersion
+        }
+        scene.labelBatchEntity?.isEnabled = true
         if commandBuffer == nil { cmdBuf.commit() }
+        lastFrameState = frameState
         mark("write")
         if sectionStats && frameCount % 120 == 7 {
             var out = "[labels-sections] frame=\(frameCount)"

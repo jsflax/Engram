@@ -36,6 +36,7 @@ final class GalaxyRegistry {
     @ObservationIgnored private(set) var mergedHubs: Set<UUID> = []
     @ObservationIgnored private(set) var mergedColorMap: [String: Color] = [:]
     @ObservationIgnored private(set) var mergedNodeById: [UUID: NodeData] = [:]
+    @ObservationIgnored let panelSnapshot = GalaxyPanelSnapshot()
 
     // Node -> galaxy routing (for selection, detail panel, search)
     @ObservationIgnored private(set) var nodeToGalaxy: [UUID: String] = [:]
@@ -45,28 +46,99 @@ final class GalaxyRegistry {
     var hiddenProjects: Set<String> = []
     var hiddenRelations: Set<String> = []
 
-    /// Per-frame drain config — built by MetalSceneManager from VisualizerConfig + layout mode,
-    /// stored here so migration code and other callers can read it.
+    /// Snapshot pushed before loading and whenever a graph setting changes.
+    /// The RealityKit drain and partition migrations consume this same config.
     var currentDrainConfig = DrainConfig(
         hiddenProjects: [], hiddenRelations: [], timeFilter: nil,
         is3D: true, soundEnabled: false, notificationsEnabled: false
     )
 
-    // Topology tracking — each galaxy's topologyVersion is summed to detect changes
-    @ObservationIgnored private var lastMergedTopologySum: UInt64 = 0
+    func updateDrainConfig(from config: VisualizerConfig, timeFilter: Date?) {
+        hiddenProjects = config.hiddenProjects
+        hiddenRelations = config.hiddenRelations
+        currentDrainConfig = DrainConfig(
+            hiddenProjects: hiddenProjects, hiddenRelations: hiddenRelations,
+            timeFilter: timeFilter, is3D: true,
+            soundEnabled: config.soundEnabled, notificationsEnabled: config.notificationsEnabled
+        )
+    }
+
+    // Per-galaxy revisions include metadata consumed by cached render aggregates.
+    private struct RenderRevision: Equatable {
+        let identity: ObjectIdentifier
+        let topology: UInt64
+        let colors: UInt64
+        let worldCenter: SIMD3<Float>
+    }
+    @ObservationIgnored private var lastMergedRevisions: [String: RenderRevision] = [:]
+    @ObservationIgnored private(set) var mergedTopologyVersion: UInt64 = 0
+    @ObservationIgnored private var loadTasks: [String: Task<Void, Never>] = [:]
 
     // MARK: - Galaxy Management
 
     func register(_ galaxy: Galaxy) {
         galaxies[galaxy.id] = galaxy
         galaxy.simulation3D = unifiedSimulation
+        galaxy.registry = self
         computeWorldLayout()
         unifiedSimulation.setGalaxyCenter(galaxy.id, galaxy.worldCenter)
     }
 
     func remove(_ galaxyId: String) {
-        galaxies.removeValue(forKey: galaxyId)
+        guard let galaxy = galaxies.removeValue(forKey: galaxyId) else { return }
+        loadTasks.removeValue(forKey: galaxyId)?.cancel()
+        galaxy.renderStore.pendingNodeFlush?.cancel()
+        galaxy.renderStore.pendingEdgeFlush?.cancel()
+        // Detached observers/queued flushes must never mutate the shared sim.
+        galaxy.simulation3D = nil
+        galaxy.registry = nil
+        galaxy.embeddingProjection.invalidate()
+        reconcileSimulationOwnership(for: galaxy.renderStore.visibleNodeIds)
+        Task { await galaxy.stopObservers() }
         computeWorldLayout()
+    }
+
+    /// Observer deletes can remove only one copy of a shared UUID. Preserve
+    /// the unified slot while another displayed galaxy owns it, and move its
+    /// galaxy metadata to the same precedence winner used by rendering.
+    func reconcileSimulationOwnership(for nodeIDs: Set<UUID>) {
+        guard !nodeIDs.isEmpty else { return }
+        let owners = galaxiesInPrecedenceOrder()
+        var unowned: Set<UUID> = []
+        var retained: [String: Set<UUID>] = [:]
+        for id in nodeIDs {
+            if let owner = owners.first(where: { $0.renderStore.visibleNodeIds.contains(id) }) {
+                retained[owner.id, default: []].insert(id)
+            } else { unowned.insert(id) }
+        }
+        unifiedSimulation.removeNodes(unowned)
+        for (galaxyID, ids) in retained { unifiedSimulation.changeGalaxyGroup(for: ids, to: galaxyID) }
+    }
+
+    /// A spring belongs to an endpoint pair, not an individual edge row. A
+    /// replicated copy or different relation in another galaxy may retain it.
+    func removeSimulationEdgeIfUnowned(from source: UUID, to target: UUID) {
+        if galaxies.count == 1, let only = galaxies.values.first {
+            if only.renderStore.edges.contains(where: { $0.sourceId == source && $0.targetId == target }) { return }
+        } else {
+            let ordered = galaxiesInPrecedenceOrder()
+            let sourceVisible = ordered.contains { $0.renderStore.visibleNodeIds.contains(source) }
+            let targetVisible = ordered.contains { $0.renderStore.visibleNodeIds.contains(target) }
+            if sourceVisible && targetVisible {
+                // Match mergeRenderData's first-wins global-ID precedence,
+                // including edges whose endpoints now live in different galaxies.
+                for galaxy in ordered {
+                    for candidate in galaxy.renderStore.edgesByNode[source] ?? []
+                    where candidate.sourceId == source && candidate.targetId == target {
+                        guard let owner = ordered.first(where: { $0.renderStore.allEdges[candidate.id] != nil }),
+                              let edge = owner.renderStore.allEdges[candidate.id] else { continue }
+                        if edge.sourceId == source && edge.targetId == target
+                            && !hiddenRelations.contains(edge.relation) { return }
+                    }
+                }
+            }
+        }
+        unifiedSimulation.removeEdge(from: source, to: target)
     }
 
     /// The focused galaxy (for detail panel, search, etc.)
@@ -109,7 +181,9 @@ final class GalaxyRegistry {
                     Float(level) * levelSpacing,
                     0
                 )
+                #if ENGRAM_INSTRUMENTATION
                 print("LAYOUT: galaxy=\(galaxy.id) center=\(center) galaxyCount=\(galaxies.count)")
+                #endif
                 galaxy.worldCenter = center
                 unifiedSimulation.setGalaxyCenter(galaxy.id, center)
             }
@@ -137,11 +211,15 @@ final class GalaxyRegistry {
                             parentGalaxyId: parentGalaxyId)
         register(galaxy)
 
-        Task {
+        loadTasks[id] = Task { [weak self] in
+            defer {
+                if self?.galaxies[id] === galaxy { self?.loadTasks[id] = nil }
+            }
             if let filter = nodeFilter { galaxy.setNodeFilter(filter) }
             // Before loadData — the loader snapshots it per node.
             if let resolver = projectResolver { galaxy.setProjectResolver(resolver) }
             await galaxy.loadData()
+            guard !Task.isCancelled else { return }
             await galaxy.startObservers()
         }
     }
@@ -172,7 +250,7 @@ final class GalaxyRegistry {
     /// the most specific group first (leaf team before its org) and sorted id
     /// as the final tiebreak. Matches the node-filter precedence, so the
     /// merge backstop lands on the same galaxy the filters intended.
-    private func galaxiesInPrecedenceOrder() -> [Galaxy] {
+    func galaxiesInPrecedenceOrder() -> [Galaxy] {
         func rank(_ id: String) -> Int {
             if id.hasPrefix("group:") { return 0 }
             if id == "synced" { return 1 }
@@ -189,13 +267,20 @@ final class GalaxyRegistry {
     }
 
     func mergeRenderData() {
-        // Check if any galaxy's topology changed
-        var topologySum: UInt64 = 0
-        for galaxy in galaxies.values {
-            topologySum &+= galaxy.renderStore.topologyVersion
+        // Contents, colors, instance identity, and layout all affect the merge.
+        let revisions = galaxies.mapValues {
+            // Immutable metadata belongs to this Galaxy instance, not just
+            // its ID. A same-ID replacement can restart store revisions at
+            // the same values while changing its display name or hierarchy.
+            RenderRevision(identity: ObjectIdentifier($0),
+                           topology: $0.renderStore.topologyVersion,
+                           colors: $0.renderStore.colorMapVersion,
+                           worldCenter: $0.worldCenter)
         }
-        guard topologySum != lastMergedTopologySum else { return }
-        lastMergedTopologySum = topologySum
+        guard revisions != lastMergedRevisions else { return }
+        let previousRevisions = lastMergedRevisions
+        lastMergedRevisions = revisions
+        mergedTopologyVersion &+= 1
 
         #if ENGRAM_INSTRUMENTATION
         let mergeStart = CFAbsoluteTimeGetCurrent()
@@ -214,12 +299,19 @@ final class GalaxyRegistry {
             mergedColorMap = store.colorMap
             mergedNodeById = store.nodeById
 
-            // nodeToGalaxy: only rebuild when node count diverges
-            if nodeToGalaxy.count != store.nodes.count || lastSingleGalaxyId != only.id {
-                nodeToGalaxy.removeAll(keepingCapacity: true)
-                for node in store.nodes { nodeToGalaxy[node.id] = only.id }
-                lastSingleGalaxyId = only.id
-            }
+            // Bulk drains only append and bump topology once per slice. Reuse
+            // established routing until final reconciliation; unrelated edits
+            // (including filtering or replacement) still force a full rebuild.
+            let previous = previousRevisions[only.id]
+            let canAppendRouting = only.isDrainingInitialSnapshot
+                && lastSingleGalaxyId == only.id
+                && previous?.identity == ObjectIdentifier(only)
+                && previous.map { $0.topology &+ 1 == store.topologyVersion } == true
+                && nodeToGalaxy.count <= store.nodes.count
+            let start = canAppendRouting ? nodeToGalaxy.count : 0
+            if !canAppendRouting { nodeToGalaxy.removeAll(keepingCapacity: true) }
+            for node in store.nodes.dropFirst(start) { nodeToGalaxy[node.id] = only.id }
+            lastSingleGalaxyId = only.id
             nodeCount = store.nodes.count
             edgeCount = store.edges.count
         } else {
@@ -296,6 +388,37 @@ final class GalaxyRegistry {
             }
         }
         #endif
+        // A background panel scan retains the mutable node buffers. Publishing
+        // each partial snapshot would force another full CoW copy next frame.
+        // The completed snapshot and every ordinary live update still refresh.
+        if !galaxies.values.contains(where: { $0.isDrainingInitialSnapshot }) {
+            panelSnapshot.refresh(from: self)
+        }
+    }
+
+    /// A synchronous borrow around a bulk mutation. No suspension or external
+    /// publication occurs while aliases are released; callers see restored,
+    /// consistent store/simulation snapshots as soon as the drain returns.
+    func withReleasedSingleGalaxySnapshot(for galaxy: Galaxy, _ mutation: () -> Void) {
+        guard galaxies.count == 1, galaxies[galaxy.id] === galaxy,
+              lastSingleGalaxyId == galaxy.id else {
+            mutation()
+            return
+        }
+        mergedNodes = []
+        mergedEdges = []
+        mergedNodeById = [:]
+        mergedHubs = []
+        mergedColorMap = [:]
+        defer {
+            let store = galaxy.renderStore
+            mergedNodes = store.nodes
+            mergedEdges = store.edges
+            mergedNodeById = store.nodeById
+            mergedHubs = store.hubs
+            mergedColorMap = store.colorMap
+        }
+        mutation()
     }
 
     @ObservationIgnored private var lastSingleGalaxyId: String?
@@ -426,22 +549,9 @@ final class GalaxyRegistry {
         return counts.sorted(by: { $0.key < $1.key })
     }
 
-    /// Merged topology version — sum of all galaxy versions.
-    var mergedTopologyVersion: UInt64 {
-        var sum: UInt64 = 0
-        for galaxy in galaxies.values {
-            sum &+= galaxy.renderStore.topologyVersion
-        }
-        return sum
-    }
-
     /// Merged colorMapVersion — sum of all galaxy versions.
     var mergedColorMapVersion: UInt64 {
-        var sum: UInt64 = 0
-        for galaxy in galaxies.values {
-            sum &+= galaxy.renderStore.colorMapVersion
-        }
-        return sum
+        mergedTopologyVersion
     }
 
     /// Merged edgeCountByNode.
@@ -704,6 +814,9 @@ final class GalaxyRegistry {
 
         // Add nodes to render store
         for nd in nodes {
+            // The destination may already hold the same replicated UUID while
+            // its source observer catches up with a partition policy change.
+            guard !store.visibleNodeIds.contains(nd.id) else { continue }
             store.allNodes[nd.id] = nd
             let visible = !config.hiddenProjects.contains(nd.project) &&
                 (config.timeFilter == nil || nd.createdAt <= config.timeFilter!)

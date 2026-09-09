@@ -15,9 +15,9 @@ struct ActivityLogPanel: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
-            let colorMap = galaxyRegistry.mergedColorMap
-            let recent = galaxyRegistry.mergedRecentNodes
-            let nodeCount = galaxyRegistry.mergedNodes.count
+            let colorMap = galaxyRegistry.panelSnapshot.colorMap
+            let recent = galaxyRegistry.panelSnapshot.recentNodes
+            let nodeCount = galaxyRegistry.panelSnapshot.visibleCount
 
             VStack(alignment: .trailing, spacing: 0) {
                 HStack(spacing: 6) {
@@ -71,6 +71,7 @@ struct ActivityLogPanel: View {
                 }
             }
         }
+        .onAppear { galaxyRegistry.panelSnapshot.refresh(from: galaxyRegistry) }
     }
 }
 

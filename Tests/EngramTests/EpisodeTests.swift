@@ -233,6 +233,8 @@ import Foundation
     #expect(text(from: recall).contains("No memories in this episode"))
 }
 
+// This test controls time through a DEBUG-only MemoryTools seam.
+#if DEBUG
 @Test func explicitEpisode_gapClearsActive() async throws {
     let tools = try await makeTools()
 
@@ -264,6 +266,8 @@ import Foundation
     #expect(text(from: recall).contains("Memory before gap"))
     #expect(!text(from: recall).contains("Memory after gap"))
 }
+
+#endif
 
 // MARK: - Recall Episode
 

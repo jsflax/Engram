@@ -16,6 +16,7 @@ final class PerfBottleneckTests: XCTestCase {
     private var localIds: [UUID] = []
     private var syncedIds: [UUID] = []
     private let testUUID = UUID().uuidString
+    private var frameStatsPath: String { NSTemporaryDirectory() + "engram-frames-\(testUUID).csv" }
 
     // All CSV paths we collect
     private let csvPaths = [
@@ -97,6 +98,8 @@ final class PerfBottleneckTests: XCTestCase {
         )
 
         app.launchEnvironment["CLAUDE_MEMORY_DB"] = localDbPath
+        app.launchEnvironment["ENGRAM_PERF_ISOLATED"] = "1"
+        app.launchEnvironment["ENGRAM_FRAME_STATS"] = frameStatsPath
         app.launchEnvironment["ENGRAM_FORCE_SOUND"] = "1"
         app.launchEnvironment["ENGRAM_TEST_NO_NOTIFY"] = "1"
         app.launchEnvironment["ENGRAM_TEST_INSERT_DELAY"] = "45"
@@ -305,7 +308,7 @@ final class PerfBottleneckTests: XCTestCase {
 
         var report = BottleneckReport()
 
-        report.addSection(analyzeMetalFrames())
+        report.addSection(try RealityFrameReport(path: frameStatsPath).section())
         report.addSection(analyzeDrawPipeline())
         report.addSection(analyzeFlushTiming())
         report.addSection(analyzePackTiming())
@@ -321,7 +324,8 @@ final class PerfBottleneckTests: XCTestCase {
         report.printSummary()
 
         // Hard assertion: p95 frame time under budget
-        if let p95 = report.metalP95 {
+        let p95 = try XCTUnwrap(report.metalP95, "Missing RealityKit performance data")
+        do {
             XCTAssertLessThan(p95, 33.0,
                 "p95 frame time \(String(format: "%.1f", p95))ms exceeds 30fps budget (33ms)")
         }
@@ -330,7 +334,7 @@ final class PerfBottleneckTests: XCTestCase {
     // MARK: - Frame Count
 
     private func currentFrameCount() -> Int {
-        let path = "/tmp/metal-frame-timing.csv"
+        let path = frameStatsPath
         guard let data = FileManager.default.contents(atPath: path),
               let csv = String(data: data, encoding: .utf8) else { return 0 }
         return csv.components(separatedBy: "\n").count - 2 // header + trailing newline
@@ -1049,6 +1053,6 @@ func toggleSyncConfig(at path: String, project: String, policy: SyncConfig.Polic
         existing.policy = policy
         existing.updatedAt = Date()
     } else {
-        lattice.add(SyncConfig(project: project, policy: policy))
+        try! lattice.add(SyncConfig(project: project, policy: policy))
     }
 }

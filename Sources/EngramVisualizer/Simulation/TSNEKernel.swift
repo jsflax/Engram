@@ -42,6 +42,7 @@ struct TSNEKernel: Sendable {
         onPositions: @Sendable ([(id: UUID, x: Double, y: Double)], _ zValues: [Double]?) -> Void = { _, _ in }
     ) -> Output {
         let n = input.embeddings.count
+        guard !Task.isCancelled else { return Output(positions: [], zValues: nil) }
         let D = input.outputDims  // output dimensionality (2 or 3)
         guard n >= 2 else {
             return Output(
@@ -68,8 +69,10 @@ struct TSNEKernel: Sendable {
         }
 
         // Distance matrix (cosine distance = 1 - cosine similarity)
+        guard !Task.isCancelled else { return Output(positions: [], zValues: nil) }
         var dist = [Double](repeating: 0, count: n * n)
         for i in 0..<n {
+            guard !Task.isCancelled else { return Output(positions: [], zValues: nil) }
             for j in (i + 1)..<n {
                 var dot: Float = 0
                 vDSP_dotpr(input.embeddings[i], 1, input.embeddings[j], 1, &dot, vDSP_Length(dim))
@@ -84,10 +87,12 @@ struct TSNEKernel: Sendable {
 
         // --- Step 2: Perplexity calibration (binary search for sigma per point) ---
         let targetEntropy = log(min(input.perplexity, Double(n - 1) / 3.0))
+        guard !Task.isCancelled else { return Output(positions: [], zValues: nil) }
         var P = [Double](repeating: 0, count: n * n)  // conditional probabilities P(j|i)
 
         for i in 0..<n {
             var lo: Double = 1e-10
+            guard !Task.isCancelled else { return Output(positions: [], zValues: nil) }
             var hi: Double = 1e4
             var sigma: Double = 1.0
 
@@ -173,6 +178,7 @@ struct TSNEKernel: Sendable {
         let progressRange = 0.8  // 0.2 to 1.0
 
         for iter in 0..<input.maxIterations {
+            guard !Task.isCancelled else { return Output(positions: [], zValues: nil) }
             let momentum: Double = iter < earlyExaggerationIters ? 0.5 : 0.8
             let exaggeration: Double = iter < earlyExaggerationIters ? earlyExaggeration : 1.0
 

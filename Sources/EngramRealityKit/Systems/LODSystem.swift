@@ -1,6 +1,70 @@
 import simd
 import Foundation
 
+/// Keep the same priority/distance order as a stable full sort, without sorting
+/// thousands of discarded nodes when only a small part of a tier fits. The
+/// index tie-break preserves classification order even after partitioning.
+enum LODBudgetSelection {
+    typealias Candidate = (index: Int, distance: Float, priority: Int)
+
+    private static func precedes(_ lhs: Candidate, _ rhs: Candidate) -> Bool {
+        if lhs.priority != rhs.priority { return lhs.priority > rhs.priority }
+        if lhs.distance != rhs.distance { return lhs.distance < rhs.distance }
+        return lhs.index < rhs.index
+    }
+
+    static func indices(from candidates: inout [Candidate], limit: Int) -> [Int] {
+        let take = min(candidates.count, max(0, limit))
+        guard take > 0 else { return [] }
+        if candidates.count > take {
+            candidates.withUnsafeMutableBufferPointer { buffer in
+                partitionPrefix(buffer, count: take)
+                var prefix = UnsafeMutableBufferPointer(rebasing: buffer[..<take])
+                prefix.sort(by: precedes)
+            }
+        }
+        // Tiers that fit retain input order, including their label ordering.
+        return candidates.prefix(take).map(\.index)
+    }
+
+    private static func partitionPrefix(_ candidates: UnsafeMutableBufferPointer<Candidate>, count: Int) {
+        let buffer = candidates
+        var lower = 0
+        var upper = buffer.count
+        var depth = 2 * (Int.bitWidth - buffer.count.leadingZeroBitCount)
+        while upper - lower > 24 {
+            // Bound adversarial partition sequences; sorting the active range
+            // still keeps worst-case work at O(n log n), as before this change.
+            guard depth > 0 else {
+                var remainder = UnsafeMutableBufferPointer(rebasing: buffer[lower..<upper])
+                remainder.sort(by: precedes)
+                return
+            }
+            depth -= 1
+            let middle = lower + (upper - lower) / 2
+            let last = upper - 1
+            // Median-of-three avoids degenerate splits on already ordered,
+            // reverse-ordered, or distance-clustered input.
+            if precedes(buffer[middle], buffer[lower]) { buffer.swapAt(middle, lower) }
+            if precedes(buffer[last], buffer[lower]) { buffer.swapAt(last, lower) }
+            if precedes(buffer[last], buffer[middle]) { buffer.swapAt(last, middle) }
+            buffer.swapAt(middle, last)
+            let pivot = buffer[last]
+            var boundary = lower
+            for index in lower..<last where precedes(buffer[index], pivot) {
+                if index != boundary { buffer.swapAt(index, boundary) }
+                boundary += 1
+            }
+            buffer.swapAt(boundary, last)
+            if boundary == count { return }
+            if boundary < count { lower = boundary + 1 }
+            else { upper = boundary }
+        }
+        var remainder = UnsafeMutableBufferPointer(rebasing: buffer[lower..<upper])
+        remainder.sort(by: precedes)
+    }
+}
+
 /// Distance-based LOD + culling system. Runs before batch systems.
 /// Determines which nodes/edges/labels are visible each frame.
 ///
@@ -29,17 +93,22 @@ public final class LODSystem {
     public init() {}
 
     // Reused per-frame buffers + topology-cached edge endpoint indices.
-    private var nearBuf: [(index: Int, distance: Float, priority: Int)] = []
-    private var midBuf: [(index: Int, distance: Float, priority: Int)] = []
-    private var farBuf: [(index: Int, distance: Float, priority: Int)] = []
+    private var nearBuf: [LODBudgetSelection.Candidate] = []
+    private var midBuf: [LODBudgetSelection.Candidate] = []
+    private var farBuf: [LODBudgetSelection.Candidate] = []
     private var visibleBits: [Bool] = []
-    private var edgeSrcIdx: [Int32] = []
-    private var edgeTgtIdx: [Int32] = []
+    // Classification only needs these two scalar fields from each large node
+    // snapshot. Keep them compact so orbiting a settled graph does not walk
+    // the strings/dates in tens of thousands of immutable snapshots per frame.
+    private var basePriorities: [Int] = []
+    private var prioritiesTopologyVersion: UInt64 = .max
+    private var edgeEndpoints = EdgeEndpointIndexCache()
     private var edgeTopologyVersion: UInt64 = .max
     /// EMA of the previous frames' min/max node-to-camera distance —
     /// the basis for scale-free LOD tier thresholds.
     private var distMinEMA: Float = 0
     private var distMaxEMA: Float = 5000
+    private var distanceRangeIsSettled = false
 
     // Idle cache: the full O(nodes + edges) visible-set recompute is wasted
     // when the camera is static and topology unchanged — the common case in
@@ -49,6 +118,10 @@ public final class LODSystem {
     private var lastCameraPosition: SIMD3<Float> = .init(repeating: .greatestFiniteMagnitude)
     private var lastVisibleTopologyVersion: UInt64 = .max
     private var lastSelectedNode: UUID?
+    private var lastPositionVersion: UInt64?
+    private var lastGlowingIDs: Set<UUID> = []
+    private var lastHubs: Set<UUID> = []
+    private var lastBudgets: SIMD3<Int> = .zero
 
     /// Compute which nodes/edges/labels are visible this frame.
     ///
@@ -65,18 +138,26 @@ public final class LODSystem {
         selectedNode: UUID?,
         glowingNodes: [UUID: Float],
         hubs: Set<UUID>,
-        topologyVersion: UInt64 = 0
+        topologyVersion: UInt64 = 0,
+        positionVersion: UInt64? = nil
     ) -> VisibleSet {
         let n = nodes.count
         let useArray = positionArray.count == n
+        if prioritiesTopologyVersion != topologyVersion || basePriorities.count != n || hubs != lastHubs {
+            basePriorities = nodes.map { $0.isHub ? 100 : $0.importance }
+            prioritiesTopologyVersion = topologyVersion
+        }
 
-        // Idle fast-path: identical camera (within ~0.5 world unit), same
-        // topology, same selection → the visible set can't have changed
-        // (glow/search only affect priority within an already-visible node's
-        // tier, not membership). Skip the whole recompute.
+        let glowingIDs = Set(glowingNodes.keys)
+        let budgets = SIMD3(maxNodeInstances, maxEdgeInstances, maxLabelInstances)
+        // Callers without a position revision deliberately bypass this cache.
+        // Recall membership can displace a node when a tier exceeds its budget.
         if let cached = cachedVisibleSet,
+           distanceRangeIsSettled,
+           let positionVersion, positionVersion == lastPositionVersion,
            topologyVersion == lastVisibleTopologyVersion,
            selectedNode == lastSelectedNode,
+           glowingIDs == lastGlowingIDs, hubs == lastHubs, budgets == lastBudgets,
            simd_distance_squared(cameraPosition, lastCameraPosition) < 0.25 {
             return cached
         }
@@ -98,6 +179,7 @@ public final class LODSystem {
 
         // Classify into tiers (reused buffers)
         let hasGlows = !glowingNodes.isEmpty
+        let hasPriorityOverrides = selectedNode != nil || hasGlows
         nearBuf.removeAll(keepingCapacity: true)
         midBuf.removeAll(keepingCapacity: true)
         farBuf.removeAll(keepingCapacity: true)
@@ -106,12 +188,11 @@ public final class LODSystem {
 
         positionArray.withUnsafeBufferPointer { posBuf in
             for i in 0..<n {
-                let node = nodes[i]
                 let pos: SIMD3<Float>
                 if useArray {
                     pos = posBuf[i]
                 } else {
-                    guard let p = positions[node.id] else { continue }
+                    guard let p = positions[nodes[i].id] else { continue }
                     pos = p
                 }
                 let distSq = simd_length_squared(pos - cameraPosition)
@@ -121,38 +202,48 @@ public final class LODSystem {
                 // Priority: selected > glowing > hub > importance > distance.
                 // The glow lookup is gated: an empty dict still costs a UUID
                 // hash per node per frame (42k/frame) without the check.
-                var priority = 0
-                if node.id == selectedNode { priority = 1000 }
-                else if hasGlows, glowingNodes[node.id] != nil { priority = 500 }
-                else if node.isHub { priority = 100 }
-                else { priority = node.importance }
+                var priority = basePriorities[i]
+                if hasPriorityOverrides {
+                    let id = nodes[i].id
+                    if id == selectedNode { priority = 1000 }
+                    else if hasGlows, glowingNodes[id] != nil { priority = 500 }
+                }
 
                 if distSq < nearTSq { nearBuf.append((i, distSq, priority)) }
                 else if distSq < midTSq { midBuf.append((i, distSq, priority)) }
                 else if distSq < farTSq { farBuf.append((i, distSq, priority)) }
             }
         }
-        if frameMinSq < frameMaxSq {
-            distMinEMA = 0.8 * distMinEMA + 0.2 * frameMinSq.squareRoot()
-            distMaxEMA = 0.8 * distMaxEMA + 0.2 * frameMaxSq.squareRoot()
+        if frameMinSq <= frameMaxSq, frameMaxSq.isFinite {
+            let minDistance = frameMinSq.squareRoot()
+            let maxDistance = frameMaxSq.squareRoot()
+            let tolerance = max(0.01, (maxDistance - minDistance) * 0.0001)
+            // Classification above used the previous EMA. After snapping to
+            // the final range, require one more classification before caching;
+            // otherwise the last visible set still reflects the old thresholds.
+            distanceRangeIsSettled = distMinEMA == minDistance && distMaxEMA == maxDistance
+            if abs(distMinEMA - minDistance) <= tolerance && abs(distMaxEMA - maxDistance) <= tolerance {
+                distMinEMA = minDistance
+                distMaxEMA = maxDistance
+            } else {
+                distMinEMA = 0.8 * distMinEMA + 0.2 * minDistance
+                distMaxEMA = 0.8 * distMaxEMA + 0.2 * maxDistance
+            }
+        } else {
+            distanceRangeIsSettled = true
         }
 
-        // Apply render budget. Sort a tier only when it overflows what's left
-        // of the budget — sorted order is irrelevant when everything fits.
+        // Apply the unchanged tier budgets. Select only the retained prefix of
+        // an overflowing tier; full sorting is especially wasteful near the
+        // graph, where near/mid nodes can leave only a few hundred far slots.
         var remaining = maxNodeInstances
-        func capped(_ buf: inout [(index: Int, distance: Float, priority: Int)]) -> [Int] {
-            guard remaining > 0 else { return [] }
-            if buf.count > remaining {
-                buf.sort { $0.priority != $1.priority ? $0.priority > $1.priority : $0.distance < $1.distance }
-            }
-            let take = min(buf.count, remaining)
-            remaining -= take
-            var out = [Int](); out.reserveCapacity(take)
-            for k in 0..<take { out.append(buf[k].index) }
+        func capped(_ buf: inout [LODBudgetSelection.Candidate]) -> [Int] {
+            let out = LODBudgetSelection.indices(from: &buf, limit: remaining)
+            remaining -= out.count
             return out
         }
-        var nearCapped = capped(&nearBuf)
-        var midCapped = capped(&midBuf)
+        let nearCapped = capped(&nearBuf)
+        let midCapped = capped(&midBuf)
         var farCapped = capped(&farBuf)
 
         // First-frame guard (EMA not yet seeded): render the first
@@ -161,20 +252,12 @@ public final class LODSystem {
         if nearCapped.isEmpty && midCapped.isEmpty && farCapped.isEmpty && n > 0 {
             farCapped = Array(0..<min(n, maxNodeInstances))
         }
-        _ = nearCapped; _ = midCapped
-
         // Edge endpoints as node indices, cached on topology. The UUID-Set
         // filter did 2 hashed lookups × edge count per frame (460k+ at 230k
         // edges); with int indices + a bit array it's two loads and two tests.
-        if edgeTopologyVersion != topologyVersion || edgeSrcIdx.count != edges.count {
-            var idToIndex = [UUID: Int32](minimumCapacity: n)
-            for i in 0..<n { idToIndex[nodes[i].id] = Int32(i) }
-            edgeSrcIdx = [Int32](repeating: -1, count: edges.count)
-            edgeTgtIdx = [Int32](repeating: -1, count: edges.count)
-            for e in 0..<edges.count {
-                edgeSrcIdx[e] = idToIndex[edges[e].sourceId] ?? -1
-                edgeTgtIdx[e] = idToIndex[edges[e].targetId] ?? -1
-            }
+        if edgeTopologyVersion != topologyVersion || edgeEndpoints.sourceIndices.count != edges.count
+            || edgeEndpoints.nodeCount != n {
+            edgeEndpoints.update(nodes: nodes, edges: edges)
             edgeTopologyVersion = topologyVersion
         }
 
@@ -187,8 +270,8 @@ public final class LODSystem {
         var visibleEdges: [Int] = []
         visibleEdges.reserveCapacity(min(edges.count, maxEdgeInstances))
         let edgeCount = edges.count
-        edgeSrcIdx.withUnsafeBufferPointer { src in
-            edgeTgtIdx.withUnsafeBufferPointer { tgt in
+        edgeEndpoints.sourceIndices.withUnsafeBufferPointer { src in
+            edgeEndpoints.targetIndices.withUnsafeBufferPointer { tgt in
                 visibleBits.withUnsafeBufferPointer { bits in
                     for e in 0..<edgeCount {
                         guard visibleEdges.count < maxEdgeInstances else { break }
@@ -226,6 +309,10 @@ public final class LODSystem {
         lastCameraPosition = cameraPosition
         lastVisibleTopologyVersion = topologyVersion
         lastSelectedNode = selectedNode
+        lastPositionVersion = positionVersion
+        lastGlowingIDs = glowingIDs
+        lastHubs = hubs
+        lastBudgets = budgets
         return result
     }
 }

@@ -6,6 +6,38 @@ All notable changes to Engram are documented in this file.
 
 ## [Unreleased]
 
+## [0.14.4] - 2026-09-09
+
+### Performance
+- **The menu-bar activity feed reads only its latest 20 memories.** Reads
+  happen off the main thread, bursts of database changes are coalesced,
+  and relative timestamps no longer re-enumerate the database every second.
+  Cached rows survive closing the feed, and its subscription restarts on
+  every opening of macOS's reused status panel.
+- **Sidebar statistics, recent activity, and log tails are cached.** Log
+  reads are bounded and run in the background; opening panels no longer
+  sorts or scans the full graph on the main thread.
+  Project and relation rows are laid out lazily, with configuration read
+  once per render instead of repeatedly for each row.
+- **Graph loading yields between small batches.** Semantic embedding work,
+  label-atlas rasterization, and mascot information cards run in the
+  background, with obsolete work discarded when the graph changes.
+- **Settled graphs avoid redundant rendering work.** Position revisions,
+  complete visibility-cache invalidation, and stable GPU instance slots
+  reduce repeated data preparation and uploads without lowering visual
+  budgets. Settled nebula emitters also avoid redundant transform writes.
+  Bounded upload buffers are reused only after the GPU finishes
+  reading them; failed uploads remain eligible for retry.
+- Added isolated macOS profiling fixtures and regression coverage for
+  menu SQL work, graph updates, label generation, and GPU instance reuse.
+
+### Known performance limits
+- Large real-world graphs still exceed the 33 ms frame target, and some
+  automated menu interactions exceed 100 ms. This is an incremental performance
+  release, not clearance of every performance gate. See the
+  [validation report](https://github.com/jsflax/Engram/blob/v0.14.4/docs/performance/2026-09-09-follow-up.md) for measurements
+  and remaining validation gaps.
+
 Hook-side half of the agents-platform "learner nudge" incident fix
 (Aug 13: mid-run nudges became the workup agent's posted Linear
 "diagnosis"; see the engram-server/overlord waves for the other half).

@@ -3,10 +3,8 @@ import Lattice
 import EngramKit
 
 struct MenuBarActivityFeed: View {
-    @LatticeQuery(fetchLimit: 20, sort: \Memory.createdAt, order: .reverse)
-    private var memories: TableResults<Memory>
-
-    @State private var projectColors: [String: Color] = [:]
+    @Environment(\.lattice) private var lattice
+    @State private var store = MenuBarActivityStore()
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -18,7 +16,8 @@ struct MenuBarActivityFeed: View {
                     Text("Engram")
                         .font(.system(size: 13, weight: .semibold, design: .monospaced))
                     Spacer()
-                    Text("\(memories.count)")
+                    Text("\(store.rows.count)")
+                        .accessibilityIdentifier("menu.memory-count")
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.secondary)
                 }
@@ -51,11 +50,10 @@ struct MenuBarActivityFeed: View {
                 // Recent memories
                 ScrollView(.vertical, showsIndicators: true) {
                     LazyVStack(alignment: .leading, spacing: 2) {
-                        let recent = Array(memories)
-                        ForEach(recent, id: \.primaryKey) { memory in
+                        ForEach(store.rows) { memory in
                             MenuBarMemoryRow(
                                 memory: memory,
-                                color: projectColors[memory.project] ?? .gray,
+                                color: store.projectColors[memory.project] ?? .gray,
                                 now: context.date
                             )
                         }
@@ -64,46 +62,36 @@ struct MenuBarActivityFeed: View {
                 }
             }
             .frame(width: 300, height: 400)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("menu.activity-feed")
+            .background {
+                WindowVisibilityLifecycle(
+                    responseName: "menu.feed",
+                    onShow: { store.start(lattice: lattice) },
+                    onHide: { store.stop() }
+                )
+                .allowsHitTesting(false)
+            }
         }
-        .onChange(of: memories.count, initial: true) {
-            rebuildColorMap()
-        }
-    }
-
-    private func rebuildColorMap() {
-        var projects = Set<String>()
-        for m in memories { projects.insert(m.project) }
-        let sorted = projects.sorted()
-        var map: [String: Color] = [:]
-        for (i, p) in sorted.enumerated() {
-            map[p] = GraphView.goldenAngleColor(at: i)
-        }
-        projectColors = map
     }
 }
 
 private struct MenuBarMemoryRow: View {
-    let memory: Memory
+    let memory: MenuBarMemory
     let color: Color
     let now: Date
-
-    private static let relativeFormatter: RelativeDateTimeFormatter = {
-        let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .abbreviated
-        return f
-    }()
 
     var body: some View {
         HStack(spacing: 8) {
             Circle()
                 .fill(color)
                 .frame(width: 6, height: 6)
-            Text(extractLabel(content: memory.content, topic: memory.topic))
+            Text(memory.label)
                 .font(.system(size: 11, design: .monospaced))
                 .lineLimit(1)
                 .truncationMode(.tail)
             Spacer(minLength: 0)
-            Text(Self.relativeFormatter.localizedString(for: memory.createdAt, relativeTo: now))
+            Text(memory.relativeTimestamp(at: now))
                 .font(.system(size: 9, design: .monospaced))
                 .foregroundStyle(.secondary)
         }

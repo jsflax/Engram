@@ -51,6 +51,8 @@ public final class ForceSimulation3D {
     public var topicProjectGroupPublic: [Int] { topicProjectGroup }
     public var nodeIds: [UUID] { ids }
     public var nodeCount: Int { ids.count }
+    /// Identity/order of flat GPU slots, independent of count and simulation ticks.
+    public private(set) var nodeOrderVersion: UInt64 = 0
 
     /// Position dictionary — lazily materialized from the flat x/y/z arrays
     /// on first read per generation. The render path consumes the flat
@@ -61,6 +63,8 @@ public final class ForceSimulation3D {
     private var _positionsCache: [UUID: SIMD3<Float>] = [:]
     private var _positionsCacheGeneration: UInt64 = .max
     private var _positionsGeneration: UInt64 = 0
+    /// Changes only when coordinates or their node ordering change.
+    public var positionVersion: UInt64 { _positionsGeneration }
     public var positions: [UUID: SIMD3<Float>] {
         if _positionsCacheGeneration != _positionsGeneration {
             _positionsCache.removeAll(keepingCapacity: true)
@@ -151,10 +155,14 @@ public final class ForceSimulation3D {
         if galaxyGroup.count < ids.count {
             galaxyGroup.append(contentsOf: [Int](repeating: 0, count: ids.count - galaxyGroup.count))
         }
+        var changed = false
         for id in nodeIds {
             guard let i = idToIndex[id] else { continue }
+            guard galaxyGroup[i] != newGroup else { continue }
             galaxyGroup[i] = newGroup
+            changed = true
         }
+        guard changed else { return }
         hasPendingTopologyChanges = true
         pendingTopologyDelta += 1_000_000  // migrations always relayout
         topologyDirtyForGPU = true
@@ -223,6 +231,7 @@ public final class ForceSimulation3D {
         }
 
         ids = newIds
+        nodeOrderVersion &+= 1
         x = newX; y = newY; z = newZ
         vx = newVx; vy = newVy; vz = newVz
         pinned = newPinned
@@ -309,6 +318,7 @@ public final class ForceSimulation3D {
         }
 
         ids = newIds; x = newX; y = newY; z = newZ
+        nodeOrderVersion &+= 1
         vx = newVx; vy = newVy; vz = newVz; pinned = newPinned
         projectGroup = newProjGroup; topicGroup = newTopicGrp
         galaxyGroup = newGalaxyGrp
@@ -358,6 +368,7 @@ public final class ForceSimulation3D {
         }
 
         ids.append(id)
+        nodeOrderVersion &+= 1
         x.append(position.x); y.append(position.y); z.append(position.z)
         vx.append(0); vy.append(0); vz.append(0)
         pinned.append(false)
@@ -411,6 +422,16 @@ public final class ForceSimulation3D {
         pendingTopologyDelta += 1
     }
 
+    public func removeEdge(from source: UUID, to target: UUID) {
+        guard let si = idToIndex[source], let ti = idToIndex[target] else { return }
+        let key = UInt64(si) << 32 | UInt64(ti)
+        guard edgeIndexSet.remove(key) != nil else { return }
+        edgeIndices.removeAll { $0.0 == si && $0.1 == ti }
+        topologyDirtyForGPU = true
+        hasPendingTopologyChanges = true
+        pendingTopologyDelta += 1
+    }
+
     /// Write external positions (e.g. from 2D positions + z jitter) into internal arrays.
     public func setPositions(_ positions: [UUID: SIMD3<Float>]) {
         for (id, point) in positions {
@@ -451,7 +472,10 @@ public final class ForceSimulation3D {
         guard isActive else { return }
         let n = ids.count
         guard n > 1 else {
-            if n == 1 { x[0] = center.x; y[0] = center.y; z[0] = center.z; syncPositions() }
+            if n == 1, x[0] != center.x || y[0] != center.y || z[0] != center.z {
+                x[0] = center.x; y[0] = center.y; z[0] = center.z
+                syncPositions()
+            }
             return
         }
 
@@ -501,24 +525,26 @@ public final class ForceSimulation3D {
             settledFrameCount += 1
             if settledFrameCount >= 30 {
                 isSettled = true
-                syncPositions()
                 return
             }
         } else {
             settledFrameCount = 0
         }
 
-        syncPositions()
-
+        #if ENGRAM_INSTRUMENTATION
         let totalTickMs = (CFAbsoluteTimeGetCurrent() - tickStart) * 1000.0
         if framesSinceWake % 60 == 1 || totalTickMs > 20 {
             print("[engram:sim] tick n=\(n) integrate=\(String(format: "%.1f", totalTickMs))ms maxSpeedSq=\(String(format: "%.4f", maxSpeedSq)) alpha=\(String(format: "%.4f", alpha)) settled=\(isSettled)")
         }
+        #endif
     }
 
     /// Apply GPU force results delivered via @MainActor callback.
     /// Called from MetalForceCompute's completion handler (dispatched to main actor).
-    public func applyGPUForces(_ result: ForceResult) {
+    public func applyGPUForces(_ result: ForceResult, expectedNodeOrderVersion: UInt64? = nil) {
+        // An insert/delete pair can restore count while changing every remaining
+        // slot. Count equality alone must not authorize an old GPU readback.
+        if let expectedNodeOrderVersion, expectedNodeOrderVersion != nodeOrderVersion { return }
         // GPU-integrated positions: forces were already applied with alpha scaling on GPU.
         // Write positions directly into CPU arrays.
         if let gpuPositions = result.positions {

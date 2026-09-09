@@ -224,11 +224,14 @@ enum LowLevelMeshFactory {
 
     /// Create or resize the label batch LowLevelMesh.
     @MainActor
+    @discardableResult
     static func ensureLabelBatchMesh(
         scene: EngramRealityScene,
-        capacity: Int
-    ) {
-        guard capacity > scene.labelBatchCapacity else { return }
+        capacity: Int,
+        makeResource: @MainActor (LowLevelMesh) throws -> MeshResource = { try MeshResource(from: $0) }
+    ) -> Bool {
+        if capacity <= scene.labelBatchCapacity,
+           scene.labelBatchMesh != nil, scene.labelBatchEntity?.model != nil { return true }
         let newCapacity = max(capacity * 2, 512)
 
         let vertsPerLabel = 4    // billboard quad
@@ -237,7 +240,7 @@ enum LowLevelMeshFactory {
         let totalIndices = newCapacity * indicesPerLabel
         let desc = makeBatchMeshDescriptor(vertexCapacity: totalVerts, indexCapacity: totalIndices)
 
-        guard let mesh = try? LowLevelMesh(descriptor: desc) else { return }
+        guard let mesh = try? LowLevelMesh(descriptor: desc) else { return false }
 
         // Pre-fill index buffer: quad topology per label
         mesh.withUnsafeMutableIndices { raw in
@@ -263,34 +266,39 @@ enum LowLevelMeshFactory {
             )
         ])
 
-        scene.labelBatchMesh = mesh
-        scene.labelBatchCapacity = newCapacity
-
         let material = MaterialFactory.makeLabelMaterial(
             device: scene.device,
             atlasTexture: scene.labelAtlasGenerator.atlasTexture
         )
-        assignBatchEntity(
+        guard assignBatchEntity(
             mesh: mesh,
             material: material,
             entity: &scene.labelBatchEntity,
             name: "label_batch",
-            parent: scene.rootEntity
-        )
+            parent: scene.rootEntity,
+            makeResource: makeResource
+        ) else { return false }
+        // The old mesh/entity/material remain intact until all fallible work
+        // succeeds. Failed growth must not advertise a capacity it cannot draw.
+        scene.labelBatchMesh = mesh
+        scene.labelBatchCapacity = newCapacity
         scene.labelBatchEntity?.components.set(LabelBatchComponent())
+        return true
     }
 
     // MARK: - Helper
 
     @MainActor
+    @discardableResult
     private static func assignBatchEntity(
         mesh: LowLevelMesh,
         material: any Material,
         entity: inout ModelEntity?,
         name: String,
-        parent: Entity
-    ) {
-        guard let resource = try? MeshResource(from: mesh) else { return }
+        parent: Entity,
+        makeResource: @MainActor (LowLevelMesh) throws -> MeshResource = { try MeshResource(from: $0) }
+    ) -> Bool {
+        guard let resource = try? makeResource(mesh) else { return false }
         if let existing = entity {
             existing.model = ModelComponent(mesh: resource, materials: [material])
         } else {
@@ -299,5 +307,6 @@ enum LowLevelMeshFactory {
             parent.addChild(newEntity)
             entity = newEntity
         }
+        return true
     }
 }

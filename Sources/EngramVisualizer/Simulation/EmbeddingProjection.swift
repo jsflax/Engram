@@ -17,6 +17,9 @@ final class EmbeddingProjection {
 
     /// Raw 384-dim embeddings, cached from Lattice
     private var embeddings: [UUID: [Float]] = [:]
+    @ObservationIgnored private var requestVersion: UInt64 = 0
+    @ObservationIgnored private var embeddingTask: Task<[UUID: [Float]], Never>?
+    @ObservationIgnored private var projectionTask: Task<TSNEKernel.Output, Never>?
 
     /// Track which node IDs were projected so we know when to re-project
     private var projectedNodeIds: Set<UUID> = []
@@ -44,20 +47,31 @@ final class EmbeddingProjection {
 
     // MARK: - Embedding Loading
 
-    func loadEmbeddings(for nodeIds: Set<UUID>, from lattice: Lattice) {
+    func loadEmbeddings(for nodeIds: Set<UUID>, from reference: LatticeThreadSafeReference) async -> Bool {
+        embeddingTask?.cancel()
+        projectionTask?.cancel()
+        requestVersion &+= 1
+        let version = requestVersion
         state = .loadingEmbeddings
-        var loaded = 0
-        for id in nodeIds {
-            if embeddings[id] != nil { loaded += 1; continue }
-            guard let memory = lattice.objects(Memory.self).where({ $0.globalId == id }).first else { continue }
-            let elements = memory.embedding.elements
-            guard !elements.isEmpty else { continue }
-            embeddings[id] = elements
-            loaded += 1
+        let existing = embeddings
+        let task = Task.detached(priority: .userInitiated) {
+            guard let lattice = reference.resolve() else { return [UUID: [Float]]() }
+            var result: [UUID: [Float]] = [:]
+            for id in nodeIds {
+                guard !Task.isCancelled else { return [:] }
+                if let cached = existing[id] { result[id] = cached; continue }
+                guard let memory = lattice.objects(Memory.self).where({ $0.globalId == id }).first else { continue }
+                let elements = memory.embedding.elements
+                if !elements.isEmpty { result[id] = elements }
+            }
+            return result
         }
-        // Prune stale entries
-        let staleIds = Set(embeddings.keys).subtracting(nodeIds)
-        for id in staleIds { embeddings.removeValue(forKey: id) }
+        embeddingTask = task
+        let loaded = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+        guard version == requestVersion, !Task.isCancelled, !task.isCancelled else { return false }
+        embeddings = loaded
+        embeddingTask = nil
+        return true
     }
 
     // MARK: - Projection
@@ -66,6 +80,7 @@ final class EmbeddingProjection {
         nodeIds: Set<UUID>, center: CGPoint, spread: CGFloat,
         initialPositions: [UUID: CGPoint] = [:]
     ) async {
+        let version = requestVersion
         // Collect embeddings for nodes that have them
         var ids: [UUID] = []
         var embeddingArrays: [[Float]] = []
@@ -120,7 +135,9 @@ final class EmbeddingProjection {
 
         let progressHandler: @Sendable (Double) -> Void = { [weak self] progress in
             Task { @MainActor [weak self] in
-                self?.state = .computing(progress: progress)
+                guard let self, self.requestVersion == version else { return }
+                guard case .computing = self.state else { return }
+                self.state = .computing(progress: progress)
             }
         }
 
@@ -135,6 +152,7 @@ final class EmbeddingProjection {
         let positionsHandler: @Sendable ([(id: UUID, x: Double, y: Double)], _ zValues: [Double]?) -> Void = { [weak self] rawPositions, _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                guard self.requestVersion == version else { return }
                 // Ignore stale emissions that arrive after computation finished
                 guard case .computing = self.state else { return }
                 self.targetPositions = Self.scaleToWorld(
@@ -144,9 +162,13 @@ final class EmbeddingProjection {
             }
         }
 
-        let result = await Task.detached(priority: .userInitiated) {
+        let task = Task.detached(priority: .userInitiated) {
             await TSNEKernel.compute(input, progress: progressHandler, onPositions: positionsHandler)
-        }.value
+        }
+        projectionTask = task
+        let result = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+        guard version == requestVersion, !Task.isCancelled, !task.isCancelled else { return }
+        projectionTask = nil
 
         // Final scaling with the converged positions
         guard !result.positions.isEmpty else {
@@ -235,10 +257,11 @@ final class EmbeddingProjection {
 
     // MARK: - 3D Projection
 
-    func computeProjection3D(
+    @discardableResult func computeProjection3D(
         nodeIds: Set<UUID>, spread: Float,
         initialPositions: [UUID: SIMD3<Float>] = [:]
-    ) async {
+    ) async -> Bool {
+        let version = requestVersion
         var ids: [UUID] = []
         var embeddingArrays: [[Float]] = []
         var noEmbeddingIds: [UUID] = []
@@ -254,7 +277,7 @@ final class EmbeddingProjection {
 
         guard ids.count >= 2 else {
             state = .failed("Need at least 2 memories with embeddings")
-            return
+            return false
         }
 
         state = .computing(progress: 0)
@@ -280,7 +303,9 @@ final class EmbeddingProjection {
 
         let progressHandler: @Sendable (Double) -> Void = { [weak self] progress in
             Task { @MainActor [weak self] in
-                self?.state = .computing(progress: progress)
+                guard let self, self.requestVersion == version else { return }
+                guard case .computing = self.state else { return }
+                self.state = .computing(progress: progress)
             }
         }
 
@@ -291,6 +316,7 @@ final class EmbeddingProjection {
         let positionsHandler: @Sendable ([(id: UUID, x: Double, y: Double)], _ zValues: [Double]?) -> Void = { [weak self] rawPositions, zValues in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                guard self.requestVersion == version else { return }
                 guard case .computing = self.state else { return }
                 self.targetPositions3D = Self.scaleToWorld3D(
                     rawPositions, zValues: zValues, spread: capturedSpread,
@@ -299,13 +325,17 @@ final class EmbeddingProjection {
             }
         }
 
-        let result = await Task.detached(priority: .userInitiated) {
+        let task = Task.detached(priority: .userInitiated) {
             await TSNEKernel.compute(input, progress: progressHandler, onPositions: positionsHandler)
-        }.value
+        }
+        projectionTask = task
+        let result = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+        guard version == requestVersion, !Task.isCancelled, !task.isCancelled else { return false }
+        projectionTask = nil
 
         guard !result.positions.isEmpty else {
             state = .failed("t-SNE 3D produced no positions")
-            return
+            return false
         }
 
         targetPositions3D = Self.scaleToWorld3D(
@@ -314,6 +344,7 @@ final class EmbeddingProjection {
         )
         projectedNodeIds = nodeIds
         state = .ready
+        return true
     }
 
     private static func scaleToWorld3D(
@@ -379,6 +410,11 @@ final class EmbeddingProjection {
     // MARK: - Invalidation
 
     func invalidate() {
+        requestVersion &+= 1
+        embeddingTask?.cancel()
+        projectionTask?.cancel()
+        embeddingTask = nil
+        projectionTask = nil
         state = .idle
         projectedPositions = [:]
         projectedPositions3D = [:]

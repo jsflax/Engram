@@ -52,11 +52,13 @@ struct EngramApp: App {
     #endif
 
     init() {
+        PerformanceLaunch.beginBenchmarkActivity()
         // ENGRAM_FRAME_STATS (the perf-instrumentation harness) and headless
         // launches never want Sparkle: a terminal-launched unsigned binary
         // can't reach the appcast, so startingUpdater:true throws a modal
         // NSAlert that captures the main thread before the scene ever renders.
-        let startUpdater = ProcessInfo.processInfo.environment["ENGRAM_FRAME_STATS"] == nil
+        let startUpdater = !PerformanceLaunch.isIsolated
+            && ProcessInfo.processInfo.environment["ENGRAM_FRAME_STATS"] == nil
         updaterController = SPUStandardUpdaterController(
             startingUpdater: startUpdater, updaterDelegate: nil, userDriverDelegate: nil
         )
@@ -72,8 +74,7 @@ struct EngramApp: App {
         
         #endif
         Lattice.setLogLevel(.error)
-        let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
-            ?? NSHomeDirectory() + "/.claude/memory.sqlite"
+        let dbPath = PerformanceLaunch.databasePath
         self.dbPath = dbPath
 
         // Local DB — full schema. The sync daemon handles IPC relay separately.
@@ -114,7 +115,15 @@ struct EngramApp: App {
             GIDSignIn.sharedInstance.configuration = GIDConfiguration(clientID: googleClientID)
         }
 
-        Task.detached { CLIInstaller.syncIfNeeded() }
+        if !PerformanceLaunch.isIsolated {
+            Task.detached { CLIInstaller.syncIfNeeded() }
+        } else {
+            config.notificationsEnabled = false
+            if PerformanceLaunch.usesTemporaryDatabase {
+                config.hiddenProjects = []
+                config.hiddenRelations = []
+            }
+        }
 
         // Test hook: insert a test memory after a delay for jitter profiling
         if let delayStr = ProcessInfo.processInfo.environment["ENGRAM_TEST_INSERT_DELAY"],
@@ -139,7 +148,8 @@ struct EngramApp: App {
     }
 
     private func autoConnectSync() {
-        guard let wsURL = accountService.syncWebSocketURL,
+        guard !PerformanceLaunch.isIsolated,
+              let wsURL = accountService.syncWebSocketURL,
               let token = accountService.token,
               !syncManager.isSyncing else { return }
         syncManager.connectSync(wssEndpoint: wsURL, authToken: token)
@@ -207,6 +217,8 @@ struct EngramApp: App {
                 .environment(syncManager)
         } label: {
             Image(systemName: "brain.head.profile")
+                .accessibilityLabel("Engram activity")
+                .accessibilityIdentifier("engram.status-item")
         }
         .menuBarExtraStyle(.window)
     }

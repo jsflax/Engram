@@ -247,7 +247,7 @@ public final class EngramRealityScene {
         if !frameStatsHeaderWritten {
             let refresh = NSScreen.main?.maximumFramesPerSecond ?? 0
             let header = "# refresh_hz=\(refresh) date=\(Date())\n"
-                + "frame,dt_ms,tick_ms,lod_ms,node_ms,edge_ms,label_ms,commit_ms,nebula_ms,mascot_ms,flow_ms,lights_ms,audio_ms,total_ms,nodes,edges,vis_edges,near,mid,far\n"
+                + "frame,dt_ms,tick_ms,lod_ms,node_ms,edge_ms,label_ms,commit_ms,nebula_ms,galaxy_titles_ms,mascot_ms,flow_ms,lights_ms,audio_ms,total_ms,nodes,edges,vis_edges,near,mid,far\n"
             FileManager.default.createFile(atPath: path, contents: header.data(using: .utf8))
             frameStatsHeaderWritten = true
         }
@@ -278,7 +278,7 @@ public final class EngramRealityScene {
         updateBody(dt: dt, dataProvider: dataProvider)
         let tEnd = nowNs()
         // phaseMarks: [start, afterTick, afterLOD, afterNode, afterEdge,
-        //              afterLabel, afterCommit, afterNebula, afterMascot,
+        //              afterLabel, afterCommit, afterNebula, afterGalaxyTitles, afterMascot,
         //              afterFlow, afterLights, afterAudio]
         func ms(_ i: Int, _ j: Int) -> Double {
             guard i < phaseMarks.count, j < phaseMarks.count else { return 0 }
@@ -286,10 +286,10 @@ public final class EngramRealityScene {
         }
         let totalMs = Double(tEnd &- t0) / 1_000_000
         let line = String(
-            format: "%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d\n",
+            format: "%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d\n",
             frameCount, Double(dt) * 1000,
             ms(0, 1), ms(1, 2), ms(2, 3), ms(3, 4), ms(4, 5), ms(5, 6),
-            ms(6, 7), ms(7, 8), ms(8, 9), ms(9, 10), ms(10, 11), totalMs,
+            ms(6, 7), ms(7, 8), ms(8, 9), ms(9, 10), ms(10, 11), ms(11, 12), totalMs,
             dataProvider.nodes.count, dataProvider.edges.count,
             visibleSet.visibleEdgeIndices.count, visibleSet.nearNodes.count,
             visibleSet.midNodes.count, visibleSet.farNodes.count)
@@ -332,17 +332,18 @@ public final class EngramRealityScene {
         visibleSet = lodSystem.computeVisibleSet(
             nodes: dataProvider.nodes,
             edges: dataProvider.edges,
-            positions: dataProvider.positions,
+            positions: dataProvider.positionArray.count == dataProvider.nodes.count ? [:] : dataProvider.positions,
             positionArray: dataProvider.positionArray,
             cameraPosition: cameraPos,
             selectedNode: dataProvider.selectedNode,
             glowingNodes: dataProvider.glowingNodes,
             hubs: dataProvider.hubs,
-            topologyVersion: dataProvider.topologyVersion
+            topologyVersion: dataProvider.topologyVersion,
+            positionVersion: dataProvider.positionVersion
         )
         phaseMark()
 
-        if frameCount % 120 == 1 {
+        if frameStatsPath != nil, frameCount % 120 == 1 {
             print("[scene] frame=\(frameCount) nodes=\(dataProvider.nodes.count) edges=\(dataProvider.edges.count) near=\(visibleSet.nearNodes.count) mid=\(visibleSet.midNodes.count) far=\(visibleSet.farNodes.count) visEdges=\(visibleSet.visibleEdgeIndices.count) cam=\(cameraPos)")
         }
 
@@ -559,7 +560,9 @@ public final class EngramRealityScene {
     /// Ensure sphere template entity and instance data/texture exist with sufficient capacity.
     @available(macOS 26, *)
     func ensureNodeInstanceResources(capacity: Int) {
-        guard nodeInstanceData == nil else { return }
+        guard nodeInstanceData == nil || nodeInstanceTexture == nil || nodeTemplateEntity == nil else { return }
+        nodeTemplateEntity?.removeFromParent()
+        nodeTemplateEntity = nil
         // Allocate once at LOD max — instanceCount starts at 0, capacity is fixed.
         let maxCap = lodSystem.maxNodeInstances
         print("[NODE-INST] ensureNodeInstanceResources allocating capacity=\(maxCap)")
@@ -610,7 +613,9 @@ public final class EngramRealityScene {
     /// Ensure cylinder template entity and instance data/texture exist with sufficient capacity.
     @available(macOS 26, *)
     func ensureEdgeInstanceResources(capacity: Int) {
-        guard edgeInstanceData == nil else { return }
+        guard edgeInstanceData == nil || edgeInstanceTexture == nil || edgeTemplateEntity == nil else { return }
+        edgeTemplateEntity?.removeFromParent()
+        edgeTemplateEntity = nil
         let maxCap = min(lodSystem.maxEdgeInstances, 16384)
         print("[EDGE-INST] ensureEdgeInstanceResources allocating capacity=\(maxCap)")
 

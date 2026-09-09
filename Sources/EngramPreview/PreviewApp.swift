@@ -7,13 +7,29 @@ import EngramSceneKit
 struct EngramPreviewApp: App {
     #if SWIFT_PACKAGE && os(macOS)
     private final class Delegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+        private var benchmarkActivity: NSObjectProtocol?
+
         func applicationDidFinishLaunching(_ notification: Notification) {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
+            // Automated runs may lose foreground focus. Keep App Nap from
+            // throttling measurements, while leaving system sleep policy alone.
+            if ProcessInfo.processInfo.environment["ENGRAM_FRAME_STATS"] != nil {
+                benchmarkActivity = ProcessInfo.processInfo.beginActivity(
+                    options: .userInitiatedAllowingIdleSystemSleep,
+                    reason: "Measure Engram preview rendering performance")
+            }
             // ENGRAM_GPU_LOG=<path> — per-frame GPU timing + charge algorithm
             // (GPULog.configure has no other caller since the refactor).
             if let gpuLogPath = ProcessInfo.processInfo.environment["ENGRAM_GPU_LOG"] {
                 GPULog.configure(path: gpuLogPath)
+            }
+        }
+
+        func applicationWillTerminate(_ notification: Notification) {
+            if let benchmarkActivity {
+                ProcessInfo.processInfo.endActivity(benchmarkActivity)
+                self.benchmarkActivity = nil
             }
         }
 
@@ -95,7 +111,7 @@ struct PreviewContentView: View {
                     scene.onFrameCallback = { [weak camera, weak inputBridge, weak scene] dt in
                         inputBridge?.tick(dt: dt)
                         if let orbitRate, let camera {
-                            camera.lookRotate(deltaAz: orbitRate * dt * .pi / 180, deltaEl: 0)
+                            camera.targetAzimuth += orbitRate * dt * .pi / 180
                         }
                         camera?.updateCamera(dt: dt)
                         if let exitAfter {

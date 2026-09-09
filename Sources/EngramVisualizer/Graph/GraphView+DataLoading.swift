@@ -42,8 +42,7 @@ extension GraphView {
     /// `onAppear` and `onReceive(syncManager.didConnect)`.
     func loadData() {
         // Propagate initial filter config to registry (onChange only fires on subsequent changes)
-        galaxyRegistry.hiddenProjects = config.hiddenProjects
-        galaxyRegistry.hiddenRelations = config.hiddenRelations
+        syncDrainConfig()
 
         // Personal galaxy filter
         var personalFilter: (@Sendable (Memory) -> Bool)?
@@ -159,6 +158,7 @@ extension GraphView {
 
     /// Handle late-arriving synced galaxy when daemon connects.
     func handleSyncConnect() {
+        syncDrainConfig()
         if let ref = syncManager.actor.syncedLatticeRef {
             galaxyRegistry.onLatticeAvailable(
                 id: "synced", displayName: "Synced", latticeRef: ref
@@ -184,12 +184,22 @@ extension GraphView {
     // Node/edge change handlers and flush methods are now in GalaxyDataLoader.
     // GraphView delegates all data operations through the Galaxy pipeline.
 
+    /// Publish before starting a load and from setting changes, not from a
+    /// render tick: scalar Lattice config reads stay outside the hot path.
+    func syncDrainConfig() {
+        galaxyRegistry.updateDrainConfig(from: config, timeFilter: debouncedTimeSliderDate)
+    }
+
     func recomputeFilteredData() {
+        // Lattice-backed scalar getters must not issue one SQL read per row.
+        let hiddenProjects = config.hiddenProjects
+        let hiddenRelations = config.hiddenRelations
+        let timeFilter = debouncedTimeSliderDate
         for galaxy in galaxyRegistry.galaxies.values {
             let store = galaxy.renderStore
             store.nodes = store.allNodes.values.filter { node in
-                !config.hiddenProjects.contains(node.project) &&
-                (debouncedTimeSliderDate == nil || node.createdAt <= debouncedTimeSliderDate!)
+                !hiddenProjects.contains(node.project) &&
+                (timeFilter == nil || node.createdAt <= timeFilter!)
             }
             // Recompute hubs
             var hubs = Set<UUID>()
@@ -201,7 +211,7 @@ extension GraphView {
             let nodeIds = Set(store.nodes.map(\.id))
             store.edges = store.allEdges.values.filter { edge in
                 nodeIds.contains(edge.sourceId) && nodeIds.contains(edge.targetId) &&
-                !config.hiddenRelations.contains(edge.relation)
+                !hiddenRelations.contains(edge.relation)
             }
             store.filteredEdgeIds = Set(store.edges.map(\.id))
             galaxy.recomputeDerivedData()

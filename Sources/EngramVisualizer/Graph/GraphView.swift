@@ -89,8 +89,10 @@ struct GraphView: View {
     // MARK: - Body
 
     var body: some View {
+        #if ENGRAM_INSTRUMENTATION
         let _ = os_log(.fault, log: OSLog(subsystem: "io.engram.app", category: "FrameStall"), "HOTPATH: GraphView.body eval")
         let _ = bodyLog.warning("[BODY-EVAL] GraphView.body evaluated at frame \(CFAbsoluteTimeGetCurrent())")
+        #endif
         GeometryReader { geo in
             graphContent(size: geo.size)
                 .onAppear {
@@ -123,18 +125,21 @@ struct GraphView: View {
                 .onChange(of: isSearchActive) { _, active in
                     for galaxy in galaxyRegistry.galaxies.values { galaxy.renderStore.isSearchActive = active }
                 }
-                .onChange(of: config.hiddenProjects) { _, newProjects in
-                    galaxyRegistry.hiddenProjects = newProjects
+                .onChange(of: config.hiddenProjects) { _, _ in
+                    syncDrainConfig()
                 }
-                .onChange(of: config.hiddenRelations) { _, newRelations in
-                    galaxyRegistry.hiddenRelations = newRelations
+                .onChange(of: config.hiddenRelations) { _, _ in
+                    syncDrainConfig()
                     recomputeFilteredData()
                     rebuildSimulationGraph()
                 }
                 .onChange(of: debouncedTimeSliderDate) { _, _ in
+                    syncDrainConfig()
                     recomputeFilteredData()
                     rebuildSimulationGraph()
                 }
+                .onChange(of: config.soundEnabled) { _, _ in syncDrainConfig() }
+                .onChange(of: config.notificationsEnabled) { _, _ in syncDrainConfig() }
                 .onReceive(glowTimer) { _ in
                     let now = Date()
                     // Clean up expired glows across ALL galaxies
@@ -224,8 +229,6 @@ struct GraphView: View {
             // Sidebar panel
             if sidebarVisible {
                 SidebarView(
-                    projects: uniqueProjects(),
-                    colorMap: galaxyRegistry.mergedColorMap,
                     galaxyRegistry: galaxyRegistry,
                     projectionState: embeddingProjection.state,
                     toggleProject: toggleProject,
@@ -242,6 +245,7 @@ struct GraphView: View {
             // Toggle button
             VStack {
                 Button {
+                    if !sidebarVisible { PanelResponseRecorder.begin("sidebar.open") }
                     withAnimation(.easeInOut(duration: 0.2)) {
                         sidebarPinned.toggle()
                         if sidebarPinned {
@@ -261,6 +265,8 @@ struct GraphView: View {
                 }
                 .buttonStyle(.plain)
                 .help(sidebarPinned ? "Unpin sidebar" : "Pin sidebar")
+                .accessibilityLabel(sidebarPinned ? "Unpin sidebar" : "Pin sidebar")
+                .accessibilityIdentifier("sidebar.toggle")
                 Spacer()
             }
             .frame(width: 44)
@@ -273,6 +279,7 @@ struct GraphView: View {
             if hovering {
                 sidebarHideTask?.cancel()
                 if !sidebarPinned && !sidebarPeeking {
+                    PanelResponseRecorder.begin("sidebar.open")
                     withAnimation(.easeInOut(duration: 0.2)) {
                         sidebarPeeking = true
                     }
@@ -313,10 +320,8 @@ struct GraphView: View {
                     galaxyRegistry: galaxyRegistry,
                     hiddenProjects: config.hiddenProjects,
                     hiddenRelations: config.hiddenRelations,
-                    projects: uniqueProjects(),
                     toggleProject: toggleProject,
                     toggleRelation: toggleRelation,
-                    colorMap: galaxyRegistry.mergedColorMap,
                     driveToProject: { cameraProjectTarget = $0 }
                 )
                 .transition(.opacity)
@@ -390,9 +395,11 @@ struct GraphView: View {
     func toggleProject(_ project: String) {
         if config.hiddenProjects.contains(project) {
             config.hiddenProjects.remove(project)
+            syncDrainConfig()
             showProject(project)
         } else {
             config.hiddenProjects.insert(project)
+            syncDrainConfig()
             hideProject(project)
         }
     }

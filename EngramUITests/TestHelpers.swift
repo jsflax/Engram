@@ -165,14 +165,14 @@ func seedDatabase(
             lastAccessedAt: now.addingTimeInterval(-staleAge),
             importance: max(1, (i % 5) + 1)
         )
-        lattice.add(m)
-        if let gid = m.__globalId {
+        try! lattice.add(m)
+        if let gid = m.globalId {
             globalIds.append(gid)
         }
     }
 
     if withSyncConfig {
-        lattice.add(SyncConfig(project: project, policy: .sync))
+        try! lattice.add(SyncConfig(project: project, policy: .sync))
     }
 
     return globalIds
@@ -219,9 +219,9 @@ func seedMultiProjectDatabase(
                 lastAccessedAt: now.addingTimeInterval(-staleAge),
                 importance: max(1, (i % 5) + 1)
             )
-            lattice.add(m)
+            try! lattice.add(m)
             projectMemories.append(m)
-            if let gid = m.__globalId { allIds.append(gid) }
+            if let gid = m.globalId { allIds.append(gid) }
         }
         memoriesByProject[project] = projectMemories
     }
@@ -236,55 +236,55 @@ func seedMultiProjectDatabase(
     for (_, memories) in memoriesByProject where memories.count >= 3 {
         // Consecutive relates_to chain (1 edge per memory)
         for i in 1..<memories.count {
-            guard let srcGid = memories[i].__globalId,
-                  let tgtGid = memories[i - 1].__globalId else { continue }
-            lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: tgtGid, relation: .relatesTo))
+            guard let srcGid = memories[i].globalId,
+                  let tgtGid = memories[i - 1].globalId else { continue }
+            try! lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: tgtGid, relation: .relatesTo))
         }
 
         // Tier 1: clusters of 5 — each member gets summarized_by to hub (~4 edges per 5 = 0.8/memory)
         let tier1Size = 5
         for clusterStart in stride(from: 0, to: memories.count, by: tier1Size) {
-            guard let hubGid = memories[clusterStart].__globalId else { continue }
+            guard let hubGid = memories[clusterStart].globalId else { continue }
             let clusterEnd = min(clusterStart + tier1Size, memories.count)
 
             for i in (clusterStart + 1)..<clusterEnd {
-                guard let srcGid = memories[i].__globalId else { continue }
-                lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: hubGid, relation: .summarizedBy))
+                guard let srcGid = memories[i].globalId else { continue }
+                try! lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: hubGid, relation: .summarizedBy))
             }
 
             // part_of: first 2 non-hub members → hub
             for i in (clusterStart + 1)..<min(clusterStart + 3, clusterEnd) {
-                guard let srcGid = memories[i].__globalId else { continue }
-                lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: hubGid, relation: .partOf))
+                guard let srcGid = memories[i].globalId else { continue }
+                try! lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: hubGid, relation: .partOf))
             }
         }
 
         // Tier 2: super-hubs every 25 memories — each tier-1 hub → super-hub (summarized_by)
         let tier2Size = 25
         for superStart in stride(from: 0, to: memories.count, by: tier2Size) {
-            guard let superGid = memories[superStart].__globalId else { continue }
+            guard let superGid = memories[superStart].globalId else { continue }
             // Link sub-hubs (every tier1Size within this super-cluster) to super-hub
             for subHub in stride(from: superStart + tier1Size, to: min(superStart + tier2Size, memories.count), by: tier1Size) {
-                guard let subGid = memories[subHub].__globalId else { continue }
-                lattice.add(Edge(sourceGlobalId: subGid, targetGlobalId: superGid, relation: .summarizedBy))
+                guard let subGid = memories[subHub].globalId else { continue }
+                try! lattice.add(Edge(sourceGlobalId: subGid, targetGlobalId: superGid, relation: .summarizedBy))
             }
         }
 
         // Tier 3: cross-cluster relates_to — every 3rd memory links to one 7 positions ahead
         // This creates a denser web of connections (~0.33 extra edges/memory)
         for i in stride(from: 0, to: memories.count - 7, by: 3) {
-            guard let srcGid = memories[i].__globalId,
-                  let tgtGid = memories[i + 7].__globalId else { continue }
-            lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: tgtGid, relation: .relatesTo))
+            guard let srcGid = memories[i].globalId,
+                  let tgtGid = memories[i + 7].globalId else { continue }
+            try! lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: tgtGid, relation: .relatesTo))
         }
 
         // Additional summarized_by density: every 2nd memory also links to a hub 10 positions back
         // Real DB has many memories summarized by multiple hubs (re-consolidation)
         for i in stride(from: 10, to: memories.count, by: 2) {
             let hubIdx = ((i - 10) / tier1Size) * tier1Size  // nearest earlier hub
-            guard let srcGid = memories[i].__globalId,
-                  let hubGid = memories[hubIdx].__globalId else { continue }
-            lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: hubGid, relation: .summarizedBy))
+            guard let srcGid = memories[i].globalId,
+                  let hubGid = memories[hubIdx].globalId else { continue }
+            try! lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: hubGid, relation: .summarizedBy))
         }
     }
 
@@ -301,15 +301,15 @@ func seedMultiProjectDatabase(
                 let srcIdx = k * 5  // hub nodes at multiples of 5
                 let tgtIdx = k * 5
                 guard srcIdx < srcMemories.count, tgtIdx < tgtMemories.count,
-                      let srcGid = srcMemories[srcIdx].__globalId,
-                      let tgtGid = tgtMemories[tgtIdx].__globalId else { continue }
-                lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: tgtGid, relation: .relatesTo))
+                      let srcGid = srcMemories[srcIdx].globalId,
+                      let tgtGid = tgtMemories[tgtIdx].globalId else { continue }
+                try! lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: tgtGid, relation: .relatesTo))
             }
         }
     }
 
     for project in withSyncConfig {
-        lattice.add(SyncConfig(project: project, policy: .sync))
+        try! lattice.add(SyncConfig(project: project, policy: .sync))
     }
 
     return allIds
@@ -329,7 +329,7 @@ func triggerRecall(at path: String, globalIds: [UUID]) {
 
     let now = Date()
     for gid in globalIds {
-        for m in lattice.objects(Memory.self).where({ $0.__globalId == gid }) {
+        for m in lattice.objects(Memory.self).where({ $0.globalId == gid }) {
             m.lastAccessedAt = now
             m.accessCount += 1
         }
@@ -363,8 +363,8 @@ func insertMemories(at path: String, project: String, count: Int) -> [UUID] {
             lastAccessedAt: now,
             importance: 3
         )
-        lattice.add(m)
-        if let gid = m.__globalId { ids.append(gid) }
+        try! lattice.add(m)
+        if let gid = m.globalId { ids.append(gid) }
     }
     return ids
 }
@@ -381,7 +381,7 @@ func deleteMemories(at path: String, globalIds: [UUID]) {
     )
 
     for gid in globalIds {
-        for m in lattice.objects(Memory.self).where({ $0.__globalId == gid }) {
+        for m in lattice.objects(Memory.self).where({ $0.globalId == gid }) {
             lattice.delete(m)
         }
     }
@@ -400,7 +400,7 @@ func addCrossProjectEdges(at path: String, sourceIds: [UUID], targetIds: [UUID])
 
     let count = min(sourceIds.count, targetIds.count)
     for i in 0..<count {
-        lattice.add(Edge(sourceGlobalId: sourceIds[i], targetGlobalId: targetIds[i], relation: .relatesTo))
+        try! lattice.add(Edge(sourceGlobalId: sourceIds[i], targetGlobalId: targetIds[i], relation: .relatesTo))
     }
 }
 

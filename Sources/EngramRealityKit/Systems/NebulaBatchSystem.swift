@@ -92,7 +92,8 @@ public final class NebulaBatchSystem {
             let color = colorMap[cluster.project] ?? SIMD3<Float>(0.5, 0.5, 0.5)
 
             if let entity = activeNebulae[key] {
-                entity.position = cluster.centroid * scaleFactor
+                let position = cluster.centroid * scaleFactor
+                if entity.position != position { entity.position = position }
                 // Clusters RESIZE now — the old system froze radius at
                 // creation, so anything created mid-load stayed invisible
                 // (radius ~40 against a spread of hundreds). Rebuild the
@@ -149,7 +150,8 @@ public final class NebulaBatchSystem {
             let key = "gas|\(galaxy.id)"
             let radius = max(galaxy.radius * 0.9, 200)
             if let entity = activeGalaxyGas[galaxy.id] {
-                entity.position = galaxy.worldCenter * scaleFactor
+                let position = galaxy.worldCenter * scaleFactor
+                if entity.position != position { entity.position = position }
                 let known = galaxyGasRadii[galaxy.id] ?? radius
                 if abs(radius - known) / max(known, 1) > 0.25 {
                     let colors = nebulaColors(for: key, rgb: galaxy.dominantColor)
@@ -219,7 +221,8 @@ public final class NebulaBatchSystem {
             let radius = max(60, 140 * (1 - pinch * 0.45))
 
             if let entity = activeBridges[item.key] {
-                entity.position = center * scaleFactor
+                let position = center * scaleFactor
+                if entity.position != position { entity.position = position }
             } else {
                 let entity = Entity()
                 entity.name = "Bridge_\(item.key)"

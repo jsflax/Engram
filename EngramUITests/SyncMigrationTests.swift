@@ -49,7 +49,7 @@ final class SyncMigrationTests: XCTestCase {
             existing.policy = policy
             existing.updatedAt = Date()
         } else {
-            ext.add(SyncConfig(project: project, policy: policy))
+            try! ext.add(SyncConfig(project: project, policy: policy))
         }
     }
 

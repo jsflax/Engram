@@ -2,14 +2,16 @@ import XCTest
 import EngramKit
 import Lattice
 
-/// Performance test against the REAL database — no injected test data.
-/// Launches the app with its actual memory.sqlite and captures frame timing
-/// at real scale to identify true production bottlenecks.
+/// Profiles an isolated SQLite backup of ENGRAM_PERF_DB_SNAPSHOT at real scale.
+/// The source is read-only; insertion tests never touch the user's live database.
 ///
 /// Requires the Engram-UITesting scheme (ENGRAM_INSTRUMENTATION flag).
 @MainActor
 final class RealDBPerfTests: XCTestCase {
     let app = XCUIApplication()
+    private var testDirectory: URL!
+    private var databasePath: String!
+    private var frameStatsPath: String { testDirectory.appendingPathComponent("frames.csv").path }
 
     private let csvPaths = [
         "/tmp/metal-frame-timing.csv",
@@ -22,8 +24,22 @@ final class RealDBPerfTests: XCTestCase {
 
     override func setUpWithError() throws {
         continueAfterFailure = false
+        guard let source = ProcessInfo.processInfo.environment["ENGRAM_PERF_DB_SNAPSHOT"] else {
+            throw XCTSkip("Set ENGRAM_PERF_DB_SNAPSHOT to profile an isolated backup")
+        }
+        testDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("engram-real-perf-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testDirectory, withIntermediateDirectories: true)
+        databasePath = try makePerformanceDatabaseCopy(source: source, directory: testDirectory)
+        app.launchEnvironment["CLAUDE_MEMORY_DB"] = databasePath
+        app.launchEnvironment["ENGRAM_PERF_ISOLATED"] = "1"
+        app.launchEnvironment["ENGRAM_FRAME_STATS"] = frameStatsPath
         for path in csvPaths { try? FileManager.default.removeItem(atPath: path) }
-        // No CLAUDE_MEMORY_DB override — uses real database
+    }
+
+    override func tearDownWithError() throws {
+        app.terminate()
+        if let testDirectory { try? FileManager.default.removeItem(at: testDirectory) }
     }
 
     // MARK: - Main Test
@@ -112,11 +128,12 @@ final class RealDBPerfTests: XCTestCase {
         //   ANALYSIS
         // ═══════════════════════════════════════
 
-        let report = buildReport()
+        let report = try buildReport()
         report.printSummary()
 
         // Hard assertion: p95 wall_dt under 30fps budget
-        if let p95 = report.metalP95 {
+        let p95 = try XCTUnwrap(report.metalP95, "Missing RealityKit performance data")
+        do {
             XCTAssertLessThan(p95, 33.0,
                 "p95 wall_dt \(String(format: "%.1f", p95))ms exceeds 30fps budget (33ms)")
         }
@@ -140,7 +157,7 @@ final class RealDBPerfTests: XCTestCase {
         usleep(200_000)
 
         // Real DB path — the app launched without CLAUDE_MEMORY_DB override
-        let dbPath = ("/Users/" + NSUserName() as NSString).appendingPathComponent(".claude/memory.sqlite")
+        let dbPath = databasePath!
 
         let baselineFrames = frameCountFromCSV()
 
@@ -202,12 +219,12 @@ final class RealDBPerfTests: XCTestCase {
         print("  Burst 3 (50 nodes):  \(postBurst3Frames - postBurst2Frames) frames in ~5s")
         print("  Burst 4 (30 rapid):  \(postBurst4Frames - postBurst3Frames) frames in ~6s")
 
-        let report = buildReport()
+        let report = try buildReport()
         report.printSummary()
     }
 
     private func frameCountFromCSV() -> Int {
-        let path = "/tmp/metal-frame-timing.csv"
+        let path = frameStatsPath
         guard let data = FileManager.default.contents(atPath: path),
               let csv = String(data: data, encoding: .utf8) else { return 0 }
         return csv.components(separatedBy: "\n").count - 2
@@ -215,9 +232,9 @@ final class RealDBPerfTests: XCTestCase {
 
     // MARK: - Report
 
-    private func buildReport() -> BottleneckReport {
+    private func buildReport() throws -> BottleneckReport {
         var report = BottleneckReport()
-        report.addSection(analyzeMetalFrames())
+        report.addSection(try RealityFrameReport(path: frameStatsPath).section())
         report.addSection(analyzePackTiming())
         report.addSection(analyzeLabelDiag())
         report.addSection(analyzeDrawPipeline())

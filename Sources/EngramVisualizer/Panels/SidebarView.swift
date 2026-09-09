@@ -12,6 +12,30 @@ import UserNotifications
     case account = "Account"
 }
 
+/// Read live configuration once in the parent's observation scope. Lazy rows
+/// receive values, not a long-lived materialized model or per-row SQL getters.
+struct SidebarRenderConfiguration {
+    struct Graph {
+        let hiddenProjects: Set<String>
+        let hiddenRelations: Set<String>
+        let layoutMode: LayoutMode
+    }
+
+    let selectedTab: SidebarTab
+    let graph: Graph?
+
+    @MainActor init(config: VisualizerConfig) {
+        selectedTab = config.selectedTab
+        if selectedTab == .visualizer {
+            graph = Graph(hiddenProjects: config.hiddenProjects,
+                          hiddenRelations: config.hiddenRelations,
+                          layoutMode: config.layoutMode)
+        } else {
+            graph = nil
+        }
+    }
+}
+
 struct SidebarView: View {
     typealias Tab = SidebarTab
 
@@ -24,8 +48,8 @@ struct SidebarView: View {
     @State var expandedExposureProject: String?
 
     // Visualizer tab
-    let projects: [String]
-    let colorMap: [String: Color]
+    var projects: [String] { galaxyRegistry.panelSnapshot.projects }
+    var colorMap: [String: Color] { galaxyRegistry.panelSnapshot.colorMap }
     var galaxyRegistry: GalaxyRegistry
     let projectionState: ProjectionState
     let toggleProject: (String) -> Void
@@ -49,42 +73,46 @@ struct SidebarView: View {
     // the in-memory graph in one pass — the rows previously ran a
     // synchronous SQL COUNT against the (1GB+) database per project per
     // SwiftUI body evaluation, which made opening the drawer a lag spike.
-    @State var projectCounts: [String: Int] = [:]
+    var projectCounts: [String: Int] { galaxyRegistry.panelSnapshot.projectCounts }
 
     func refreshProjectCounts() {
-        var counts: [String: Int] = [:]
-        for galaxy in galaxyRegistry.galaxies.values {
-            for node in galaxy.renderStore.allNodes.values {
-                counts[node.project, default: 0] += 1
-            }
-        }
-        projectCounts = counts
+        galaxyRegistry.panelSnapshot.refresh(from: galaxyRegistry)
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        let renderConfig = SidebarRenderConfiguration(config: config)
+        return VStack(spacing: 0) {
             Spacer().frame(height: 28) // clear traffic light buttons
-            tabBar
+            tabBar(selectedTab: renderConfig.selectedTab)
             Divider().overlay(Color.white.opacity(0.08))
 
-            switch config.selectedTab {
+            switch renderConfig.selectedTab {
             case .logs:
                 LogsContentView()
                     .padding(16)
+            case .visualizer:
+                ScrollView(.vertical, showsIndicators: false) {
+                    if let graphConfig = renderConfig.graph {
+                        visualizerContent(graphConfig).padding(16)
+                    }
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("sidebar.graph-scroll")
             default:
                 ScrollView(.vertical, showsIndicators: false) {
                     Group {
-                        switch config.selectedTab {
-                        case .visualizer: visualizerContent
+                        switch renderConfig.selectedTab {
                         case .settings: settingsContent
                         case .account: accountContent
-                        case .logs: EmptyView()
+                        case .visualizer, .logs: EmptyView()
                         }
                     }
                     .padding(16)
                 }
             }
         }
+        .panelResponseProbe("sidebar.open")
+        .panelResponseProbe("sidebar.\(renderConfig.selectedTab.rawValue)")
         .frame(width: 310)
         .frame(maxHeight: .infinity)
         .background(Color(red: 0.055, green: 0.07, blue: 0.095).opacity(0.98))
@@ -103,31 +131,45 @@ struct SidebarView: View {
             .strokeBorder(.white.opacity(0.08), lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.5), radius: 20, x: 5)
+        .onAppear { refreshProjectCounts() }
+        .task {
+            while !Task.isCancelled {
+                let size = await Task.detached(priority: .utility) { Self.readDBFileSize() }.value
+                guard !Task.isCancelled else { break }
+                dbFileSize = size
+                do { try await Task.sleep(for: .seconds(30)) } catch { break }
+            }
+        }
     }
 
     // MARK: - Tab Bar
 
-    private var tabBar: some View {
+    private func tabBar(selectedTab: Tab) -> some View {
         HStack(spacing: 2) {
             ForEach(Tab.allCases, id: \.self) { tab in
                 Button {
+                    guard config.selectedTab != tab else { return }
+                    // Timing begins after the live guard, not at action entry.
+                    PanelResponseRecorder.begin("sidebar.\(tab.rawValue)")
                     config.selectedTab = tab
+                    PanelResponseRecorder.mutationReturned("sidebar.\(tab.rawValue)")
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: tabIcon(tab))
                             .font(.system(size: 10))
                         Text(tab.rawValue)
-                            .font(.system(size: 11, weight: config.selectedTab == tab ? .semibold : .regular, design: .monospaced))
+                            .font(.system(size: 11, weight: selectedTab == tab ? .semibold : .regular, design: .monospaced))
                     }
-                    .foregroundStyle(.white.opacity(config.selectedTab == tab ? 0.9 : 0.4))
+                    .foregroundStyle(.white.opacity(selectedTab == tab ? 0.9 : 0.4))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 7)
                     .background(
                         RoundedRectangle(cornerRadius: 5)
-                            .fill(config.selectedTab == tab ? .white.opacity(0.1) : .clear)
+                            .fill(selectedTab == tab ? .white.opacity(0.1) : .clear)
                     )
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("sidebar.tab.\(tab.rawValue)")
             }
         }
         .padding(6)
@@ -146,67 +188,79 @@ struct SidebarView: View {
 
     func section(_ title: String, @ViewBuilder content: () -> some View) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(title.uppercased())
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.3))
-                .tracking(1.2)
+            sectionHeader(title)
             content()
         }
     }
 
-    // MARK: - Visualizer Tab
-
-    // Cached stats — mergedVisibleNodeIds/mergedAllNodes are full dict
-    // merges across galaxies (O(n)); computing them inline re-ran the
-    // merges on every body evaluation.
-    @State private var statVisibleCount = 0
-    @State private var statTotalCount = 0
-
-    private func refreshStats() {
-        statVisibleCount = galaxyRegistry.mergedVisibleNodeIds.count
-        statTotalCount = galaxyRegistry.mergedAllNodes.count
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+            .foregroundStyle(.white.opacity(0.3))
+            .tracking(1.2)
     }
 
+    // MARK: - Visualizer Tab
+
+    @State private var dbFileSize = "—"
+
     @ViewBuilder
-    private var visualizerContent: some View {
-        VStack(alignment: .leading, spacing: 24) {
+    private func visualizerContent(_ renderConfig: SidebarRenderConfiguration.Graph) -> some View {
+        let projects = self.projects
+        let colors = colorMap
+        let relationCounts = galaxyRegistry.panelSnapshot.relationCounts
+        let onToggleProject = toggleProject
+        let onToggleRelation = toggleRelation
+        let onDriveToProject = driveToProject
+        // Rows must be direct lazy children. A lazy stack around an eager
+        // Projects/Relations section still lays out every offscreen row.
+        LazyVStack(alignment: .leading, spacing: 0) {
             section("Stats") {
-                let visibleCount = statVisibleCount
-                let totalCount = statTotalCount
+                let visibleCount = galaxyRegistry.panelSnapshot.visibleCount
+                let totalCount = galaxyRegistry.panelSnapshot.totalCount
                 VStack(alignment: .leading, spacing: 6) {
                     if visibleCount < totalCount {
                         statRow("Memories", value: "\(visibleCount)/\(totalCount)")
+                            .accessibilityIdentifier("sidebar.memory-count")
+                            .accessibilityValue("\(totalCount)")
                     } else {
                         statRow("Memories", value: "\(totalCount)")
+                            .accessibilityIdentifier("sidebar.memory-count")
+                            .accessibilityValue("\(totalCount)")
                     }
-                    statRow("Edges", value: "\(galaxyRegistry.mergedEdges.count)")
+                    statRow("Edges", value: "\(galaxyRegistry.panelSnapshot.edgeCount)")
                     statRow("Database", value: dbFileSize)
                 }
-                .onAppear { refreshStats() }
             }
+            .padding(.bottom, 24)
 
             section("Layout") {
                 VStack(alignment: .leading, spacing: 10) {
-                    layoutModePicker
+                    layoutModePicker(selectedMode: renderConfig.layoutMode)
                 }
             }
+            .padding(.bottom, 24)
 
-            section("Projects") {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(projects, id: \.self) { project in
-                        projectRow(project)
-                    }
-                }
+            sectionHeader("Projects")
+                .padding(.bottom, 10)
+            ForEach(projects, id: \.self) { project in
+                SidebarProjectRow(project: project,
+                                  hidden: renderConfig.hiddenProjects.contains(project),
+                                  color: GraphView.projectColor(for: project, in: colors),
+                                  toggleProject: onToggleProject, driveToProject: onDriveToProject)
+                    .padding(.top, project == projects.first ? 0 : 2)
             }
 
-            let relationCounts = galaxyRegistry.mergedRelationCounts
             if !relationCounts.isEmpty {
-                section("Relations") {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(relationCounts, id: \.key) { relation, count in
-                            relationRow(relation, count: count)
-                        }
-                    }
+                sectionHeader("Relations")
+                    .padding(.top, 24)
+                    .padding(.bottom, 10)
+                ForEach(relationCounts, id: \.key) { relation, count in
+                    SidebarRelationRow(relation: relation, count: count,
+                                       hidden: renderConfig.hiddenRelations.contains(relation),
+                                       color: EdgeColors.relationColors[relation] ?? .white,
+                                       toggleRelation: onToggleRelation)
+                        .padding(.top, relation == relationCounts.first?.key ? 0 : 2)
                 }
             }
         }
@@ -214,7 +268,7 @@ struct SidebarView: View {
 
     // MARK: - Layout Controls
 
-    private var layoutModePicker: some View {
+    private func layoutModePicker(selectedMode: LayoutMode) -> some View {
         HStack(spacing: 0) {
             ForEach(LayoutMode.allCases, id: \.rawValue) { mode in
                 Button { switchLayoutMode(mode) } label: {
@@ -230,17 +284,17 @@ struct SidebarView: View {
                             .frame(width: 10, height: 10)
                         }
                         Text(mode.rawValue)
-                            .font(.system(size: 11, weight: config.layoutMode == mode ? .semibold : .regular, design: .monospaced))
+                            .font(.system(size: 11, weight: selectedMode == mode ? .semibold : .regular, design: .monospaced))
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6)
                     .background(
                         RoundedRectangle(cornerRadius: 5)
-                            .fill(config.layoutMode == mode ? .white.opacity(0.12) : .clear)
+                            .fill(selectedMode == mode ? .white.opacity(0.12) : .clear)
                     )
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.white.opacity(config.layoutMode == mode ? 0.9 : 0.4))
+                .foregroundStyle(.white.opacity(selectedMode == mode ? 0.9 : 0.4))
             }
         }
         .padding(2)
@@ -256,80 +310,96 @@ struct SidebarView: View {
 
     // MARK: - Project Row
 
-    private func projectRow(_ project: String) -> some View {
-        let hidden = config.hiddenProjects.contains(project)
-        return Button { toggleProject(project) } label: {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(GraphView.projectColor(for: project, in: colorMap))
-                    .frame(width: 8, height: 8)
-                    .opacity(hidden ? 0.3 : 1.0)
+    private struct SidebarProjectRow: View {
+        let project: String
+        let hidden: Bool
+        let color: Color
+        let toggleProject: (String) -> Void
+        let driveToProject: ((String) -> Void)?
 
-                Text(project)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(.white.opacity(hidden ? 0.3 : 0.7))
-                    .strikethrough(hidden)
-                    .lineLimit(1)
+        var body: some View {
+            Button { toggleProject(project) } label: {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(color)
+                        .frame(width: 8, height: 8)
+                        .opacity(hidden ? 0.3 : 1.0)
 
-                Spacer()
+                    Text(project)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(.white.opacity(hidden ? 0.3 : 0.7))
+                        .strikethrough(hidden)
+                        .lineLimit(1)
 
-                if let driveToProject {
-                    Button { driveToProject(project) } label: {
-                        Image(systemName: "scope")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.white.opacity(hidden ? 0.15 : 0.4))
+                    Spacer()
+
+                    if let driveToProject {
+                        Button { driveToProject(project) } label: {
+                            Image(systemName: "scope")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.white.opacity(hidden ? 0.15 : 0.4))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Fly to \(project)")
                     }
-                    .buttonStyle(.plain)
-                    .help("Fly to \(project)")
-                }
 
-                Image(systemName: hidden ? "eye.slash" : "eye")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(hidden ? 0.3 : 0.5))
+                    Image(systemName: hidden ? "eye.slash" : "eye")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(hidden ? 0.3 : 0.5))
+                }
+                .padding(.vertical, 5)
+                .padding(.horizontal, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(.white.opacity(hidden ? 0 : 0.03))
+                )
+                .contentShape(Rectangle())
             }
-            .padding(.vertical, 5)
-            .padding(.horizontal, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 5)
-                    .fill(.white.opacity(hidden ? 0 : 0.03))
-            )
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("sidebar.project.\(project)")
         }
-        .buttonStyle(.plain)
     }
 
     // MARK: - Relation Row
 
-    private func relationRow(_ relation: String, count: Int) -> some View {
-        let hidden = config.hiddenRelations.contains(relation)
-        return Button { toggleRelation(relation) } label: {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(EdgeColors.relationColors[relation] ?? .white)
-                    .frame(width: 8, height: 8)
-                    .opacity(hidden ? 0.3 : 1.0)
+    private struct SidebarRelationRow: View {
+        let relation: String
+        let count: Int
+        let hidden: Bool
+        let color: Color
+        let toggleRelation: (String) -> Void
 
-                Text(relation.replacingOccurrences(of: "_", with: " "))
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(.white.opacity(hidden ? 0.3 : 0.7))
-                    .strikethrough(hidden)
-                    .lineLimit(1)
+        var body: some View {
+            Button { toggleRelation(relation) } label: {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(color)
+                        .frame(width: 8, height: 8)
+                        .opacity(hidden ? 0.3 : 1.0)
 
-                Spacer()
+                    Text(relation.replacingOccurrences(of: "_", with: " "))
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(.white.opacity(hidden ? 0.3 : 0.7))
+                        .strikethrough(hidden)
+                        .lineLimit(1)
 
-                Text("\(count)")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.3))
+                    Spacer()
 
-                Image(systemName: hidden ? "eye.slash" : "eye")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(hidden ? 0.3 : 0.5))
+                    Text("\(count)")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.3))
+
+                    Image(systemName: hidden ? "eye.slash" : "eye")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(hidden ? 0.3 : 0.5))
+                }
+                .padding(.vertical, 5)
+                .padding(.horizontal, 8)
+                .contentShape(Rectangle())
             }
-            .padding(.vertical, 5)
-            .padding(.horizontal, 8)
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("sidebar.relation.\(relation)")
         }
-        .buttonStyle(.plain)
     }
 
     // MARK: - Toggle Row
@@ -399,7 +469,7 @@ struct SidebarView: View {
         }
     }
 
-    private var dbFileSize: String {
+    nonisolated private static func readDBFileSize() -> String {
         let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
             ?? NSHomeDirectory() + "/.claude/memory.sqlite"
         let fm = FileManager.default

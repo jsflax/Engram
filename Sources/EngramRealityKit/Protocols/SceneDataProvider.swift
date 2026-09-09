@@ -91,8 +91,10 @@ public protocol SceneDataProvider: AnyObject {
     var isSearchActive: Bool { get }
     /// Centroid position per project cluster.
     var projectCentroids: [String: SIMD3<Float>] { get }
-    /// Increments on topology change (node/edge add/remove).
+    /// Increments on topology or render metadata changes (including labels/hubs).
     var topologyVersion: UInt64 { get }
+    /// Increments when positions or their node ordering change; stable while idle.
+    var positionVersion: UInt64 { get }
 
     /// Positions as a flat array indexed parallel to `nodes`. Avoids UUID dict lookups.
     var positionArray: [SIMD3<Float>] { get }
@@ -116,19 +118,9 @@ extension SceneDataProvider {
     /// same projectCentroids the old nebula path used.
     public var galaxySnapshots: [RKGalaxySnapshot] { [] }
     public var nebulaClusters: [RKNebulaCluster] {
-        var counts: [String: Int] = [:]
-        for node in nodes { counts[node.project, default: 0] += 1 }
-        return projectCentroids.map { project, centroid in
-            var maxDist: Float = 0
-            for node in nodes where node.project == project {
-                if let pos = positions[node.id] {
-                    maxDist = max(maxDist, simd_length(pos - centroid))
-                }
-            }
-            return RKNebulaCluster(galaxyId: "main", project: project,
-                                   centroid: centroid,
-                                   count: counts[project] ?? 0,
-                                   radius: maxDist + 40)
-        }
+        // Keep the default's missing-position semantics, but scan all nodes
+        // once rather than once per project and read the position map once.
+        deriveSingleGalaxyNebulaClusters(nodes: nodes, centroids: projectCentroids,
+                                         positionArray: [], positions: { positions })
     }
 }

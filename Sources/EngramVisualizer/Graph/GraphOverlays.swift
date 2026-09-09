@@ -16,26 +16,23 @@ enum EdgeColors {
 }
 
 // MARK: - Stats Overlay
-struct StatsOverlay: View, @MainActor Equatable {
+struct StatsOverlay: View {
     let galaxyRegistry: GalaxyRegistry
     let hiddenProjects: Set<String>
     let hiddenRelations: Set<String>
-    let projects: [String]
+    private var projects: [String] { galaxyRegistry.panelSnapshot.projects }
     let toggleProject: (String) -> Void
     let toggleRelation: (String) -> Void
-    let colorMap: [String: Color]
+    private var colorMap: [String: Color] { galaxyRegistry.panelSnapshot.colorMap }
     var driveToProject: ((String) -> Void)? = nil
 
     @Environment(\.lattice) private var lattice
     @State private var isMaintenanceActive: Bool = false
     @State private var maintenanceObserver: AnyObject?
 
-    // LatticeQuery triggers SwiftUI re-renders when Memory/Edge tables change.
-    // Actual displayed values are read from galaxyRegistry (which respects filters).
-    @LatticeQuery<Memory>(fetchLimit: 0) private var memoryQuery
-    @LatticeQuery<EngramKit.Edge>(fetchLimit: 0) private var edgeQuery
+    @State private var dbFileSize = "—"
 
-    private var dbFileSize: String {
+    nonisolated private static func readDatabaseSize() -> String {
         let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
             ?? NSHomeDirectory() + "/.claude/memory.sqlite"
         let fm = FileManager.default
@@ -55,13 +52,10 @@ struct StatsOverlay: View, @MainActor Equatable {
     }
 
     var body: some View {
-        // Touch query counts so SwiftUI tracks the @LatticeQuery observations
-//        let _ = memoryQuery.count
-//        let _ = edgeQuery.count
-        let visibleMemoryCount = galaxyRegistry.mergedVisibleNodeIds.count
-        let totalMemories = galaxyRegistry.mergedNodes.count
-        let visibleEdgeCount = galaxyRegistry.mergedEdges.count
-        let allRelationCounts = galaxyRegistry.mergedRelationCounts
+        let visibleMemoryCount = galaxyRegistry.panelSnapshot.visibleCount
+        let totalMemories = galaxyRegistry.panelSnapshot.totalCount
+        let visibleEdgeCount = galaxyRegistry.panelSnapshot.edgeCount
+        let allRelationCounts = galaxyRegistry.panelSnapshot.relationCounts
         VStack(alignment: .trailing, spacing: 6) {
             if visibleMemoryCount < totalMemories {
                 Text("\(visibleMemoryCount)/\(totalMemories) memories")
@@ -150,6 +144,14 @@ struct StatsOverlay: View, @MainActor Equatable {
         .padding(12)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
         .onAppear { setupMaintenanceObserver() }
+        .task {
+            while !Task.isCancelled {
+                let size = await Task.detached(priority: .utility) { Self.readDatabaseSize() }.value
+                guard !Task.isCancelled else { return }
+                dbFileSize = size
+                do { try await Task.sleep(for: .seconds(30)) } catch { return }
+            }
+        }
     }
 
     private func setupMaintenanceObserver() {
@@ -175,9 +177,6 @@ struct StatsOverlay: View, @MainActor Equatable {
         } as AnyObject
     }
     
-    static func == (lhs: Self, rhs: Self) -> Bool {
-        true
-    }
 }
 
 // MARK: - Time Slider

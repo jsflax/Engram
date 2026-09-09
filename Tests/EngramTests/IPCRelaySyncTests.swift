@@ -953,9 +953,20 @@ struct IPCRelaySyncTests {
         syncedConfig2.ipcTargets = [.init(channel: channel)]
         let synced2 = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: syncedConfig2)
 
-        // Wait for data to arrive on synced side
-        let insertTask2 = await waitForChange(on: syncedConfig2, table: "Memory", operation: .insert, count: 3)
-        try await insertTask2.value
+        // Reconnection can finish before an event observer subscribes. Await
+        // the resulting state with a deadline in this task, so cancellation
+        // cannot leave a detached changeStream watcher running forever.
+        let syncDeadline = ContinuousClock.now + .seconds(30)
+        while synced2.objects(Memory.self).count < 3 {
+            try Task.checkCancellation()
+            guard ContinuousClock.now < syncDeadline else {
+                throw NSError(domain: "IPCRelaySyncTests", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey:
+                                "Fresh synced database did not receive three memories within 30 seconds"])
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try Task.checkCancellation()
         try await Task.sleep(for: .seconds(2))
 
         // === Assertions ===

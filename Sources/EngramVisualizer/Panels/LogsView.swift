@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// A log file source displayed in the logs tab.
-struct LogSource: Identifiable {
+struct LogSource: Identifiable, Sendable {
     let id: String
     let label: String
     let path: String
@@ -10,7 +10,7 @@ struct LogSource: Identifiable {
 }
 
 /// Parsed log entry from a log file.
-struct LogEntry: Identifiable {
+struct LogEntry: Identifiable, Equatable, Sendable {
     let id: Int
     let timestamp: Date?
     let source: String
@@ -20,12 +20,20 @@ struct LogEntry: Identifiable {
 
 @MainActor @Observable
 final class LogsStore {
-    var entries: [LogEntry] = []
-    var selectedSource: String? = nil
-    var searchText = ""
+    private(set) var entries: [LogEntry] = [] {
+        didSet { filterEntries() }
+    }
+    var selectedSource: String? = nil {
+        didSet { filterEntries() }
+    }
+    var searchText = "" {
+        didSet { filterEntries() }
+    }
     var autoScroll = true
-
-    private var fileWatcher: DispatchSourceFileSystemObject?
+    private(set) var filteredEntries: [LogEntry] = []
+    @ObservationIgnored private var generation: UInt64 = 0
+    @ObservationIgnored nonisolated(unsafe) private var worker: Task<Void, Never>?
+    @ObservationIgnored nonisolated(unsafe) private var continuation: AsyncStream<Void>.Continuation?
 
     static let sources: [LogSource] = [
         LogSource(
@@ -58,7 +66,7 @@ final class LogsStore {
         ),
     ]
 
-    var filteredEntries: [LogEntry] {
+    private func filterEntries() {
         var result = entries
         if let source = selectedSource {
             result = result.filter { $0.source == source }
@@ -67,113 +75,56 @@ final class LogsStore {
             let query = searchText.lowercased()
             result = result.filter { $0.raw.lowercased().contains(query) }
         }
-        return result
+        filteredEntries = result
     }
 
     func loadLogs() {
-        var all: [LogEntry] = []
-        var counter = 0
-
-        for source in Self.sources {
-            guard let data = FileManager.default.contents(atPath: source.path),
-                  let content = String(data: data, encoding: .utf8) else { continue }
-
-            let lines = content.components(separatedBy: .newlines)
-            let recent = lines.suffix(500)
-            for line in recent {
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { continue }
-                let parsed = Self.parseLine(trimmed, source: source.id)
-                all.append(LogEntry(id: counter, timestamp: parsed.timestamp, source: source.id, message: parsed.message, raw: trimmed))
-                counter += 1
-            }
-        }
-
-        all.sort { a, b in
-            guard let ta = a.timestamp else { return false }
-            guard let tb = b.timestamp else { return true }
-            return ta < tb
-        }
-
-        entries = all.enumerated().map { i, e in
-            LogEntry(id: i, timestamp: e.timestamp, source: e.source, message: e.message, raw: e.raw)
-        }
+        if worker == nil { startWatching() }
+        continuation?.yield(())
     }
 
     func startWatching() {
-        guard fileWatcher == nil else { return }
-        fileWatcher = Self.makeWatcher { [weak self] in
-            self?.loadLogs()
+        guard worker == nil else { return }
+        generation &+= 1
+        let generation = generation
+        let sources = Self.sources
+        let (changes, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        self.continuation = continuation
+        worker = Task.detached(priority: .utility) { [weak self] in
+            var watchers = LogTailReader.makeWatchers(sources: sources, continuation: continuation)
+            defer { watchers.forEach { $0.cancel() } }
+            continuation.yield(())
+            for await _ in changes {
+                do { try await Task.sleep(for: .milliseconds(150)) } catch { break }
+                guard !Task.isCancelled else { break }
+                // Reattach after directory changes/rotation before reading, so
+                // writes to replacement files cannot fall between subscriptions.
+                let replacement = LogTailReader.makeWatchers(sources: sources, continuation: continuation)
+                watchers.forEach { $0.cancel() }
+                watchers = replacement
+                let entries = LogTailReader.read(sources: sources)
+                guard !Task.isCancelled else { break }
+                await self?.publish(entries, generation: generation)
+            }
         }
     }
 
-    /// Creates the DispatchSource outside of @MainActor context so that
-    /// the event/cancel handler closures don't inherit MainActor isolation.
-    /// GCD runs these on the utility queue — an inherited @MainActor assertion
-    /// would crash at runtime (swift_task_isCurrentExecutor).
-    nonisolated private static func makeWatcher(
-        onChange: @escaping @MainActor @Sendable () -> Void
-    ) -> DispatchSourceFileSystemObject? {
-        let dirPath = NSHomeDirectory() + "/.claude"
-        let fd = open(dirPath, O_EVTONLY)
-        guard fd >= 0 else { return nil }
-
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fd,
-            eventMask: .write,
-            queue: .global(qos: .utility)
-        )
-        source.setEventHandler {
-            Task { @MainActor in
-                onChange()
-            }
-        }
-        source.setCancelHandler {
-            close(fd)
-        }
-        source.resume()
-        return source
+    private func publish(_ entries: [LogEntry], generation: UInt64) {
+        guard generation == self.generation, self.entries != entries else { return }
+        self.entries = entries
     }
 
     func stopWatching() {
-        fileWatcher?.cancel()
-        fileWatcher = nil
+        generation &+= 1
+        continuation?.finish()
+        continuation = nil
+        worker?.cancel()
+        worker = nil
     }
 
-    // MARK: - Parsing
-
-    private static func parseLine(_ line: String, source: String) -> (timestamp: Date?, message: String) {
-        let isoFormatter = ISO8601DateFormatter()
-
-        if source == "memory" {
-            let mcpPattern = /^\[claude-memory\]\s+(\d{4}-\d{2}-\d{2}T[\d:]+Z)\s+(.*)/
-            if let match = line.wholeMatch(of: mcpPattern) {
-                let ts = isoFormatter.date(from: String(match.1))
-                return (ts, String(match.2))
-            }
-        }
-
-        if source == "hooks" {
-            let isoPattern = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+\[memory-hooks\]\s*(.*)/
-            if let match = line.wholeMatch(of: isoPattern) {
-                let ts = isoFormatter.date(from: String(match.1))
-                return (ts, String(match.2))
-            }
-        }
-
-        let startPattern = /^=+\s*started at '([^']+)'\s*=+$/
-        if let match = line.wholeMatch(of: startPattern) {
-            let ts = isoFormatter.date(from: String(match.1))
-            return (ts, "--- Session started ---")
-        }
-
-        let genericPattern = /^(\d{4}-\d{2}-\d{2}T[\d:]+Z?)\s+(.*)/
-        if let match = line.wholeMatch(of: genericPattern) {
-            let ts = isoFormatter.date(from: String(match.1))
-            return (ts, String(match.2))
-        }
-
-        return (nil, line)
+    deinit {
+        continuation?.finish()
+        worker?.cancel()
     }
 }
 
@@ -230,7 +181,7 @@ struct LogsContentView: View {
                     }
                     .padding(.vertical, 4)
                 }
-                .onChange(of: store.entries.count) { _, _ in
+                .onChange(of: store.entries.last) { _, _ in
                     if store.autoScroll, let last = store.filteredEntries.last {
                         withAnimation(.easeOut(duration: 0.2)) {
                             proxy.scrollTo(last.id, anchor: .bottom)

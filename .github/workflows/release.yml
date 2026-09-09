@@ -72,7 +72,7 @@ jobs:
       - name: Run tests
         timeout-minutes: 30
         run: >
-          swift test --skip-build --filter "EngramTests|EngramRealityKitTests"
+          swift test --skip-build --filter "EngramTests|EngramRealityKitTests|PositionVersionTests"
           --skip "PerfTests"
           --skip "keyBERTKeywordExtraction"
           --skip "recall_semanticRelevanceOrdering"
@@ -96,6 +96,9 @@ jobs:
         run: |
           swift test --skip-build --filter "recall_statementBudget"
           swift test --skip-build --filter "clusters_statementBudget"
+
+      - name: Validate performance report parser
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_profile*.py'
 
       - name: Build CLI release binaries
         run: swift build -c release

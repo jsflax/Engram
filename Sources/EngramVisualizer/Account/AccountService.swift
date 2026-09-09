@@ -53,6 +53,11 @@ final class AccountService {
     var errorMessage: String?
 
     init() {
+        if PerformanceLaunch.isIsolated {
+            self.endpoint = "http://127.0.0.1:1"
+            self.token = nil
+            return
+        }
         // Must match the sync daemon's default (EngramDaemon → engramdb.io);
         // the old engram.io default sent auth to a different host than the
         // daemon relayed sync to.

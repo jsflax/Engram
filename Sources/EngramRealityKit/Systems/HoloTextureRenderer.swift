@@ -8,11 +8,11 @@ import AppKit
 /// Ported from the Metal-era MascotSystem.renderHoloTexture() — same layout,
 /// fonts, and colors. Returns a CGImage that callers convert to a RealityKit
 /// TextureResource.
-@MainActor
-enum HoloTextureRenderer {
+actor HoloTextureRenderer {
+    static let shared = HoloTextureRenderer()
 
     /// Info needed to render the holo card.
-    struct NodeInfo {
+    struct NodeInfo: Sendable, Equatable {
         let content: String
         let project: String
         let topic: String
@@ -21,14 +21,17 @@ enum HoloTextureRenderer {
         let lastAccessedAt: Date
     }
 
-    private static let dateFormatter: DateFormatter = {
+    private let dateFormatter: DateFormatter = {
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd HH:mm"
         return df
     }()
 
     /// Render an info card as a CGImage (512×400 logical, 2× retina = 1024×800).
-    static func render(info: NodeInfo) -> CGImage? {
+    func render(info: NodeInfo) -> CGImage? {
+        // Requests are serialized here, away from the main/render actor. A
+        // superseded request waiting in the actor queue performs no raster work.
+        guard !Task.isCancelled else { return nil }
         let texW = 512
         let texH = 400
         let scale = 2
@@ -127,9 +130,13 @@ enum HoloTextureRenderer {
         var lines: [String] = []
         var currentLine = ""
         for word in content.split(separator: " ", omittingEmptySubsequences: true) {
+            guard !Task.isCancelled else { return nil }
             let candidate = currentLine.isEmpty ? String(word) : currentLine + " " + word
             if candidate.count > contentCharsPerLine && !currentLine.isEmpty {
                 lines.append(currentLine)
+                // Later lines never fit on the unchanged card; avoid wrapping
+                // the remainder of a long memory that cannot be displayed.
+                if lines.count == maxLines { currentLine = ""; break }
                 currentLine = String(word)
             } else {
                 currentLine = candidate
@@ -138,6 +145,7 @@ enum HoloTextureRenderer {
         if !currentLine.isEmpty { lines.append(currentLine) }
 
         for line in lines.prefix(maxLines) {
+            guard !Task.isCancelled else { return nil }
             let ct = makeLine(line, font: contentFont, color: contentColor)
             drawLine(ct.line, ascent: ct.ascent, x: margin, topY: y)
             y += lineHeight
