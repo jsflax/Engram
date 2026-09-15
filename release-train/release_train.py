@@ -168,12 +168,28 @@ def check_notes(root, policy, version):
         require(section and section[1].strip(), f'nonempty CHANGELOG section [{version}] required')
 
 
+def published_tag_commit(repo, tag):
+    ref = gh_api(f'repos/{repo}/git/ref/tags/{quote(tag, safe="")}')
+    require(ref.get('ref') == f'refs/tags/{tag}', f'{repo}: exact published tag required: {tag}')
+    target = ref['object']
+    seen = set()
+    while target.get('type') == 'tag':
+        sha = target['sha']
+        require(SHA.fullmatch(sha) and sha not in seen, f'{repo}: invalid annotated tag chain: {tag}')
+        seen.add(sha)
+        annotated = gh_api(f'repos/{repo}/git/tags/{sha}')
+        require(annotated.get('sha') == sha, f'{repo}: annotated tag identity changed: {tag}')
+        target = annotated['object']
+    require(target.get('type') == 'commit' and SHA.fullmatch(target.get('sha', '')), f'{repo}: published tag does not resolve to a commit: {tag}')
+    return target['sha']
+
+
 def verify_dependencies(snap, policy):
     for identity, repo in policy.get('publishedDependencies', {}).items():
         pin = snap['pins'].get(identity)
         require(pin and pin['version'], f'{identity}: published version pin required')
-        commit = gh_api(f'repos/{repo}/commits/{quote(pin["version"], safe="")}')
-        require(commit['sha'] == pin['revision'], f'{identity}: pin does not match its published tag')
+        commit = published_tag_commit(repo, pin['version'])
+        require(commit == pin['revision'], f'{identity}: pin does not match its published tag')
     for relative, dep in snap['localDependencies'].items():
         remote = dep['remote']
         match = re.fullmatch(r'(?:https://github\.com/|git@github\.com:)([^/]+/[^/]+?)(?:\.git)?', remote)
@@ -193,6 +209,22 @@ def verify_ci(repo, sha, workflows):
         require(newest['status'] == 'completed' and newest['conclusion'] == 'success', f'{workflow}: newest exact-commit CI is {newest["status"]}/{newest["conclusion"]}')
         evidence.append({'workflow': workflow, 'runId': newest['id'], 'runAttempt': newest.get('run_attempt', 1), 'url': newest['html_url'], 'sha': sha, 'result': 'passed'})
     return evidence
+
+
+def matching_release_attempts(runs, policy, version, sha):
+    tag = policy['tagPrefix'] + version
+    matches = []
+    for attempt in runs:
+        if attempt.get('head_sha') != sha:
+            continue
+        event = attempt.get('event')
+        title = attempt.get('display_title')
+        if event == 'workflow_dispatch' and title == f'Release {version} at {sha}':
+            matches.append(attempt)
+        elif event == 'push' and (title == f'Release {tag} at {sha}' or attempt.get('head_branch') == tag):
+            # Older tag-push runs may predate the explicit workflow run-name.
+            matches.append(attempt)
+    return matches
 
 
 def guard(root, policy, version, expected_sha, packaged=False):
@@ -283,11 +315,12 @@ def main():
         require(policy['releaseMode'] == 'hosted', 'this repository uses the allocated local prepare/publish pipeline')
         checked = guard(root, policy, args.version, args.expected_sha)
         runs = gh_api(f'repos/{policy["repository"]}/actions/workflows/release.yml/runs?head_sha={args.expected_sha}&per_page=100')['workflow_runs']
-        # Any previous release attempt for this exact SHA must be reconciled;
-        # repeated heartbeat ticks never launch duplicate native work.
+        # Reconcile this version's attempt, including failed/rerun attempts.
+        # A completed prerelease at the same SHA is a different candidate.
+        runs = matching_release_attempts(runs, policy, args.version, args.expected_sha)
         if runs:
             latest = max(runs, key=lambda run: (run['run_number'], run.get('run_attempt', 1)))
-            print(json.dumps({'state': 'existing-release-attempt', 'runId': latest['id'], 'status': latest['status'], 'conclusion': latest['conclusion'], 'url': latest['html_url']}, indent=2))
+            print(json.dumps({'state': 'existing-release-attempt', 'sourceSha': args.expected_sha, 'tag': checked['tag'], 'runId': latest['id'], 'runAttempt': latest.get('run_attempt', 1), 'status': latest['status'], 'conclusion': latest['conclusion'], 'url': latest['html_url']}, indent=2))
             return
         run(['gh', 'workflow', 'run', 'release.yml', '--repo', policy['repository'], '--ref', policy['branch'], '-f', 'version=' + args.version, '-f', 'expected_sha=' + args.expected_sha])
         print(json.dumps({'state': 'dispatched-awaiting-validation', 'sourceSha': args.expected_sha, 'tag': checked['tag'], 'dispatchedAt': now()}, indent=2))

@@ -4,7 +4,7 @@ Each repository keeps its own SemVer 2.0.0 sequence. Orbital and Engram use `v` 
 
 ## What progresses automatically
 
-The release owner selects an explicit version and exact, adopted `main` commit. The protocol checks that commit, clean source, version monotonicity, changelog, lockfile consistency, published dependency tag revisions and required prior CI. It dispatches the **existing release workflow** directly, which runs the product's tests and packaging. Only the publication job creates the GitHub release/tag after those gates pass. Repeated dispatch calls reconcile an existing attempt instead of starting another build.
+The release owner selects an explicit version and exact, adopted `main` commit. The protocol checks that commit, clean source, version monotonicity, changelog, lockfile consistency, published dependency tag revisions and required prior CI. It dispatches the **existing release workflow** directly, which runs the product's tests and packaging. Only the publication job creates the GitHub release/tag after those gates pass. Repeated dispatch calls reconcile the same version and source commit instead of starting another build. Promoting a prerelease to stable uses its own version identity.
 
 The protocol never infers that source preparation or test discovery means a product passed tests. A changed commit, dependency, package or failed check requires a new validation. A missing credential or dependency stops before compilation. No status text or manifest field becomes a shell command.
 
@@ -35,7 +35,7 @@ python3 release-train/release_train.py dispatch \
   --version 1.8.0 --expected-sha FULL_40_CHARACTER_MAIN_SHA
 ```
 
-`dispatch` starts native hosted work. Use the existing execution/resource allocation before invoking it. It is not a lightweight check. Lattice calls its existing `ci.yml` plus release preflight; LatticeCore reuses its macOS, Linux and C ABI definitions; Engram runs its Linux portable build, existing native tests, app/CLI signing, notarization and appcast generation. The exact `GITHUB_SHA` is the source of every job. Publication rechecks that source and dependency selection. If `main` advances during a run, publication waits for the new candidate instead of silently shipping an old one.
+`dispatch` starts the configured GitHub-hosted release workflow after candidate selection. Ordinary hosted CI and these established hosted release gates are separate from the local native resource queue. Local builds, signing, GUI and model checks still require the existing ROOT allocation. Lattice calls its existing `ci.yml` plus release preflight; LatticeCore reuses its macOS, Linux and C ABI definitions; Engram runs its Linux portable build, existing native tests, app/CLI signing, notarization and appcast generation. The exact `GITHUB_SHA` is the source of every job. Publication rechecks that source and dependency selection. If `main` advances during a run, publication waits for the new candidate instead of silently shipping an old one.
 
 Direct `workflow_dispatch` avoids depending on a tag pushed with `GITHUB_TOKEN` triggering another workflow. Legacy tag pushes still enter the same gates. The newly added dispatch path does not send Slack/email notifications. Existing Engram tag-push notifications retain their existing entry point; the release owner uses dispatch.
 
@@ -102,7 +102,7 @@ The recurring release owner reads repository/workflow status and the existing Co
 - concrete missing/failed gate and evidence path/URL;
 - published release URL only after GitHub confirms it.
 
-On each follow-up: reconcile an existing run first; do not start duplicate work. Advance only the recorded candidate with the existing resource allocation. Pass `dispatch` output to the status owner as facts. On a failed run, retain its identity and root cause; a retry uses that same run's explicit rerun mechanism after correction/allocation. Never create a new version merely to bypass a failed gate. No additional polling daemon is installed by this protocol.
+On each follow-up: reconcile an existing run first; do not start duplicate work. Advance only the recorded candidate through its configured hosted gates, or with the existing ROOT allocation for local native work. Pass `dispatch` output to the status owner as facts. On a failed run, retain its identity and root cause; a retry of unchanged source uses that same run's explicit rerun mechanism after its failure is resolved; changed source is a new validated candidate. Never create a new version merely to bypass a failed gate. No additional polling daemon is installed by this protocol.
 
 ## Validation
 

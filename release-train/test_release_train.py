@@ -1,6 +1,11 @@
+import contextlib
 import copy
 import importlib.util
+import io
+import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -82,8 +87,85 @@ class ReleaseTrainTests(unittest.TestCase):
 
     def test_published_pin_must_match_exact_tag(self):
         snap = {'pins': {'core': {'version': '1.0.0', 'revision': 'a' * 40}}, 'localDependencies': {}}
-        with patch.object(r, 'gh_api', return_value={'sha': 'b' * 40}), self.assertRaises(ValueError):
+        ref = {'ref': 'refs/tags/1.0.0', 'object': {'type': 'commit', 'sha': 'b' * 40}}
+        with patch.object(r, 'gh_api', return_value=ref), self.assertRaises(ValueError):
             r.verify_dependencies(snap, {'publishedDependencies': {'core': 'o/core'}})
+
+    def test_published_pin_rejects_branch_without_tag(self):
+        snap = {'pins': {'core': {'version': '1.0.0', 'revision': 'a' * 40}}, 'localDependencies': {}}
+        def branch_only(endpoint):
+            if endpoint == 'repos/o/core/commits/1.0.0':
+                return {'sha': 'a' * 40}
+            raise subprocess.CalledProcessError(1, ['gh', 'api', endpoint])
+        with patch.object(r, 'gh_api', side_effect=branch_only) as api, self.assertRaises(subprocess.CalledProcessError):
+            r.verify_dependencies(snap, {'publishedDependencies': {'core': 'o/core'}})
+        api.assert_called_once_with('repos/o/core/git/ref/tags/1.0.0')
+
+    def test_published_lightweight_and_nested_annotated_tags(self):
+        for annotated in (False, True):
+            with self.subTest(annotated=annotated):
+                target = {'type': 'commit', 'sha': 'a' * 40}
+                responses = {'repos/o/core/git/ref/tags/1.0.0': {'ref': 'refs/tags/1.0.0', 'object': target}}
+                if annotated:
+                    responses['repos/o/core/git/ref/tags/1.0.0']['object'] = {'type': 'tag', 'sha': 'b' * 40}
+                    responses['repos/o/core/git/tags/' + 'b' * 40] = {'sha': 'b' * 40, 'object': {'type': 'tag', 'sha': 'c' * 40}}
+                    responses['repos/o/core/git/tags/' + 'c' * 40] = {'sha': 'c' * 40, 'object': target}
+                with patch.object(r, 'gh_api', side_effect=responses.__getitem__):
+                    self.assertEqual(r.published_tag_commit('o/core', '1.0.0'), 'a' * 40)
+
+    def test_published_tag_requires_exact_ref_and_commit_target(self):
+        for ref, target in [('refs/heads/1.0.0', {'type': 'commit', 'sha': 'a' * 40}), ('refs/tags/1.0.0', {'type': 'tree', 'sha': 'a' * 40})]:
+            with self.subTest(ref=ref, target=target), patch.object(r, 'gh_api', return_value={'ref': ref, 'object': target}), self.assertRaises(ValueError):
+                r.published_tag_commit('o/core', '1.0.0')
+
+    def test_release_attempt_identity_includes_version_sha_and_event(self):
+        sha = 'a' * 40
+        selected = {'head_sha': sha, 'event': 'workflow_dispatch', 'display_title': f'Release 1.0.0 at {sha}'}
+        other = [dict(selected, display_title=f'Release 1.0.0-rc.1 at {sha}'), dict(selected, head_sha='b' * 40), dict(selected, event='pull_request')]
+        for prefix in ('', 'v'):
+            with self.subTest(prefix=prefix):
+                tag_push = dict(selected, event='push', display_title=f'Release {prefix}1.0.0 at {sha}')
+                legacy = dict(selected, event='push', display_title='Old release workflow', head_branch=prefix + '1.0.0')
+                self.assertEqual(r.matching_release_attempts(other + [selected, tag_push, legacy], {'tagPrefix': prefix}, '1.0.0', sha), [selected, tag_push, legacy])
+
+    def test_dispatch_stable_after_prerelease_at_same_sha(self):
+        sha = 'a' * 40
+        prior = {'head_sha': sha, 'event': 'workflow_dispatch', 'display_title': f'Release 1.0.0-rc.1 at {sha}', 'run_number': 1, 'id': 1, 'status': 'completed', 'conclusion': 'success', 'html_url': 'https://github.com/o/repo/actions/runs/1'}
+        policy = {'releaseMode': 'hosted', 'repository': 'o/repo', 'branch': 'main', 'tagPrefix': 'v'}
+        output = io.StringIO()
+        with (
+            patch.object(sys, 'argv', ['release_train.py', 'dispatch', '--version', '1.0.0', '--expected-sha', sha]),
+            patch.object(r, 'repository', return_value=Path('.')),
+            patch.object(r, 'policy_at', return_value=policy),
+            patch.object(r, 'guard', return_value={'tag': 'v1.0.0'}),
+            patch.object(r, 'gh_api', return_value={'workflow_runs': [prior]}),
+            patch.object(r, 'run') as invoke,
+            contextlib.redirect_stdout(output),
+        ):
+            r.main()
+        invoke.assert_called_once_with(['gh', 'workflow', 'run', 'release.yml', '--repo', 'o/repo', '--ref', 'main', '-f', 'version=1.0.0', '-f', 'expected_sha=' + sha])
+        self.assertEqual(json.loads(output.getvalue())['state'], 'dispatched-awaiting-validation')
+
+    def test_dispatch_reconciles_newest_attempt_for_selected_version(self):
+        sha = 'a' * 40
+        selected = {'head_sha': sha, 'event': 'workflow_dispatch', 'display_title': f'Release 1.0.0 at {sha}', 'run_number': 2, 'run_attempt': 1, 'id': 2, 'status': 'completed', 'conclusion': 'failure', 'html_url': 'https://github.com/o/repo/actions/runs/2'}
+        rerun = dict(selected, run_attempt=2, status='in_progress', conclusion=None)
+        other = dict(selected, display_title=f'Release 1.0.0-rc.1 at {sha}', run_number=3, id=3)
+        policy = {'releaseMode': 'hosted', 'repository': 'o/repo', 'branch': 'main', 'tagPrefix': 'v'}
+        output = io.StringIO()
+        with (
+            patch.object(sys, 'argv', ['release_train.py', 'dispatch', '--version', '1.0.0', '--expected-sha', sha]),
+            patch.object(r, 'repository', return_value=Path('.')),
+            patch.object(r, 'policy_at', return_value=policy),
+            patch.object(r, 'guard', return_value={'tag': 'v1.0.0'}),
+            patch.object(r, 'gh_api', return_value={'workflow_runs': [selected, other, rerun]}),
+            patch.object(r, 'run') as invoke,
+            contextlib.redirect_stdout(output),
+        ):
+            r.main()
+        invoke.assert_not_called()
+        result = json.loads(output.getvalue())
+        self.assertEqual((result['runId'], result['runAttempt'], result['tag'], result['sourceSha']), (2, 2, 'v1.0.0', sha))
 
     def test_generated_appcast_is_only_packaging_change(self):
         with patch.object(r, 'git', return_value=' M appcast.xml'):
