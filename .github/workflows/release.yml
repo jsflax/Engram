@@ -1,25 +1,83 @@
 name: Release
+run-name: Release ${{ inputs.version || github.ref_name }} at ${{ inputs.expected_sha || github.sha }}
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Explicit SemVer version without a v prefix'
+        required: true
+        type: string
+      expected_sha:
+        description: 'Exact main commit (full 40-character SHA)'
+        required: true
+        type: string
 
 permissions:
   contents: write
+  actions: read
+
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  RELEASE_VERSION_INPUT: ${{ inputs.version }}
+  EXPECTED_SHA: ${{ inputs.expected_sha || github.sha }}
 
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.candidate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify exact candidate and published dependency pins
+        id: candidate
+        run: |
+          VERSION="${RELEASE_VERSION_INPUT:-${GITHUB_REF_NAME#v}}"
+          python3 release-train/release_train.py check --version "$VERSION" --expected-sha "$EXPECTED_SHA"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Require complete signed distribution credentials
+        env:
+          CERT: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          SPARKLE: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          SWIFTLM: ${{ secrets.SWIFTLM_CLONE_TOKEN }}
+        run: |
+          for key in CERT CERT_PASSWORD TEAM APPLE_ID APPLE_PASSWORD SPARKLE SWIFTLM; do
+            if [ -z "${!key}" ]; then echo "::error::Required release credential unavailable: $key"; exit 1; fi
+          done
+  portable:
+    needs: preflight
+    uses: ./.github/workflows/linux-core.yml
+    secrets:
+      SWIFTLM_CLONE_TOKEN: ${{ secrets.SWIFTLM_CLONE_TOKEN }}
   build:
+    needs: [preflight, portable]
     runs-on: macos-26
     # SwiftLM is a private dependency (since the mascot-chat work) — SwiftPM
     # resolution needs a token. SWIFTLM_CLONE_TOKEN: fine-grained PAT, read-only
     # Contents on jsflax/SwiftLM. Scoped insteadOf so no other clone is touched.
     env:
+      RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
       GIT_CONFIG_COUNT: 1
       GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.SWIFTLM_CLONE_TOKEN }}@github.com/jsflax/SwiftLM.insteadOf
       GIT_CONFIG_VALUE_0: https://github.com/jsflax/SwiftLM
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # SwiftPM's URLSession-based binary-artifact download of the Sparkle
       # zip hangs DETERMINISTICALLY on this runner image (6/6 alarm-killed
@@ -142,7 +200,7 @@ jobs:
           DEVELOPER_ID_CERT_BASE64: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
+          VERSION=${RELEASE_TAG#v}
           PREV_BUILD=$(sed -n 's/.*<sparkle:version>\([0-9]*\)<.*/\1/p' appcast.xml | head -1)
           BUILD_NUMBER=$(( ${PREV_BUILD:-0} + 1 ))
           xcodebuild archive \
@@ -157,7 +215,7 @@ jobs:
             CODE_SIGN_IDENTITY="Developer ID Application" \
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-            MARKETING_VERSION="$VERSION" \
+            MARKETING_VERSION="${VERSION%%-*}" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
             OTHER_CODE_SIGN_FLAGS="--keychain $RUNNER_TEMP/signing.keychain-db"
 
@@ -168,11 +226,12 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           # Inject team ID into ExportOptions.plist
-          sed -i '' "s|</dict>|    <key>teamID</key><string>$APPLE_TEAM_ID</string></dict>|" ExportOptions.plist
+          cp ExportOptions.plist "$RUNNER_TEMP/ExportOptions.plist"
+          sed -i '' "s|</dict>|    <key>teamID</key><string>$APPLE_TEAM_ID</string></dict>|" "$RUNNER_TEMP/ExportOptions.plist"
           xcodebuild -exportArchive \
             -archivePath build/Engram.xcarchive \
             -exportPath build/export \
-            -exportOptionsPlist ExportOptions.plist
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
 
       - name: Bundle CLI binaries into .app
         if: env.DEVELOPER_ID_CERT_BASE64 != ''
@@ -227,24 +286,24 @@ jobs:
       # (forks), the tarball still builds — just unsigned, as before.
       - name: Package CLI tarball
         run: |
-          mkdir -p staging/agents
+          mkdir -p build/staging/agents
           if [ -d "build/export/Engram.app/Contents/Resources/cli" ]; then
             CLI="build/export/Engram.app/Contents/Resources/cli"
-            cp "$CLI/memory" staging/memory
-            cp "$CLI/memory-hooks" staging/memory-hooks
-            cp "$CLI/memory-sync" staging/memory-sync
+            cp "$CLI/memory" build/staging/memory
+            cp "$CLI/memory-hooks" build/staging/memory-hooks
+            cp "$CLI/memory-sync" build/staging/memory-sync
           else
-            cp .build/release/Engram staging/memory
-            cp .build/release/EngramHooks staging/memory-hooks
-            cp .build/release/EngramDaemon staging/memory-sync
+            cp .build/release/Engram build/staging/memory
+            cp .build/release/EngramHooks build/staging/memory-hooks
+            cp .build/release/EngramDaemon build/staging/memory-sync
           fi
-          cp -R .build/release/Engram_EngramKit.bundle staging/
-          cp -R .build/release/swift-transformers_Hub.bundle staging/
-          cp -R .build/release/SwiftLM_SwiftLM.bundle staging/
-          cp agents/*.md staging/agents/
-          cp -R skills staging/skills
-          bash scripts/package_codex_learner.sh staging/codex
-          cd staging && tar czf ../engram-macos-arm64.tar.gz *
+          cp -R .build/release/Engram_EngramKit.bundle build/staging/
+          cp -R .build/release/swift-transformers_Hub.bundle build/staging/
+          cp -R .build/release/SwiftLM_SwiftLM.bundle build/staging/
+          cp agents/*.md build/staging/agents/
+          cp -R skills build/staging/skills
+          bash scripts/package_codex_learner.sh build/staging/codex
+          cd build/staging && tar czf ../engram-macos-arm64.tar.gz *
 
       - name: Create DMG
         if: env.DEVELOPER_ID_CERT_BASE64 != ''
@@ -252,7 +311,7 @@ jobs:
           DEVELOPER_ID_CERT_BASE64: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
         run: |
           brew install create-dmg
-          VERSION=${GITHUB_REF_NAME#v}
+          VERSION=${RELEASE_TAG#v}
           create-dmg \
             --volname "Engram $VERSION" \
             --window-pos 200 120 \
@@ -261,7 +320,7 @@ jobs:
             --icon "Engram.app" 150 190 \
             --app-drop-link 450 190 \
             --no-internet-enable \
-            "Engram-${VERSION}.dmg" \
+            "build/Engram-${VERSION}.dmg" \
             "build/export/Engram.app"
 
       - name: Notarize DMG
@@ -272,8 +331,8 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          DMG="Engram-${VERSION}.dmg"
+          VERSION=${RELEASE_TAG#v}
+          DMG="build/Engram-${VERSION}.dmg"
 
           SUBMIT_OUT=$(xcrun notarytool submit "$DMG" \
             --apple-id "$APPLE_ID" \
@@ -284,7 +343,7 @@ jobs:
 
           # Extract submission ID and fetch log on failure
           SUB_ID=$(echo "$SUBMIT_OUT" | grep "id:" | head -1 | awk '{print $2}')
-          if echo "$SUBMIT_OUT" | grep -q "status: Invalid"; then
+          if ! echo "$SUBMIT_OUT" | grep -q "status: Accepted"; then
             echo "--- Notarization log ---"
             xcrun notarytool log "$SUB_ID" \
               --apple-id "$APPLE_ID" \
@@ -300,8 +359,8 @@ jobs:
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          DMG="Engram-${VERSION}.dmg"
+          VERSION=${RELEASE_TAG#v}
+          DMG="build/Engram-${VERSION}.dmg"
 
           # Download Sparkle tools
           SPARKLE_VERSION="2.8.1"
@@ -309,36 +368,47 @@ jobs:
           curl -sL "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz" | tar xJ -C /tmp/sparkle-tools bin/
 
           # Move DMG to a staging dir for generate_appcast
-          mkdir -p appcast_staging
-          cp "$DMG" appcast_staging/
+          mkdir -p build/appcast_staging
+          cp "$DMG" build/appcast_staging/
 
           # Generate appcast from the DMG
           echo "$SPARKLE_PRIVATE_KEY" | /tmp/sparkle-tools/bin/generate_appcast \
             --ed-key-file - \
-            --download-url-prefix "https://github.com/jsflax/Engram/releases/download/${GITHUB_REF_NAME}/" \
-            appcast_staging
+            --download-url-prefix "https://github.com/jsflax/Engram/releases/download/${RELEASE_TAG}/" \
+            build/appcast_staging
 
           # Use generated appcast
-          cp appcast_staging/appcast.xml appcast.xml
+          cp build/appcast_staging/appcast.xml appcast.xml
 
       - name: Extract changelog for release
         id: changelog
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
+          VERSION=${RELEASE_TAG#v}
           BODY=$(awk "/^## \\[${VERSION}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md)
           # Write to file for multi-line handling
           echo "$BODY" > /tmp/release-body.md
 
+      - name: Recheck exact source and emit packaged release receipt
+        run: |
+          python3 release-train/release_train.py candidate --version "${RELEASE_TAG#v}" --expected-sha "$EXPECTED_SHA" --output "$RUNNER_TEMP/candidate.json" --packaged
+          python3 release-train/release_train.py workflow-receipt --candidate "$RUNNER_TEMP/candidate.json" --output "$RUNNER_TEMP/release-receipt.json" \
+            --artifact "cli=build/engram-macos-arm64.tar.gz" --artifact "dmg=build/Engram-${RELEASE_TAG#v}.dmg" --artifact "appcast=appcast.xml"
+      # Direct dispatch runs the existing native pipeline; it does not depend on
+      # a GITHUB_TOKEN-created tag triggering a second workflow.
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            engram-macos-arm64.tar.gz
-            Engram-*.dmg
-          body_path: /tmp/release-body.md
+        run: |
+          if ! git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then git tag "$RELEASE_TAG" "$EXPECTED_SHA"; fi
+          git push origin "refs/tags/$RELEASE_TAG"
+          FLAGS=(--latest)
+          if [[ "$RELEASE_TAG" == *-* ]]; then FLAGS=(--prerelease --latest=false); fi
+          # create is deliberately not an update/upsert of an existing release.
+          gh release create "$RELEASE_TAG" build/engram-macos-arm64.tar.gz \
+            "build/Engram-${RELEASE_TAG#v}.dmg" appcast.xml "$RUNNER_TEMP/release-receipt.json" \
+            --verify-tag --target "$EXPECTED_SHA" --title "Engram ${RELEASE_TAG#v}" \
+            --notes-file /tmp/release-body.md "${FLAGS[@]}"
 
       - name: Commit appcast.xml to main
-        if: env.SPARKLE_PRIVATE_KEY != ''
+        if: env.SPARKLE_PRIVATE_KEY != '' && !contains(env.RELEASE_TAG, '-')
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
@@ -347,15 +417,15 @@ jobs:
           git fetch origin main
           git checkout main
           git add appcast.xml
-          git diff --cached --quiet || (git commit -m "Update appcast.xml for ${GITHUB_REF_NAME}" && git push origin main)
+          git diff --cached --quiet || (git commit -m "Update appcast.xml for ${RELEASE_TAG}" && git push origin main)
 
       - name: Update Homebrew formula
-        if: env.TAP_TOKEN != ''
+        if: env.TAP_TOKEN != '' && !contains(env.RELEASE_TAG, '-')
         env:
           TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
         run: |
-          SHA=$(shasum -a 256 engram-macos-arm64.tar.gz | awk '{print $1}')
-          VERSION=${GITHUB_REF_NAME#v}
+          SHA=$(shasum -a 256 build/engram-macos-arm64.tar.gz | awk '{print $1}')
+          VERSION=${RELEASE_TAG#v}
 
           git clone https://x-access-token:${TAP_TOKEN}@github.com/jsflax/homebrew-tap.git tap
           cd tap
@@ -370,11 +440,11 @@ jobs:
           git diff --cached --quiet || (git commit -m "Update engram to ${VERSION}" && git push)
 
       - name: Notify Slack
-        if: success() && env.SLACK_WEBHOOK_URL != ''
+        if: github.event_name == 'push' && success() && env.SLACK_WEBHOOK_URL != ''
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${RELEASE_TAG}"
           VERSION="${TAG#v}"
           REPO="${{ github.repository }}"
           URL="https://github.com/${REPO}/releases/tag/${TAG}"
@@ -414,13 +484,13 @@ jobs:
       # Failed releases were silent (the success notifier is if: success()) —
       # announce failures too, with a link to the run.
       - name: Notify Slack (failure)
-        if: failure() && env.SLACK_WEBHOOK_URL != ''
+        if: github.event_name == 'push' && failure() && env.SLACK_WEBHOOK_URL != ''
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           curl -s -X POST "$SLACK_WEBHOOK_URL" \
             -H 'Content-Type: application/json' \
-            -d "{\"text\": \"❌ Engram ${GITHUB_REF_NAME} release FAILED — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
+            -d "{\"text\": \"❌ Engram ${RELEASE_TAG} release FAILED — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
 
       - name: Cleanup keychain
         if: always()

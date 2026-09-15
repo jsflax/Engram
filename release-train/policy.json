@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "branch": "main",
+  "prereleaseChannels": [
+    "alpha",
+    "beta",
+    "rc"
+  ],
+  "requiredNativeChecks": [],
+  "localDependencies": [],
+  "publishedDependencies": {
+    "lattice": "jsflax/lattice",
+    "latticecore": "jsflax/LatticeCore"
+  },
+  "requiredPriorCI": [],
+  "artifacts": [
+    "cli",
+    "dmg",
+    "appcast"
+  ],
+  "lockfiles": [
+    "Package.resolved"
+  ],
+  "changelog": "CHANGELOG.md",
+  "releaseMode": "hosted",
+  "repository": "jsflax/Engram",
+  "tagPrefix": "v"
+}

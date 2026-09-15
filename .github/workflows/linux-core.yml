@@ -11,24 +11,38 @@ name: Linux — EngramMemoryCore
 # here still type-checks every test.
 
 on:
+  workflow_call:
+    secrets:
+      SWIFTLM_CLONE_TOKEN:
+        required: true
   push:
     branches: [main, "agents/**", "groups/**"]
     paths:
       - "Sources/EngramMemoryCore/**"
       - "Tests/EngramMemoryCoreTests/**"
       - "Package.swift"
+      - "Package.resolved"
       - ".github/workflows/linux-core.yml"
+      - ".github/workflows/release.yml"
   pull_request:
     paths:
       - "Sources/EngramMemoryCore/**"
       - "Tests/EngramMemoryCoreTests/**"
       - "Package.swift"
+      - "Package.resolved"
+      - ".github/workflows/linux-core.yml"
+      - ".github/workflows/release.yml"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: swift:6.0-noble
+    # Engram requires 6.2; its locked Lattice 1.6.2 dependency requires 6.3.
+    container: swift:6.3-noble
     timeout-minutes: 20
+    env:
+      GIT_CONFIG_COUNT: 1
+      GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.SWIFTLM_CLONE_TOKEN }}@github.com/jsflax/SwiftLM.insteadOf
+      GIT_CONFIG_VALUE_0: https://github.com/jsflax/SwiftLM
     steps:
       - uses: actions/checkout@v4
       - name: Build EngramMemoryCore (Linux)
