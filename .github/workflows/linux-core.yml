@@ -11,6 +11,7 @@ name: Linux — EngramMemoryCore
 # here still type-checks every test.
 
 on:
+  workflow_call:
   push:
     branches: [main, "agents/**", "groups/**"]
     paths:
