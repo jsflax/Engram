@@ -24,6 +24,13 @@ All notable changes to Engram are documented in this file.
   configured as a plugin. Existing standalone installations have an explicit,
   ownership-aware migration that preserves their state.
 
+- Report busy, partial, and failed maintenance outcomes instead of claiming that
+  vacuum or WAL checkpointing always succeeded.
+- Select the CLI download by its exact archive name when the release also
+  contains a Codex plugin archive.
+- Apply the owned MCP SDK mirror to Xcode as well as SwiftPM, and require the
+  committed dependency versions throughout release builds.
+
 ### Added
 - Package **Engram for Codex** alongside the native app and CLI: signed native
   memory MCP, seven skills, the app icon, and nine lifecycle/tool hook events.
@@ -35,11 +42,12 @@ All notable changes to Engram are documented in this file.
 - Publish a deterministic plugin archive and file manifest tied to the native
   release receipt. Deployment state, private paths, and credentials are excluded.
 
-### Release preparation
-- Publication requires a qualified, versioned Lattice release containing the
-  checked-transaction API and the matching Core 2.0 / SDK 0.13 dependencies.
-  The preparation branch pins the exact candidate for review; it is not a
-  published or approved storage release.
+### Dependencies
+- Adopt published Lattice 2.0.0 and LatticeCore 2.0.4, including checked
+  transactions, reader-lifetime fixes, and observer/relay corrections. Rebuild
+  models and native bridges together; audit retention remains disabled by default.
+- Preserve the owned MCP SDK 0.13.0 capability-decoding fix. No unreleased
+  batch/projection APIs or performance speedup claims are included.
 
 ## [0.14.7] - 2026-09-09
 

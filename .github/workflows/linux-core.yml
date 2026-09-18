@@ -36,7 +36,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Engram requires 6.2; its locked Lattice 1.6.2 dependency requires 6.3.
+    # Engram requires 6.2; its locked Lattice 2.0.0 dependency requires 6.3.
     container: swift:6.3-noble
     timeout-minutes: 20
     env:
@@ -46,6 +46,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build EngramMemoryCore (Linux)
-        run: swift build --target EngramMemoryCore
+        run: swift build --force-resolved-versions --target EngramMemoryCore
       - name: Compile its tests (Linux)
-        run: swift build --target EngramMemoryCoreTests
+        run: swift build --force-resolved-versions --target EngramMemoryCoreTests

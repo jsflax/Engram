@@ -75,7 +75,7 @@ class CodexPackagingTests(unittest.TestCase):
             for child in staging.iterdir():
                 tar.add(child, arcname=child.name)
         self.fake_command("curl", """case "$*" in
-  *api.github.com*) echo '{"browser_download_url":"https://example.invalid/arm64.tar.gz"}' ;;
+  *api.github.com*) echo '{"browser_download_url":"https://example.invalid/engram-macos-arm64.tar.gz"}' ;;
   *) cat """ + shlex.quote(str(archive)) + " ;;\nesac\n")
         self.fake_command("codesign", "echo 'unexpected signing' >&2\nexit 99\n")
         result = self.run_shell(SCRIPTS / "install.sh")
@@ -87,6 +87,35 @@ class CodexPackagingTests(unittest.TestCase):
         for binary in ("memory", "memory-hooks", "memory-sync"):
             self.assertEqual((self.home / ".claude/bin" / binary).read_bytes(), b"signed-release-fixture")
         self.assertNotIn("unexpected signing", result.stderr)
+
+    def test_download_selects_cli_archive_with_plugin_asset_in_either_order(self):
+        staging = self.root / "staging"
+        staging.mkdir()
+        for binary in ("memory", "memory-hooks", "memory-sync"):
+            (staging / binary).write_bytes(b"signed-cli-fixture")
+        archive = self.root / "cli-release.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            for child in staging.iterdir():
+                tar.add(child, arcname=child.name)
+        release = self.root / "release.json"
+        cli = {"name": "engram-macos-arm64.tar.gz",
+               "browser_download_url": "https://example.invalid/engram-macos-arm64.tar.gz"}
+        plugin = {"name": "engram-codex-plugin-macos-arm64.tar.gz",
+                  "browser_download_url": "https://example.invalid/engram-codex-plugin-macos-arm64.tar.gz"}
+        self.fake_command("curl", """case "$*" in
+  *api.github.com*) cat """ + shlex.quote(str(release)) + """ ;;
+  *https://example.invalid/engram-macos-arm64.tar.gz) cat """ + shlex.quote(str(archive)) + """ ;;
+  *) echo 'unexpected non-CLI download' >&2; exit 99 ;;
+esac
+""")
+        for assets in ([plugin, cli], [cli, plugin]):
+            with self.subTest(first_asset=assets[0]["name"]):
+                release.write_text(json.dumps({"assets": assets}, indent=2))
+                result = self.run_shell(SCRIPTS / "install.sh")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                for binary in ("memory", "memory-hooks", "memory-sync"):
+                    self.assertEqual((self.home / ".claude/bin" / binary).read_bytes(), b"signed-cli-fixture")
+                self.assertNotIn("unexpected non-CLI download", result.stderr)
 
     def test_uninstall_keeps_payload_when_hook_removal_cannot_run(self):
         installed = self.home / ".claude/bin/codex"

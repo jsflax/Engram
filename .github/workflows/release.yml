@@ -105,7 +105,7 @@ jobs:
         timeout-minutes: 30
         run: |
           for attempt in 1 2 3; do
-            if perl -e 'alarm(8*60); exec @ARGV' -- swift package resolve; then
+            if perl -e 'alarm(8*60); exec @ARGV' -- swift package resolve --force-resolved-versions; then
               exit 0
             fi
             echo "::warning::resolve attempt ${attempt} failed or hung - retrying"
@@ -116,7 +116,7 @@ jobs:
       # C++-heavy graph on slow hosted runners.
       - name: Build tests
         timeout-minutes: 75
-        run: swift build --build-tests
+        run: swift build --force-resolved-versions --build-tests
       # Core correctness gate (the 0.13.0 release bar): sync/memory/organize/
       # relay + RealityKit system tests. EngramVisualizerTests' GPU-internal
       # suites are known debt (see CHANGELOG 0.13.0) and on-device
@@ -130,7 +130,7 @@ jobs:
       - name: Run tests
         timeout-minutes: 30
         run: >
-          swift test --skip-build --filter "EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests"
+          swift test --force-resolved-versions --skip-build --filter "EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests"
           --skip "PerfTests"
           --skip "keyBERTKeywordExtraction"
           --skip "recall_semanticRelevanceOrdering"
@@ -152,8 +152,8 @@ jobs:
       - name: Run statement-budget regressions (serial)
         timeout-minutes: 10
         run: |
-          swift test --skip-build --filter "recall_statementBudget"
-          swift test --skip-build --filter "clusters_statementBudget"
+          swift test --force-resolved-versions --skip-build --filter "recall_statementBudget"
+          swift test --force-resolved-versions --skip-build --filter "clusters_statementBudget"
 
       - name: Validate performance report parser
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_profile*.py'
@@ -169,14 +169,17 @@ jobs:
       - name: Validate packaged Codex plugin hooks and learner
         run: python3 -B Tests/codex_plugin/run_suite.py
 
+      - name: Validate real MCP regression harness
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_mcp_locks.py'
+
       - name: Build CLI release binaries
-        run: swift build -c release
+        run: swift build --force-resolved-versions -c release
 
       - name: Verify real MCP lifecycle and database lock regressions
         timeout-minutes: 10
         run: |
           mkdir -p build/mcp-test-home build/mcp-test-tmp
-          for regression in smoke startup recall idle; do
+          for regression in smoke startup recall idle persistence; do
             env HOME="$PWD/build/mcp-test-home" \
               CFFIXED_USER_HOME="$PWD/build/mcp-test-home" \
               TMPDIR="$PWD/build/mcp-test-tmp" \
@@ -224,6 +227,8 @@ jobs:
           xcodebuild archive \
             -project Engram.xcodeproj \
             -clonedSourcePackagesDirPath .build \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
             -scheme Engram \
             -archivePath build/Engram.xcarchive \
             -configuration Release \
