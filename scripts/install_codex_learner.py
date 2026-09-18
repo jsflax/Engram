@@ -5,6 +5,9 @@ The installed runtime is immutable and content addressed. Changing it changes
 the hook definition, so Codex's normal /hooks trust review applies to upgrades.
 No trust state is written here. Uninstall removes registrations, not memories,
 queued work, runtime versions, or backups. Requires Python 3.11 or newer.
+Configured Engram plugins, including disabled entries, own Codex setup instead
+of this legacy installer. Use owned-only uninstall before switching to a plugin;
+installation never removes an existing hook, queue, cursor or MCP registration.
 """
 
 from __future__ import annotations
@@ -250,7 +253,29 @@ def stage_runtime(state_dir: Path, assets: dict[str, bytes]) -> Path:
     return destination
 
 
+def plugin_install_guard(codex_home: Path) -> dict[str, Any] | None:
+    """Respect plugin registration and disabled intent without inspecting caches."""
+    raw = read_regular(codex_home / "config.toml")
+    try:
+        config = tomllib.loads(raw.decode() if raw is not None else "")
+    except (ValueError, UnicodeError) as exc:
+        raise InstallError(f"Cannot read Codex config: {exc}") from exc
+    plugins = config.get("plugins", {})
+    if not isinstance(plugins, dict):
+        raise InstallError("Codex plugins must be a table")
+    identities = sorted(name for name in plugins
+                        if name.partition("@")[0] in {"engram", "engram-hooks"})
+    if identities:
+        return {"status": "skipped_plugin", "plugin_ids": identities,
+                "activation": "Engram plugin registration preserved, including disabled settings. "
+                              "Legacy hooks, MCP config and learner state were not changed. "
+                              "Use this installer's uninstall action for an owned-only legacy migration."}
+    return None
+
+
 def prepare(codex_home: Path, state_dir: Path, source_dir: Path, python: Path) -> dict[str, Any]:
+    if guarded := plugin_install_guard(codex_home):
+        return guarded
     assets = load_assets(source_dir)
     if not python.is_file() or not os.access(python, os.X_OK):
         raise InstallError(f"Python executable is unavailable: {python}")
@@ -379,9 +404,13 @@ def unregister_memory(codex_home: Path, state_dir: Path, manifest: dict[str, Any
 def install(codex_home: Path, state_dir: Path, source_dir: Path, python: Path, expected_sha256: str | None = None, memory_command: Path | None = None) -> dict[str, Any]:
     if codex_home.is_symlink():
         raise InstallError(f"Refusing symlink directory: {codex_home}")
+    if guarded := plugin_install_guard(codex_home):
+        return guarded
     codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     with install_lock(state_dir):
         plan = prepare(codex_home, state_dir, source_dir, python)
+        if plan.get("status") == "skipped_plugin":
+            return plan
         if expected_sha256 is not None and plan["expected_sha256"] != expected_sha256:
             raise InstallError("hooks.json changed since preparation; review a fresh plan")
         if memory_command is not None:
@@ -458,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
             memory_command = args.memory_command.expanduser().absolute() if args.memory_command is not None else None
             if args.action == "prepare":
                 result = prepare(*values)
-                if memory_command is not None:
+                if memory_command is not None and result.get("status") != "skipped_plugin":
                     raw, merged = memory_registration_plan(codex_home, memory_command)
                     result["memory_mcp"] = {"status": "would_register" if merged is not None else "existing_registration_preserved", "config_sha256": digest(raw), "command": str(memory_command) if merged is not None else None}
             else:

@@ -125,7 +125,7 @@ struct Advise: AsyncParsableCommand {
             hookLog("Advise: running budgeted recall (budget \(budget)s)")
             let outcome = try await HookBudget.race(
                 seconds: max(0, deadline.timeIntervalSinceNow)
-            ) { () -> String? in
+            ) { () -> (result: String, query: String)? in
                 guard let tools = await initMemoryTools(sessionId: sid) else {
                     hookLog("Advise: failed to initialize memory tools")
                     return nil
@@ -135,19 +135,21 @@ struct Advise: AsyncParsableCommand {
                 let contentWords = MemoryTools.extractContentWords(from: prompt)
                 let recallQuery = contentWords.isEmpty ? prompt : contentWords.joined(separator: " ")
                 hookLog("Advise: running directRecall (query: \(String(recallQuery.prefix(80)))...)")
-                return try await tools.directRecall(
+                guard let result = try await tools.directRecall(
                     query: recallQuery,
                     project: project,
                     depth: 1,
                     limit: 5
-                )
+                ) else { return nil }
+                return (result, recallQuery)
             }
             switch outcome {
-            case .completed(let result?):
+            case .completed(let recall?):
+                let result = recall.result
                 sessionLog("Advise: directRecall returned \(result.count) chars", sessionId: sid)
                 logRecalledMemories(result, hook: "Advise", sessionId: sid)
                 sessionLog("Advise: logRecalledMemories done, recall log written", sessionId: sid)
-                watchdog.append("## Relevant memories\n\n\(result)")
+                watchdog.append(AdviseAssembly.memorySection(renderedRecall: result, query: recall.query))
             case .completed(nil):
                 sessionLog("Advise: recall returned nil (or tools init failed)", sessionId: sid)
                 hookLog("Advise: recall returned nil")

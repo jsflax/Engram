@@ -55,7 +55,7 @@ extension MemoryTools: MemoryService {
             rendered = String(rendered.prefix(request.budget)) + "\n… (truncated)"
         }
         return AdviseResult(
-            block: AdviseAssembly.memorySection(renderedRecall: rendered),
+            block: AdviseAssembly.memorySection(renderedRecall: rendered, query: query),
             memoryIds: recallResult.hits.map(\.memory.id),
             mode: recallResult.mode)
     }

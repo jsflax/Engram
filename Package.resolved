@@ -1,5 +1,5 @@
 {
-  "originHash" : "bc12f7c04bffbd70a9b6fa4cce7f1d837b9a05c54ceb0f39087f9154664b4365",
+  "originHash" : "0f9c99a2ffb1b34b18b1e0d2481637bf545a9bd34157d6059a023748bd2e25a8",
   "pins" : [
     {
       "identity" : "appauth-ios",
@@ -78,8 +78,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/jsflax/lattice.git",
       "state" : {
-        "revision" : "270086a4ea5e6d87bc35cf4bdfae8c0d7a77e034",
-        "version" : "1.6.2"
+        "revision" : "d18f80408a0cb992cdc98ce616c9b28813e99bf7"
       }
     },
     {
@@ -87,8 +86,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/jsflax/LatticeCore.git",
       "state" : {
-        "revision" : "36b828864cbb1543e945898be31589f9c04d6384",
-        "version" : "1.4.2"
+        "revision" : "f8f72e97ae94d1e40b2a9663cb7d15df62c8ac2a",
+        "version" : "2.0.0"
       }
     },
     {
@@ -329,8 +328,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/modelcontextprotocol/swift-sdk.git",
       "state" : {
-        "revision" : "6132fd4b5b4217ce4717c4775e4607f5c3120129",
-        "version" : "0.12.0"
+        "revision" : "a2c3c188951448150fe34e8b9a5b17b3b00ca4ac",
+        "version" : "0.13.0"
       }
     },
     {

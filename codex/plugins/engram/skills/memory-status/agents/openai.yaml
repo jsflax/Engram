@@ -1,0 +1,9 @@
+interface:
+  display_name: "Engram Memory Status"
+  short_description: "Review memory counts and recent activity"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "memory"
+      description: "Engram memory MCP server"

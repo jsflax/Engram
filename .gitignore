@@ -1,11 +1,15 @@
 .build/
-.swiftpm/
+.swiftpm/*
+!.swiftpm/configuration/
+.swiftpm/configuration/*
+!.swiftpm/configuration/mirrors.json
 .claude/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
 .DS_Store
 .mcp.json
+!codex/plugins/engram/.mcp.json
 xcuserdata/
 *.xcuserstate
 adapter/.venv/

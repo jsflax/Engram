@@ -49,8 +49,15 @@ public enum AdviseAssembly {
     /// Wrap a rendered recall result as the advise "Relevant memories"
     /// section. `renderedRecall` is the recall text with `[by:]`/`[via:]`
     /// markers and foreign rows already fenced by the service.
-    public static func memorySection(renderedRecall: String) -> String {
-        "## Relevant memories\n\n\(renderedRecall)"
+    public static func memorySection(renderedRecall: String, query: String? = nil) -> String {
+        // JSON quoting keeps multiline prompts/headings inside one provenance value.
+        // Optional for compatibility with callers that did not record the actual query.
+        let provenance: String
+        if let query, let data = try? JSONEncoder().encode(query),
+           let quoted = String(data: data, encoding: .utf8) {
+            provenance = "## Memory recall query\n\n\(quoted)\n\n"
+        } else { provenance = "" }
+        return provenance + "## Relevant memories\n\n\(renderedRecall)"
     }
 
     /// Join advise sections in hook order with blank-line separation.

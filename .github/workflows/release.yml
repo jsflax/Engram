@@ -95,8 +95,8 @@ jobs:
           sleep 2
           curl -sSf -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip && echo "mirror serving OK"
           swift package config set-mirror \
-            --original-url https://github.com/sparkle-project/Sparkle/releases/download/2.8.1/Sparkle-for-Swift-Package-Manager.zip \
-            --mirror-url http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip
+            --original https://github.com/sparkle-project/Sparkle/releases/download/2.8.1/Sparkle-for-Swift-Package-Manager.zip \
+            --mirror http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip
           cat .swiftpm/configuration/mirrors.json
 
       # Resolution (dependency clones) — still isolated with a hard
@@ -130,7 +130,7 @@ jobs:
       - name: Run tests
         timeout-minutes: 30
         run: >
-          swift test --skip-build --filter "EngramTests|EngramRealityKitTests|PositionVersionTests"
+          swift test --skip-build --filter "EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests"
           --skip "PerfTests"
           --skip "keyBERTKeywordExtraction"
           --skip "recall_semanticRelevanceOrdering"
@@ -163,8 +163,26 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_codex*.py'
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -p 'test_codex*.py'
 
+      - name: Validate portable Codex plugin packaging
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_package_codex_plugin.py'
+
+      - name: Validate packaged Codex plugin hooks and learner
+        run: python3 -B Tests/codex_plugin/run_suite.py
+
       - name: Build CLI release binaries
         run: swift build -c release
+
+      - name: Verify real MCP lifecycle and database lock regressions
+        timeout-minutes: 10
+        run: |
+          mkdir -p build/mcp-test-home build/mcp-test-tmp
+          for regression in smoke startup recall idle; do
+            env HOME="$PWD/build/mcp-test-home" \
+              CFFIXED_USER_HOME="$PWD/build/mcp-test-home" \
+              TMPDIR="$PWD/build/mcp-test-tmp" \
+              python3 -B scripts/verify-mcp-locks.py \
+                --binary .build/release/Engram --case "$regression"
+          done
 
       - name: Import signing certificate
         if: env.DEVELOPER_ID_CERT_BASE64 != ''
@@ -250,6 +268,7 @@ jobs:
           cp -R .build/release/Engram_EngramKit.bundle "$CLI_DIR/"
           cp -R .build/release/swift-transformers_Hub.bundle "$CLI_DIR/"
           cp -R .build/release/SwiftLM_SwiftLM.bundle "$CLI_DIR/"
+          cp -R .build/release/swift-crypto_Crypto.bundle "$CLI_DIR/"
           cp agents/*.md "$AGENTS_DIR/"
           cp -R skills "$CLI_DIR/skills"
           bash scripts/package_codex_learner.sh "$CLI_DIR/codex"
@@ -300,10 +319,25 @@ jobs:
           cp -R .build/release/Engram_EngramKit.bundle build/staging/
           cp -R .build/release/swift-transformers_Hub.bundle build/staging/
           cp -R .build/release/SwiftLM_SwiftLM.bundle build/staging/
+          cp -R .build/release/swift-crypto_Crypto.bundle build/staging/
           cp agents/*.md build/staging/agents/
           cp -R skills build/staging/skills
           bash scripts/package_codex_learner.sh build/staging/codex
           cd build/staging && tar czf ../engram-macos-arm64.tar.gz *
+
+      - name: Package signed Codex plugin
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          python3 -B scripts/package_codex_plugin.py \
+            --plugin-source codex/plugins/engram \
+            --signed-cli-dir build/export/Engram.app/Contents/Resources/cli \
+            --version "${RELEASE_TAG#v}" --source-sha "$EXPECTED_SHA" \
+            --expected-team "$APPLE_TEAM_ID" \
+            --workflow-run "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output build/engram-codex-plugin-macos-arm64.tar.gz \
+            --manifest-output build/engram-codex-plugin-manifest.json
 
       - name: Create DMG
         if: env.DEVELOPER_ID_CERT_BASE64 != ''
@@ -390,9 +424,14 @@ jobs:
 
       - name: Recheck exact source and emit packaged release receipt
         run: |
+          # The checksum-preserving localhost Sparkle transport is build-local.
+          # Restore the committed SDK mirror configuration before source checks.
+          git restore --source="$EXPECTED_SHA" -- .swiftpm/configuration/mirrors.json
           python3 release-train/release_train.py candidate --version "${RELEASE_TAG#v}" --expected-sha "$EXPECTED_SHA" --output "$RUNNER_TEMP/candidate.json" --packaged
           python3 release-train/release_train.py workflow-receipt --candidate "$RUNNER_TEMP/candidate.json" --output "$RUNNER_TEMP/release-receipt.json" \
-            --artifact "cli=build/engram-macos-arm64.tar.gz" --artifact "dmg=build/Engram-${RELEASE_TAG#v}.dmg" --artifact "appcast=appcast.xml"
+            --artifact "cli=build/engram-macos-arm64.tar.gz" --artifact "dmg=build/Engram-${RELEASE_TAG#v}.dmg" --artifact "appcast=appcast.xml" \
+            --artifact "codex-plugin=build/engram-codex-plugin-macos-arm64.tar.gz" \
+            --artifact "codex-plugin-manifest=build/engram-codex-plugin-manifest.json"
       # Direct dispatch runs the existing native pipeline; it does not depend on
       # a GITHUB_TOKEN-created tag triggering a second workflow.
       - name: Create GitHub Release
@@ -404,6 +443,7 @@ jobs:
           # create is deliberately not an update/upsert of an existing release.
           gh release create "$RELEASE_TAG" build/engram-macos-arm64.tar.gz \
             "build/Engram-${RELEASE_TAG#v}.dmg" appcast.xml "$RUNNER_TEMP/release-receipt.json" \
+            build/engram-codex-plugin-macos-arm64.tar.gz build/engram-codex-plugin-manifest.json \
             --verify-tag --target "$EXPECTED_SHA" --title "Engram ${RELEASE_TAG#v}" \
             --notes-file /tmp/release-body.md "${FLAGS[@]}"
 

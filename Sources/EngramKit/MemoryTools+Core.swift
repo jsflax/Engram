@@ -725,7 +725,7 @@ extension MemoryTools {
             sessionLog("[recall] Bumping access stats (\(bumpTargets.count) memories)")
             let accessNow = Date()
             do {
-                try db.transaction {
+                try db.withTransaction {
                     for m in bumpTargets {
                         m.lastAccessedAt = accessNow
                         m.increment("accessCount")

@@ -1,0 +1,81 @@
+{
+  "source_repository": "Engram",
+  "source_revision": "0749cd0228a6bf7b680cc74169da3ab0aadc5ce2",
+  "license": {
+    "source": "LICENSE",
+    "copied_to": "LICENSE",
+    "sha256": "5d60c060e02a382454076d1c25e269c09e115ddb8de2ad65f44dede1fe2aea23",
+    "licensor": "Jason Flax",
+    "copyright": "2025-2026 Jason Flax",
+    "license_name": "Business Source License 1.1",
+    "change_date": "2030-02-28",
+    "change_license": "Apache License, Version 2.0"
+  },
+  "icon": {
+    "source": "Engram.icon/Assets/gen-adc9fd93-118c-4ac5-8d0f-adc816f57289.png",
+    "copied_to": "assets/engram.png",
+    "sha256": "39366eb8967596da88e9933be744f0c5ce4cb326053416545ca25ee6ed36fc0e",
+    "dimensions": [
+      768,
+      768
+    ],
+    "unchanged": true,
+    "source_reference": "Engram.icon/icon.json and Engram.xcodeproj/project.pbxproj include this app icon asset",
+    "last_source_commit": "f3c06ff",
+    "last_source_commit_date": "2026-02-22",
+    "reuse_direction": "Existing Engram application icon, unchanged."
+  },
+  "skills": [
+    {
+      "name": "remember",
+      "source": "skills/remember/SKILL.md",
+      "source_sha256": "5da2285e4bb3dfc81bbbe13deb54a4a602745e6583df840757b62f550dedb5cf",
+      "staged": "skills/remember/SKILL.md",
+      "adapted": true
+    },
+    {
+      "name": "recall",
+      "source": "skills/recall/SKILL.md",
+      "source_sha256": "1016dba20fb98c6a847a75790c6f014e2acf7d0702a4d238c1152a47ebdfec1a",
+      "staged": "skills/recall/SKILL.md",
+      "adapted": true
+    },
+    {
+      "name": "memory-status",
+      "source": "skills/memory-status/SKILL.md",
+      "source_sha256": "85b2b4c5efe944e5461a447d33fb0a3917e82e44e71ad4794bce4cb9c4a90502",
+      "staged": "skills/memory-status/SKILL.md",
+      "adapted": true
+    },
+    {
+      "name": "forget",
+      "source": "skills/forget/SKILL.md",
+      "source_sha256": "99f8959d7a4b3a691b0050e97ceb50756c49f3ef8a8c6fdc4f1db8d93f286d09",
+      "staged": "skills/forget/SKILL.md",
+      "adapted": true
+    },
+    {
+      "name": "session-learn",
+      "source": "skills/session-learn/SKILL.md",
+      "source_sha256": "fc48927a7a442a41bd5abdbde0dc92851f23a76ba2ae4bd0c9563dbdb78c3d1e",
+      "staged": "skills/session-learn/SKILL.md",
+      "adapted": true
+    },
+    {
+      "name": "maintenance",
+      "source": "skills/maintenance/SKILL.md",
+      "source_sha256": "c597e3109d5fc14599118faa521b5d8a2c738b31b07742f92766a0a63e2332a0",
+      "staged": "skills/maintenance/SKILL.md",
+      "adapted": true
+    }
+  ],
+  "adaptations": [
+    "Use Codex SKILL.md and agents/openai.yaml metadata with the memory MCP dependency.",
+    "Preserve explicit-only invocation for forget, session-learn, and maintenance; retain normal implicit discovery for remember, recall, and memory-status.",
+    "Replace Claude argument/context conventions; use mcp__memory__ tool names and UUID identifiers.",
+    "Choose memory projects by their subjects and established names, not working-directory basenames.",
+    "Keep operations within the user request without redundant confirmation for already explicit deletion intent."
+  ],
+  "integration_note": "This package contains Engram assets and skills plus Codex runtime adapters. Final native build and release provenance are recorded in the release manifest.",
+  "source_path_basis": "Paths are relative to the Engram source repository."
+}

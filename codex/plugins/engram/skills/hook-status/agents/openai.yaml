@@ -1,0 +1,3 @@
+interface:
+  display_name: "Engram Hook Status"
+  short_description: "Check advice and learner receipts for this task"

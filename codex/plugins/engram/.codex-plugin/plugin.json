@@ -1,0 +1,23 @@
+{
+  "name": "engram",
+  "version": "0.14.8",
+  "description": "Engram memory tools, skills, contextual advice, and session learning for Codex.",
+  "author": {
+    "name": "Engram"
+  },
+  "interface": {
+    "displayName": "Engram",
+    "shortDescription": "Memory, advice, and automatic learning for Codex.",
+    "longDescription": "Engram bundles its native Swift MCP server, memory skills, project advice, tool lifecycle hooks, and a bounded automatic session learner. Tasks enroll locally and learner providers run one at a time per laptop.",
+    "developerName": "Engram",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Check the advice and session learner hook receipts for this task.",
+    "composerIcon": "./assets/engram.png",
+    "logo": "./assets/engram.png",
+    "logoDark": "./assets/engram.png"
+  },
+  "skills": "./skills/",
+  "license": "BUSL-1.1",
+  "mcpServers": "./.mcp.json"
+}

@@ -1,0 +1,12 @@
+interface:
+  display_name: "Engram Forget"
+  short_description: "Remove the Engram memories you select"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "memory"
+      description: "Engram memory MCP server"
+
+policy:
+  allow_implicit_invocation: false

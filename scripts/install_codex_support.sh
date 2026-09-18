@@ -1,6 +1,9 @@
 #!/bin/bash
 # Shared by the shell installer and GUI updater. Optional Codex support must
-# never prevent Claude's existing installation from completing.
+# never prevent Claude's existing installation from completing. The delegated
+# installer skips all writes when an Engram plugin is configured, even disabled;
+# plugin-absent recipients retain the standalone setup. Explicit uninstall is
+# the owned-only legacy migration and preserves queue/cursor/runtime data.
 set -eu
 
 ACTION="${1:-install}"

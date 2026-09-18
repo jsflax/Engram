@@ -38,11 +38,14 @@ let package = Package(
         .library(name: "EngramRealityKit", targets: ["EngramRealityKit"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.12.0"),
-        // 1.6.2 floor (0.14.3): coherence — the hook's 2s busyTimeoutMs only
-        // bounds explicit BEGINs on a core with the begin_transaction fix,
-        // and the daemon's WAL self-defense assumes the keeper interlock.
-        .package(url: "https://github.com/jsflax/lattice.git", from: "1.6.2"),
+        // Preserve the Codex client-capability decoding fix in the owned SDK.
+        .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.0"),
+        // Release preparation only: this exact candidate contains checked
+        // transactions and the matching Core 2.0 / SDK 0.13 requirements.
+        // Replace with its qualified published version before release. The
+        // release policy rejects an unversioned Lattice dependency.
+        .package(url: "https://github.com/jsflax/lattice.git",
+                 revision: "d18f80408a0cb992cdc98ce616c9b28813e99bf7"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
