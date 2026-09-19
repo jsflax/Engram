@@ -399,6 +399,12 @@ await server.withMethodHandler(CallTool.self) { params in
         return try await tools.handle(params)
     } catch let error as MCPError {
         throw error // MCP errors are expected — let the server return them to the client
+    } catch let error as LatticeError {
+        log("Storage error handling tool '\(params.name)': \(error)")
+        return CallTool.Result(
+            content: [.text("Internal error: \(mcpLatticeErrorDescription(error))")],
+            isError: true
+        )
     } catch {
         log("Unexpected error handling tool '\(params.name)': \(error)")
         return CallTool.Result(
