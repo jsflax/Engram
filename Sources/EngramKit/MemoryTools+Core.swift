@@ -388,9 +388,27 @@ extension MemoryTools {
 
     // MARK: - recall
 
+    /// Capture provenance while rendering, never by parsing recalled content.
+    nonisolated static func appendRecallRowMarker(_ id: UUID, to output: inout String,
+                                                  rows: inout [RecallRowBoundary]) {
+        output += "[id:\(id.uuidString)] "
+        rows.append(RecallRowBoundary(id: id, markerEnd: output.count))
+    }
+
     func handleRecall(_ args: [String: Value]?) async throws -> CallTool.Result {
         lastRecallHits = []
         lastRecallMode = .vector
+        lastRecallRows = []
+        var recalledHits: [RecallHit] = []
+        var recalledMode: RecallMode = .vector
+        var renderedRows: [RecallRowBoundary] = []
+        // Keep capture local across embedding awaits, then publish it with
+        // this invocation's result, including empty/error returns.
+        defer {
+            lastRecallHits = recalledHits
+            lastRecallMode = recalledMode
+            lastRecallRows = renderedRows
+        }
         let a = try args.decode(RecallArgs.self)
         guard !a.query.isEmpty else {
             throw MCPError.invalidParams("'query' is required")
@@ -556,7 +574,7 @@ extension MemoryTools {
             // access-stat bump — the bump's writes invalidate the row caches,
             // so a post-bump read would re-issue one SELECT per field.
             // Traversal hits append below.
-            lastRecallHits = filtered.compactMap { hit in
+            recalledHits = filtered.compactMap { hit in
                 guard hit.object.globalId != nil else { return nil }
                 return RecallHit(memory: record(from: hit.object),
                                  distance: hit.distance,
@@ -583,7 +601,7 @@ extension MemoryTools {
                 return isHubResident(gid)
             }
 
-            let lines = filtered.compactMap { match -> String? in
+            let lines = filtered.compactMap { match -> (id: UUID, body: String)? in
                 let m = match.object
                 guard let mGid = m.globalId else { return nil }
                 let dist = String(format: "%.3f", match.distance)
@@ -609,15 +627,20 @@ extension MemoryTools {
                 // escape-hardened indentation fence.
                 let body = (isForeign && fenceForeignContent)
                     ? Self.fencedForeignContent(m.content) : m.content
-                return "[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)]\(badge)\(via) (distance: \(dist)\(impInfo)\(expires)\(created)) \(body)"
+                return (mGid, "[\(m.project)/\(m.topic)]\(badge)\(via) (distance: \(dist)\(impInfo)\(expires)\(created)) \(body)")
             }
 
-            var output = lines.joined(separator: "\n\n")
+            var output = ""
 
             // Knowledge gap detection — signal when recall results are weak
             let avgDistance = filtered.map(\.distance).reduce(0, +) / Double(max(filtered.count, 1))
             if avgDistance > 1.05 {  // v2: relevant query→memory hits measure 0.86–1.05; beyond = weak
-                output = "⚠️ Weak recall (avg distance: \(String(format: "%.3f", avgDistance)), count: \(filtered.count)). Results may not be closely related to the query.\n\n" + output
+                output = "⚠️ Weak recall (avg distance: \(String(format: "%.3f", avgDistance)), count: \(filtered.count)). Results may not be closely related to the query.\n\n"
+            }
+            for (index, line) in lines.enumerated() {
+                if index > 0 { output += "\n\n" }
+                Self.appendRecallRowMarker(line.id, to: &output, rows: &renderedRows)
+                output += line.body
             }
 
             log("[recall] Output formatted, \(lines.count) lines")
@@ -679,7 +702,7 @@ extension MemoryTools {
                     for mem in connected {
                         let m = mem.memory
                         guard let memGlobalId = m.globalId else { continue }
-                        lastRecallHits.append(RecallHit(memory: record(from: m),
+                        recalledHits.append(RecallHit(memory: record(from: m),
                                                         distance: 0,
                                                         depth: mem.depth,
                                                         isForeign: isForeignAuthored(m)))
@@ -699,17 +722,19 @@ extension MemoryTools {
                             ? " [by:\(GroupDirectory.badgeName(for: m.authorUserId))]" : ""
                         let connVia = viaMarker(for: memGlobalId)
                         // Small memories shown in full; large ones get a compact preview
+                        output += "\n\n"
+                        Self.appendRecallRowMarker(memGlobalId, to: &output, rows: &renderedRows)
                         if isForeignAuthored(m) && fenceForeignContent {
-                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)]\(connBadge)\(connVia)\(expires)\(edgeInfo) \(Self.fencedForeignContent(m.content))"
+                            output += "[\(m.project)/\(m.topic)]\(connBadge)\(connVia)\(expires)\(edgeInfo) \(Self.fencedForeignContent(m.content))"
                         } else if m.content.count <= 500 {
-                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)]\(connBadge)\(connVia)\(expires)\(edgeInfo) \(m.content)"
+                            output += "[\(m.project)/\(m.topic)]\(connBadge)\(connVia)\(expires)\(edgeInfo) \(m.content)"
                         } else {
                             let firstLine = m.content.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? m.content
                             let preview = String(firstLine.prefix(120))
                             let charCount = m.content.count
                             let sectionCount = m.content.components(separatedBy: "\n").filter { $0.hasPrefix("## ") || $0.hasPrefix("### ") }.count
                             let sizeInfo = sectionCount > 0 ? "\(sectionCount) sections, \(charCount) chars" : "\(charCount) chars"
-                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)]\(connBadge)\(connVia) (\(sizeInfo)\(expires))\(edgeInfo) \(preview)\(charCount > 120 ? "..." : "")"
+                            output += "[\(m.project)/\(m.topic)]\(connBadge)\(connVia) (\(sizeInfo)\(expires))\(edgeInfo) \(preview)\(charCount > 120 ? "..." : "")"
                         }
                     }
                 }
@@ -740,7 +765,7 @@ extension MemoryTools {
             sessionLog("[recall] DONE, returning \(output.count) chars")
             return CallTool.Result(content: [.text(output)], isError: false)
         } else {
-            lastRecallMode = .fullText
+            recalledMode = .fullText
             log("[recall] No embedding available, falling back to FTS5")
             // Degraded mode: FTS5 full-text search (no embedding model loaded)
             let contentWords = Self.extractContentWords(from: query)
@@ -763,7 +788,7 @@ extension MemoryTools {
             }
             let ftsResults = results.matching(ftsQuery, on: \.content, limit: limit)
 
-            var lines: [String] = []
+            var output = ""
             for match in ftsResults {
                 let m = match.object
                 m.materialize()  // hydrated by the FTS query — format for free
@@ -773,7 +798,7 @@ extension MemoryTools {
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
                 let created = hasTemporalFilter ? ", created: \(Self.dateFormatter.string(from: m.createdAt))" : ""
                 guard let mGid = m.globalId else { continue }
-                lastRecallHits.append(RecallHit(memory: record(from: m),
+                recalledHits.append(RecallHit(memory: record(from: m),
                                                 distance: 0,
                                                 depth: 0,
                                                 isForeign: isForeign))
@@ -782,12 +807,14 @@ extension MemoryTools {
                 let via = viaMarker(for: mGid)
                 let body = (isForeign && fenceForeignContent)
                     ? Self.fencedForeignContent(m.content) : m.content
-                lines.append("[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)]\(badge)\(via)\(ftsInfo)\(expires)\(created) \(body)")
+                if !output.isEmpty { output += "\n\n" }
+                Self.appendRecallRowMarker(mGid, to: &output, rows: &renderedRows)
+                output += "[\(m.project)/\(m.topic)]\(badge)\(via)\(ftsInfo)\(expires)\(created) \(body)"
             }
-            if lines.isEmpty {
+            if output.isEmpty {
                 return CallTool.Result(content: [.text("No memories found.")], isError: false)
             }
-            return CallTool.Result(content: [.text(lines.joined(separator: "\n\n"))], isError: false)
+            return CallTool.Result(content: [.text(output)], isError: false)
         }
     }
 

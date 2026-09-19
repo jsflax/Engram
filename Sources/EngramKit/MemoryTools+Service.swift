@@ -25,6 +25,12 @@ extension MemoryTools: MemoryService {
     // MARK: Core reads
 
     public func recall(_ request: RecallRequest) async throws -> RecallResult {
+        let captured = try await recallWithRows(request)
+        return captured.result
+    }
+
+    private func recallWithRows(_ request: RecallRequest) async throws
+        -> (result: RecallResult, rows: [RecallRowBoundary]) {
         var args: [String: Value] = [
             "query": .string(request.query),
             "depth": .int(request.depth),
@@ -32,9 +38,11 @@ extension MemoryTools: MemoryService {
         ]
         if let project = request.project { args["project"] = .string(project) }
         let result = try await handleRecall(args)
-        return RecallResult(hits: lastRecallHits,
-                            mode: lastRecallMode,
-                            renderedText: Self.text(from: result))
+        // Snapshot both captures together before returning across another
+        // await; advice must never consult a later call's actor state.
+        return (RecallResult(hits: lastRecallHits,
+                             mode: lastRecallMode,
+                             renderedText: Self.text(from: result)), lastRecallRows)
     }
 
     public func advise(_ request: AdviseRequest) async throws -> AdviseResult {
@@ -44,19 +52,42 @@ extension MemoryTools: MemoryService {
         // analytics loop is the tuner (plan §advise).
         let words = MemoryTools.extractContentWords(from: request.prompt)
         let query = words.isEmpty ? request.prompt : words.joined(separator: " ")
-        let recallResult = try await recall(RecallRequest(
+        let captured = try await recallWithRows(RecallRequest(
             query: query, project: request.project, depth: 1, limit: 5))
+        return Self.boundedAdvice(captured.result, rows: captured.rows,
+                                  query: query, budget: request.budget)
+    }
+
+    /// Keep the exact query provenance and already-fenced recall prefix inside
+    /// the overall block budget. Partial or omitted row IDs are not feedback.
+    nonisolated static func boundedAdvice(_ recallResult: RecallResult,
+                                         rows: [RecallRowBoundary],
+                                         query: String, budget: Int) -> AdviseResult {
         guard !recallResult.hits.isEmpty,
               recallResult.renderedText != "No memories found." else {
             return AdviseResult(block: nil, memoryIds: [], mode: recallResult.mode)
         }
+        let budget = max(0, budget)
+        let overhead = AdviseAssembly.memorySection(renderedRecall: "", query: query).count
+        guard budget > overhead else {
+            return AdviseResult(block: nil, memoryIds: [], mode: recallResult.mode)
+        }
+        let available = budget - overhead
         var rendered = recallResult.renderedText
-        if rendered.count > request.budget {
-            rendered = String(rendered.prefix(request.budget)) + "\n… (truncated)"
+        var retainedCharacters = rendered.count
+        if rendered.count > available {
+            let suffix = "\n… (truncated)"
+            let retained = String(rendered.prefix(max(0, available - suffix.count)))
+            retainedCharacters = retained.count
+            rendered = retained + String(suffix.prefix(available))
+        }
+        let visibleIds = rows.filter { $0.markerEnd <= retainedCharacters }.map(\.id)
+        guard !visibleIds.isEmpty else {
+            return AdviseResult(block: nil, memoryIds: [], mode: recallResult.mode)
         }
         return AdviseResult(
             block: AdviseAssembly.memorySection(renderedRecall: rendered, query: query),
-            memoryIds: recallResult.hits.map(\.memory.id),
+            memoryIds: visibleIds,
             mode: recallResult.mode)
     }
 

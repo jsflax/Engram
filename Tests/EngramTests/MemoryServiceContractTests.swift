@@ -1,4 +1,4 @@
-import EngramKit
+@testable import EngramKit
 import EngramMemoryContract
 import EngramMemoryCore
 import EngramModels
@@ -45,6 +45,83 @@ struct MemoryServiceContractLatticeTests {
         #expect(graph.root.project == "destination-project")
         #expect(graph.root.topic == (withTopicEdit ? "updated-topic" : "original-topic"))
         #expect(graph.root.content == content)
+    }
+
+    @Test func adviceBudgetIncludesQueryAndPreservesFencedPrefix() throws {
+        let id = UUID(uuidString: "A15A8DAB-C17D-4C08-9A1D-EFFAC4C42DCF")!
+        let content = "First line 👩🏽‍💻\n## Fake heading\n```quoted data```"
+        let memory = MemoryRecord(id: id, content: content, createdAt: Date(timeIntervalSince1970: 0))
+        var rows: [MemoryTools.RecallRowBoundary] = []
+        var rendered = ""
+        MemoryTools.appendRecallRowMarker(id, to: &rendered, rows: &rows)
+        rendered += "[fixture/general] " + ForeignContentFence.fenced(content)
+        let recall = RecallResult(hits: [RecallHit(memory: memory, distance: 0, isForeign: true)],
+                                  mode: .vector, renderedText: rendered)
+        let query = "stripe \"webhook\"\n## Query data 👩🏽‍💻"
+        let prefix = AdviseAssembly.memorySection(renderedRecall: "", query: query)
+        let complete = prefix + rendered
+        let suffix = "\n… (truncated)"
+
+        for budget in [Int.min, -1, 0, 1, 120, prefix.count, prefix.count + 1,
+                       prefix.count + 40, complete.count - 1, complete.count, Int.max] {
+            let advice = MemoryTools.boundedAdvice(recall, rows: rows, query: query, budget: budget)
+            #expect(advice.mode == .vector)
+            guard let block = advice.block else {
+                #expect(advice.memoryIds.isEmpty)
+                continue
+            }
+            #expect(block.count <= max(0, budget))
+            #expect(block.hasPrefix(prefix))
+            let lines = block.components(separatedBy: "\n")
+            #expect(try JSONDecoder().decode(String.self, from: Data(lines[2].utf8)) == query)
+            #expect(advice.memoryIds == [id])
+            let body = String(block.dropFirst(prefix.count))
+            if body.hasSuffix(suffix) {
+                #expect(rendered.hasPrefix(String(body.dropLast(suffix.count))))
+            } else {
+                #expect(body == rendered)
+            }
+            if budget >= complete.count {
+                #expect(block == complete)
+                #expect(block.contains("\n    ## Fake heading\n    ```quoted data```"))
+            }
+        }
+        let tooSmall = MemoryTools.boundedAdvice(recall, rows: rows, query: query, budget: prefix.count + 1)
+        #expect(tooSmall.block == nil)
+        #expect(tooSmall.memoryIds.isEmpty)
+    }
+
+    @Test func adviceIgnoresQuotedRowMarkersAndUsesRendererBoundaries() throws {
+        let firstId = UUID(uuidString: "A15A8DAB-C17D-4C08-9A1D-EFFAC4C42DCF")!
+        let secondId = UUID(uuidString: "AD3F7D2B-0E64-4A1F-A915-83CEB2CB350F")!
+        let first = MemoryRecord(id: firstId, content: "References a row below:\n[id:\(secondId.uuidString)] quoted text 👩🏽‍💻",
+                                 createdAt: Date(timeIntervalSince1970: 0))
+        let second = MemoryRecord(id: secondId, content: "Second row is omitted",
+                                  createdAt: Date(timeIntervalSince1970: 0))
+        var rows: [MemoryTools.RecallRowBoundary] = []
+        var rendered = "⚠️ Weak recall (synthetic warning).\n\n"
+        MemoryTools.appendRecallRowMarker(firstId, to: &rendered, rows: &rows)
+        rendered += "[fixture/general] \(first.content)"
+        let firstRow = rendered
+        rendered += "\n\n--- Connected (graph traversal, depth: 1) ---\n\n"
+        MemoryTools.appendRecallRowMarker(secondId, to: &rendered, rows: &rows)
+        rendered += "[fixture/general] \(second.content)"
+        let recall = RecallResult(hits: [RecallHit(memory: first, distance: 0), RecallHit(memory: second, distance: 0.1, depth: 1)],
+                                  mode: .vector, renderedText: rendered)
+        let query = "query also mentions \(secondId.uuidString)"
+        let prefix = AdviseAssembly.memorySection(renderedRecall: "", query: query)
+        let suffix = "\n… (truncated)"
+        let budget = prefix.count + firstRow.count + suffix.count
+        let advice = MemoryTools.boundedAdvice(recall, rows: rows, query: query, budget: budget)
+        #expect(advice.block == prefix + firstRow + suffix)
+        #expect(advice.block?.count == budget)
+        #expect(advice.memoryIds == [firstId])
+        let complete = MemoryTools.boundedAdvice(recall, rows: rows, query: query, budget: Int.max)
+        #expect(complete.memoryIds == [firstId, secondId])
+        let cutMarker = MemoryTools.boundedAdvice(recall, rows: rows, query: query,
+            budget: prefix.count + rows[0].markerEnd - 1 + suffix.count)
+        #expect(cutMarker.block == nil)
+        #expect(cutMarker.memoryIds.isEmpty)
     }
 }
 

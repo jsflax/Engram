@@ -19,6 +19,8 @@ All notable changes to Engram are documented in this file.
   failure is reported instead of continuing after a failed transaction start.
 - Include the actual advice query as JSON-quoted provenance, preventing a
   multiline query from introducing extra result headings.
+- Keep advice within its overall character budget, including query provenance,
+  headings, and truncation markers, and report only memory IDs retained in it.
 - Persist project changes made through the typed Swift memory service, including
   project-only updates and updates that also edit a topic.
 - Preserve plugin-owned Codex configuration during native app/CLI installation;
