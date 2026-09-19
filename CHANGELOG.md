@@ -21,6 +21,8 @@ All notable changes to Engram are documented in this file.
   multiline query from introducing extra result headings.
 - Keep advice within its overall character budget, including query provenance,
   headings, and truncation markers, and report only memory IDs retained in it.
+- Report database lock failures and other storage error categories through MCP
+  without exposing internal SQL, file paths, or memory contents.
 - Persist project changes made through the typed Swift memory service, including
   project-only updates and updates that also edit a topic.
 - Preserve plugin-owned Codex configuration during native app/CLI installation;
