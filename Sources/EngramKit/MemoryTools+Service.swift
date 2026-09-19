@@ -106,7 +106,7 @@ extension MemoryTools: MemoryService {
         if let v = request.find { args["find"] = .string(v) }
         if let v = request.replace { args["replace"] = .string(v) }
         if let v = request.topic { args["topic"] = .string(v) }
-        if let v = request.project { args["project"] = .string(v) }
+        if let v = request.project { args["set_project"] = .string(v) }
         if let v = request.importance { args["importance"] = .int(v) }
         if let v = request.expiresInDays { args["expires_in_days"] = .int(v) }
         if let v = request.isPrivate { args["is_private"] = .bool(v) }

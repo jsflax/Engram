@@ -19,6 +19,8 @@ All notable changes to Engram are documented in this file.
   failure is reported instead of continuing after a failed transaction start.
 - Include the actual advice query as JSON-quoted provenance, preventing a
   multiline query from introducing extra result headings.
+- Persist project changes made through the typed Swift memory service, including
+  project-only updates and updates that also edit a topic.
 - Preserve plugin-owned Codex configuration during native app/CLI installation;
   the updated standalone learner declines automatic hooks when Engram is
   configured as a plugin. Existing standalone installations have an explicit,
@@ -43,9 +45,11 @@ All notable changes to Engram are documented in this file.
   release receipt. Deployment state, private paths, and credentials are excluded.
 
 ### Dependencies
-- Adopt published Lattice 2.0.0 and LatticeCore 2.0.4, including checked
-  transactions, reader-lifetime fixes, and observer/relay corrections. Rebuild
-  models and native bridges together; audit retention remains disabled by default.
+- Adopt published Lattice 2.0.0 and LatticeCore 2.0.5, including checked
+  transactions, reader-lifetime fixes, observer/relay corrections, and scheduler-aware
+  transport ownership. Rebuild Core, models, native bridges, and transport factories
+  together for the C++ factory interface change; audit retention remains disabled
+  by default.
 - Preserve the owned MCP SDK 0.13.0 capability-decoding fix. No unreleased
   batch/projection APIs or performance speedup claims are included.
 
