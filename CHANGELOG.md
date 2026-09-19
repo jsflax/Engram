@@ -6,7 +6,7 @@ All notable changes to Engram are documented in this file.
 
 ## [Unreleased]
 
-## [0.14.8] - Unreleased
+## [0.14.8] - 2026-09-19
 
 ### Fixed
 - Compile graph exclusion checks under Swift 6.4 without moving actor-isolated
