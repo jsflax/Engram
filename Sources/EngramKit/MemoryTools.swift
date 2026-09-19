@@ -78,6 +78,12 @@ public actor MemoryTools {
     /// write and the read, so an interleaved recall cannot cross-wire it.
     var lastRecallHits: [RecallHit] = []
     var lastRecallMode: RecallMode = .vector
+    struct RecallRowBoundary: Sendable {
+        let id: UUID
+        /// Character offset immediately after the renderer-owned row marker.
+        let markerEnd: Int
+    }
+    var lastRecallRows: [RecallRowBoundary] = []
 
     /// The globalId of the last remembered row — same capture contract.
     var lastRememberedId: UUID?

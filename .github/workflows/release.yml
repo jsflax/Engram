@@ -128,8 +128,13 @@ jobs:
       # tension recall assertions from the revival. ~345 correctness tests
       # remain as the release bar.
       - name: Run tests
-        timeout-minutes: 30
+        id: native_tests
+        # Keep the full 30-minute test budget, plus bounded diagnostics/cleanup.
+        timeout-minutes: 32
         run: >
+          python3 -B scripts/run_native_tests.py
+          --diagnostics-dir build/native-test-diagnostics
+          --timeout-seconds 1800 --silence-seconds 300 --
           swift test --force-resolved-versions --skip-build --filter "EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests"
           --skip "PerfTests"
           --skip "keyBERTKeywordExtraction"
@@ -138,6 +143,15 @@ jobs:
           --skip "recall_graphTraversal_relatesToDoesNotLeakViaUnrelatedStructuralEdge"
           --skip "recall_statementBudget"
           --skip "clusters_statementBudget"
+
+      - name: Upload native test diagnostics
+        if: ${{ (failure() || cancelled()) && steps.native_tests.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-test-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/native-test-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
 
       # Statement-budget regressions read the process-global SQL statement
       # counter; suites running in parallel pollute every measurement window

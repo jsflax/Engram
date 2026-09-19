@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -51,6 +52,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_release_and_linux_commands_enforce_locks_and_xcode_version(self):
         with tempfile.TemporaryDirectory(prefix='engram-workflow-') as temporary:
             root = Path(temporary)
+            (root / 'scripts').mkdir()
+            shutil.copyfile(ROOT / 'scripts/run_native_tests.py',
+                            root / 'scripts/run_native_tests.py')
             bin_dir = root / 'bin'
             bin_dir.mkdir()
             log = root / 'calls.jsonl'
@@ -95,6 +99,15 @@ with open(os.environ['CALL_LOG'],'a') as output:
             self.assertEqual(len(tests), 3)
             self.assertTrue(any('recall_statementBudget' in call for call in tests))
             self.assertTrue(any('clusters_statementBudget' in call for call in tests))
+            self.assertEqual(tests[0], [
+                'swift', 'test', '--force-resolved-versions', '--skip-build', '--filter',
+                'EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests',
+                '--skip', 'PerfTests', '--skip', 'keyBERTKeywordExtraction',
+                '--skip', 'recall_semanticRelevanceOrdering',
+                '--skip', 'recall_connectedMemory_showsEdgeRelation',
+                '--skip', 'recall_graphTraversal_relatesToDoesNotLeakViaUnrelatedStructuralEdge',
+                '--skip', 'recall_statementBudget', '--skip', 'clusters_statementBudget',
+            ])
 
     def test_native_mcp_gate_includes_persistence_and_existing_cases(self):
         body = run_block('release.yml', 'Verify real MCP lifecycle and database lock regressions')
