@@ -40,7 +40,7 @@ else
     echo "Downloading latest release..."
     DOWNLOAD_URL=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest" \
         | grep '"browser_download_url"' \
-        | grep 'arm64' \
+        | grep -F '/engram-macos-arm64.tar.gz"' \
         | head -1 \
         | cut -d'"' -f4)
 

@@ -3,9 +3,30 @@ import Lattice
 import MCP
 import Foundation
 
+// Keep MCP framing separate from process-wide stdout. Native model libraries
+// can emit diagnostics with printf, including from background loading threads.
+// Reserve the original stdout pipe before explicit startup initialization, then route
+// ordinary stdout to stderr. Only StdioTransport receives the reserved descriptor.
+let mcpOutputDescriptor = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3)
+guard mcpOutputDescriptor >= 0,
+      dup2(STDERR_FILENO, STDOUT_FILENO) >= 0 else {
+    if mcpOutputDescriptor >= 0 { close(mcpOutputDescriptor) }
+    let diagnostic = Array("Engram: unable to isolate MCP output\n".utf8)
+    diagnostic.withUnsafeBytes { bytes in
+        _ = write(STDERR_FILENO, bytes.baseAddress, bytes.count)
+    }
+    exit(1)
+}
+defer { close(mcpOutputDescriptor) }
+
 // MARK: - Crash Reporter
 
 CrashReporter.shared.install()
+
+// SIGTERM/SIGINT must work even when every thread is wedged inside SQLite —
+// _exit is async-signal-safe and drops all locks/WAL read marks with the fds.
+signal(SIGTERM) { _ in _exit(0) }
+signal(SIGINT) { _ in _exit(0) }
 
 // MARK: - Configuration
 
@@ -39,10 +60,40 @@ default: Lattice.setLogLevel(.error)
 let logSuffix = ProcessInfo.processInfo.environment["CLAUDE_SESSION_ID"] ?? "\(ProcessInfo.processInfo.processIdentifier)"
 Lattice.setLogFile(URL(fileURLWithPath: NSHomeDirectory() + "/.claude/memory-logs/lattice-mcp-\(logSuffix).log"))
 log("Lattice log suffix: \(logSuffix) (session=\(ProcessInfo.processInfo.environment["CLAUDE_SESSION_ID"] ?? "nil"), pid=\(ProcessInfo.processInfo.processIdentifier))")
+// Lifecycle watchdog on a dedicated thread: the async EOF reader and a
+// cooperative-pool Task both starve when blocking SQLite calls occupy the
+// pool (Aug 2026 WAL incident: servers outlived their session by weeks).
+// poll(2) with events=0 observes stdin peer-close without consuming bytes
+// the MCP transport needs. Started before the first database open so even
+// a wedged open cannot outlive the session.
+let lifecycleWatchdog = Thread {
+    var fds = pollfd(fd: 0, events: 0, revents: 0)
+    while true {
+        fds.revents = 0
+        _ = poll(&fds, 1, 5000)
+        if fds.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 {
+            log("EXIT: stdin peer closed (session ended)")
+            exit(0)
+        }
+        if getppid() == 1 {
+            log("EXIT: Orphaned (ppid=1)")
+            exit(0)
+        }
+    }
+}
+lifecycleWatchdog.name = "lifecycle-watchdog"
+lifecycleWatchdog.start()
+
+// Worst-case summed open-time lock waits (hub + synced + spokes) must stay
+// far below the client's 30 s MCP handshake timeout — a locked hub has to
+// fail fast and visibly, not eat the whole handshake window.
+let mcpBusyTimeoutMs = 2_000
+
 let localLattice: Lattice
 
 do {
-    let localConfig: Lattice.Configuration = .init(fileURL: URL(fileURLWithPath: dbPath), migration: engramMigrations)
+    var localConfig: Lattice.Configuration = .init(fileURL: URL(fileURLWithPath: dbPath), migration: engramMigrations)
+    localConfig.busyTimeoutMs = mcpBusyTimeoutMs
     localLattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self, SyncConfig.self, configuration: localConfig)
     log("Database at \(dbPath)")
 } catch {
@@ -61,10 +112,11 @@ let syncedLattice: Lattice?
 let claudeDir = (dbPath as NSString).deletingLastPathComponent
 let syncedDbPath = SyncService.syncedDbPath(claudeDir: claudeDir)
 if FileManager.default.fileExists(atPath: syncedDbPath) {
-    let syncedConfig: Lattice.Configuration = .init(
+    var syncedConfig: Lattice.Configuration = .init(
         fileURL: URL(fileURLWithPath: syncedDbPath),
         migration: engramMigrations
     )
+    syncedConfig.busyTimeoutMs = mcpBusyTimeoutMs
     syncedLattice = try? Lattice(
         Memory.self, Edge.self, SyncConfig.self,
         configuration: syncedConfig
@@ -87,10 +139,12 @@ if FileManager.default.fileExists(atPath: syncedDbPath) {
 // per-read stat() guard picks up. Plain opens: no WSS, no IPC.
 var groupRefs: [MemoryTools.GroupSpokeRef] = []
 for spoke in SyncService.discoverGroupSpokes(claudeDir: claudeDir) {
+    var spokeConfig: Lattice.Configuration = .init(fileURL: URL(fileURLWithPath: spoke.path),
+                                                   migration: engramMigrations)
+    spokeConfig.busyTimeoutMs = mcpBusyTimeoutMs
     guard let lattice = try? Lattice(
         Memory.self, Edge.self, GroupProjectMap.self,
-        configuration: .init(fileURL: URL(fileURLWithPath: spoke.path),
-                             migration: engramMigrations)
+        configuration: spokeConfig
     ) else {
         log("Failed to open group spoke at \(spoke.path)")
         continue
@@ -354,7 +408,7 @@ await server.withMethodHandler(CallTool.self) { params in
     }
 }
 
-let transport = StdioTransport()
+let transport = StdioTransport(output: .init(rawValue: mcpOutputDescriptor))
 do {
     try await server.start(transport: transport)
     log("Server started")
@@ -363,20 +417,10 @@ do {
     exit(1)
 }
 
-// Exit if orphaned (parent died, ppid becomes 1).
-// Blocking SQLite calls can prevent the stdin EOF reader from running,
-// so this is a safety net to avoid zombie processes.
-Task.detached {
-    while true {
-        try await Task.sleep(for: .seconds(5))
-        if getppid() == 1 {
-            log("EXIT: Orphaned (ppid=1)")
-            exit(0)
-        }
-    }
-}
+// Lifecycle exits are handled by the dedicated watchdog thread started
+// before the first database open (top of file) — a cooperative-pool Task
+// here would starve under blocking SQLite calls.
 
 // Keep alive
 await server.waitUntilCompleted()
 log("EXIT: Transport completed (stdin closed)")
-

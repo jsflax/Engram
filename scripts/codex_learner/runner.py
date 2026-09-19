@@ -110,6 +110,26 @@ def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser().resolve()
 
 
+def automatic_hooks_allowed() -> bool:
+    """A configured Engram plugin replaces legacy automatic hooks, even paused.
+
+    Unreadable/invalid policy declines automatic work. Explicit enqueue/retry
+    remain operator actions; no pending work or cursor is adopted or removed.
+    """
+    path = codex_home() / "config.toml"
+    try:
+        if path.is_symlink():
+            return False
+        config = tomllib.loads(path.read_text())
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        return False
+    plugins = config.get("plugins", {})
+    return isinstance(plugins, dict) and not any(
+        name.partition("@")[0] in {"engram", "engram-hooks"} for name in plugins)
+
+
 def validate_request(payload: dict, root: Path) -> dict:
     event = payload.get("hook_event_name")
     if event not in EVENTS:
@@ -575,6 +595,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     root = args.state_dir.expanduser().resolve()
     if args.command == "hook":
+        if not automatic_hooks_allowed():
+            print("{}")
+            return 0
         try:
             payload = json.loads(sys.stdin.buffer.read(1024 * 1024))
             enqueue(root, payload)

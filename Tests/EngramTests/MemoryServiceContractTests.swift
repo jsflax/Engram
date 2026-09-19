@@ -20,6 +20,32 @@ struct MemoryServiceContractLatticeTests {
         }
         #expect(violations.isEmpty)
     }
+
+    @Test(arguments: [false, true])
+    func projectUpdatePersistsThroughTypedService(withTopicEdit: Bool) async throws {
+        let harness = LatticeContractHarness()
+        let service = try await harness.makeService(
+            principal: .anonymous, embedding: .deterministic, fencing: false)
+        let content = "Project move fixture: obsidian falcon riverbed"
+        let stored = try await service.remember(RememberRequest(
+            content: content, topic: "original-topic", project: "original-project"))
+
+        // Project-only updates must be accepted. With another edit present,
+        // a successful response must not silently drop the project change.
+        let reply = try await service.update(UpdateRequest(
+            id: stored.id, topic: withTopicEdit ? "updated-topic" : nil,
+            project: "destination-project"))
+        #expect(!reply.isError)
+
+        let peer = try await harness.makePeer(
+            of: service, principal: .anonymous, embedding: .deterministic, fencing: false)
+        let reader = try #require(peer)
+        let graph = try await reader.graph(GraphRequest(id: stored.id, depth: 0))
+        #expect(graph.root.id == stored.id)
+        #expect(graph.root.project == "destination-project")
+        #expect(graph.root.topic == (withTopicEdit ? "updated-topic" : "original-topic"))
+        #expect(graph.root.content == content)
+    }
 }
 
 /// Builds `MemoryTools` over throwaway sqlite files. Peers share the

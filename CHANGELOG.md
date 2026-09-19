@@ -6,6 +6,53 @@ All notable changes to Engram are documented in this file.
 
 ## [Unreleased]
 
+## [0.14.8] - 2026-09-19
+
+### Fixed
+- Compile graph exclusion checks under Swift 6.4 without moving actor-isolated
+  models into a Boolean autoclosure.
+- Isolate MCP protocol output from native library diagnostics and accept the
+  structured experimental capabilities sent by Codex clients.
+- Bound MCP database-open lock waits and exit when the client closes its input,
+  even when blocking database calls occupy the cooperative thread pool.
+- Use checked transactions for best-effort recall statistics so a storage
+  failure is reported instead of continuing after a failed transaction start.
+- Include the actual advice query as JSON-quoted provenance, preventing a
+  multiline query from introducing extra result headings.
+- Persist project changes made through the typed Swift memory service, including
+  project-only updates and updates that also edit a topic.
+- Preserve plugin-owned Codex configuration during native app/CLI installation;
+  the updated standalone learner declines automatic hooks when Engram is
+  configured as a plugin. Existing standalone installations have an explicit,
+  ownership-aware migration that preserves their state.
+
+- Report busy, partial, and failed maintenance outcomes instead of claiming that
+  vacuum or WAL checkpointing always succeeded.
+- Select the CLI download by its exact archive name when the release also
+  contains a Codex plugin archive.
+- Apply the owned MCP SDK mirror to Xcode as well as SwiftPM, and require the
+  committed dependency versions throughout release builds.
+
+### Added
+- Package **Engram for Codex** alongside the native app and CLI: signed native
+  memory MCP, seven skills, the app icon, and nine lifecycle/tool hook events.
+- Automatically enroll tasks at their observed transcript boundary, serialize
+  bounded session learners per host, preserve child boundaries and cursors, and
+  hold uncertain writes for reconciliation instead of replaying them.
+- Resolve plugin policies by the installed marketplace identity, including team
+  marketplaces, while respecting explicit disables and custom memory servers.
+- Publish a deterministic plugin archive and file manifest tied to the native
+  release receipt. Deployment state, private paths, and credentials are excluded.
+
+### Dependencies
+- Adopt published Lattice 2.0.0 and LatticeCore 2.0.5, including checked
+  transactions, reader-lifetime fixes, observer/relay corrections, and scheduler-aware
+  transport ownership. Rebuild Core, models, native bridges, and transport factories
+  together for the C++ factory interface change; audit retention remains disabled
+  by default.
+- Preserve the owned MCP SDK 0.13.0 capability-decoding fix. No unreleased
+  batch/projection APIs or performance speedup claims are included.
+
 ## [0.14.7] - 2026-09-09
 
 ### Added

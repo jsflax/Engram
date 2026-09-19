@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import dataclasses
 import contextlib
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -81,6 +82,52 @@ class RunnerTests(unittest.TestCase):
 
     def payload(self, **extra):
         return {"hook_event_name": "Stop", "session_id": self.sid, "transcript_path": str(self.path), **extra}
+
+    def test_plugin_registration_declines_automatic_hook_before_input_or_queue(self):
+        for name in ("engram@personal", "engram-hooks@team"):
+            for enabled in (True, False):
+                with self.subTest(name=name, enabled=enabled):
+                    (self.home / "config.toml").write_text(f'[plugins."{name}"]\nenabled={str(enabled).lower()}\n')
+                    with mock.patch.object(runner, "enqueue") as enqueue, \
+                         mock.patch.object(runner.sys, "stdin") as stdin, \
+                         contextlib.redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(runner.main(["hook", "--state-dir", str(self.root)]), 0)
+                    enqueue.assert_not_called()
+                    stdin.buffer.read.assert_not_called()
+                    self.assertEqual(output.getvalue(), "{}\n")
+                    self.assertFalse(self.root.exists())
+
+    def test_invalid_plugin_policy_declines_automatic_work(self):
+        for raw in ('invalid = [', 'plugins = "invalid"'):
+            with self.subTest(raw=raw):
+                (self.home / "config.toml").write_text(raw)
+                self.assertFalse(runner.automatic_hooks_allowed())
+        (self.home / "config.toml").unlink()
+        (self.home / "config.toml").symlink_to(self.path)
+        self.assertFalse(runner.automatic_hooks_allowed())
+
+    def test_plugin_absence_and_unrelated_plugin_allow_legacy_hooks(self):
+        self.assertTrue(runner.automatic_hooks_allowed())
+        (self.home / "config.toml").write_text('[plugins."engram-tools@personal"]\nenabled=true\n')
+        self.assertTrue(runner.automatic_hooks_allowed())
+        (self.home / "config.toml").unlink()
+        self.assertTrue(runner.automatic_hooks_allowed())
+
+    def test_plugin_guard_preserves_pending_cursor_and_explicit_retry(self):
+        request = self.request()
+        pending = self.root / "pending" / (self.sid + ".json")
+        cursor = self.root / "sessions" / (self.sid + ".json")
+        runner.atomic_json(pending, request)
+        runner.atomic_json(cursor, {"offset": 167})
+        before = {str(p): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        (self.home / "config.toml").write_text('[features]\nplugins=false\n[plugins."engram@personal"]\nenabled=false\n')
+        with mock.patch.object(runner, "enqueue", return_value=True) as enqueue, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(runner.main(["hook", "--state-dir", str(self.root)]), 0)
+            enqueue.assert_not_called()
+            self.assertEqual(before, {str(p): p.read_bytes() for p in self.root.rglob("*") if p.is_file()})
+            self.assertEqual(runner.main(["retry", "--state-dir", str(self.root), "--session-id", self.sid]), 0)
+            enqueue.assert_called_once()
 
     def request(self, **extra):
         return runner.validate_request(self.payload(**extra), self.root)

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Portable launcher: the Swift MCP is bundled; lifecycle adapters need Python 3.11+.
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+for candidate in python3.13 python3.12 python3.11 python3 \
+    /opt/homebrew/bin/python3 /usr/local/bin/python3 \
+    "$HOME"/.pyenv/versions/*/bin/python3; do
+    if command -v "$candidate" >/dev/null 2>&1 &&
+       "$candidate" -I -B -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
+        export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+        exec "$candidate" -B "$root/engram_hook.py" "$@"
+    fi
+done
+printf '%s\n' 'Engram: Python 3.11 or newer is required for lifecycle hooks.' >&2
+printf '%s\n' '{}'
+exit 0

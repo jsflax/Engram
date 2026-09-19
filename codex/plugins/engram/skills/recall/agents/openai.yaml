@@ -1,0 +1,9 @@
+interface:
+  display_name: "Engram Recall"
+  short_description: "Find relevant stored Engram memories"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "memory"
+      description: "Engram memory MCP server"

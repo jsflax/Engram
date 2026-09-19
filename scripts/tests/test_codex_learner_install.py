@@ -2,8 +2,10 @@
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shlex
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -49,6 +51,59 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(plan["expected_sha256"], "absent")
         command = plan["fragment"]["hooks"]["Stop"][0]["hooks"][0]["command"]
         self.assertEqual(shlex.split(command), [str(self.python), str(Path(plan["runtime_dir"]) / "codex_learner.py"), "hook", "--state-dir", str(self.state)])
+
+    def test_plugin_registration_skips_prepare_and_install_without_writes(self):
+        for name in ("engram@personal", "engram-hooks@team"):
+            for enabled in (True, False):
+                with self.subTest(name=name, enabled=enabled):
+                    raw = self.config_before + (f'\n[plugins."{name}"]\nenabled = {str(enabled).lower()}\n').encode()
+                    self.config.write_bytes(raw)
+                    for result in (installer.prepare(self.home, self.state, self.root / "absent", self.python),
+                                   self.run_install(memory_command=self.root / "absent-memory")):
+                        self.assertEqual(result["status"], "skipped_plugin")
+                        self.assertEqual(result["plugin_ids"], [name])
+                    self.assertEqual(self.config.read_bytes(), raw)
+                    self.assertFalse(self.state.exists())
+                    self.assertFalse(self.hooks_path.exists())
+
+    def test_plugin_guard_preserves_old_state_and_owned_uninstall_still_works(self):
+        self.run_install()
+        pending = self.state / "pending" / "old.json"
+        pending.parent.mkdir()
+        pending.write_bytes(b'{"request_id":"preserved"}')
+        cursor = self.state / "sessions" / "old.json"
+        cursor.parent.mkdir()
+        cursor.write_bytes(b'{"offset":167}')
+        raw = self.config_before + b'\n[features]\nplugins = false\n[plugins."engram@personal"]\nenabled = false\n[mcp_servers.memory]\ncommand = "/custom/memory"\n'
+        self.config.write_bytes(raw)
+        before = {str(p): p.read_bytes() for p in self.home.rglob("*") if p.is_file()}
+        self.assertEqual(self.run_install()["status"], "skipped_plugin")
+        self.assertEqual(before, {str(p): p.read_bytes() for p in self.home.rglob("*") if p.is_file()})
+        self.assertEqual(installer.uninstall(self.home, self.state)["status"], "uninstalled")
+        self.assertEqual(pending.read_bytes(), b'{"request_id":"preserved"}')
+        self.assertEqual(cursor.read_bytes(), b'{"offset":167}')
+        self.assertEqual(self.config.read_bytes(), raw)
+
+    def test_unrelated_plugin_retains_fresh_legacy_setup(self):
+        self.config.write_bytes(self.config_before + b'\n[plugins."engram-tools@personal"]\nenabled = true\n')
+        result = self.run_install(memory_command=self.memory_executable())
+        self.assertEqual(result["status"], "installed")
+        self.assertEqual(result["memory_mcp"]["status"], "registered")
+        self.assertEqual(set(self.read_hooks()["hooks"]), set(installer.EVENTS))
+
+    def test_automatic_shell_respects_disabled_plugin(self):
+        raw = self.config_before + b'\n[plugins."engram@personal"]\nenabled = false\n'
+        self.config.write_bytes(raw)
+        env = {**os.environ, "HOME": str(self.root),
+               "CODEX_HOME": str(self.home), "ENGRAM_CODEX_PYTHON": str(self.python),
+               "PYTHONDONTWRITEBYTECODE": "1"}
+        completed = subprocess.run(["/bin/bash", str(MODULE_PATH.with_name("install_codex_support.sh")), "install"],
+                                   env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout)["status"], "skipped_plugin")
+        self.assertEqual(self.config.read_bytes(), raw)
+        self.assertFalse(self.state.exists())
+        self.assertFalse(self.hooks_path.exists())
 
     def test_install_is_idempotent_preserves_notify_and_has_private_backups(self):
         first = self.run_install()

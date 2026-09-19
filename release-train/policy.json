@@ -10,16 +10,20 @@
   "localDependencies": [],
   "publishedDependencies": {
     "lattice": "jsflax/lattice",
-    "latticecore": "jsflax/LatticeCore"
+    "latticecore": "jsflax/LatticeCore",
+    "swift-sdk": "jsflax/swift-sdk"
   },
   "requiredPriorCI": [],
   "artifacts": [
     "cli",
     "dmg",
-    "appcast"
+    "appcast",
+    "codex-plugin",
+    "codex-plugin-manifest"
   ],
   "lockfiles": [
-    "Package.resolved"
+    "Package.resolved",
+    "Engram.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
   ],
   "changelog": "CHANGELOG.md",
   "releaseMode": "hosted",

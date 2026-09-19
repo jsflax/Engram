@@ -1,0 +1,13 @@
+{
+  "object" : [
+    {
+      "mirror" : "https://github.com/jsflax/swift-sdk.git",
+      "original" : "https://github.com/modelcontextprotocol/swift-sdk"
+    },
+    {
+      "mirror" : "https://github.com/jsflax/swift-sdk.git",
+      "original" : "https://github.com/modelcontextprotocol/swift-sdk.git"
+    }
+  ],
+  "version" : 1
+}

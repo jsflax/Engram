@@ -725,7 +725,7 @@ extension MemoryTools {
             sessionLog("[recall] Bumping access stats (\(bumpTargets.count) memories)")
             let accessNow = Date()
             do {
-                try db.transaction {
+                try db.withTransaction {
                     for m in bumpTargets {
                         m.lastAccessedAt = accessNow
                         m.increment("accessCount")
@@ -1277,6 +1277,37 @@ extension MemoryTools {
 
     // MARK: - vacuum
 
+    struct VacuumStoreOutcome {
+        let label: String
+        let checkpoint: CheckpointResult
+        let reindexedRows: Int64
+        let vacuumSucceeded: Bool?
+        let boundedCheckpointFrames: Int64
+
+        var checkpointDescription: String {
+            if checkpoint.busy { return "busy" }
+            if checkpoint.complete { return "complete" }
+            if checkpoint.logFrames >= 0 && checkpoint.checkpointed >= 0 { return "partial" }
+            return "failed"
+        }
+
+        var failed: Bool {
+            checkpoint.busy || !checkpoint.complete || reindexedRows < 0
+                || vacuumSucceeded == false || boundedCheckpointFrames < 0
+        }
+
+        var description: String {
+            let initial = "initial checkpoint \(checkpointDescription) (\(checkpoint.checkpointed)/\(checkpoint.logFrames) frames)"
+            let index = reindexedRows >= 0 ? "vector index rebuilt (\(reindexedRows) rows)" : "vector index rebuild failed"
+            let vacuum = vacuumSucceeded.map { $0 ? "database VACUUM succeeded" : "database VACUUM failed" }
+                ?? "database VACUUM not requested"
+            let final = boundedCheckpointFrames >= 0
+                ? "final bounded checkpoint processed \(boundedCheckpointFrames) frames"
+                : "final bounded checkpoint busy or failed (no frame count available)"
+            return "\(label): \(initial); \(index); \(vacuum); \(final)."
+        }
+    }
+
     func handleVacuum() throws -> CallTool.Result {
         // Checkpoint AFTER the VACUUM as well as before. SQLite's VACUUM
         // rewrites the entire database through the WAL, so a vacuum on an
@@ -1288,15 +1319,17 @@ extension MemoryTools {
         // (hooks, the visualizer) may hold snapshots, and a 30s writer-gate
         // stall inside an MCP tool call is worse than a large-but-shrinking
         // WAL.
-        localLattice.checkpoint()
-        localLattice._vacuumVec0(Memory(), for: \.embedding)
-        localLattice.vacuum()
-        localLattice.checkpointBounded()
+        func maintain(_ db: Lattice, label: String, compact: Bool) -> VacuumStoreOutcome {
+            let checkpoint = db.checkpoint()
+            let rows = db._vacuumVec0(Memory(), for: \.embedding)
+            let vacuum: Bool? = compact ? db.vacuum() : nil
+            let frames = db.checkpointBounded()
+            return VacuumStoreOutcome(label: label, checkpoint: checkpoint, reindexedRows: rows,
+                                      vacuumSucceeded: vacuum, boundedCheckpointFrames: frames)
+        }
+        var outcomes = [maintain(localLattice, label: "local", compact: true)]
         if let synced = syncedLattice {
-            synced.checkpoint()
-            synced._vacuumVec0(Memory(), for: \.embedding)
-            synced.vacuum()
-            synced.checkpointBounded()
+            outcomes.append(maintain(synced, label: "synced", compact: true))
         }
         // Group spokes too (increment-4 contract): a spoke populated purely
         // by sync-apply has NO vec sidecar — the apply path inserts rows
@@ -1305,13 +1338,19 @@ extension MemoryTools {
         // tombstone GC (that's server/admin-owned).
         var spokeCount = 0
         for spoke in liveGroupSpokes() {
-            spoke.lattice.checkpoint()
-            spoke.lattice._vacuumVec0(Memory(), for: \.embedding)
-            spoke.lattice.checkpointBounded()
-            spokeCount += 1
+            let outcome = maintain(spoke.lattice, label: "group \(spoke.groupId.uuidString)", compact: false)
+            outcomes.append(outcome)
+            if outcome.reindexedRows >= 0 { spokeCount += 1 }
         }
         let spokeNote = spokeCount > 0 ? " \(spokeCount) group spoke(s) reindexed." : ""
-        return CallTool.Result(content: [.text("Vacuum complete: WAL checkpointed, vector index rebuilt, database compacted.\(spokeNote)")], isError: false)
+        let failed = outcomes.contains { $0.failed }
+        let heading = failed ? "Vacuum incomplete." : "Vacuum maintenance finished."
+        // checkpointBounded can fall back to PASSIVE. Its frame count does
+        // not prove that every WAL frame was folded back or the WAL truncated.
+        let text = ([heading + spokeNote] + outcomes.map(\.description)
+                    + ["Final WAL truncation is not confirmed by bounded checkpoint frame counts."])
+            .joined(separator: "\n")
+        return CallTool.Result(content: [.text(text)], isError: failed)
     }
 
     // MARK: - train_vectors

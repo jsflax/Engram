@@ -1,0 +1,39 @@
+{
+  "mcpServers": {
+    "memory": {
+      "command": "./bin/memory",
+      "args": [],
+      "cwd": ".",
+      "env_vars": [
+        "HOME"
+      ],
+      "default_tools_approval_mode": "auto",
+      "tools": {
+        "recall": {
+          "approval_mode": "approve"
+        },
+        "graph": {
+          "approval_mode": "approve"
+        },
+        "list_topics": {
+          "approval_mode": "approve"
+        },
+        "stats": {
+          "approval_mode": "approve"
+        },
+        "timeline": {
+          "approval_mode": "approve"
+        },
+        "remember": {
+          "approval_mode": "approve"
+        },
+        "update": {
+          "approval_mode": "approve"
+        },
+        "connect": {
+          "approval_mode": "approve"
+        }
+      }
+    }
+  }
+}
