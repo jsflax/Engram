@@ -24,6 +24,7 @@ import stat
 from . import admission, file_identity, host_admission
 
 MAX_SELECTED = 32
+MAX_IMPACT_TASKS = 500
 MAX_PLAN_BYTES = 32 * 1024 * 1024
 MODE_V1 = "host_sessions_v1"
 MODE_V2 = "host_sessions_v2"
@@ -336,6 +337,147 @@ def _retained_legacy(root, path, legacy_raw, current_policy_raw):
             "retained_policy_lineage_changed")
 
 
+def _impact_members(root):
+    """Bound every directory entry, including malformed/non-JSON names."""
+    parent = root / "enrollments"
+    _directory(parent)
+    result = []
+    with os.scandir(parent) as entries:
+        for index, entry in enumerate(entries):
+            require(index < MAX_IMPACT_TASKS, "impact_inventory_limit_exceeded")
+            if not entry.name.endswith(".json"):
+                continue
+            sid = entry.name[:-5]
+            try:
+                admission._uuid(sid, 7)
+            except ValueError:
+                continue  # Exactly as maintained host enrollment enumeration.
+            result.append(sid)
+    return sorted(result)
+
+
+def _impact_task(root, policy, policy_raw, sid):
+    paths = _paths(root, sid)
+    # Unsafe/unbounded metadata cannot be evidence that a task is not healthy.
+    # Refuse the complete assertion instead of silently classifying it as held.
+    snapshots = {name: _read(path, absent=name != "enrollments") for name, path in paths.items()}
+    healthy = False
+    try:
+        # Retained v1 runtimes predate migration holds. A marker must not hide a
+        # task those runtimes could still admit; selected conversion separately
+        # refuses any existing hold instead of overwriting or releasing it.
+        entry = admission._json(snapshots["enrollments"][0])
+        admission._require(entry.get("session_id") == sid and "identity" not in entry, "enrollment_origin_changed")
+        payload = {"session_id": sid, "agent_id": sid, "transcript_path": entry.get("transcript_path"),
+                   "cwd": entry.get("project", {}).get("path")}
+        admission._require(host_admission._validate_entry(root, policy, payload) == entry, "enrollment_origin_changed")
+        binding = _binding(entry, policy, policy_raw)
+        record_raw, state_raw, pending_raw = (snapshots[name][0] for name in ("admissions", "sessions", "pending"))
+        if record_raw is None and state_raw is None and pending_raw is None:
+            healthy = True
+        else:
+            admission._require(record_raw is not None and state_raw is not None, "missing_durable_record")
+            # runner.load_json uses ordinary JSON decoding for these two files.
+            # Preserve its last-key-wins semantics in the coverage predicate;
+            # strict conversion can subsequently refuse duplicate-key records.
+            try:
+                record, state = (json.loads(raw.decode("utf-8")) for raw in (record_raw, state_raw))
+            except (UnicodeError, ValueError, RecursionError) as error:
+                raise ValueError("admission_invalid_json") from error
+            admission._require(isinstance(record, dict) and isinstance(state, dict), "json_not_object")
+            # Match v1 runner.admitted_record(create=False), NOT the deliberately
+            # stricter conversion predicates. An admissible unusual record must
+            # be selected or refuse conversion, never disappear from impact.
+            admission._require(record.get("binding") == binding, "durable_binding_changed")
+            admission._require({"state_sha256", "last_event", "processing"} <= set(record), "incomplete_durable_record")
+            admission._require(record["state_sha256"] is not None
+                               and record["state_sha256"] == object_digest(state), "cursor_missing_or_changed")
+            admission._require(type(state.get("offset")) is int and state["offset"] >= binding["frontier_offset"]
+                               and state.get("admission") == binding, "cursor_before_frontier")
+            # A genuinely new enqueue can replace a damaged/stale pending item.
+            # Future-event coverage therefore depends on the admitted cursor,
+            # not pending validity or pause. Conversion remains independently
+            # strict and may refuse such a selected task until it is repaired.
+            healthy = not bool(state.get("reconciliation_required")) and record["processing"] is None
+        admission._require(host_admission._validate_entry(root, policy, payload) == entry, "enrollment_origin_changed")
+    except ValueError as error:
+        if not str(error).startswith("admission_"):
+            raise
+        healthy = False
+    except (OSError, KeyError, TypeError, RuntimeError):
+        # These origin/cursor errors are also fail-closed in maintained admission.
+        healthy = False
+    for name, path in paths.items():
+        require(_read(path, absent=name != "enrollments") == snapshots[name], "impact_metadata_changed")
+    return healthy
+
+
+def _impact_directory_valid(policy):
+    try:
+        admission._bound_directory(policy["sessions_dir"])
+        return True
+    except ValueError as error:
+        if not str(error).startswith("admission_"):
+            raise
+        return False
+    except OSError:
+        return False
+
+
+def _activation_impact(root, expected_policy_raw):
+    policy_raw, identity = _read(root / "admission.json")
+    require(policy_raw == expected_policy_raw, "impact_policy_changed")
+    policy = admission._json(policy_raw)
+    require(policy["mode"] == MODE_V1, "impact_requires_v1_policy")
+    members = _impact_members(root)
+    healthy = []
+    # A strict v1 directory mismatch already prevents every v1 task from being
+    # admitted. Re-evaluate it on apply so an origin becoming valid is detected.
+    directory_valid = _impact_directory_valid(policy)
+    if directory_valid:
+        for sid in members:
+            if _impact_task(root, policy, policy_raw, sid):
+                healthy.append(sid)
+                require(len(healthy) <= MAX_SELECTED, "impact_healthy_cohort_limit_exceeded")
+    require(_impact_members(root) == members, "impact_membership_changed")
+    require(_impact_directory_valid(policy) == directory_valid, "impact_directory_changed")
+    require(_read(root / "admission.json") == (policy_raw, identity), "impact_policy_changed")
+    return {"schema_version": 1, "predicate": "host_v1_future_event_admission_v1", "policy_sha256": digest(policy_raw),
+            "policy_enabled": policy["enabled"], "legacy_sessions_directory_valid": directory_valid,
+            "healthy_session_ids": healthy, "max_tasks": MAX_IMPACT_TASKS}
+
+
+def _validate_impact(plan):
+    original_raw = _unb64(plan["records"][-1]["preimage"])
+    policy = admission._json(original_raw)
+    impact = plan["activation_impact"]
+    if policy["mode"] == MODE_V2:
+        require(impact is None, "unexpected_v2_impact_assertion")
+        return
+    require(isinstance(impact, dict) and set(impact) == {"schema_version", "predicate", "policy_sha256", "policy_enabled",
+            "legacy_sessions_directory_valid", "healthy_session_ids", "max_tasks"}
+            and type(impact["schema_version"]) is int and impact["schema_version"] == 1
+            and impact["predicate"] == "host_v1_future_event_admission_v1"
+            and impact["policy_sha256"] == digest(original_raw)
+            and type(impact["policy_enabled"]) is bool and impact["policy_enabled"] == policy["enabled"]
+            and type(impact["legacy_sessions_directory_valid"]) is bool
+            and type(impact["max_tasks"]) is int and impact["max_tasks"] == MAX_IMPACT_TASKS, "invalid_impact_assertion")
+    ids = impact["healthy_session_ids"]
+    require(isinstance(ids, list) and ids == sorted(set(ids)) and len(ids) <= MAX_SELECTED
+            and set(ids) <= set(plan["session_ids"]), "impact_healthy_cohort_not_selected")
+
+
+def _recheck_impact(root, plan):
+    if plan["activation_impact"] is not None:
+        require(_activation_impact(root, _unb64(plan["records"][-1]["preimage"])) == plan["activation_impact"],
+                "impact_healthy_cohort_changed")
+
+
+def _impact_seal(plan, plan_sha):
+    return encode({"schema_version": 1, "kind": "pre_transition_activation_impact", "plan_sha256": plan_sha,
+                   "activation_impact": plan["activation_impact"]})
+
+
 def _build(root, route_path, session_ids, legacy_policy_path):
     policy_raw, policy_info = _read(root / "admission.json")
     current = admission._json(policy_raw)
@@ -344,6 +486,8 @@ def _build(root, route_path, session_ids, legacy_policy_path):
     route_raw, route_info = _read(route_path)
     route = admission._json(route_raw)
     _route(route, root, stable)
+    impact = None if stable else _activation_impact(root, policy_raw)
+    require(impact is None or set(impact["healthy_session_ids"]) <= set(session_ids), "impact_healthy_cohort_not_selected")
     if legacy_policy_path is None:
         require(not stable, "retained_legacy_policy_required")
         legacy_raw, legacy_info = policy_raw, policy_info
@@ -382,6 +526,7 @@ def _build(root, route_path, session_ids, legacy_policy_path):
     return {"schema_version": 1, "kind": PLAN_KIND, "root": str(root), "route_path": str(route_path),
             "session_ids": session_ids, "runtime_sha256": _runtime(), "records": records, "hold_paths": holds,
             "transitional_policy": _record(root / "admission.json", policy_raw, policy_info, transition_raw),
+            "activation_impact": impact,
             "legacy_policy": {"path": str(legacy_path), "bytes": _b64(legacy_raw), "sha256": digest(legacy_raw), "identity": legacy_info},
             "historical_volume_continuity_proven": False, "owner_authorized_current_volume_adoption": True,
             "learner_started": False, "publication_order": ORDER}
@@ -408,7 +553,7 @@ def _validate_plan(root, plan, expected_sha):
             and digest(encode(plan)) == expected_sha, "plan_sha_mismatch")
     require(set(plan) == {"schema_version", "kind", "root", "route_path", "session_ids", "runtime_sha256",
                          "records", "hold_paths", "legacy_policy", "historical_volume_continuity_proven",
-                         "owner_authorized_current_volume_adoption", "learner_started", "publication_order", "transitional_policy"}
+                         "owner_authorized_current_volume_adoption", "learner_started", "publication_order", "transitional_policy", "activation_impact"}
             and type(plan["schema_version"]) is int and plan["schema_version"] == 1
             and plan["kind"] == PLAN_KIND and plan["root"] == str(root)
             and plan["publication_order"] == ORDER
@@ -446,6 +591,7 @@ def _validate_plan(root, plan, expected_sha):
     transition = encode({**original, "enabled": False}) if original["enabled"] else original_raw
     require(plan["transitional_policy"] == _record(root / "admission.json", original_raw,
             plan["records"][-1]["preimage_identity"], transition), "transitional_policy_changed")
+    _validate_impact(plan)
 
 
 def _validate_candidates(root, plan):
@@ -581,7 +727,35 @@ def _run(root, plan, plan_sha, *, recovery):
     with Locks(root) as locks:
         _validate_plan(root, plan, plan_sha)
         states = _verify_prefix(plan, recover=recovery)
-        work = _journal(root, plan, plan_sha, create=not recovery)
+        if not recovery:
+            # This must precede even journal creation: changed eligibility causes
+            # zero application mutations, not merely zero task-record writes.
+            _recheck_impact(root, plan)
+            locks.verify()
+            work = _journal(root, plan, plan_sha, create=True)
+        else:
+            work = _journal(root, plan, plan_sha, create=False)
+        if plan["activation_impact"] is not None:
+            seal_path = work / "activation-impact.json"
+            seal_raw, _ = _read(seal_path, absent=True)
+            expected_seal = _impact_seal(plan, plan_sha)
+            if seal_raw is None:
+                # Journal preparation may have been interrupted before the seal.
+                # It is never safe to reconstruct it after transition/hold writes.
+                policy_raw, info = _read(root / "admission.json")
+                require(policy_raw == _unb64(plan["records"][-1]["preimage"])
+                        and info == plan["records"][-1]["preimage_identity"]
+                        and all(state == "before" for state in states)
+                        and not any(os.path.lexists(path) for path in plan["hold_paths"]), "impact_seal_missing_after_transition")
+                if recovery:
+                    _recheck_impact(root, plan)
+                _new(seal_path, expected_seal)
+            else:
+                require(seal_raw == expected_seal, "impact_seal_changed")
+                # A crash before an enabled original policy was suspended leaves
+                # enrollment possible; recheck that cohort before continuing.
+                if recovery and _policy_phase(plan, recover=True) == "original":
+                    _recheck_impact(root, plan)
         if _policy_phase(plan, recover=True) == "original":
             locks.verify()
             _event(work, "before_transitional_policy", candidate_sha256=plan["transitional_policy"]["candidate_sha256"])
@@ -844,7 +1018,10 @@ def main(argv=None):
                 result = (apply if args.command == "apply" else recover)(args.state_dir, plan, args.plan_sha256)
         if args.output is not None:
             _new(args.output, encode(result))
-        print(json.dumps({"status": result.get("status", "review_required"), "sha256": digest(encode(result)), "learner_started": False}))
+        summary = {"status": result.get("status", "review_required"), "sha256": digest(encode(result)), "learner_started": False}
+        if result.get("activation_impact") is not None:
+            summary["reviewed_healthy_session_ids"] = result["activation_impact"]["healthy_session_ids"]
+        print(json.dumps(summary))
         return 0
     except (OSError, ValueError, TypeError, KeyError) as error:
         reason = str(error) if isinstance(error, ValueError) and re.fullmatch(r"(?:admission|migration)_[a-z_]+", str(error)) else "migration_failed"

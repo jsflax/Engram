@@ -96,6 +96,13 @@ before passing its path and SHA256 to `apply`. When no historical volume UUID
 exists, current-volume adoption must be explicitly authorized and is recorded
 as such; migration does not prove historical volume continuity.
 
+The first host policy conversion must include the explicitly reviewed healthy
+v1 tasks, including tasks waiting for their next event. The tool rechecks that
+cohort under its locks before changing state. A newly eligible task causes a
+refusal and a new review; it is never silently added. If the required cohort
+exceeds the supported selection bound, keep v1 until a coordinated rollout is
+prepared. Installing the new runtime preserves an existing v1 policy.
+
 Applying a plan temporarily disables host admission while publishing the selected
 records and route, then restores the policy's original enabled setting in v2.
 The journal supports `recover` after an interrupted publication. Other tasks'

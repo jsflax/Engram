@@ -606,7 +606,7 @@ class MigrationTests(unittest.TestCase):
         return importlib.import_module(name + ".admission")
 
     def test_transitional_policy_refuses_actual_retained_v1_and_current_v2_workers(self):
-        unselected = self.fixture.task(2, paused=False, gated=False)
+        unselected = self.fixture.task(2, paused=False, gated=True)
         plan = self.prepare()
         legacy = self._legacy_admission()
         self.assertEqual(legacy.check_activation(self.root)["mode"], "host_sessions_v1")
@@ -664,6 +664,230 @@ class MigrationTests(unittest.TestCase):
         F.write_json(path, value)
         with self.assertRaisesRegex(ValueError, "policy_cas_mismatch"):
             M.recover(self.root, plan, M.digest(M.encode(plan)))
+
+
+class ImpactTests(unittest.TestCase):
+    """Only the new first-flip cohort assertion; old suite is run by the owner."""
+    setUp = MigrationTests.setUp
+    prepare = MigrationTests.prepare
+    apply = MigrationTests.apply
+    snapshot = MigrationTests.snapshot
+
+    def healthy(self, sid, *, processing=None):
+        paths = M._paths(self.root, sid)
+        state = json.loads(paths["sessions"].read_bytes())
+        state.pop("reconciliation_required", None)
+        F.write_json(paths["sessions"], state)
+        record = json.loads(paths["admissions"].read_bytes())
+        record.update(state_sha256=M.object_digest(state), processing=processing)
+        F.write_json(paths["admissions"], record)
+
+    def unchanged_refusal(self, plan, reason="impact_healthy_cohort_changed"):
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, reason):
+            self.apply(plan)
+        self.assertEqual(before, self.snapshot())
+        self.assertFalse((self.root / "migrations").exists())
+        self.assertFalse((self.root / "migration-holds").exists())
+
+    def test_first_flip_rejects_omitted_healthy_cursor_without_pending(self):
+        self.fixture.task(2, pending=False, gated=False)
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "impact_healthy_cohort_not_selected"):
+            self.prepare()
+        self.assertEqual(before, self.snapshot())
+
+    def test_first_flip_rejects_omitted_enrollment_only(self):
+        self.fixture.task(2, cursor=False, pending=False)
+        with self.assertRaisesRegex(ValueError, "impact_healthy_cohort_not_selected"):
+            self.prepare()
+
+    def test_unchanged_selected_healthy_cohort_and_normal_paused_queue_pass(self):
+        paused = self.fixture.task(2, paused=True, gated=False)
+        no_cursor = self.fixture.task(3, cursor=False, pending=False)
+        plan = self.prepare([self.sid, paused, no_cursor])
+        self.assertEqual(plan["activation_impact"]["healthy_session_ids"], sorted([paused, no_cursor]))
+        self.assertEqual(plan["activation_impact"]["max_tasks"], 500)
+        result = self.apply(plan)
+        self.assertEqual(result["status"], "migration_complete_held")
+        sha = M.digest(M.encode(plan))
+        seal = self.root / "migrations" / sha / "activation-impact.json"
+        self.assertEqual(seal.read_bytes(), M._impact_seal(plan, sha))
+        pending = json.loads(M._paths(self.root, paused)["pending"].read_bytes())
+        self.assertEqual(pending["paused_request_id"], pending["request_id"])
+
+    def test_new_healthy_enrollment_after_plan_refuses_with_zero_mutation(self):
+        plan = self.prepare()
+        self.fixture.task(2, cursor=False, pending=False)
+        self.unchanged_refusal(plan)
+
+    def test_existing_gate_cleared_after_plan_refuses_with_zero_mutation(self):
+        other = self.fixture.task(2, gated=True)
+        plan = self.prepare()
+        self.healthy(other)
+        self.unchanged_refusal(plan)
+
+    def test_processing_completion_after_plan_refuses_with_zero_mutation(self):
+        other = self.fixture.task(2, gated=False)
+        self.healthy(other, processing="existing-worker-request")
+        plan = self.prepare()
+        self.healthy(other, processing=None)
+        self.unchanged_refusal(plan)
+
+    def test_same_membership_origin_failure_becoming_valid_is_rechecked(self):
+        other = self.fixture.task(2, gated=False)
+        path = M._paths(self.root, other)["enrollments"]
+        original = path.read_bytes()
+        value = json.loads(original)
+        value["device"] += 99
+        F.write_json(path, value)
+        plan = self.prepare()
+        path.write_bytes(original)
+        self.unchanged_refusal(plan)
+
+    def test_runtime_admissible_unusual_cursor_is_counted_not_hidden_by_conversion(self):
+        other = self.fixture.task(2, gated=False)
+        paths = M._paths(self.root, other)
+        state = json.loads(paths["sessions"].read_bytes())
+        for key in ("session_id", "transcript_path", "device", "inode"):
+            del state[key]
+        F.write_json(paths["sessions"], state)
+        record = json.loads(paths["admissions"].read_bytes())
+        record["state_sha256"] = M.object_digest(state)
+        F.write_json(paths["admissions"], record)
+        with self.assertRaisesRegex(ValueError, "impact_healthy_cohort_not_selected"):
+            self.prepare()
+        with self.assertRaisesRegex(ValueError, "cursor_chain_invalid"):
+            self.prepare([self.sid, other])
+
+    def test_damaged_pending_does_not_hide_future_event_healthy_cursor(self):
+        other = self.fixture.task(2, gated=False)
+        path = M._paths(self.root, other)["pending"]
+        for raw in (b"not json\n", b'{"admission":"stale","request_id":null}\n'):
+            with self.subTest(raw=raw):
+                path.write_bytes(raw)
+                with self.assertRaisesRegex(ValueError, "impact_healthy_cohort_not_selected"):
+                    self.prepare()
+                with self.assertRaises(ValueError):
+                    self.prepare([self.sid, other])
+
+    def test_ignored_invalid_pending_does_not_mask_gate_clear_after_plan(self):
+        other = self.fixture.task(2, gated=True)
+        path = M._paths(self.root, other)["pending"]
+        path.write_bytes(b"not json\n")
+        plan = self.prepare()
+        self.healthy(other)
+        self.unchanged_refusal(plan)
+
+    def test_runner_accepted_duplicate_cursor_json_is_counted_then_conversion_refuses(self):
+        other = self.fixture.task(2, gated=False)
+        paths = M._paths(self.root, other)
+        state = json.loads(paths["sessions"].read_bytes())
+        normal = json.dumps(state)
+        self.assertEqual(normal[0], "{")
+        paths["sessions"].write_text('{"offset":0,' + normal[1:])
+        # Runtime JSON decoding yields the same final object and valid digest.
+        self.assertEqual(json.loads(paths["sessions"].read_bytes()), state)
+        with self.assertRaisesRegex(ValueError, "impact_healthy_cohort_not_selected"):
+            self.prepare()
+        with self.assertRaisesRegex(ValueError, "admission_invalid_json"):
+            self.prepare([self.sid, other])
+
+    def test_existing_hold_cannot_hide_retained_v1_healthy_task(self):
+        other = self.fixture.task(2, gated=False)
+        parent = F.private_directory(self.root / "migration-holds")
+        F.write_json(parent / (other + ".json"), {"existing": "must not be replaced"})
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "impact_healthy_cohort_not_selected"):
+            self.prepare()
+        with self.assertRaisesRegex(ValueError, "existing_migration_hold"):
+            self.prepare([self.sid, other])
+        self.assertEqual(before, self.snapshot())
+
+    def test_healthy_cohort_over_32_refuses_without_expansion_or_mutation(self):
+        for n in range(2, 35):
+            self.fixture.task(n, cursor=False, pending=False)
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "impact_healthy_cohort_limit_exceeded"):
+            self.prepare()
+        self.assertEqual(before, self.snapshot())
+
+    def test_inventory_bound_counts_non_json_entries_too(self):
+        (self.root / "enrollments" / "junk-a").touch()
+        (self.root / "enrollments" / "junk-b").touch()
+        with mock.patch.object(M, "MAX_IMPACT_TASKS", 2):
+            with self.assertRaisesRegex(ValueError, "impact_inventory_limit_exceeded"):
+                self.prepare()
+
+    def test_disabled_policy_keeps_latent_healthy_cohort_and_seals_initial_apply(self):
+        self.healthy(self.sid)
+        policy = {**self.fixture.policy, "enabled": False}
+        F.write_json(self.root / "admission.json", policy)
+        MigrationTests._repair_fixture_chain(self)
+        plan = self.prepare()
+        self.assertEqual(plan["activation_impact"]["healthy_session_ids"], [self.sid])
+        self.assertIs(plan["activation_impact"]["policy_enabled"], False)
+        self.apply(plan)
+        sha = M.digest(M.encode(plan))
+        self.assertTrue((self.root / "migrations" / sha / "activation-impact.json").exists())
+        self.assertIs(json.loads((self.root / "admission.json").read_bytes())["enabled"], False)
+
+    def test_recovery_after_transition_uses_seal_not_partial_record_reclassification(self):
+        other = self.fixture.task(2, gated=False)
+        plan = self.prepare([self.sid, other])
+        sha = M.digest(M.encode(plan))
+        original = M._publish
+        def stop(record, work, index):
+            original(record, work, index)
+            if index == 0: raise RuntimeError("selected enrollment converted")
+        with mock.patch.object(M, "_publish", side_effect=stop):
+            with self.assertRaises(RuntimeError): self.apply(plan)
+        with mock.patch.object(M, "_activation_impact", side_effect=AssertionError("must not reclassify partial records")):
+            M.recover(self.root, plan, sha)
+
+    def test_missing_seal_after_transition_refuses_recovery(self):
+        plan = self.prepare()
+        sha = M.digest(M.encode(plan))
+        original = M._event
+        def stop(work, label, **fields):
+            if label == "transitional_policy_published": raise RuntimeError("suspended")
+            original(work, label, **fields)
+        with mock.patch.object(M, "_event", side_effect=stop):
+            with self.assertRaises(RuntimeError): self.apply(plan)
+        seal = self.root / "migrations" / sha / "activation-impact.json"
+        seal.unlink()
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "impact_seal_missing_after_transition"):
+            M.recover(self.root, plan, sha)
+        self.assertEqual(before, self.snapshot())
+
+    def test_recovery_before_transition_rechecks_newly_healthy_task(self):
+        plan = self.prepare()
+        sha = M.digest(M.encode(plan))
+        original = M._event
+        def stop(work, label, **fields):
+            if label == "before_transitional_policy": raise RuntimeError("not suspended yet")
+            original(work, label, **fields)
+        with mock.patch.object(M, "_event", side_effect=stop):
+            with self.assertRaises(RuntimeError): self.apply(plan)
+        self.fixture.task(2, cursor=False, pending=False)
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "impact_healthy_cohort_changed"):
+            M.recover(self.root, plan, sha)
+        self.assertEqual(before, self.snapshot())
+
+    def test_later_v2_selection_keeps_policy_hash_without_v1_rescan(self):
+        other = self.fixture.task(2, gated=True)
+        first = self.prepare()
+        self.apply(first)
+        sha = M.digest(M.encode(first))
+        legacy = self.root / "migrations" / sha / "legacy-policy.json"
+        policy_raw = (self.root / "admission.json").read_bytes()
+        with mock.patch.object(M, "_activation_impact", side_effect=AssertionError("no v1 rescan for later v2 migration")):
+            later = self.prepare([other], legacy_policy_path=legacy)
+            self.assertIsNone(later["activation_impact"])
+            self.apply(later)
+        self.assertEqual((self.root / "admission.json").read_bytes(), policy_raw)
 
 
 if __name__ == "__main__":
