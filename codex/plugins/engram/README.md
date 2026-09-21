@@ -80,6 +80,37 @@ apply at Codex's supported reload boundary; existing-task pickup needs verificat
 
 ## Migration
 
+### Persistent transcript identity
+
+Fresh host setup uses `host_sessions_v2`: a local APFS volume UUID plus inode
+identifies each bound directory and transcript. A device number may change after
+a remount; it is checked within each read for races, but is not saved as the v2
+identity. Unsupported filesystems fail closed. Existing host settings are kept
+unchanged when the package is updated.
+
+Existing `host_sessions_v1` tasks require explicit, selected-task migration with
+`scripts/codex_learner_migrate.py`. Its `plan` command validates the original
+policy, enrollment frontier, transcript metadata, cursor and pending request;
+the resulting plan binds exact preimages and runtime hashes. Inspect that plan
+before passing its path and SHA256 to `apply`. When no historical volume UUID
+exists, current-volume adoption must be explicitly authorized and is recorded
+as such; migration does not prove historical volume continuity.
+
+Applying a plan temporarily disables host admission while publishing the selected
+records and route, then restores the policy's original enabled setting in v2.
+The journal supports `recover` after an interrupted publication. Other tasks'
+records remain untouched; unmigrated v1 enrollments under v2 require their own
+migration. Later plans use the retained original v1 policy as their legacy anchor.
+
+Each migrated task receives a separate migration hold. `release-plan` and
+`release` remove only explicitly selected holds after validating their records.
+They do not clear a reconciliation gate, change a cursor or paused request, retry
+work, or launch a learner. Previously released tasks may advance normally while
+their siblings remain held. Use the CLI's `--help` and `hook-status` to inspect
+the required arguments and current state.
+
+### Previous installers
+
 `engram@personal` succeeds `engram-hooks@personal`. Disable the old plugin through
 Codex's plugin controls before trusting the successor. Keep old cached resources
 for open tasks that still reference them. The new package never replays or deletes

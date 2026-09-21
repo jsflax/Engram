@@ -54,6 +54,7 @@ RUNTIME_SCRIPTS = (
     "codex_learner/memory_proxy.py", "codex_learner/memory_config.py",
     "codex_learner/runtime_identity.py", "codex_learner/stdio_bridge.py",
     "codex_learner/transcript.py",
+    "codex_learner/file_identity.py", "codex_learner/migration.py", "codex_learner_migrate.py",
 )
 VERSION = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:alpha|beta|rc)\.[1-9]\d*)?")
 PRIVATE_PATH = re.compile(r"(?:/Users/|/home/)[^\s\"'<>/]+/|[A-Za-z]:\\{1,2}Users\\{1,2}", re.I)

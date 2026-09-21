@@ -13,11 +13,16 @@ than learning an inherited conversation a second time.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat as stat_module
 from typing import Any, BinaryIO
+
+from . import file_identity
 
 
 DEFAULT_MAX_CHARS = 24_000
@@ -47,6 +52,7 @@ class RolloutMetadata:
     device: int
     inode: int
     hook_session_id: str | None = None
+    identity: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -70,7 +76,32 @@ def _string(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def inspect_rollout(path: str | Path) -> RolloutMetadata:
+@contextmanager
+def _rollout_stream(path: Path, *, stable_identity=False):
+    if not stable_identity:
+        with path.open("rb") as stream:
+            yield stream
+        return
+    if not path.is_absolute() or path.resolve(strict=True) != path:
+        raise TranscriptError("admission_noncanonical_path")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags), "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat_module.S_ISREG(before.st_mode) or before.st_uid != os.getuid():
+            raise TranscriptError("admission_file_not_owned_regular")
+        identity = file_identity.capture_fd(stream.fileno())
+        yield stream
+        after = os.fstat(stream.fileno())
+        current = path.stat(follow_symlinks=False)
+        def fields(value):
+            return value.st_dev, value.st_ino, value.st_uid, value.st_mode
+        if (path.resolve(strict=True) != path or fields(before) != fields(after)
+                or fields(current) != fields(after)
+                or file_identity.capture_fd(stream.fileno()) != identity):
+            raise TranscriptError("admission_transcript_identity_changed")
+
+
+def inspect_rollout(path: str | Path, *, stable_identity=False) -> RolloutMetadata:
     """Inspect only the first complete metadata record, never its instructions.
 
     Subagents can put the logical root session's ID in ``session_id`` and their
@@ -80,15 +111,20 @@ def inspect_rollout(path: str | Path) -> RolloutMetadata:
     override either identity.
     """
     rollout = Path(path)
-    with rollout.open("rb") as stream:
-        return _inspect_stream(rollout, stream)
+    with _rollout_stream(rollout, stable_identity=stable_identity) as stream:
+        return _inspect_stream(rollout, stream, stable_identity=stable_identity)
 
 
-def _inspect_stream(path: Path, stream: BinaryIO) -> RolloutMetadata:
-    import os
-
+def _inspect_stream(path: Path, stream: BinaryIO, *, stable_identity=False) -> RolloutMetadata:
     stat = os.fstat(stream.fileno())
+    identity = file_identity.capture_fd(stream.fileno()) if stable_identity else None
     line = stream.readline(MAX_METADATA_BYTES + 1)
+    return _metadata_from_line(path, stat, line, stream.tell(), identity)
+
+
+def _metadata_from_line(path: Path, stat: Any, line: bytes, start_offset: int,
+                        identity: dict[str, Any] | None = None) -> RolloutMetadata:
+    """Parse metadata already read from the descriptor that supplied its identity."""
     if len(line) > MAX_METADATA_BYTES or not line.endswith(b"\n"):
         raise TranscriptError("missing, incomplete, or oversized initial session metadata")
     try:
@@ -142,12 +178,13 @@ def _inspect_stream(path: Path, stream: BinaryIO) -> RolloutMetadata:
         history_mode=_string(payload.get("history_mode")),
         history_start_ordinal=start_ordinal,
         fork_boundary_known=boundary_known,
-        start_offset=stream.tell(),
+        start_offset=start_offset,
         size_bytes=stat.st_size,
         mtime_ns=stat.st_mtime_ns,
         device=stat.st_dev,
         inode=stat.st_ino,
         hook_session_id=_string(payload.get("session_id")),
+        identity=identity,
     )
 
 
@@ -306,6 +343,7 @@ def read_excerpt(
     max_scan_bytes: int = DEFAULT_MAX_SCAN_BYTES,
     recent_messages: list[dict[str, Any]] | None = None,
     current_turn_id: str | None = None,
+    stable_identity: bool = False,
 ) -> Excerpt:
     """Return a bounded excerpt and the exact safely consumed byte boundary.
 
@@ -328,8 +366,8 @@ def read_excerpt(
     chunks: list[str] = []
     chars = 0
     blocked = None
-    with Path(path).open("rb") as stream:
-        metadata = _inspect_stream(Path(path), stream)
+    with _rollout_stream(Path(path), stable_identity=stable_identity) as stream:
+        metadata = _inspect_stream(Path(path), stream, stable_identity=stable_identity)
         if start_offset > metadata.size_bytes:
             raise TranscriptError("cursor is beyond file size; rollout was truncated or replaced")
         if start_offset:

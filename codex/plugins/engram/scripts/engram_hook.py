@@ -78,15 +78,26 @@ def initialize(codex_home: Path) -> Path:
             "relevant_project_recall": True,
             "tool_recall": True, "projects": {}, "selected_memory_ids": [],
             "wall_seconds": 2, "cooldown_seconds": 1, "context_chars": 6000})
+        from codex_learner import admission, host_admission
+        policy_path = root / "learner" / "admission.json"
+        if not policy_path.exists() and not policy_path.is_symlink():
+            initial_json(policy_path, {
+                "schema_version": 2, "mode": host_admission.MODE_V2, "enabled": True,
+                "activation_id": str(uuid.uuid4()),
+                "cutoff": datetime.now(timezone.utc).isoformat(),
+                "state_dir": str(root / "learner"),
+                "sessions_dir": admission._directory_binding(sessions, stable_identity=True)})
+        else:
+            initial_json(policy_path, {})  # Validate existing ownership; never replace it.
+        raw, _ = admission._owned_bytes(policy_path, private=True)
+        current = admission._json(raw)
+        # Preserve an existing host's identity scheme, including disabled policy.
+        if (current.get("mode"), current.get("schema_version")) not in {
+                (host_admission.MODE, 1), (host_admission.MODE_V2, 2)}:
+            raise ValueError("unsupported_existing_host_policy")
         initial_json(root / "learner-routes.json", {
-            "schema_version": 1, "mode": "host_sessions_v1", "enabled": True,
+            "schema_version": current["schema_version"], "mode": current["mode"], "enabled": True,
             "state_dir": str(root / "learner")})
-        initial_json(root / "learner" / "admission.json", {
-            "schema_version": 1, "mode": "host_sessions_v1", "enabled": True,
-            "activation_id": str(uuid.uuid4()),
-            "cutoff": datetime.now(timezone.utc).isoformat(),
-            "state_dir": str(root / "learner"),
-            "sessions_dir": {"path": str(sessions), "device": info.st_dev, "inode": info.st_ino}})
         initial_json(root / "learner" / "settings.json", {
             "min_chars": 400, "max_chars": 12000, "max_scan_bytes": 8 * 1024 * 1024,
             "wall_seconds": 300, "max_tool_calls": 12, "max_writes": 3,

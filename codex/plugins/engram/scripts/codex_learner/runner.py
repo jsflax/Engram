@@ -25,7 +25,7 @@ import uuid
 
 from .transcript import inspect_rollout, read_excerpt
 from .memory_proxy import verified_no_write_receipt
-from . import admission, memory_config
+from . import admission, memory_config, host_admission
 
 EVENTS = {"Stop", "SubagentStop", "PreCompact", "SessionEnd"}
 GUARD = "ENGRAM_CODEX_LEARNER"
@@ -169,7 +169,10 @@ def validate_request(payload: dict, root: Path) -> dict:
     st = path.stat()
     if not path.is_file() or st.st_uid != os.getuid():
         raise ValueError("transcript_not_owned_regular_file")
-    meta = inspect_rollout(str(path))
+    stable = admission.check_activation(root).get("mode") == host_admission.MODE_V2
+    meta = inspect_rollout(str(path), **({"stable_identity": True} if stable else {}))
+    if (st.st_dev, st.st_ino) != (meta.device, meta.inode):
+        raise ValueError("transcript_replaced_during_validation")
     agent_id = payload.get("agent_id")
     if agent_id is not None and agent_id != meta.session_id:
         raise ValueError("transcript_session_mismatch")
@@ -196,6 +199,10 @@ def validate_request(payload: dict, root: Path) -> dict:
             "trigger": payload.get("trigger"),
             "requested_at": utc(), "size_bytes": st.st_size, "mtime_ns": st.st_mtime_ns,
             "device": st.st_dev, "inode": st.st_ino, "request_id": uuid.uuid4().hex}
+    if stable:
+        request.pop("device")
+        request.pop("inode")
+        request["identity"] = meta.identity
     request["admission"] = admission.check(root, request)
     return request
 
@@ -203,6 +210,31 @@ def validate_request(payload: dict, root: Path) -> dict:
 def admission_digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
                                      ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+
+
+def transcript_identity_fields(binding: dict) -> dict:
+    if binding.get("mode") == host_admission.MODE_V2:
+        return {"identity": binding["identity"]}
+    return {"device": binding["device"], "inode": binding["inode"]}
+
+
+def event_digest(request: dict) -> str:
+    fields = {key: request.get(key) for key in ("event", "turn_id", "trigger", "size_bytes")}
+    fields.update(transcript_identity_fields({**request, "mode": request["admission"].get("mode")}))
+    return admission_digest(fields)
+
+
+def legacy_event_matches(record: dict, request: dict) -> bool:
+    """One-way migration bridge using retained historical constants, never st_dev now."""
+    if "legacy_event_identity" not in record:
+        return False
+    previous = record["legacy_event_identity"]
+    if (request["admission"].get("mode") != host_admission.MODE_V2
+            or not isinstance(previous, dict) or set(previous) != {"device", "inode"}
+            or any(type(previous[key]) is not int or previous[key] < 0 for key in previous)):
+        raise ValueError("admission_invalid_legacy_event_identity")
+    fields = {key: request.get(key) for key in ("event", "turn_id", "trigger", "size_bytes")}
+    return record["last_event"] == admission_digest({**fields, **previous})
 
 
 def admitted_record(root: Path, request: dict, *, create: bool = False) -> dict:
@@ -219,7 +251,7 @@ def admitted_record(root: Path, request: dict, *, create: bool = False) -> dict:
         if state_path.exists() or paths["pending"].exists():
             raise ValueError("admission_unowned_existing_state")
         state = {"session_id": sid, "transcript_path": binding["transcript_path"],
-                 "device": binding["device"], "inode": binding["inode"],
+                 **transcript_identity_fields(binding),
                  "offset": binding["frontier_offset"], "admission": binding,
                  "recent_messages": [], "current_turn_id": None, "status": "enrolled_frontier"}
         record = {"binding": binding, "state_sha256": admission_digest(state),
@@ -241,6 +273,9 @@ def admitted_record(root: Path, request: dict, *, create: bool = False) -> dict:
     if (type(state.get("offset")) is not int or state["offset"] < binding["frontier_offset"]
             or state.get("admission") != binding):
         raise ValueError("admission_cursor_before_frontier")
+    if binding.get("mode") == host_admission.MODE_V2 and (
+            state.get("identity") != binding["identity"] or "device" in state or "inode" in state):
+        raise ValueError("admission_cursor_binding_changed")
     return record
 
 
@@ -257,7 +292,8 @@ def commit_admitted_state(root: Path, request: dict, state: dict) -> None:
         atomic_json(root / "sessions" / (sid + ".json"), state)
 
 
-def enqueue(root: Path, payload: dict, *, spawn: bool = True, expected_admission: dict | None = None) -> bool:
+def enqueue(root: Path, payload: dict, *, spawn: bool = True, expected_admission: dict | None = None,
+            route_guard=None) -> bool:
     if os.environ.get(GUARD) or os.environ.get("CLAUDE_MEMORY_LEARNER") or os.environ.get("ENGRAM_LEARNER_ORCHESTRATED") == "1":
         return False
     if payload.get("stop_hook_active"):
@@ -274,6 +310,10 @@ def enqueue(root: Path, payload: dict, *, spawn: bool = True, expected_admission
     sid = request["session_id"]
     try:
         with lock_file(root / "enqueue.lock"):
+            # Trusted router callback, never obtained from hook input or config.
+            # Revalidate after waiting behind any policy/route migration.
+            if route_guard is not None:
+                route_guard()
             record = admitted_record(root, request, create=True)
             state = load_json(root / "sessions" / (sid + ".json"))
             if state.get("reconciliation_required"):
@@ -281,14 +321,15 @@ def enqueue(root: Path, payload: dict, *, spawn: bool = True, expected_admission
                 event_log(root, "reconciliation_required", session_id=sid,
                           run_id=state.get("last_run"), reason=gate.get("reason"), memory_ids=gate.get("memory_ids", []))
                 return False
-            event_key = admission_digest({key: request.get(key) for key in
-                                         ("event", "turn_id", "trigger", "size_bytes", "device", "inode")})
-            if record["last_event"] == event_key:
+            event_key = event_digest(request)
+            if record["last_event"] == event_key or legacy_event_matches(record, request):
                 event_log(root, "duplicate_event", session_id=sid)
                 return False
             # The durable receipt precedes the queue. A crash cannot mint a
             # second request for the same Stop or silently discard its cursor.
-            atomic_json(root / "admissions" / (sid + ".json"), {**record, "last_event": event_key})
+            next_record = {**record, "last_event": event_key}
+            next_record.pop("legacy_event_identity", None)
+            atomic_json(root / "admissions" / (sid + ".json"), next_record)
             pending = root / "pending" / (sid + ".json")
             previous = load_pending(pending)
             # A final flush wins over a redundant Stop for the same snapshot.
@@ -776,24 +817,30 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=run_codex
     if state.get("retry_after", 0) > time.time():
         return "backoff"
     path = Path(request["transcript_path"])
-    meta = inspect_rollout(str(path))
+    stable = request["admission"].get("mode") == host_admission.MODE_V2
+    stable_kwargs = {"stable_identity": True} if stable else {}
+    meta = inspect_rollout(str(path), **stable_kwargs)
     if meta.session_id != sid:
         raise ValueError("transcript_session_changed")
-    if (request.get("device"), request.get("inode")) != (meta.device, meta.inode):
+    observed_identity = {"identity": meta.identity} if stable else {"device": meta.device, "inode": meta.inode}
+    if any(request.get(key) != value for key, value in observed_identity.items()):
         raise ValueError("transcript_replaced_since_enqueue")
-    if state and (state.get("device"), state.get("inode")) != (meta.device, meta.inode):
+    if state and any(state.get(key) != value for key, value in observed_identity.items()):
         raise ValueError("transcript_replaced")
     offset = state["offset"]  # Durable admission requires a cursor at/after the sealed frontier.
     if meta.size_bytes < offset:
         raise ValueError("transcript_truncated")
     excerpt = read_excerpt(str(path), offset, max_chars=config["max_chars"], max_scan_bytes=config["max_scan_bytes"],
-                           recent_messages=state.get("recent_messages"), current_turn_id=state.get("current_turn_id"))
+                           recent_messages=state.get("recent_messages"), current_turn_id=state.get("current_turn_id"),
+                           **stable_kwargs)
     if (excerpt.metadata.session_id, excerpt.metadata.device, excerpt.metadata.inode) != (sid, meta.device, meta.inode):
+        raise ValueError("transcript_replaced_during_read")
+    if stable and excerpt.metadata.identity != meta.identity:
         raise ValueError("transcript_replaced_during_read")
     next_state = {"session_id": sid, "hook_session_id": request.get("hook_session_id", sid),
                   "transcript_path": str(path), "offset": excerpt.next_offset,
                   "recent_messages": excerpt.recent_messages, "current_turn_id": excerpt.current_turn_id,
-                  "device": meta.device, "inode": meta.inode, "updated_at": utc()}
+                  **observed_identity, "updated_at": utc()}
     if excerpt.blocked_reason and not excerpt.text:
         event_log(root, "blocked", session_id=sid, reason=excerpt.blocked_reason, offset=offset)
         return "blocked"
@@ -836,7 +883,7 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=run_codex
               status=result["status"], writes=result.get("write_calls", 0))
     if result["status"] != "succeeded":
         reconciliation = failure_reconciliation(run_dir, provider_started)
-        failure_state = {**state, "session_id": sid, "device": meta.device, "inode": meta.inode,
+        failure_state = {**state, "session_id": sid, **observed_identity,
                          "status": "failed", "last_run": run_dir.name,
                          "retry_after": time.time() + config["retry_seconds"]}
         if reconciliation is not None:
