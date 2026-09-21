@@ -325,6 +325,34 @@ class HostTests(unittest.TestCase):
         self.assertEqual(result, 'reconciliation_required')
         self.assertEqual(state['reconciliation_required']['reason'], 'successful_or_unverified_write')
 
+    def test_known_no_write_conflict_failure_keeps_retry_without_reconciliation(self):
+        _, _, _, result, state = self.failure_with_audit([
+            {'event': 'relay_started'}, {'event': 'tool_call', 'id': 1, 'tool': 'remember'},
+            {'event': 'tool_result', 'id': 1, 'tool': 'remember', 'ok': True,
+             'forwarded': True, 'memory_ids': [], 'write_outcome': 'not_stored_near_duplicate'}])
+        self.assertEqual(result, 'failed')
+        self.assertNotIn('reconciliation_required', state)
+
+    def test_unrecognized_forwarded_no_ids_response_stays_held(self):
+        _, _, _, result, state = self.failure_with_audit([
+            {'event': 'relay_started'}, {'event': 'tool_call', 'id': 1, 'tool': 'remember'},
+            {'event': 'tool_result', 'id': 1, 'tool': 'remember', 'ok': True,
+             'forwarded': True, 'memory_ids': []}])
+        self.assertEqual(result, 'reconciliation_required')
+        self.assertEqual(state['reconciliation_required']['reason'], 'successful_or_unverified_write')
+
+    def test_conflict_plus_successful_write_failure_stays_held(self):
+        memory_id = '11111111-2222-4333-8444-555555555555'
+        _, _, _, result, state = self.failure_with_audit([
+            {'event': 'relay_started'}, {'event': 'tool_call', 'id': 1, 'tool': 'remember'},
+            {'event': 'tool_result', 'id': 1, 'tool': 'remember', 'ok': True,
+             'forwarded': True, 'memory_ids': [], 'write_outcome': 'not_stored_near_duplicate'},
+            {'event': 'tool_call', 'id': 2, 'tool': 'remember'},
+            {'event': 'tool_result', 'id': 2, 'tool': 'remember', 'ok': True,
+             'forwarded': True, 'memory_ids': [memory_id]}])
+        self.assertEqual(result, 'reconciliation_required')
+        self.assertEqual(state['reconciliation_required']['memory_ids'], [memory_id])
+
     def test_missing_audit_after_provider_start_is_unknown_write_status(self):
         _, _, _, result, state = self.failure_with_audit(None)
         self.assertEqual(result, 'reconciliation_required')

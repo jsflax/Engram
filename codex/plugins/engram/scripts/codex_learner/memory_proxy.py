@@ -75,8 +75,51 @@ def rpc_error(request_id: Any, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": message}}
 
 
+# This warning and suffix are emitted only by remember's pre-storage conflict
+# branch in MemoryTools+Core.swift. Match the outer native receipt, never a
+# phrase or UUID quoted inside remembered content.
+NO_WRITE_OUTCOME = "not_stored_near_duplicate"
+NEAR_DUPLICATE_PREFIX = "⚠️ Near-duplicate memory detected. The new memory was NOT stored.\n\nExisting similar memories:"
+NEAR_DUPLICATE_SUFFIX = ('\n\nTo resolve:'
+                         '\n  - Use `update(id: "UUID", ...)` to modify the existing memory'
+                         '\n  - Use `remember(..., force: true)` to keep both'
+                         '\n  - Use `forget(id: "UUID")` to remove the old one, then `remember` the new one')
+
+
+def verified_no_write_response(tool: str, result: Any) -> bool:
+    """Recognize one vetted native no-write contract; unknown results stay unsafe."""
+    if (tool != "remember" or not isinstance(result, dict)
+            or result.get("isError") is not False or "structuredContent" in result):
+        return False
+    content = result.get("content")
+    if not isinstance(content, list) or len(content) != 1:
+        return False
+    item = content[0]
+    if not isinstance(item, dict) or set(item) != {"type", "text"} or item.get("type") != "text":
+        return False
+    text = item.get("text")
+    return (isinstance(text, str) and text.startswith(NEAR_DUPLICATE_PREFIX)
+            and text.endswith(NEAR_DUPLICATE_SUFFIX))
+
+
+def verified_no_write_receipt(entry: Any) -> bool:
+    """Exact gateway metadata shared by completion and failed-run reconciliation."""
+    return (isinstance(entry, dict)
+            and set(entry) == {"event", "id", "tool", "ok", "memory_ids", "forwarded", "write_outcome"}
+            and entry.get("event") == "tool_result" and valid_id(entry.get("id"))
+            and entry.get("tool") == "remember" and entry.get("ok") is True
+            and entry.get("forwarded") is True
+            and isinstance(entry.get("memory_ids"), list) and entry["memory_ids"] == []
+            and entry.get("write_outcome") == NO_WRITE_OUTCOME)
+
+
 def verified_write_ids(tool: str, arguments: dict[str, Any], result: dict[str, Any]) -> list[str]:
-    texts = [item.get("text", "") for item in result.get("content", []) if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)]
+    content = result.get("content")
+    if (not isinstance(content, list) or len(content) != 1
+            or not isinstance(content[0], dict) or content[0].get("type") != "text"
+            or not isinstance(content[0].get("text"), str) or "structuredContent" in result):
+        return []
+    texts = [content[0]["text"]]
     for text in texts:
         if tool in {"remember", "update"}:
             prefix = "Stored" if tool == "remember" else "Updated"
@@ -134,8 +177,11 @@ class Policy:
         self.message_count = 0
         self.max_messages = max(64, max_tool_calls * 4 + 8)
 
-    def record_result(self, request_id: Any, tool: str, ok: bool, memory_ids: list[str] | None = None, *, forwarded: bool = True) -> None:
-        self.audit.write({"event": "tool_result", "id": request_id, "tool": tool, "ok": ok, "memory_ids": memory_ids or [], "forwarded": forwarded})
+    def record_result(self, request_id: Any, tool: str, ok: bool, memory_ids: list[str] | None = None, *, forwarded: bool = True, write_outcome: str | None = None) -> None:
+        entry = {"event": "tool_result", "id": request_id, "tool": tool, "ok": ok, "memory_ids": memory_ids or [], "forwarded": forwarded}
+        if write_outcome is not None:
+            entry["write_outcome"] = write_outcome
+        self.audit.write(entry)
 
     def deny_tool(self, request_id: Any, tool: str, reason: str) -> tuple[None, dict[str, Any]]:
         self.record_result(request_id, tool, False, forwarded=False)
@@ -234,10 +280,12 @@ class Policy:
         if pending["method"] == "tools/call":
             tool = pending["tool"]
             ok = "error" not in message and isinstance(result, dict) and result.get("isError", False) is False
-            memory_ids = verified_write_ids(tool, pending["arguments"], result) if ok and tool in WRITE_TOOLS else []
-            if tool in WRITE_TOOLS and not memory_ids:
+            no_write = ok and verified_no_write_response(tool, result)
+            memory_ids = verified_write_ids(tool, pending["arguments"], result) if ok and tool in WRITE_TOOLS and not no_write else []
+            if tool in WRITE_TOOLS and not memory_ids and not no_write:
                 ok = False
-            self.record_result(request_id, tool, ok, memory_ids if ok else [])
+            self.record_result(request_id, tool, ok, memory_ids if ok else [],
+                               write_outcome=NO_WRITE_OUTCOME if no_write else None)
             if not ok and "error" not in message and isinstance(result, dict) and result.get("isError", False) is False:
                 return tool_error(request_id, "write was not verified by an Engram receipt; do not retry blindly"), None
         return message, None

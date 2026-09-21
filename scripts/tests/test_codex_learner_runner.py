@@ -180,7 +180,7 @@ class RunnerTests(unittest.TestCase):
                 if errors:
                     raise errors[0]
 
-    def fake_codex(self, *, events=None, result=None, exit_code=0, delay=0, read_stdin=True, audit_events=None, write_audit=True):
+    def fake_codex(self, *, events=None, result=None, exit_code=0, delay=0, read_stdin=True, audit_events=None, write_audit=True, audit_rows=None):
         events = events if events is not None else [mcp_event(), {"type": "turn.completed"}]
         audit_events = events if audit_events is None else audit_events
         result = result if result is not None else {"outcome": "no_new_memories", "summary": "Already represented.", "memory_ids": []}
@@ -215,6 +215,7 @@ class RunnerTests(unittest.TestCase):
             "  ids=re.findall(r'\\b[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\\b',text)\n"
             "  audit.append({'event':'tool_call','id':call_id,'tool':item['tool']})\n"
             "  audit.append({'event':'tool_result','id':call_id,'tool':item['tool'],'ok':item.get('status')=='completed' and not item.get('error') and not result.get('isError',False),'memory_ids':ids})\n"
+            f" if {audit_rows is not None!r}: audit={audit_rows!r}\n"
             " audit_path.write_text(''.join(json.dumps(item)+'\\n' for item in audit))\n"
             "result_path=pathlib.Path(args[args.index('--output-last-message')+1])\n"
             f"result_path.write_text(json.dumps({result!r}))\n"
@@ -595,6 +596,48 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(result["write_calls"], 1)
         self.assertEqual(result["writes"][0]["memory_ids"], [MEMORY_ID])
+
+    def no_write_rows(self):
+        return [{"event": "tool_call", "id": 1, "tool": "remember"},
+                {"event": "tool_result", "id": 1, "tool": "remember", "ok": True,
+                 "forwarded": True, "memory_ids": [], "write_outcome": "not_stored_near_duplicate"}]
+
+    def test_provider_known_conflict_can_complete_with_no_new_memories(self):
+        result = self.provider_run(events=[{"type": "turn.completed"}], audit_rows=self.no_write_rows())
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["write_calls"], 0)
+        self.assertEqual(result["tool_errors"], 0)
+
+    def test_provider_known_conflict_cannot_support_stored_claim(self):
+        result = self.provider_run(events=[{"type": "turn.completed"}], audit_rows=self.no_write_rows(),
+            result={"outcome": "stored", "summary": "Only an existing ID was returned.", "memory_ids": [MEMORY_ID]})
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["writes"], [])
+
+    def test_provider_mixed_verified_write_and_conflict_counts_only_write(self):
+        rows = self.no_write_rows() + [
+            {"event": "tool_call", "id": 2, "tool": "remember"},
+            {"event": "tool_result", "id": 2, "tool": "remember", "ok": True, "memory_ids": [MEMORY_ID]}]
+        result = self.provider_run(events=[{"type": "turn.completed"}], audit_rows=rows,
+            result={"outcome": "stored", "summary": "One saved finding.", "memory_ids": [MEMORY_ID]})
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["tool_calls"], 2)
+        self.assertEqual(result["write_calls"], 1)
+        self.assertEqual(result["writes"], [{"tool": "remember", "memory_ids": [MEMORY_ID]}])
+
+    def test_invalid_no_write_receipts_do_not_count_as_clean_completion(self):
+        mutations = [{"write_outcome": "unknown"}, {"memory_ids": [MEMORY_ID]},
+                     {"memory_ids": None}, {"forwarded": 1}, {"ok": 1},
+                     {"tool": "update"}, {"extra": "inconsistent"}]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                rows = self.no_write_rows()
+                rows[-1].update(mutation)
+                path = self.base / "malformed-audit.jsonl"
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                observed = runner.audit_tools(path)
+                self.assertGreater(observed["tool_errors"], 0)
+                self.assertEqual(observed["writes"], [])
 
     def test_claimed_memory_id_must_match_observed_successful_write(self):
         result = self.provider_run(

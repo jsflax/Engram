@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,20 @@ SPEC.loader.exec_module(proxy)
 ID_A = "11111111-1111-1111-1111-111111111111"
 ID_B = "22222222-2222-2222-2222-222222222222"
 EDGE_ID = "33333333-3333-3333-3333-333333333333"
+REPO_ROOT = MODULE_PATH.parents[2]
+PLUGIN_SPEC = importlib.util.spec_from_file_location(
+    "packaged_memory_proxy", REPO_ROOT / "codex/plugins/engram/scripts/codex_learner/memory_proxy.py")
+packaged_proxy = importlib.util.module_from_spec(PLUGIN_SPEC)
+PLUGIN_SPEC.loader.exec_module(packaged_proxy)
+
+# The native contract is literal here so a production parser change cannot also
+# silently change the fixture it is being tested against.
+CONFLICT_PREFIX = "⚠️ Near-duplicate memory detected. The new memory was NOT stored.\n\nExisting similar memories:"
+CONFLICT_SUFFIX = ('\n\nTo resolve:'
+                   '\n  - Use `update(id: "UUID", ...)` to modify the existing memory'
+                   '\n  - Use `remember(..., force: true)` to keep both'
+                   '\n  - Use `forget(id: "UUID")` to remove the old one, then `remember` the new one')
+CONFLICT_TEXT = CONFLICT_PREFIX + f"\n  [id:{ID_A}] (distance: 0.123, term overlap: 90%) PRIVATE_CONFLICT_SENTINEL" + CONFLICT_SUFFIX
 
 
 class CaptureAudit:
@@ -127,6 +142,96 @@ class PolicyTests(unittest.TestCase):
         self.assertIsNone(forwarded)
         self.assertTrue(denied["result"]["isError"])
         self.assertEqual(self.policy.pending[proxy.id_key(1)]["tool"], "recall")
+
+
+class NoWriteContractTests(unittest.TestCase):
+    def policies(self, *, max_writes=3):
+        for module in (proxy, packaged_proxy):
+            audit = CaptureAudit()
+            yield module, audit, module.Policy(audit, "fixture", 8, max_writes)
+
+    def test_native_warning_is_forwarded_with_only_vetted_no_write_metadata(self):
+        for module, audit, policy in self.policies():
+            with self.subTest(module=module.__name__):
+                policy.client_message(call(1, "remember", {"content": "private"}))
+                native = result(1, CONFLICT_TEXT)
+                forwarded, child = policy.server_message(native)
+                self.assertEqual(forwarded, native)
+                self.assertIsNone(child)
+                self.assertEqual(audit.records[-1], {"event": "tool_result", "id": 1,
+                    "tool": "remember", "ok": True, "forwarded": True,
+                    "memory_ids": [], "write_outcome": "not_stored_near_duplicate"})
+                self.assertTrue(module.verified_no_write_receipt(audit.records[-1]))
+                self.assertNotIn(ID_A, json.dumps(audit.records))
+                self.assertNotIn("PRIVATE_CONFLICT_SENTINEL", json.dumps(audit.records))
+
+    def test_unknown_embedded_truncated_and_mixed_responses_stay_unverified(self):
+        cases = [result(1, "Unknown outcome " + ID_A),
+                 result(1, "Quoted memory: " + CONFLICT_TEXT),
+                 result(1, CONFLICT_PREFIX), result(1, CONFLICT_TEXT + "extra"),
+                 result(1, CONFLICT_TEXT.replace("NOT stored", "stored"))]
+        mixed = result(1, CONFLICT_TEXT)
+        mixed["result"]["content"].append({"type": "text", "text": f"Stored memory (id: {ID_B})"})
+        cases.append(mixed)
+        structured = result(1, CONFLICT_TEXT)
+        structured["result"]["structuredContent"] = {"stored": True}
+        cases.append(structured)
+        for native in cases:
+            for module, audit, policy in self.policies():
+                with self.subTest(module=module.__name__, response=native):
+                    policy.client_message(call(1, "remember", {"content": "private"}))
+                    output, _ = policy.server_message(native)
+                    self.assertTrue(output["result"]["isError"])
+                    self.assertIs(audit.records[-1]["ok"], False)
+                    self.assertNotIn("write_outcome", audit.records[-1])
+
+    def test_non_boolean_error_flags_and_malformed_content_never_prove_no_write(self):
+        cases = []
+        for flag in (True, None, 0, 1, "false", []):
+            cases.append(result(1, CONFLICT_TEXT, flag))
+        missing = result(1, CONFLICT_TEXT)
+        del missing["result"]["isError"]
+        cases.append(missing)
+        for content in (None, {}, "bad", [None], [{"type": "text", "text": None}]):
+            native = result(1, CONFLICT_TEXT)
+            native["result"]["content"] = content
+            cases.append(native)
+        for native in cases:
+            for module, audit, policy in self.policies():
+                with self.subTest(module=module.__name__, response=native):
+                    policy.client_message(call(1, "remember", {"content": "private"}))
+                    policy.server_message(native)
+                    self.assertIs(audit.records[-1]["ok"], False)
+                    self.assertNotIn("write_outcome", audit.records[-1])
+
+    def test_conflict_does_not_verify_other_tools_and_consumes_attempt_budget(self):
+        for module, audit, policy in self.policies(max_writes=1):
+            with self.subTest(module=module.__name__):
+                policy.client_message(call(1, "remember", {"content": "private"}))
+                policy.server_message(result(1, CONFLICT_TEXT))
+                forwarded, denied = policy.client_message(call(2, "update", {"id": ID_A, "append": "new"}))
+                self.assertIsNone(forwarded)
+                self.assertTrue(denied["result"]["isError"])
+                self.assertEqual(policy.write_calls, 2)
+                self.assertEqual(policy.total_calls, 2)
+        for module, audit, policy in self.policies():
+            policy.client_message(call(1, "update", {"id": ID_A, "append": "new"}))
+            policy.server_message(result(1, CONFLICT_TEXT))
+            self.assertIs(audit.records[-1]["ok"], False)
+
+    def test_parser_contract_matches_native_source_and_packaged_copy(self):
+        native = (REPO_ROOT / "Sources/EngramKit/MemoryTools+Core.swift").read_text()
+        start = native.index('var warning = ')
+        end = native.index('return CallTool.Result(content: [.text(warning)], isError: false)', start)
+        body = native[start:end]
+        prefix = re.search(r'var warning = (".*")', body)[1]
+        suffix = ''.join(json.loads(value) for value in re.findall(r'warning \+= (".*")', body)
+                         if '\\(mGid' not in value)
+        self.assertEqual(json.loads(prefix), CONFLICT_PREFIX)
+        self.assertEqual(suffix, CONFLICT_SUFFIX)
+        for module in (proxy, packaged_proxy):
+            self.assertEqual(module.NEAR_DUPLICATE_PREFIX, CONFLICT_PREFIX)
+            self.assertEqual(module.NEAR_DUPLICATE_SUFFIX, CONFLICT_SUFFIX)
 
 
 class TransportTests(unittest.TestCase):

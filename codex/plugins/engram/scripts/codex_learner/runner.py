@@ -24,6 +24,7 @@ import tomllib
 import uuid
 
 from .transcript import inspect_rollout, read_excerpt
+from .memory_proxy import verified_no_write_receipt
 from . import admission, memory_config
 
 EVENTS = {"Stop", "SubagentStop", "PreCompact", "SessionEnd"}
@@ -522,6 +523,9 @@ def audit_tools(path: Path, *, allow_clean_interrupt: bool = False) -> dict:
         result = results.get(key, {})
         if result.get("ok") is not True or result.get("tool") != tool:
             errors += 1
+        elif "write_outcome" in result:
+            if not verified_no_write_receipt(result):
+                errors += 1
         elif tool in WRITE_TOOLS:
             ids = result.get("memory_ids", [])
             if not isinstance(ids, list) or not ids or any(not isinstance(i, str) or not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", i) for i in ids):
@@ -740,6 +744,10 @@ def failure_reconciliation(run_dir: Path, provider_started: bool | None) -> dict
             result = results.get(key)
             if result is not None and result.get("tool") != call["tool"]:
                 return unknown
+            if result is not None and "write_outcome" in result:
+                if verified_no_write_receipt(result):
+                    continue  # A vetted native conflict completed without storage.
+                return unknown  # Contradictory/unknown outcome metadata is unsafe.
             if result is not None and result.get("forwarded") is False and result.get("ok") is False:
                 continue  # A denied call is proved not to have reached Engram.
             risky = True

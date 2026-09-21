@@ -66,6 +66,57 @@ class ReceiptTests(unittest.TestCase):
         self.assertGreater(self.audit_result()['tool_errors'], 0)
         self.assertEqual(self.audit_result()['writes'], [])
 
+    def conflict(self):
+        return (PROXY.NEAR_DUPLICATE_PREFIX
+                + f'\n  [id:{OTHER}] (distance: 0.123, term overlap: 90%) PRIVATE_EXISTING'
+                + PROXY.NEAR_DUPLICATE_SUFFIX)
+
+    def test_near_duplicate_is_not_a_write_or_tool_error(self):
+        self.call(1, 'remember', {'content': 'Synthetic'})
+        output, _ = self.reply(1, self.conflict())
+        self.assertIs(output['result']['isError'], False)
+        self.assertIn(OTHER, output['result']['content'][0]['text'])
+        self.assertNotIn(OTHER, json.dumps(self.audit.rows))
+        self.assertNotIn('PRIVATE_EXISTING', json.dumps(self.audit.rows))
+        self.assertEqual(self.audit_result(), {'tool_calls': 1, 'write_calls': 0,
+                                             'writes': [], 'tool_errors': 0})
+
+    def test_conflict_then_update_counts_only_the_verified_update(self):
+        self.policy = PROXY.Policy(self.audit, 'codex-session:SOURCE', 3, 2)
+        self.call(1, 'remember', {'content': 'Synthetic'})
+        self.reply(1, self.conflict())
+        self.call(2, 'update', {'id': OTHER, 'append': 'New finding'})
+        self.reply(2, f'Updated memory (id: {OTHER})')
+        self.assertEqual(self.audit_result(), {'tool_calls': 2, 'write_calls': 1,
+            'writes': [{'tool': 'update', 'memory_ids': [OTHER]}], 'tool_errors': 0})
+
+    def test_conflict_attempt_still_consumes_write_budget(self):
+        self.call(1, 'remember', {'content': 'Synthetic'})
+        self.reply(1, self.conflict())
+        forwarded, denied = self.call(2, 'remember', {'content': 'Another'})
+        self.assertIsNone(forwarded)
+        self.assertTrue(denied['result']['isError'])
+        self.assertEqual(self.policy.write_calls, 2)
+        self.assertEqual(self.audit_result()['write_calls'], 0)
+        self.assertGreater(self.audit_result()['tool_errors'], 0)
+
+    def test_malformed_no_write_receipts_fail_both_completion_and_reconciliation(self):
+        self.call(1, 'remember', {'content': 'Synthetic'})
+        self.reply(1, self.conflict())
+        valid = self.audit.rows[-1]
+        changes = [{'write_outcome': 'unknown'}, {'memory_ids': [OTHER]},
+                   {'memory_ids': None}, {'forwarded': 1}, {'forwarded': False},
+                   {'ok': 1}, {'ok': False}, {'tool': 'update'}, {'extra': True}]
+        for change in changes:
+            with self.subTest(change=change):
+                self.audit.rows[-1] = dict(valid, **change)
+                self.assertGreater(self.audit_result()['tool_errors'], 0)
+                with tempfile.TemporaryDirectory() as temp:
+                    path = Path(temp)
+                    rows = [{'event': 'relay_started'}, *self.audit.rows]
+                    (path / 'mcp-audit.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                    self.assertIsNotNone(F.RUNNER.failure_reconciliation(path, True))
+
     def test_update_receipt_requires_requested_exact_uuid(self):
         self.call(1, 'update', {'id': ID, 'content': 'Synthetic'})
         self.reply(1, f'Updated memory (id: {OTHER})')
