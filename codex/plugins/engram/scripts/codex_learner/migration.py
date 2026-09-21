@@ -23,7 +23,7 @@ import stat
 
 from . import admission, file_identity, host_admission
 
-MAX_SELECTED = 32
+MAX_SELECTED = 64
 MAX_IMPACT_TASKS = 500
 MAX_PLAN_BYTES = 32 * 1024 * 1024
 MODE_V1 = "host_sessions_v1"
@@ -548,9 +548,31 @@ def prepare(root, route_path, session_ids, *, legacy_policy_path=None, authorize
         return plan
 
 
-def _validate_plan(root, plan, expected_sha):
-    require(isinstance(plan, dict) and len(encode(plan)) <= MAX_PLAN_BYTES
-            and digest(encode(plan)) == expected_sha, "plan_sha_mismatch")
+def _validate_plan_digest(plan, expected_sha):
+    require(isinstance(plan, dict), "plan_sha_mismatch")
+    raw = encode(plan)
+    require(len(raw) <= MAX_PLAN_BYTES and digest(raw) == expected_sha, "plan_sha_mismatch")
+
+
+def _validate_legacy_source(root, plan):
+    """Re-read external retained bytes and their exact journal lineage."""
+    legacy = plan["legacy_policy"]
+    legacy_path = Path(legacy["path"])
+    if legacy_path != root / "admission.json":
+        raw, identity = _read(legacy_path)
+        require(raw == _unb64(legacy["bytes"]) and identity == legacy["identity"], "legacy_source_changed")
+        if admission._json(_unb64(plan["records"][-1]["preimage"]))["mode"] == MODE_V2:
+            _retained_legacy(root, legacy_path, raw, _unb64(plan["records"][-1]["preimage"]))
+
+
+def _validate_plan(root, plan, expected_sha, *, candidate_task_ids=None):
+    """Validate every immutable/source/shared assertion; default is every task.
+
+    During one locked publication only, the caller may additionally narrow fresh
+    task-origin/frontier checks to the affected task. Full checks remain required
+    at command entry and before the final activation policy is published.
+    """
+    _validate_plan_digest(plan, expected_sha)
     require(set(plan) == {"schema_version", "kind", "root", "route_path", "session_ids", "runtime_sha256",
                          "records", "hold_paths", "legacy_policy", "historical_volume_continuity_proven",
                          "owner_authorized_current_volume_adoption", "learner_started", "publication_order", "transitional_policy", "activation_impact"}
@@ -579,13 +601,8 @@ def _validate_plan(root, plan, expected_sha):
                 == (record["preimage_identity"] is None), "record_absence_changed")
     legacy = plan["legacy_policy"]
     require(digest(_unb64(legacy["bytes"])) == legacy["sha256"], "legacy_policy_digest_changed")
-    legacy_path = Path(legacy["path"])
-    if legacy_path != root / "admission.json":
-        raw, identity = _read(legacy_path)
-        require(raw == _unb64(legacy["bytes"]) and identity == legacy["identity"], "legacy_source_changed")
-        if admission._json(_unb64(plan["records"][-1]["preimage"]))["mode"] == MODE_V2:
-            _retained_legacy(root, legacy_path, raw, _unb64(plan["records"][-1]["preimage"]))
-    _validate_candidates(root, plan)
+    _validate_legacy_source(root, plan)
+    _validate_candidates(root, plan, candidate_task_ids=candidate_task_ids)
     original_raw = _unb64(plan["records"][-1]["preimage"])
     original = admission._json(original_raw)
     transition = encode({**original, "enabled": False}) if original["enabled"] else original_raw
@@ -594,7 +611,21 @@ def _validate_plan(root, plan, expected_sha):
     _validate_impact(plan)
 
 
-def _validate_candidates(root, plan):
+def _validate_publication(root, plan, expected_sha, *, candidate_task_ids):
+    """Only for _run after full validation within its current lock acquisition.
+
+    The pinned canonical digest proves that all immutable plan assertions remain
+    exactly those already validated at entry. Recheck every source and shared
+    live assertion, plus the affected task, before the caller's full prefix/hold
+    CAS. Nothing is cached across writes, commands, or lock acquisitions.
+    """
+    _validate_plan_digest(plan, expected_sha)
+    require(plan["runtime_sha256"] == _runtime(), "runtime_changed")
+    _validate_legacy_source(root, plan)
+    _validate_candidates(root, plan, candidate_task_ids=candidate_task_ids)
+
+
+def _validate_candidates(root, plan, *, candidate_task_ids=None):
     records = plan["records"]
     original = admission._json(_unb64(records[-1]["preimage"]))
     _policy(original, root, original.get("mode") == MODE_V2)
@@ -616,7 +647,12 @@ def _validate_candidates(root, plan):
     _route(route_before, root, original["mode"] == MODE_V2)
     _route(route_after, root, True)
     require(route_after == {**route_before, "schema_version": 2, "mode": MODE_V2}, "route_transformation_invalid")
+    if candidate_task_ids is not None:
+        require(isinstance(candidate_task_ids, tuple) and len(candidate_task_ids) <= 1
+                and set(candidate_task_ids) <= set(plan["session_ids"]), "invalid_candidate_task_selection")
     for index, sid in enumerate(plan["session_ids"]):
+        if candidate_task_ids is not None and sid not in candidate_task_ids:
+            continue
         batch = records[index * 4:index * 4 + 4]
         before = {Path(r["path"]).parent.name: _unb64(r["preimage"]) for r in batch}
         expected = _task_candidates(root, sid, before, legacy, legacy_raw, target, target_raw)
@@ -773,13 +809,17 @@ def _run(root, plan, plan_sha, *, recovery):
                 _new(path, expected)
                 _event(work, "hold_published", session_id=sid)
         for index, record in enumerate(plan["records"][:-1]):
+            # Entry validation already proved the complete plan and exact prefix.
+            # Recovery must reach its first remaining record without rechecking
+            # every task's native identity once per already-published record.
+            if record["preimage"] == record["candidate"] or states[index] == "after":
+                continue
             locks.verify()
-            _validate_plan(root, plan, plan_sha)
+            affected = (plan["session_ids"][index // 4],) if index < len(plan["session_ids"]) * 4 else ()
+            _validate_publication(root, plan, plan_sha, candidate_task_ids=affected)
             _verify_prefix(plan, recover=True)
             for sid, path in zip(plan["session_ids"], plan["hold_paths"]):
                 require(_read(Path(path))[0] == _hold(sid, plan_sha), "hold_changed")
-            if record["preimage"] == record["candidate"] or _match(record, recover=True) == "after":
-                continue
             _event(work, "before_publish", index=index, path=record["path"], candidate_sha256=record["candidate_sha256"])
             _publish(record, work, index)
             _event(work, "published", index=index, path=record["path"], candidate_sha256=record["candidate_sha256"])

@@ -118,7 +118,7 @@ class MigrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid_selection"):
             self.prepare([self.sid, self.sid])
         with self.assertRaisesRegex(ValueError, "invalid_selection"):
-            self.prepare([F.uuid7(F.ORIGIN, suffix=n) for n in range(33)])
+            self.prepare([F.uuid7(F.ORIGIN, suffix=n) for n in range(M.MAX_SELECTED + 1)])
 
     def test_apply_preserves_every_nonidentity_field_and_other_task(self):
         other = self.fixture.task(2)
@@ -804,8 +804,8 @@ class ImpactTests(unittest.TestCase):
             self.prepare([self.sid, other])
         self.assertEqual(before, self.snapshot())
 
-    def test_healthy_cohort_over_32_refuses_without_expansion_or_mutation(self):
-        for n in range(2, 35):
+    def test_healthy_cohort_over_selected_bound_refuses_without_expansion_or_mutation(self):
+        for n in range(2, M.MAX_SELECTED + 3):
             self.fixture.task(n, cursor=False, pending=False)
         before = self.snapshot()
         with self.assertRaisesRegex(ValueError, "impact_healthy_cohort_limit_exceeded"):
@@ -888,6 +888,396 @@ class ImpactTests(unittest.TestCase):
             self.assertIsNone(later["activation_impact"])
             self.apply(later)
         self.assertEqual((self.root / "admission.json").read_bytes(), policy_raw)
+
+
+class Bound64Tests(unittest.TestCase):
+    """Expanded selection boundary with real owned metadata and unchanged guards."""
+    setUp = MigrationTests.setUp
+    prepare = MigrationTests.prepare
+    apply = MigrationTests.apply
+    snapshot = MigrationTests.snapshot
+    healthy = ImpactTests.healthy
+    unchanged_refusal = ImpactTests.unchanged_refusal
+
+    def cohort(self, *, first_healthy=True):
+        if first_healthy:
+            self.healthy(self.sid)
+        selected = [self.sid]
+        for n in range(2, 65):
+            cursor = n % 4 != 0
+            selected.append(self.fixture.task(n, cursor=cursor, pending=cursor,
+                                              paused=n % 3 != 0, gated=False))
+        self.assertEqual(len(selected), 64)
+        return sorted(selected)
+
+    def test_exact_64_healthy_tasks_prepare_without_mutation_or_changed_other_bounds(self):
+        self.assertEqual(M.MAX_SELECTED, 64)
+        self.assertEqual(M.MAX_IMPACT_TASKS, 500)
+        self.assertEqual(M.MAX_PLAN_BYTES, 32 * 1024 * 1024)
+        selected = self.cohort()
+        before = self.snapshot()
+        plan = self.prepare(selected)
+        self.assertEqual(plan["session_ids"], selected)
+        self.assertEqual(plan["activation_impact"]["healthy_session_ids"], selected)
+        self.assertEqual(len(plan["records"]), 64 * 4 + 2)
+        self.assertLess(len(M.encode(plan)), M.MAX_PLAN_BYTES)
+        M._validate_plan(self.root, plan, M.digest(M.encode(plan)))
+        self.assertEqual(before, self.snapshot())
+        self.assertFalse((self.root / "migrations").exists())
+        self.assertFalse((self.root / "migration-holds").exists())
+
+    def test_64_plan_preserves_all_cursor_gate_pause_and_dedup_fields(self):
+        selected = self.cohort(first_healthy=False)
+        plan = self.prepare(selected)
+        self.assertEqual(len(plan["activation_impact"]["healthy_session_ids"]), 63)
+        found_gate = found_paused = found_unpaused = found_event_bridge = False
+        for record in plan["records"]:
+            name = Path(record["path"]).parent.name
+            if name not in {"sessions", "pending", "admissions"} or record["preimage"] is None:
+                continue
+            before = json.loads(M._unb64(record["preimage"]))
+            after = json.loads(M._unb64(record["candidate"]))
+            if name == "admissions":
+                self.assertEqual({k: v for k, v in before.items() if k not in {"binding", "state_sha256"}},
+                                 {k: v for k, v in after.items() if k not in {"binding", "state_sha256", "legacy_event_identity"}})
+                self.assertEqual(after["last_event"], before["last_event"])
+                self.assertEqual(after["processing"], before["processing"])
+                self.assertEqual(after["legacy_event_identity"],
+                                 {k: before["binding"][k] for k in ("device", "inode")})
+                found_event_bridge = True
+                continue
+            self.assertEqual({k: v for k, v in before.items() if k not in {"device", "inode", "admission"}},
+                             {k: v for k, v in after.items() if k not in {"identity", "admission"}})
+            found_gate |= bool(after.get("reconciliation_required"))
+            if name == "pending":
+                found_paused |= after.get("paused_request_id") == after["request_id"]
+                found_unpaused |= after.get("paused_request_id") != after["request_id"]
+        self.assertTrue(found_gate and found_paused and found_unpaused and found_event_bridge)
+
+    def test_65_explicit_selected_tasks_refuse_before_mutation(self):
+        selected = self.cohort()
+        selected.append(self.fixture.task(65, cursor=False, pending=False))
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "invalid_selection"):
+            self.prepare(selected)
+        self.assertEqual(before, self.snapshot())
+        self.assertFalse((self.root / "migrations").exists())
+
+    def test_65_healthy_tasks_cannot_fit_by_omitting_one_from_64_selection(self):
+        selected = self.cohort()
+        self.fixture.task(65, cursor=False, pending=False)
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "impact_healthy_cohort_limit_exceeded"):
+            self.prepare(selected)
+        self.assertEqual(before, self.snapshot())
+
+    def test_new_65th_healthy_enrollment_after_64_plan_refuses_without_journal(self):
+        selected = self.cohort()
+        plan = self.prepare(selected)
+        self.fixture.task(65, cursor=False, pending=False)
+        self.unchanged_refusal(plan, "impact_healthy_cohort_limit_exceeded")
+        self.assertEqual(plan["session_ids"], selected)
+
+    def test_new_membership_within_health_bound_still_refuses_exact_64_selection(self):
+        selected = self.cohort(first_healthy=False)
+        plan = self.prepare(selected)
+        self.fixture.task(65, cursor=False, pending=False)
+        self.unchanged_refusal(plan)
+
+    def test_existing_gate_clear_outside_64_selection_refuses_without_mutation(self):
+        selected = self.cohort(first_healthy=False)
+        outsider = self.fixture.task(65, gated=True)
+        plan = self.prepare(selected)
+        self.healthy(outsider)
+        self.unchanged_refusal(plan)
+
+    def test_existing_processing_completion_outside_64_selection_refuses_without_mutation(self):
+        selected = self.cohort(first_healthy=False)
+        outsider = self.fixture.task(65, gated=False)
+        self.healthy(outsider, processing="existing-run")
+        plan = self.prepare(selected)
+        self.healthy(outsider, processing=None)
+        self.unchanged_refusal(plan)
+
+    def test_last_selected_cursor_stale_cas_still_refuses_at_64(self):
+        selected = self.cohort()
+        plan = self.prepare(selected)
+        cursor_sid = next(sid for sid in reversed(selected) if M._paths(self.root, sid)["sessions"].exists())
+        path = M._paths(self.root, cursor_sid)["sessions"]
+        state = json.loads(path.read_bytes())
+        state["newer_state_must_survive"] = True
+        F.write_json(path, state)
+        self.unchanged_refusal(plan, "cas_mismatch")
+
+
+class PublicationEfficiencyTests(unittest.TestCase):
+    """Scoped native revalidation still protects every actual publication."""
+    setUp = MigrationTests.setUp
+    prepare = MigrationTests.prepare
+    apply = MigrationTests.apply
+    snapshot = MigrationTests.snapshot
+    healthy = ImpactTests.healthy
+
+    def cohort(self):
+        self.healthy(self.sid)
+        return [self.sid] + [self.fixture.task(n, gated=False) for n in range(2, 65)]
+
+    def extend_frontier(self, sid):
+        paths = M._paths(self.root, sid)
+        entry = json.loads(paths["enrollments"].read_bytes())
+        entry.update(M.admission._frontier(entry))
+        F.write_json(paths["enrollments"], entry)
+        binding = M._binding(entry, self.fixture.policy, (self.root / "admission.json").read_bytes())
+        state = json.loads(paths["sessions"].read_bytes())
+        state.update(admission=binding, offset=entry["frontier_offset"])
+        F.write_json(paths["sessions"], state)
+        record = json.loads(paths["admissions"].read_bytes())
+        record.update(binding=binding, state_sha256=M.object_digest(state))
+        F.write_json(paths["admissions"], record)
+        pending = json.loads(paths["pending"].read_bytes())
+        pending["admission"] = binding
+        F.write_json(paths["pending"], pending)
+
+    def assert_suspended(self):
+        self.assertIs(json.loads((self.root / "admission.json").read_bytes())["enabled"], False)
+
+    def test_late_task_frontier_drift_refuses_before_that_task_publication(self):
+        other = self.fixture.task(2, gated=False)
+        self.extend_frontier(other)
+        plan = self.prepare([self.sid, other])
+        late = self.fixture.tasks[other]["path"]
+        original = M._event
+        def change(work, event, **fields):
+            original(work, event, **fields)
+            if event == "published" and fields["index"] == 3:
+                raw = late.read_bytes()
+                self.assertIn(b"fixture durable fact", raw)
+                late.write_bytes(raw.replace(b"fixture durable fact", b"changed durable fact"))
+        with mock.patch.object(M, "_event", side_effect=change):
+            with self.assertRaisesRegex(ValueError, "legacy_frontier_changed"):
+                self.apply(plan)
+        self.assert_suspended()
+        for record in plan["records"][4:8]:
+            self.assertEqual(Path(record["path"]).read_bytes(), M._unb64(record["preimage"]))
+
+    def test_late_task_origin_drift_refuses_before_that_task_publication(self):
+        other = self.fixture.task(2, gated=False)
+        plan = self.prepare([self.sid, other])
+        late = self.fixture.tasks[other]["path"]
+        original = M._event
+        def change(work, event, **fields):
+            original(work, event, **fields)
+            if event == "published" and fields["index"] == 3:
+                late.write_bytes(late.read_bytes().replace(b'"cli_version": "fixture"', b'"cli_version": "changed"'))
+        with mock.patch.object(M, "_event", side_effect=change):
+            with self.assertRaisesRegex(ValueError, "legacy_origin_changed"):
+                self.apply(plan)
+        self.assert_suspended()
+        self.assertEqual(Path(plan["records"][4]["path"]).read_bytes(), M._unb64(plan["records"][4]["preimage"]))
+
+    def test_full_final_validation_rechecks_already_published_task_before_activation(self):
+        other = self.fixture.task(2, gated=False)
+        self.extend_frontier(self.sid)
+        plan = self.prepare([self.sid, other])
+        path = self.fixture.tasks[self.sid]["path"]
+        original = M._event
+        def change(work, event, **fields):
+            original(work, event, **fields)
+            if event == "published" and fields["index"] == len(plan["records"]) - 2:
+                path.write_bytes(path.read_bytes().replace(b"fixture durable fact", b"changed durable fact"))
+        with mock.patch.object(M, "_event", side_effect=change):
+            with self.assertRaisesRegex(ValueError, "legacy_frontier_changed"):
+                self.apply(plan)
+        self.assert_suspended()
+        self.assertEqual(self.route.read_bytes(), M._unb64(plan["records"][-2]["candidate"]))
+        self.assertNotEqual((self.root / "admission.json").read_bytes(), M._unb64(plan["records"][-1]["candidate"]))
+
+    def test_runtime_drift_after_first_write_refuses_next_write(self):
+        plan = self.prepare()
+        original_event, original_runtime = M._event, M._runtime
+        changed = False
+        def change(work, event, **fields):
+            nonlocal changed
+            original_event(work, event, **fields)
+            if event == "published" and fields["index"] == 0:
+                changed = True
+        def runtime():
+            actual = original_runtime()
+            return {**actual, "changed.py": "0" * 64} if changed else actual
+        with mock.patch.object(M, "_event", side_effect=change), mock.patch.object(M, "_runtime", side_effect=runtime):
+            with self.assertRaisesRegex(ValueError, "runtime_changed"):
+                self.apply(plan)
+        self.assert_suspended()
+        self.assertEqual(Path(plan["records"][1]["path"]).read_bytes(), M._unb64(plan["records"][1]["preimage"]))
+
+    def test_global_prefix_cas_still_checks_previously_published_task(self):
+        other = self.fixture.task(2, gated=False)
+        plan = self.prepare([self.sid, other])
+        first = M._paths(self.root, self.sid)["sessions"]
+        original = M._event
+        def change(work, event, **fields):
+            original(work, event, **fields)
+            if event == "published" and fields["index"] == 3:
+                value = json.loads(first.read_bytes())
+                F.write_json(first, {**value, "newer": "must remain untouched"})
+        with mock.patch.object(M, "_event", side_effect=change):
+            with self.assertRaisesRegex(ValueError, "cas_mismatch"):
+                self.apply(plan)
+        self.assert_suspended()
+        self.assertEqual(json.loads(first.read_bytes())["newer"], "must remain untouched")
+
+    def test_recovery_skips_published_prefix_native_scans_and_completes_64_under_cli_deadline(self):
+        import time
+        selected = self.cohort()
+        plan = self.prepare(selected)
+        plan_path = self.base / "reviewed-plan.json"
+        plan_path.write_bytes(M.encode(plan)); plan_path.chmod(0o600)
+        sha = M.digest(M.encode(plan))
+        original = M._publish
+        def crash(record, work, index):
+            original(record, work, index)
+            if index == 239:
+                raise RuntimeError("injected after 60 complete tasks")
+        with mock.patch.object(M, "_publish", side_effect=crash):
+            with self.assertRaisesRegex(RuntimeError, "60 complete tasks"):
+                self.apply(plan)
+        before = {r["path"]: Path(r["path"]).read_bytes() for r in plan["records"][:240]}
+        candidate_calls = []
+        original_validate = M._validate_candidates
+        def validate(*args, **kwargs):
+            candidate_calls.append(kwargs.get("candidate_task_ids"))
+            return original_validate(*args, **kwargs)
+        started = time.monotonic()
+        with mock.patch.object(M, "_validate_candidates", side_effect=validate), mock.patch("builtins.print") as output:
+            result = M.main(["recover", "--state-dir", str(self.root), "--plan", str(plan_path), "--plan-sha256", sha])
+        self.assertEqual(result, 0)
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertEqual(json.loads(output.call_args.args[0])["status"], "migration_complete_held")
+        self.assertEqual(candidate_calls.count(None), 3)  # Entry, pre-activation, completed chain.
+        subsets = [value for value in candidate_calls if value is not None]
+        self.assertEqual(subsets, [tuple([sid]) for sid in selected[60:] for _ in range(4)] + [()])
+        self.assertEqual(before, {path: Path(path).read_bytes() for path in before})
+        self.assertEqual((self.root / "admission.json").read_bytes(), M._unb64(plan["records"][-1]["candidate"]))
+
+    def test_completed_recovery_still_revalidates_all_sources_and_origins(self):
+        plan = self.prepare()
+        self.apply(plan)
+        source = M._runtime()
+        with mock.patch.object(M, "_runtime", return_value={**source, "changed.py": "0" * 64}):
+            with self.assertRaisesRegex(ValueError, "runtime_changed"):
+                M.recover(self.root, plan, M.digest(M.encode(plan)))
+        path = self.fixture.tasks[self.sid]["path"]
+        path.write_bytes(path.read_bytes().replace(b'"cli_version": "fixture"', b'"cli_version": "changed"'))
+        with self.assertRaisesRegex(ValueError, "legacy_origin_changed"):
+            M.recover(self.root, plan, M.digest(M.encode(plan)))
+
+
+class PublicationPlanIntegrityTests(unittest.TestCase):
+    """Exact pinned bytes replace only repeated immutable parsing, never live checks."""
+    setUp = MigrationTests.setUp
+    prepare = MigrationTests.prepare
+    apply = MigrationTests.apply
+    snapshot = MigrationTests.snapshot
+    assert_suspended = PublicationEfficiencyTests.assert_suspended
+
+    def changed_plan_refuses(self, mutate):
+        plan = self.prepare()
+        sha = M.digest(M.encode(plan))
+        original_event = M._event
+        before_next = Path(plan["records"][1]["path"]).read_bytes()
+        def change(work, event, **fields):
+            original_event(work, event, **fields)
+            if event == "published" and fields["index"] == 0:
+                mutate(plan)
+        with mock.patch.object(M, "_event", side_effect=change):
+            with self.assertRaisesRegex(ValueError, "plan_sha_mismatch"):
+                M.apply(self.root, plan, sha)
+        self.assert_suspended()
+        self.assertEqual(Path(plan["records"][1]["path"]).read_bytes(), before_next)
+
+    def test_nested_record_mutation_after_first_write_refuses_pinned_sha(self):
+        def mutate(plan):
+            record = plan["records"][1]
+            state = json.loads(M._unb64(record["candidate"]))
+            state["offset"] += 1
+            raw = M.encode(state)
+            record.update(candidate=M._b64(raw), candidate_sha256=M.digest(raw))
+        self.changed_plan_refuses(mutate)
+
+    def test_nested_impact_mutation_after_first_write_refuses_pinned_sha(self):
+        self.changed_plan_refuses(lambda plan: plan["activation_impact"].update(policy_enabled=False))
+
+    def test_nested_transition_mutation_after_first_write_refuses_pinned_sha(self):
+        self.changed_plan_refuses(lambda plan: plan["transitional_policy"]["preimage_identity"].update(mtime_ns=0))
+
+    def test_cli_rehashed_invalid_plan_cannot_skip_full_entry_validation(self):
+        plan = self.prepare()
+        plan["records"][1]["candidate_sha256"] = "0" * 64
+        plan_path = self.base / "altered-plan.json"
+        plan_path.write_bytes(M.encode(plan))
+        plan_path.chmod(0o600)
+        before = self.snapshot()
+        with mock.patch.object(M, "_validate_publication") as publication, mock.patch("builtins.print") as output:
+            result = M.main(["apply", "--state-dir", str(self.root), "--plan", str(plan_path),
+                             "--plan-sha256", M.digest(M.encode(plan))])
+        self.assertNotEqual(result, 0)
+        self.assertIn("record_digest_changed", output.call_args.args[0])
+        publication.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+
+    def later_plan(self):
+        second = self.fixture.task(2)
+        first = self.prepare()
+        self.apply(first)
+        journal = self.root / "migrations" / M.digest(M.encode(first))
+        later = self.prepare([second], legacy_policy_path=journal / "legacy-policy.json")
+        return later, journal
+
+    def assert_later_write_refuses(self, plan, change_source, reason):
+        original_event = M._event
+        def change(work, event, **fields):
+            original_event(work, event, **fields)
+            if event == "published" and fields["index"] == 0:
+                change_source()
+        with mock.patch.object(M, "_event", side_effect=change):
+            with self.assertRaisesRegex(ValueError, reason):
+                self.apply(plan)
+        self.assert_suspended()
+        self.assertEqual(Path(plan["records"][1]["path"]).read_bytes(), M._unb64(plan["records"][1]["preimage"]))
+
+    def test_retained_legacy_identity_drift_after_first_write_refuses(self):
+        plan, journal = self.later_plan()
+        source = journal / "legacy-policy.json"
+        self.assert_later_write_refuses(plan, lambda: source.write_bytes(source.read_bytes()), "legacy_source_changed")
+
+    def test_retained_journal_lineage_drift_after_first_write_refuses(self):
+        plan, journal = self.later_plan()
+        source = journal / "plan.json"
+        def change():
+            value = json.loads(source.read_bytes())
+            value["learner_started"] = True
+            source.write_bytes(M.encode(value))
+        self.assert_later_write_refuses(plan, change, "retained_plan_digest_changed")
+
+    def test_later_stable_policy_reencoding_refuses_before_any_write(self):
+        plan, _ = self.later_plan()
+        record = plan["records"][-1]
+        raw = (json.dumps(json.loads(M._unb64(record["candidate"])), indent=2) + "\n").encode()
+        record.update(candidate=M._b64(raw), candidate_sha256=M.digest(raw))
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "stable_policy_must_not_change"):
+            self.apply(plan)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_immutable_impact_validation_only_at_full_boundaries(self):
+        plan = self.prepare()
+        with mock.patch.object(M, "_validate_impact", wraps=M._validate_impact) as immutable, \
+                mock.patch.object(M, "_validate_publication", wraps=M._validate_publication) as publication:
+            self.apply(plan)
+        self.assertEqual(immutable.call_count, 3)  # Entry, pre-activation, completed chain.
+        self.assertEqual(publication.call_count, 5)  # Four task records, then the route.
+        self.assertEqual([call.kwargs["candidate_task_ids"] for call in publication.call_args_list],
+                         [(self.sid,)] * 4 + [()])
 
 
 if __name__ == "__main__":

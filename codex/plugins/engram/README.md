@@ -99,15 +99,23 @@ as such; migration does not prove historical volume continuity.
 The first host policy conversion must include the explicitly reviewed healthy
 v1 tasks, including tasks waiting for their next event. The tool rechecks that
 cohort under its locks before changing state. A newly eligible task causes a
-refusal and a new review; it is never silently added. If the required cohort
-exceeds the supported selection bound, keep v1 until a coordinated rollout is
-prepared. Installing the new runtime preserves an existing v1 policy.
+refusal and a new review; it is never silently added. A plan can explicitly select
+at most 64 tasks; the impact scan remains bounded to 500 enrollment entries.
+If the required cohort exceeds 64, keep v1 until a coordinated rollout is
+prepared. Installing the new runtime preserves an existing v1 policy. A larger
+selection still requires a fresh reviewed list of IDs and an exact plan; raising
+the bound does not expand any existing selection or authorize activation.
 
 Applying a plan temporarily disables host admission while publishing the selected
 records and route, then restores the policy's original enabled setting in v2.
 The journal supports `recover` after an interrupted publication. Other tasks'
 records remain untouched; unmigrated v1 enrollments under v2 require their own
 migration. Later plans use the retained original v1 policy as their legacy anchor.
+The 32 MiB plan limit and 30-second command deadline remain unchanged. An oversized
+plan is refused before migration begins. A deadline after publication has started
+can leave admission suspended or tasks held; use the exact journal's `recover`
+path after review. Planning speed alone does not qualify application or recovery
+time for a larger cohort.
 
 Each migrated task receives a separate migration hold. `release-plan` and
 `release` remove only explicitly selected holds after validating their records.
