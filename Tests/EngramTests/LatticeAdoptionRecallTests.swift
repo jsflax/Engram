@@ -1,8 +1,9 @@
-import EngramKit
+@testable import EngramKit
 import EngramMemoryCore
 import EngramModels
 import Foundation
 import Lattice
+import MCP
 import SQLite3
 import Testing
 
@@ -115,6 +116,7 @@ struct LatticeAdoptionRecallTests {
     private struct SavedMemory {
         let id: UUID
         let content: String
+        let topic: String
         let accesses: Int
         let accessedAt: Double
     }
@@ -147,9 +149,26 @@ struct LatticeAdoptionRecallTests {
             }
         }
 
+        func edgeCount() throws -> Int {
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM Edge", -1, &statement, nil) == SQLITE_OK,
+                  let statement else {
+                throw SQLiteFailure(message: String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_step(statement) == SQLITE_ROW else {
+                throw SQLiteFailure(message: String(cString: sqlite3_errmsg(db)))
+            }
+            let count = Int(sqlite3_column_int64(statement, 0))
+            guard sqlite3_step(statement) == SQLITE_DONE else {
+                throw SQLiteFailure(message: String(cString: sqlite3_errmsg(db)))
+            }
+            return count
+        }
+
         func memories() throws -> [UUID: SavedMemory] {
             var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(db, "SELECT globalId, content, accessCount, lastAccessedAt FROM Memory", -1, &statement, nil) == SQLITE_OK,
+            guard sqlite3_prepare_v2(db, "SELECT globalId, content, accessCount, lastAccessedAt, topic FROM Memory", -1, &statement, nil) == SQLITE_OK,
                   let statement else {
                 throw SQLiteFailure(message: String(cString: sqlite3_errmsg(db)))
             }
@@ -159,10 +178,12 @@ struct LatticeAdoptionRecallTests {
             while status == SQLITE_ROW {
                 guard let idText = sqlite3_column_text(statement, 0),
                       let id = UUID(uuidString: String(cString: idText)),
-                      let content = sqlite3_column_text(statement, 1) else {
+                      let content = sqlite3_column_text(statement, 1),
+                      let topic = sqlite3_column_text(statement, 4) else {
                     throw SQLiteFailure(message: "Invalid persisted Memory identity/content")
                 }
                 rows[id] = SavedMemory(id: id, content: String(cString: content),
+                                       topic: String(cString: topic),
                                        accesses: Int(sqlite3_column_int64(statement, 2)),
                                        accessedAt: sqlite3_column_double(statement, 3))
                 status = sqlite3_step(statement)
@@ -317,4 +338,173 @@ struct LatticeAdoptionRecallTests {
         #expect(saved[recovered.id]?.content == "recovered durable write")
         #expect(!saved.values.contains { $0.content == "write must fail" })
     }
+
+    @Test
+    func remember_missingParentDoesNotInsertMemoryOrPublishBookkeeping() async throws {
+        let fixture = try fixture(seed: false)
+        let previousTime = Self.oldAccess
+        await fixture.tools.setLastMemoryTime(previousTime)
+        await #expect(throws: (any Error).self) {
+            _ = try await fixture.tools.handle(CallTool.Parameters(name: "remember", arguments: [
+                "content": .string("a rejected parent must not leave an orphan memory"),
+                "project": .string("Persistence"),
+                "parent_id": .string(UUID().uuidString),
+            ]))
+        }
+        let saved = try SQL(fixture.path, readOnly: true)
+        #expect(try saved.memories().isEmpty)
+        #expect(try saved.edgeCount() == 0)
+        let lastTime = await fixture.tools.lastMemoryTime
+        let lastId = await fixture.tools.lastRememberedId
+        #expect(lastTime == previousTime)
+        #expect(lastId == nil)
+    }
+
+    @Test(arguments: ["edge-abort", "edge-rollback", "busy-begin"])
+    func remember_graphFailurePreservesMemoryAndBookkeepingUntilCommit(_ failure: String) async throws {
+        let fixture = try fixture(seed: false)
+        _ = try await fixture.tools.handle(CallTool.Parameters(name: "begin_episode", arguments: [
+            "title": .string("atomic remember fixture"), "project": .string("Persistence"),
+        ]))
+        let activeEpisode = await fixture.tools.activeEpisodeId
+        let parentId = try #require(activeEpisode)
+        _ = try await fixture.tools.handle(CallTool.Parameters(name: "remember", arguments: [
+            "content": .string("baseline remembered child"), "project": .string("Persistence"),
+            "topic": .string("episode"),
+        ]))
+        let previousId = await fixture.tools.lastRememberedId
+        #expect(previousId != nil)
+        let previousTime = Self.oldAccess
+        await fixture.tools.setLastMemoryTime(previousTime)
+        let originalMemories = try SQL(fixture.path, readOnly: true).memories()
+        let originalEdges = try SQL(fixture.path, readOnly: true).edgeCount()
+        let blocker = try SQL(fixture.path)
+        if failure == "busy-begin" {
+            try blocker.execute("BEGIN IMMEDIATE")
+        } else {
+            let action = failure == "edge-abort" ? "ABORT" : "ROLLBACK"
+            try blocker.execute("CREATE TRIGGER remember_edge_fault BEFORE INSERT ON Edge BEGIN SELECT RAISE(\(action), 'remember-edge-fault'); END")
+        }
+        defer {
+            try? blocker.execute(failure == "busy-begin" ? "ROLLBACK" : "DROP TRIGGER IF EXISTS remember_edge_fault")
+        }
+        let started = Date()
+        await #expect(throws: (any Error).self) {
+            _ = try await fixture.tools.handle(CallTool.Parameters(name: "remember", arguments: [
+                "content": .string("child must roll back with its required parent edge"),
+                "project": .string("Persistence"), "topic": .string("episode"),
+                "parent_id": .string(parentId.uuidString),
+            ]))
+        }
+        #expect(Date().timeIntervalSince(started) < 5)
+        // New independent readers prove committed state, rather than inspecting
+        // the failed transaction's managed Memory instance or cached results.
+        let afterFailure = try SQL(fixture.path, readOnly: true)
+        #expect(Set(try afterFailure.memories().keys) == Set(originalMemories.keys))
+        #expect(try afterFailure.edgeCount() == originalEdges)
+        let episodeAfterFailure = await fixture.tools.activeEpisodeId
+        let timeAfterFailure = await fixture.tools.lastMemoryTime
+        let idAfterFailure = await fixture.tools.lastRememberedId
+        #expect(episodeAfterFailure == parentId)
+        #expect(timeAfterFailure == previousTime)
+        #expect(idAfterFailure == previousId)
+
+        try blocker.execute(failure == "busy-begin" ? "ROLLBACK" : "DROP TRIGGER remember_edge_fault")
+        _ = try await fixture.tools.handle(CallTool.Parameters(name: "remember", arguments: [
+            "content": .string("subsequent child commits with its required parent edge"),
+            "project": .string("Persistence"), "topic": .string("episode"),
+            "parent_id": .string(parentId.uuidString),
+        ]))
+        let committedId = await fixture.tools.lastRememberedId
+        let id = try #require(committedId)
+        let saved = try SQL(fixture.path, readOnly: true)
+        let rows = try saved.memories()
+        #expect(Set(rows.keys) == Set(originalMemories.keys).union([id]))
+        #expect(rows[id]?.content == "subsequent child commits with its required parent edge")
+        #expect(try saved.edgeCount() == originalEdges + 1)
+        let episodeAfterCommit = await fixture.tools.activeEpisodeId
+        let timeAfterCommit = await fixture.tools.lastMemoryTime
+        #expect(episodeAfterCommit == nil)
+        #expect(timeAfterCommit > previousTime)
+    }
+
+    @Test(arguments: ["ABORT", "ROLLBACK"])
+    func remember_laterEdgeFailureRollsBackEarlierEdge(_ action: String) async throws {
+        let fixture = try fixture(seed: false)
+        let parent = Memory(content: "explicit parent", topic: "episode", project: "Persistence")
+        try fixture.writer.add(parent)
+        let parentId = try #require(parent.globalId)
+        _ = try await fixture.tools.handle(CallTool.Parameters(name: "begin_episode", arguments: [
+            "title": .string("active episode"), "project": .string("Persistence"),
+        ]))
+        let episodeId = await fixture.tools.activeEpisodeId
+        let episode = try #require(episodeId)
+        let previousTime = Date()
+        await fixture.tools.setLastMemoryTime(previousTime)
+        let original = try SQL(fixture.path, readOnly: true).memories()
+        let fault = try SQL(fixture.path)
+        // The explicit parent edge succeeds first; the active episode edge
+        // then fails, testing rollback of both Memory and an earlier Edge.
+        try fault.execute("CREATE TRIGGER remember_later_edge_fault BEFORE INSERT ON Edge WHEN NEW.targetGlobalId = '\(episode.uuidString.lowercased())' BEGIN SELECT RAISE(\(action), 'remember-later-edge-fault'); END")
+        defer { try? fault.execute("DROP TRIGGER IF EXISTS remember_later_edge_fault") }
+        await #expect(throws: (any Error).self) {
+            _ = try await fixture.tools.handle(CallTool.Parameters(name: "remember", arguments: [
+                "content": .string("child requires both edges"), "topic": .string("episode"),
+                "project": .string("Persistence"), "parent_id": .string(parentId.uuidString),
+            ]))
+        }
+        let saved = try SQL(fixture.path, readOnly: true)
+        #expect(Set(try saved.memories().keys) == Set(original.keys))
+        #expect(try saved.edgeCount() == 0)
+        let time = await fixture.tools.lastMemoryTime
+        let id = await fixture.tools.lastRememberedId
+        let active = await fixture.tools.activeEpisodeId
+        #expect(time == previousTime)
+        #expect(id == nil)
+        #expect(active == episode)
+    }
+
+    @Test(arguments: ["ABORT", "ROLLBACK"])
+    func remember_inferredTopicFailureRollsBackMemoryAndEdges(_ action: String) async throws {
+        let fixture = try fixture(seed: false)
+        var vector = [Float](repeating: 0, count: 384)
+        vector[0] = 1 - 0.75 * 0.75 / 2
+        vector[1] = (1 - vector[0] * vector[0]).squareRoot()
+        for content in ["first related neighbor", "second related neighbor"] {
+            try fixture.writer.add(Memory(content: content, topic: "contract", project: "Persistence",
+                                          embedding: Vector<Float>(vector)))
+        }
+        let original = try SQL(fixture.path, readOnly: true).memories()
+        let previousTime = Self.oldAccess
+        await fixture.tools.setLastMemoryTime(previousTime)
+        let fault = try SQL(fixture.path)
+        // Topic inference is the final write after Memory and both relates_to
+        // edges. Its nonthrowing setter must still poison checked commit.
+        try fault.execute("CREATE TRIGGER remember_topic_fault BEFORE UPDATE OF topic ON Memory WHEN OLD.topic = 'general' AND NEW.topic = 'contract' BEGIN SELECT RAISE(\(action), 'remember-topic-fault'); END")
+        defer { try? fault.execute("DROP TRIGGER IF EXISTS remember_topic_fault") }
+        let arguments: [String: Value] = [
+            "content": .string("new connected concept"), "project": .string("Persistence"),
+        ]
+        await #expect(throws: (any Error).self) {
+            _ = try await fixture.tools.handle(CallTool.Parameters(name: "remember", arguments: arguments))
+        }
+        let failed = try SQL(fixture.path, readOnly: true)
+        #expect(Set(try failed.memories().keys) == Set(original.keys))
+        #expect(try failed.edgeCount() == 0)
+        let time = await fixture.tools.lastMemoryTime
+        let id = await fixture.tools.lastRememberedId
+        #expect(time == previousTime)
+        #expect(id == nil)
+
+        try fault.execute("DROP TRIGGER remember_topic_fault")
+        _ = try await fixture.tools.handle(CallTool.Parameters(name: "remember", arguments: arguments))
+        let committedId = await fixture.tools.lastRememberedId
+        let committed = try #require(committedId)
+        let saved = try SQL(fixture.path, readOnly: true)
+        let rows = try saved.memories()
+        #expect(Set(rows.keys) == Set(original.keys).union([committed]))
+        #expect(rows[committed]?.topic == "contract")
+        #expect(try saved.edgeCount() == 2)
+    }
+
 }

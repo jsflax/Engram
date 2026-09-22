@@ -749,20 +749,44 @@ def failure_reconciliation(run_dir: Path, provider_started: bool | None) -> dict
     if provider_started is False:
         return None  # The real runner proves no subprocess was created.
     unknown = {"reason": "write_status_unknown", "memory_ids": []}
+    def unique_fields(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate audit field")
+            value[key] = item
+        return value
     try:
         raw = memory_config.read_bytes(run_dir / "mcp-audit.jsonl", 1024 * 1024)
         if not raw or not raw.endswith(b"\n"):
             return unknown
         calls, results = {}, {}
         started = False
+        request_timed_out = False
         for line in raw.splitlines():
-            entry = json.loads(line)
+            entry = json.loads(line, object_pairs_hook=unique_fields)
             if not isinstance(entry, dict):
                 return unknown
             event = entry.get("event")
             if event == "relay_started":
+                if request_timed_out:
+                    return unknown
                 started = True
                 continue
+            if event == "request_timeout":
+                # The trusted relay fsyncs each tool_call before forwarding it.
+                # This exact event terminates its message pump; cleanup may add
+                # failed pending results, but cannot forward another request.
+                # A timeout before any write therefore needs backoff, not a
+                # reconciliation gate. Earlier writes remain risky below.
+                if not started or request_timed_out or set(entry) != {"event"}:
+                    return unknown
+                request_timed_out = True
+                continue
+            if request_timed_out and (event in {"tool_call", "initialize_compat"}
+                                      or (event == "tool_result" and
+                                          (entry.get("ok") is not False or entry.get("forwarded") is not True))):
+                return unknown
             if event in {"relay_finished", "relay_interrupted", "relay_failed", "relay_cleanup_failed", "initialize_compat"}:
                 continue
             if event not in {"tool_call", "tool_result"}:

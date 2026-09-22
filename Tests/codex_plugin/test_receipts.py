@@ -122,6 +122,83 @@ class ReceiptTests(unittest.TestCase):
         self.reply(1, f'Updated memory (id: {OTHER})')
         self.assertGreater(self.audit_result()['tool_errors'], 0)
 
+    def reconciliation(self, rows, *, complete=True):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            raw = ''.join(json.dumps(row) + '\n' for row in rows)
+            (path / 'mcp-audit.jsonl').write_text(raw if complete else raw.rstrip('\n'))
+            return F.RUNNER.failure_reconciliation(path, True)
+
+    def timeout_prefix(self):
+        return [{'event': 'relay_started'},
+                {'event': 'initialize_compat', 'omitted_capability': 'codex/auth-change'}]
+
+    def test_initialize_timeout_has_no_forwarded_write_but_is_not_success(self):
+        rows = [*self.timeout_prefix(), {'event': 'request_timeout'}]
+        self.assertIsNone(self.reconciliation(rows))
+        self.audit.rows = rows
+        self.assertGreater(self.audit_result()['tool_errors'], 0)
+
+    def test_timeout_retains_unknown_and_acknowledged_earlier_writes(self):
+        call = {'event': 'tool_call', 'id': 1, 'tool': 'remember'}
+        for result in (None,
+                       {'event': 'tool_result', 'id': 1, 'tool': 'remember',
+                        'ok': False, 'forwarded': True, 'memory_ids': []},
+                       {'event': 'tool_result', 'id': 1, 'tool': 'remember',
+                        'ok': True, 'forwarded': True, 'memory_ids': [ID]}):
+            with self.subTest(result=result):
+                rows = [*self.timeout_prefix(), call]
+                if result is not None:
+                    rows.append(result)
+                rows.append({'event': 'request_timeout'})
+                gate = self.reconciliation(rows)
+                self.assertEqual(gate['reason'], 'successful_or_unverified_write')
+                self.assertEqual(gate['memory_ids'], [ID] if result and result['ok'] else [])
+
+    def test_timeout_cleanup_can_record_failed_pending_call_but_not_erase_risk(self):
+        rows = [*self.timeout_prefix(), {'event': 'tool_call', 'id': 1, 'tool': 'remember'},
+                {'event': 'request_timeout'},
+                {'event': 'relay_finished', 'child_reaped': True, 'cleanup_overrun': False},
+                {'event': 'tool_result', 'id': 1, 'tool': 'remember',
+                 'ok': False, 'forwarded': True, 'memory_ids': []}]
+        self.assertIsNotNone(self.reconciliation(rows))
+        for forwarded in (False, None, 0, 1):
+            with self.subTest(forwarded=forwarded):
+                rows[-1]['forwarded'] = forwarded
+                self.assertEqual(self.reconciliation(rows)['reason'], 'write_status_unknown')
+
+    def test_timeout_after_local_denial_does_not_create_write_uncertainty(self):
+        rows = [*self.timeout_prefix(), {'event': 'tool_call', 'id': 1, 'tool': 'remember'},
+                {'event': 'tool_result', 'id': 1, 'tool': 'remember',
+                 'ok': False, 'forwarded': False, 'memory_ids': []},
+                {'event': 'request_timeout'}]
+        self.assertIsNone(self.reconciliation(rows))
+
+    def test_malformed_or_nonterminal_timeout_remains_unknown(self):
+        timeout = {'event': 'request_timeout'}
+        cases = [[timeout],
+                 [*self.timeout_prefix(), dict(timeout, no_writes=True)],
+                 [*self.timeout_prefix(), timeout, timeout],
+                 [*self.timeout_prefix(), timeout, {'event': 'relay_started'}],
+                 [*self.timeout_prefix(), timeout,
+                  {'event': 'tool_call', 'id': 1, 'tool': 'remember'}],
+                 [*self.timeout_prefix(), timeout, {'event': 'initialize_compat'}],
+                 [*self.timeout_prefix(), {'event': 'unknown_timeout'}]]
+        for rows in cases:
+            with self.subTest(rows=rows):
+                self.assertEqual(self.reconciliation(rows)['reason'], 'write_status_unknown')
+        self.assertEqual(self.reconciliation([*self.timeout_prefix(), timeout], complete=False)['reason'],
+                         'write_status_unknown')
+
+    def test_duplicate_audit_fields_cannot_hide_a_write_as_a_timeout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            (path / 'mcp-audit.jsonl').write_text(
+                '{"event":"relay_started"}\n'
+                '{"event":"tool_call","event":"request_timeout"}\n')
+            self.assertEqual(F.RUNNER.failure_reconciliation(path, True)['reason'],
+                             'write_status_unknown')
+
     def test_failed_and_denied_calls_consume_total_budget(self):
         self.call(1, 'recall'); self.reply(1, 'failed', error=True)
         self.call(2, 'shell')
