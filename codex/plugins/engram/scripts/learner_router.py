@@ -41,9 +41,10 @@ def read_routes(path: Path) -> dict:
     raw, _ = admission._owned_bytes(path, private=True)
     require(len(raw) <= MAX_ROUTES_BYTES, "routes_too_large")
     policy = admission._json(raw)
-    if policy.get("mode") == host_admission.MODE:
+    if policy.get("mode") in host_admission.MODES:
         require(set(policy) == {"schema_version", "mode", "enabled", "state_dir"}
-                and type(policy["schema_version"]) is int and policy["schema_version"] == 1,
+                and type(policy["schema_version"]) is int
+                and policy["schema_version"] == (2 if policy["mode"] == host_admission.MODE_V2 else 1),
                 "routes_schema_invalid")
         require(policy["enabled"] is True, "routes_inactive")
         root = admission._canonical(policy["state_dir"])
@@ -106,7 +107,7 @@ def dispatch(path: Path, payload: dict, *, spawn: bool = True) -> bool:
     phase, sid = "routes", None
     try:
         policy = read_routes(path)
-        if policy.get("mode") == host_admission.MODE:
+        if policy.get("mode") in host_admission.MODES:
             return dispatch_host(path, policy, payload, spawn=spawn)
         phase = "selection"
         require(isinstance(payload, dict) and payload.get("hook_event_name") == "Stop", "event_not_stop")
@@ -157,6 +158,12 @@ def dispatch_host(path: Path, policy: dict, payload: dict, *, spawn=True) -> boo
         if event in {"SubagentStart", "SubagentStop"} and payload.get("agent_transcript_path"):
             payload["transcript_path"] = payload["agent_transcript_path"]
         root = admission._canonical(policy["state_dir"])
+        def route_guard():
+            require(read_routes(path) == policy, "admission_route_mismatch")
+            current, _ = host_admission.policy(root)
+            require((policy["mode"], policy["schema_version"]) ==
+                    (current["mode"], current["schema_version"]), "admission_route_mismatch")
+        route_guard()
         if event == "SessionEnd":
             # Claude parity: cleanup belongs to lifecycle adapter, not a new learner.
             receipt(path, {"phase": "cleanup", "status": "observed", "reason": "session_end_cleanup_only",
@@ -164,6 +171,7 @@ def dispatch_host(path: Path, policy: dict, payload: dict, *, spawn=True) -> boo
             return False
         phase = "enrollment"
         with runner.lock_file(root / "enqueue.lock"):
+            route_guard()
             sid, enrolled, fresh_child = host_admission.observe(root, payload)
         if (enrolled and not fresh_child) or event not in host_admission.LEARN_EVENTS:
             receipt(path, {"phase": phase, "status": "enrolled" if enrolled else "observed",
@@ -171,7 +179,7 @@ def dispatch_host(path: Path, policy: dict, payload: dict, *, spawn=True) -> boo
                            "session_id": sid, "hook_event": event})
             return False
         phase = "enqueue"
-        queued = runner.enqueue(root, payload, spawn=spawn)
+        queued = runner.enqueue(root, payload, spawn=spawn, route_guard=route_guard)
         receipt(path, {"phase": phase, "status": "queued" if queued else "not_queued",
                        "reason": "queued" if queued else "enqueue_refused", "session_id": sid,
                        "hook_event": event, "trigger": payload.get("trigger")})

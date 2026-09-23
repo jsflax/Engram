@@ -80,6 +80,52 @@ apply at Codex's supported reload boundary; existing-task pickup needs verificat
 
 ## Migration
 
+### Persistent transcript identity
+
+Fresh host setup uses `host_sessions_v2`: a local APFS volume UUID plus inode
+identifies each bound directory and transcript. A device number may change after
+a remount; it is checked within each read for races, but is not saved as the v2
+identity. Unsupported filesystems fail closed. Existing host settings are kept
+unchanged when the package is updated.
+
+Existing `host_sessions_v1` tasks require explicit, selected-task migration with
+`scripts/codex_learner_migrate.py`. Its `plan` command validates the original
+policy, enrollment frontier, transcript metadata, cursor and pending request;
+the resulting plan binds exact preimages and runtime hashes. Inspect that plan
+before passing its path and SHA256 to `apply`. When no historical volume UUID
+exists, current-volume adoption must be explicitly authorized and is recorded
+as such; migration does not prove historical volume continuity.
+
+The first host policy conversion must include the explicitly reviewed healthy
+v1 tasks, including tasks waiting for their next event. The tool rechecks that
+cohort under its locks before changing state. A newly eligible task causes a
+refusal and a new review; it is never silently added. A plan can explicitly select
+at most 64 tasks; the impact scan remains bounded to 500 enrollment entries.
+If the required cohort exceeds 64, keep v1 until a coordinated rollout is
+prepared. Installing the new runtime preserves an existing v1 policy. A larger
+selection still requires a fresh reviewed list of IDs and an exact plan; raising
+the bound does not expand any existing selection or authorize activation.
+
+Applying a plan temporarily disables host admission while publishing the selected
+records and route, then restores the policy's original enabled setting in v2.
+The journal supports `recover` after an interrupted publication. Other tasks'
+records remain untouched; unmigrated v1 enrollments under v2 require their own
+migration. Later plans use the retained original v1 policy as their legacy anchor.
+The 32 MiB plan limit and 30-second command deadline remain unchanged. An oversized
+plan is refused before migration begins. A deadline after publication has started
+can leave admission suspended or tasks held; use the exact journal's `recover`
+path after review. Planning speed alone does not qualify application or recovery
+time for a larger cohort.
+
+Each migrated task receives a separate migration hold. `release-plan` and
+`release` remove only explicitly selected holds after validating their records.
+They do not clear a reconciliation gate, change a cursor or paused request, retry
+work, or launch a learner. Previously released tasks may advance normally while
+their siblings remain held. Use the CLI's `--help` and `hook-status` to inspect
+the required arguments and current state.
+
+### Previous installers
+
 `engram@personal` succeeds `engram-hooks@personal`. Disable the old plugin through
 Codex's plugin controls before trusting the successor. Keep old cached resources
 for open tasks that still reference them. The new package never replays or deletes

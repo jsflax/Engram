@@ -25,5 +25,9 @@ memory IDs and a short non-sensitive summary. For stored, list only the primary
 ID in each successful "Stored memory (id: ...)" or "Updated memory (id: ...)"
 receipt, plus both endpoints of any explicit successful connect call. Do not
 include IDs mentioned in recall results, memory text, or automatic linking notes.
-For no_new_memories, return an empty ID list and make no writes. The runner
+A near-duplicate warning saying the new memory was NOT stored is a successful
+no-write outcome, not a saved memory. Its existing IDs are context only. Review
+whether an update is needed; otherwise finish with no_new_memories. Never force
+or delete a duplicate, and count the rejected attempt against the write budget.
+For no_new_memories, return an empty ID list and make no successful writes. The runner
 independently checks tool results before accepting the excerpt as processed.

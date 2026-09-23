@@ -187,171 +187,206 @@ extension MemoryTools {
             autoConnectCandidates = Array(autoConnectCandidates.prefix(3))
         }
 
-        // Episode: end stale episodes on 30-min gap
-        if activeEpisodeId != nil {
-            let gap = Date().timeIntervalSince(lastMemoryTime)
-            if gap > 1800 { endActiveEpisode() }
-        }
-        lastMemoryTime = Date()
-
-        let isPrivate = a.isPrivate ?? false
-
-        log("[remember] creating Memory object")
-        let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance, isPrivate: isPrivate, authorUserId: currentUserId, modifiedAt: Date())
-        log("[remember] calling localLattice.add()")
-        try localLattice.add(memory)
-        log("[remember] add() complete")
-
-        lastRememberedId = memory.globalId
-        guard let memoryGlobalId = memory.globalId else {
-            throw MCPError.internalError("Failed to persist memory — globalId is nil after add()")
-        }
-
-        // Auto-connect, link, and organize — all writes in one transaction
-        var parentNote = ""
-        var autoLinkedGids: [UUID] = []
         let parentGidValue: UUID? = a.parentId?.value
-
         if let parentGid = parentGidValue {
             guard findMemory(id: parentGid) != nil else {
                 throw MCPError.invalidParams("parent_id \(parentGid.uuidString) not found")
             }
         }
 
-        try localLattice.transaction {
-            // Auto-create part_of edge when parent_id is provided
-            if let parentGid = parentGidValue {
-                let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: parentGid, relation: .partOf, authorUserId: currentUserId)
-                try localLattice.add(edge)
-                parentNote = ", parent: \(parentGid.uuidString)"
-                log("Auto-created part_of edge: \(memoryGlobalId.uuidString) -> \(parentGid.uuidString)")
-            }
+        // Prepare episode bookkeeping without publishing it on a failed write.
+        // There is no suspension between this snapshot and the checked commit.
+        let rememberedAt = Date()
+        let episodeExpired = activeEpisodeId != nil && rememberedAt.timeIntervalSince(lastMemoryTime) > 1800
+        let episodeId = episodeExpired ? nil : activeEpisodeId
+        let isPrivate = a.isPrivate ?? false
+        let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance, isPrivate: isPrivate, authorUserId: currentUserId, modifiedAt: rememberedAt)
+        var parentNote = ""
+        var autoLinkedGids: [UUID] = []
+        var committedLogs: [String] = []
 
-            // Link to active episode via part_of edge
-            if let epGid = activeEpisodeId,
-               localLattice.objects(Memory.self).where({ $0.globalId == epGid }).first != nil {
-                let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: epGid, relation: .partOf, authorUserId: currentUserId)
-                try localLattice.add(edge)
-                log("Linked memory \(memoryGlobalId.uuidString) to episode \(epGid.uuidString)")
-            }
-
-            // Auto-connect: create relates_to edges to semantically similar memories
-            for candidate in autoConnectCandidates {
-                guard let candidateGlobalId = candidate.object.globalId else { continue }
-                if let pgid = parentGidValue, candidateGlobalId == pgid { continue }
-                if let epGid = activeEpisodeId, candidateGlobalId == epGid { continue }
-                let forwardEdge = localLattice.objects(Edge.self)
-                    .where { $0.sourceGlobalId == memoryGlobalId && $0.targetGlobalId == candidateGlobalId && $0.relation == .relatesTo }
-                    .first != nil
-                let reverseEdge = localLattice.objects(Edge.self)
-                    .where { $0.sourceGlobalId == candidateGlobalId && $0.targetGlobalId == memoryGlobalId && $0.relation == .relatesTo }
-                    .first != nil
-                guard !(forwardEdge || reverseEdge) else { continue }
-
-                let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: candidateGlobalId, relation: .relatesTo, authorUserId: currentUserId)
-                try localLattice.add(edge)
-                autoLinkedGids.append(candidateGlobalId)
-                log("Auto-connected [\(memoryGlobalId.uuidString)] --[relates_to]--> [\(candidateGlobalId.uuidString)] (distance: \(String(format: "%.3f", candidate.distance)))")
-            }
-
-            // Cross-project hub linking
-            if topic != "episode" {
-                let allProjects = Set(
-                    localLattice.objects(Memory.self)
-                        .snapshot()
-                        .map(\.project)
-                ).subtracting([project, "global"])
-
-                for otherProject in allProjects {
-                    guard otherProject.count >= 3 else { continue }
-
-                    let pattern = "\\b\(NSRegularExpression.escapedPattern(for: otherProject))\\b"
-                    guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
-                          regex.firstMatch(in: content, range: NSRange(content.startIndex..., in: content)) != nil
-                    else { continue }
-
-                    let projectMemories = localLattice.objects(Memory.self)
-                        .where { $0.project == otherProject && $0.topic != "episode" }
-                        .snapshot()
-
-                    var bestHub: (mem: Memory, count: Int)? = nil
-                    for mem in projectMemories {
-                        let incomingCount = localLattice.objects(Edge.self)
-                            .where { $0.targetGlobalId == mem.globalId && $0.relation == .partOf }
-                            .count
-                        if incomingCount > 0 && (bestHub == nil || incomingCount > bestHub!.count) {
-                            bestHub = (mem: mem, count: incomingCount)
-                        }
+        // The Memory and its required graph/topic effects share one checked
+        // transaction. A failed BEGIN cannot execute the body in autocommit.
+        // Other errors still propagate without claiming that rollback settled.
+        var transactionBodyEntered = false
+        let memoryGlobalId: UUID
+        do {
+            memoryGlobalId = try localLattice.withTransaction { () throws -> UUID in
+                transactionBodyEntered = true
+                if let parentGid = parentGidValue {
+                    guard findMemory(id: parentGid) != nil else {
+                        throw MCPError.invalidParams("parent_id \(parentGid.uuidString) not found")
                     }
-
-                    guard let hub = bestHub, let hubGlobalId = hub.mem.globalId else { continue }
-
-                    let forwardLinked = localLattice.objects(Edge.self)
-                        .where { $0.sourceGlobalId == memoryGlobalId && $0.targetGlobalId == hubGlobalId && $0.relation == .relatesTo }
-                        .first != nil
-                    let reverseLinked = localLattice.objects(Edge.self)
-                        .where { $0.sourceGlobalId == hubGlobalId && $0.targetGlobalId == memoryGlobalId && $0.relation == .relatesTo }
-                        .first != nil
-                    guard !(forwardLinked || reverseLinked) else { continue }
-
-                    let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: hubGlobalId, relation: .relatesTo, authorUserId: currentUserId)
-                    try localLattice.add(edge)
-                    autoLinkedGids.append(hubGlobalId)
-                    log("Cross-project link [\(memoryGlobalId.uuidString)] --[relates_to]--> [\(hubGlobalId.uuidString)] (project '\(otherProject)' mentioned in content)")
                 }
-            }
+                try localLattice.add(memory)
+                guard let memoryGlobalId = memory.globalId else {
+                    throw MCPError.internalError("Failed to persist memory — globalId is nil after add()")
+                }
+                // Auto-create part_of edge when parent_id is provided
+                if let parentGid = parentGidValue {
+                    let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: parentGid, relation: .partOf, authorUserId: currentUserId)
+                    try localLattice.add(edge)
+                    parentNote = ", parent: \(parentGid.uuidString)"
+                    committedLogs.append("Auto-created part_of edge: \(memoryGlobalId.uuidString) -> \(parentGid.uuidString)")
+                }
 
-            // Incremental topic/hub inference from auto-connect neighbors
-            if !autoConnectCandidates.isEmpty {
-                var hubCounts: [UUID: Int] = [:]
-                var topicCounts: [String: Int] = [:]
+                // Link to active episode via part_of edge
+                if let epGid = episodeId,
+                   localLattice.objects(Memory.self).where({ $0.globalId == epGid }).first != nil {
+                    let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: epGid, relation: .partOf, authorUserId: currentUserId)
+                    try localLattice.add(edge)
+                    committedLogs.append("Linked memory \(memoryGlobalId.uuidString) to episode \(epGid.uuidString)")
+                }
 
+                // Auto-connect: create relates_to edges to semantically similar memories
                 for candidate in autoConnectCandidates {
                     guard let candidateGlobalId = candidate.object.globalId else { continue }
-                    for edge in localLattice.objects(Edge.self)
-                        .where({ $0.sourceGlobalId == candidateGlobalId && $0.relation == .partOf }) {
-                        if localLattice.objects(Memory.self)
-                            .where({ $0.globalId == edge.targetGlobalId && $0.topic != "episode" }).first != nil {
-                            hubCounts[edge.targetGlobalId, default: 0] += 1
+                    if let pgid = parentGidValue, candidateGlobalId == pgid { continue }
+                    if let epGid = episodeId, candidateGlobalId == epGid { continue }
+                    let forwardEdge = localLattice.objects(Edge.self)
+                        .where { $0.sourceGlobalId == memoryGlobalId && $0.targetGlobalId == candidateGlobalId && $0.relation == .relatesTo }
+                        .first != nil
+                    let reverseEdge = localLattice.objects(Edge.self)
+                        .where { $0.sourceGlobalId == candidateGlobalId && $0.targetGlobalId == memoryGlobalId && $0.relation == .relatesTo }
+                        .first != nil
+                    guard !(forwardEdge || reverseEdge) else { continue }
+
+                    let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: candidateGlobalId, relation: .relatesTo, authorUserId: currentUserId)
+                    try localLattice.add(edge)
+                    autoLinkedGids.append(candidateGlobalId)
+                    committedLogs.append("Auto-connected [\(memoryGlobalId.uuidString)] --[relates_to]--> [\(candidateGlobalId.uuidString)] (distance: \(String(format: "%.3f", candidate.distance)))")
+                }
+
+                // Cross-project hub linking
+                if topic != "episode" {
+                    let allProjects = Set(
+                        localLattice.objects(Memory.self)
+                            .snapshot()
+                            .map(\.project)
+                    ).subtracting([project, "global"])
+
+                    for otherProject in allProjects {
+                        guard otherProject.count >= 3 else { continue }
+
+                        let pattern = "\\b\(NSRegularExpression.escapedPattern(for: otherProject))\\b"
+                        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+                              regex.firstMatch(in: content, range: NSRange(content.startIndex..., in: content)) != nil
+                        else { continue }
+
+                        let projectMemories = localLattice.objects(Memory.self)
+                            .where { $0.project == otherProject && $0.topic != "episode" }
+                            .snapshot()
+
+                        var bestHub: (mem: Memory, count: Int)? = nil
+                        for mem in projectMemories {
+                            let incomingCount = localLattice.objects(Edge.self)
+                                .where { $0.targetGlobalId == mem.globalId && $0.relation == .partOf }
+                                .count
+                            if incomingCount > 0 && (bestHub == nil || incomingCount > bestHub!.count) {
+                                bestHub = (mem: mem, count: incomingCount)
+                            }
                         }
-                    }
-                    if candidate.object.topic != "episode" {
-                        let hasIncoming = localLattice.objects(Edge.self)
-                            .where { $0.targetGlobalId == candidateGlobalId && $0.relation == .partOf }
+
+                        guard let hub = bestHub, let hubGlobalId = hub.mem.globalId else { continue }
+
+                        let forwardLinked = localLattice.objects(Edge.self)
+                            .where { $0.sourceGlobalId == memoryGlobalId && $0.targetGlobalId == hubGlobalId && $0.relation == .relatesTo }
                             .first != nil
-                        if hasIncoming {
-                            hubCounts[candidateGlobalId, default: 0] += 1
-                        }
-                    }
-                    let t = candidate.object.topic
-                    if t != "general" && t != "episode" {
-                        topicCounts[t, default: 0] += 1
+                        let reverseLinked = localLattice.objects(Edge.self)
+                            .where { $0.sourceGlobalId == hubGlobalId && $0.targetGlobalId == memoryGlobalId && $0.relation == .relatesTo }
+                            .first != nil
+                        guard !(forwardLinked || reverseLinked) else { continue }
+
+                        let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: hubGlobalId, relation: .relatesTo, authorUserId: currentUserId)
+                        try localLattice.add(edge)
+                        autoLinkedGids.append(hubGlobalId)
+                        committedLogs.append("Cross-project link [\(memoryGlobalId.uuidString)] --[relates_to]--> [\(hubGlobalId.uuidString)] (project '\(otherProject)' mentioned in content)")
                     }
                 }
 
-                if let (hubGlobalId, count) = hubCounts.max(by: { $0.value < $1.value }),
-                   count >= 2 {
-                    let skipHub = parentGidValue.map { $0 == hubGlobalId } ?? false
-                    if !skipHub {
-                        let alreadyLinked = localLattice.objects(Edge.self)
-                            .where { $0.sourceGlobalId == memoryGlobalId && $0.targetGlobalId == hubGlobalId && $0.relation == .partOf }
-                            .first != nil
-                        if !alreadyLinked {
-                            let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: hubGlobalId, relation: .partOf, authorUserId: currentUserId)
-                            try localLattice.add(edge)
-                            log("Auto-organized [\(memoryGlobalId.uuidString)] into hub [\(hubGlobalId.uuidString)]")
+                // Incremental topic/hub inference from auto-connect neighbors
+                if !autoConnectCandidates.isEmpty {
+                    var hubCounts: [UUID: Int] = [:]
+                    var topicCounts: [String: Int] = [:]
+
+                    for candidate in autoConnectCandidates {
+                        guard let candidateGlobalId = candidate.object.globalId else { continue }
+                        for edge in localLattice.objects(Edge.self)
+                            .where({ $0.sourceGlobalId == candidateGlobalId && $0.relation == .partOf }) {
+                            if localLattice.objects(Memory.self)
+                                .where({ $0.globalId == edge.targetGlobalId && $0.topic != "episode" }).first != nil {
+                                hubCounts[edge.targetGlobalId, default: 0] += 1
+                            }
+                        }
+                        if candidate.object.topic != "episode" {
+                            let hasIncoming = localLattice.objects(Edge.self)
+                                .where { $0.targetGlobalId == candidateGlobalId && $0.relation == .partOf }
+                                .first != nil
+                            if hasIncoming {
+                                hubCounts[candidateGlobalId, default: 0] += 1
+                            }
+                        }
+                        let t = candidate.object.topic
+                        if t != "general" && t != "episode" {
+                            topicCounts[t, default: 0] += 1
                         }
                     }
-                }
 
-                if topic == "general",
-                   let (consensusTopic, count) = topicCounts.max(by: { $0.value < $1.value }),
-                   count >= 2 {
-                    memory.topic = consensusTopic
-                    log("Auto-inferred topic '\(consensusTopic)' for [\(memoryGlobalId.uuidString)]")
+                    if let (hubGlobalId, count) = hubCounts.max(by: { $0.value < $1.value }),
+                       count >= 2 {
+                        let skipHub = parentGidValue.map { $0 == hubGlobalId } ?? false
+                        if !skipHub {
+                            let alreadyLinked = localLattice.objects(Edge.self)
+                                .where { $0.sourceGlobalId == memoryGlobalId && $0.targetGlobalId == hubGlobalId && $0.relation == .partOf }
+                                .first != nil
+                            if !alreadyLinked {
+                                let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: hubGlobalId, relation: .partOf, authorUserId: currentUserId)
+                                try localLattice.add(edge)
+                                committedLogs.append("Auto-organized [\(memoryGlobalId.uuidString)] into hub [\(hubGlobalId.uuidString)]")
+                            }
+                        }
+                    }
+
+                    if topic == "general",
+                       let (consensusTopic, count) = topicCounts.max(by: { $0.value < $1.value }),
+                       count >= 2 {
+                        memory.topic = consensusTopic
+                        committedLogs.append("Auto-inferred topic '\(consensusTopic)' for [\(memoryGlobalId.uuidString)]")
+                    }
                 }
+                return memoryGlobalId
             }
+        } catch {
+            // Only a failed BEGIN proves this attempt did not run any write.
+            // Identical text from a body, COMMIT, rollback, or notification
+            // failure must retain its unknown persistence outcome.
+            guard !transactionBodyEntered,
+                  case LatticeError.transactionError(let detail) = error,
+                  ["database is locked", "database is busy", "database table is locked",
+                   "database schema is locked"].contains(where: {
+                      detail == "Failed to begin transaction: " + $0
+                  }) else { throw error }
+            return CallTool.Result(
+                content: [.text("Memory was not stored: the database was busy before the write transaction started. Retry on a later turn.")],
+                structuredContent: .object([
+                    "engram_write_receipt": .object([
+                        "schema_version": .int(1),
+                        "tool": .string("remember"),
+                        "write_outcome": .string("not_stored_transaction_not_started"),
+                        "reason": .string("database_busy"),
+                        "memory_ids": .array([]),
+                    ]),
+                ]),
+                isError: true
+            )
         }
+
+        // Publish process-local state and success logs only after checked commit
+        // returns. A body/commit/notification failure leaves these untouched.
+        if episodeExpired { endActiveEpisode() }
+        lastMemoryTime = rememberedAt
+        lastRememberedId = memoryGlobalId
+        for message in committedLogs { log(message) }
 
         let expiresNote = expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: expiresAt))"
         let importanceNote = importance > 0 ? ", importance: \(importance)" : ""

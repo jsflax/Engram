@@ -23,13 +23,14 @@ enum CLIInstaller {
         let fm = FileManager.default
         guard fm.fileExists(atPath: cliDir.path) else { return }
 
-        // Independent of Claude and of the CLI version stamp: retry after a
-        // user installs Codex/Python, even when Engram itself is up to date.
+        // Retry host registration even when the binary version is current.
+        // A GUI launch may precede installation of Claude, Codex or Python.
         // Interpreter discovery and config I/O must not block app startup.
         // Schedule after any binary replacement below, so a fresh install's
         // memory command exists before the Codex registration is validated.
         defer {
             DispatchQueue.global(qos: .utility).async {
+                registerMCPServer()
                 syncCodexSupport(from: cliDir)
             }
         }
@@ -40,8 +41,6 @@ enum CLIInstaller {
         guard installedVersion == nil || compareVersions(bundledVersion, isNewerThan: installedVersion!) else {
             return
         }
-
-        let isFirstInstall = installedVersion == nil
 
         do {
             try fm.createDirectory(atPath: installDir, withIntermediateDirectories: true)
@@ -130,9 +129,6 @@ enum CLIInstaller {
 
             // Write version marker
             try bundledVersion.write(toFile: versionFile, atomically: true, encoding: .utf8)
-
-            // Register MCP server (re-register on upgrade to update path if needed)
-            registerMCPServer(isFirstInstall: isFirstInstall)
 
             // Install CLAUDE.md instructions and hooks config
             installClaudeMD()
@@ -274,27 +270,15 @@ enum CLIInstaller {
 
     // MARK: - MCP Server Registration
 
-    private static func registerMCPServer(isFirstInstall: Bool) {
-        let env = cleanEnv()
-
-        // Remove first to ensure clean state (matches install.sh behavior)
-        if !isFirstInstall {
-            let remove = Process()
-            remove.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            remove.arguments = ["claude", "mcp", "remove", "memory"]
-            remove.environment = env
-            try? remove.run()
-            remove.waitUntilExit()
+    private static func registerMCPServer() {
+        let outcome = ClaudeMCPRegistration.register(
+            memoryExecutable: URL(fileURLWithPath: installDir + "/memory"),
+            home: URL(fileURLWithPath: NSHomeDirectory()),
+            environment: cleanEnv()
+        )
+        if outcome != .alreadyRegistered {
+            NSLog("Engram Claude MCP registration: %@", outcome.description)
         }
-
-        let add = Process()
-        add.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        add.arguments = [
-            "claude", "mcp", "add", "--scope", "user", "--transport", "stdio",
-            "memory", "--", "\(installDir)/memory"
-        ]
-        add.environment = env
-        try? add.run()
     }
 
     // MARK: - CLAUDE.md

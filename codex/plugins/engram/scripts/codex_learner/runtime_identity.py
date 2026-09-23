@@ -83,6 +83,9 @@ def capture(router_file, runner_module, admission_module, host_admission_module=
                  "template": (template, ".md"), "admission": (admission_file, ".py")}
         if host_admission_module is not None:
             files["host_admission"] = (getattr(host_admission_module, "__file__", None), ".py")
+        file_identity_module = getattr(admission_module, "file_identity", None)
+        if file_identity_module is not None:
+            files["file_identity"] = (getattr(file_identity_module, "__file__", None), ".py")
         for name, (value, suffix) in files.items():
             identity["sources"][name] = _observed_file(value, MAX_SOURCE_BYTES, suffix=suffix)[0]
         router_path = identity["sources"]["router"]["path"]

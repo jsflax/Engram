@@ -23,6 +23,7 @@ import tomllib
 import uuid
 
 from .transcript import inspect_rollout, read_excerpt
+from .memory_proxy import verified_no_write_receipt
 
 EVENTS = {"Stop", "PreCompact", "SessionEnd"}
 GUARD = "ENGRAM_CODEX_LEARNER"
@@ -346,6 +347,9 @@ def audit_tools(path: Path) -> dict:
         result = results.get(key, {})
         if result.get("ok") is not True or result.get("tool") != tool:
             errors += 1
+        elif "write_outcome" in result:
+            if not verified_no_write_receipt(result):
+                errors += 1
         elif tool in WRITE_TOOLS:
             ids = result.get("memory_ids", [])
             if not isinstance(ids, list) or not ids or any(not isinstance(i, str) or not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", i) for i in ids):

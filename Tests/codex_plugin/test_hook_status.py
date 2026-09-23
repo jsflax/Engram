@@ -116,6 +116,30 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(result["learner"]["latest_run"]["read_status"], "not_linked")
         self.assertNotIn("/private", json.dumps(result))
 
+    def test_v2_identity_and_migration_hold_are_distinct_from_write_gate(self):
+        identity = {"scheme": "macos_volume_uuid_inode_v1", "volume_uuid": OTHER, "inode": 123}
+        self.write(self.modern / "learner/admission.json", {"enabled": True,
+                   "mode": "host_sessions_v2", "schema_version": 2})
+        self.write(self.modern / "learner/enrollments" / (SID + ".json"),
+                   {"session_id": SID, "identity": identity, "transcript_path": "/private"})
+        self.write(self.modern / "learner/migration-holds" / (SID + ".json"),
+                   {"session_id": SID, "kind": "identity_migration_hold", "plan_sha256": DIGEST,
+                    "private_note": "never display"})
+        result = self.report()["learner"]
+        self.assertEqual(result["policy"]["metadata"]["mode"], "host_sessions_v2")
+        self.assertEqual(result["policy"]["metadata"]["schema_version"], 2)
+        self.assertEqual(result["enrollment"]["metadata"]["identity"], identity)
+        self.assertEqual(result["migration_hold"]["metadata"]["kind"], "identity_migration_hold")
+        self.assertNotIn("reconciliation_required", result["migration_hold"]["metadata"])
+        self.assertNotIn("never display", json.dumps(result))
+        self.assertNotIn("/private", json.dumps(result))
+
+    def test_stable_identity_errors_use_exact_allowlist(self):
+        for reason in ("admission_legacy_migration_required", "admission_migration_held",
+                       "admission_identity_volume_changed", "admission_identity_filesystem_unsupported"):
+            self.assertEqual(STATUS.metadata({"reason": reason}), {"reason": reason})
+        self.assertEqual(STATUS.metadata({"reason": "admission_identity_private_path_or_secret"}), {})
+
     def test_successful_run_retains_uuid_and_evidence_qualification(self):
         self.write(self.modern / "learner/events.jsonl", [{"session_id": SID, "run_id": RUN,
             "event": "learner_finished", "status": "succeeded"}], log=True)

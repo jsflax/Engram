@@ -10,25 +10,18 @@ import hashlib
 import os
 from pathlib import Path
 import re
-import stat
 
-from . import admission, file_identity
-from .transcript import inspect_rollout, _metadata_from_line
+from . import admission
+from .transcript import inspect_rollout
 
 MODE = "host_sessions_v1"
-MODE_V2 = "host_sessions_v2"
-MODES = (MODE, MODE_V2)
 OBSERVE_EVENTS = {"SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop", "PreCompact", "SessionEnd"}
 LEARN_EVENTS = {"Stop", "SubagentStop", "PreCompact"}
 
 
 def mode(root):
     raw, _ = admission._owned_bytes(root / "admission.json", private=True)
-    return admission._json(raw).get("mode") in MODES
-
-
-def is_v2(value):
-    return value.get("mode") == MODE_V2
+    return admission._json(raw).get("mode") == MODE
 
 
 def policy(root):
@@ -39,27 +32,25 @@ def policy(root):
     value = admission._json(raw)
     admission._require(set(value) == {"schema_version", "mode", "enabled", "activation_id", "cutoff",
                                       "state_dir", "sessions_dir"}, "invalid_host_policy_schema")
-    admission._require(type(value["schema_version"]) is int
-                       and ((value["schema_version"], value["mode"]) in ((1, MODE), (2, MODE_V2))),
-                       "unsupported_policy")
+    admission._require(type(value["schema_version"]) is int and value["schema_version"] == 1
+                       and value["mode"] == MODE, "unsupported_policy")
     admission._require(value["enabled"] is True, "inactive")
     admission._uuid(value["activation_id"], 4)
     admission._require(admission._timestamp(value["cutoff"]) <= datetime.now(timezone.utc), "future_cutoff")
     admission._require(value["state_dir"] == str(root), "state_dir_mismatch")
-    admission._bound_directory(value["sessions_dir"], stable_identity=is_v2(value))
+    admission._bound_directory(value["sessions_dir"])
     return value, raw
 
 
 def _origin(value, payload):
     sid = payload.get("session_id")
     path = admission._canonical(payload.get("transcript_path"))
-    stable = is_v2(value)
-    sessions = admission._bound_directory(value["sessions_dir"], stable_identity=stable)
+    sessions = admission._bound_directory(value["sessions_dir"])
     admission._require(path.is_relative_to(sessions), "transcript_outside_sessions")
     parts = path.relative_to(sessions).parts
     admission._require(len(parts) == 4 and re.fullmatch(r"\d{4}/\d{2}/\d{2}", "/".join(parts[:3])),
                        "invalid_rollout_layout")
-    raw, info, identity = admission._owned_bytes_record(path, first_line=True, stable_identity=stable)
+    raw, info = admission._owned_bytes(path, first_line=True)
     record = admission._json(raw)
     meta = record.get("payload")
     admission._require(record.get("type") == "session_meta" and isinstance(meta, dict), "initial_metadata_required")
@@ -68,10 +59,7 @@ def _origin(value, payload):
     admission._require(re.fullmatch(r"rollout-" + re.escape("-".join(parts[:3]))
                        + r"T\d{2}-\d{2}-\d{2}-" + re.escape(canonical_sid) + r"\.jsonl", parts[3]) is not None,
                        "invalid_rollout_filename")
-    # For v2, the metadata hash and fork-boundary interpretation use the very
-    # same bytes from the FD that supplied the persistent identity.
-    parsed = (_metadata_from_line(path, info, raw, len(raw), identity)
-              if stable else inspect_rollout(path))
+    parsed = inspect_rollout(path)
     admission._require(parsed.session_id == canonical_sid and parsed.fork_boundary_known, "unknown_inherited_boundary")
     if sid != canonical_sid:
         source = parsed.source if isinstance(parsed.source, dict) else {}
@@ -86,37 +74,15 @@ def _origin(value, payload):
     version = meta.get("cli_version")
     admission._require(isinstance(version, str) and 0 < len(version) <= 128, "unqualified_version")
     project = admission._canonical(meta.get("cwd"))
-    project_binding = admission._directory_binding(project, stable_identity=stable)
+    project_info = admission._directory(project)
     admission._require(payload.get("cwd") == str(project), "project_mismatch")
     created = admission._timestamp(meta.get("timestamp"))
     admission._require(created <= datetime.now(timezone.utc), "invalid_origin_time")
-    transcript_binding = {"identity": identity} if stable else {"device": info.st_dev, "inode": info.st_ino}
-    return {"session_id": canonical_sid, "transcript_path": str(path), **transcript_binding,
-            "uid": info.st_uid, "initial_meta_bytes": len(raw),
+    return {"session_id": canonical_sid, "transcript_path": str(path), "device": info.st_dev,
+            "inode": info.st_ino, "uid": info.st_uid, "initial_meta_bytes": len(raw),
             "initial_meta_sha256": hashlib.sha256(raw).hexdigest(), "source": source,
             "cli_version": version, "origin_metadata_timestamp": admission._utc(created),
-            "project": project_binding}
-
-
-def ensure_no_migration_hold(root, sid):
-    """Any marker or unsafe marker path holds learning; its contents grant nothing."""
-    admission._uuid(sid, 7)
-    parent = root / "migration-holds"
-    try:
-        info = parent.lstat()
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        raise ValueError("admission_migration_held") from error
-    admission._require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
-                       and not info.st_mode & 0o077, "migration_held")
-    try:
-        (parent / (sid + ".json")).lstat()
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        raise ValueError("admission_migration_held") from error
-    raise ValueError("admission_migration_held")
+            "project": {"path": str(project), "device": project_info.st_dev, "inode": project_info.st_ino}}
 
 
 def _entry_path(root, sid):
@@ -134,8 +100,6 @@ def _validate_entry(root, value, payload):
     origin = _origin(value, payload)
     raw, _ = admission._owned_bytes(_entry_path(root, origin["session_id"]), private=True)
     entry = admission._json(raw)
-    if is_v2(value) and "identity" not in entry and {"device", "inode"} <= set(entry):
-        raise ValueError("admission_legacy_migration_required")
     admission._require(set(entry) == set(origin) | admission.FRONTIER_FIELDS | {"captured_at", "activation_id"},
                        "invalid_enrollment_schema")
     admission._require(entry["activation_id"] == value["activation_id"], "enrollment_activation_changed")
@@ -164,13 +128,10 @@ def observe(root, payload):
     if path.exists():
         _validate_entry(root, value, payload)
         return origin["session_id"], False, False
-    ensure_no_migration_hold(root, origin["session_id"])
     # Never adopt state from another admission or silently reset missing entries.
     for state_path in admission.state_paths(root, origin["session_id"]).values():
         admission._require(not state_path.exists(), "unowned_existing_state")
-    parsed = inspect_rollout(origin["transcript_path"], stable_identity=is_v2(value))
-    if is_v2(value):
-        admission._require(parsed.identity == origin["identity"], "transcript_identity_changed")
+    parsed = inspect_rollout(origin["transcript_path"])
     # A newly spawned child can finish before any child-start hook exposes its
     # transcript. Its known inherited-history boundary keeps the initial visible
     # excerpt child-only, and the cutoff excludes pre-installation children.
@@ -190,7 +151,6 @@ def observe(root, payload):
 
 
 def check(root, request):
-    ensure_no_migration_hold(root, request.get("session_id"))
     value, raw = policy(root)
     admission._require(request.get("event") in LEARN_EVENTS, "unqualified_event")
     if request["event"] == "Stop":
@@ -203,15 +163,9 @@ def check(root, request):
     entry = _validate_entry(root, value, payload)
     admission._require(request.get("session_id") == entry["session_id"]
                        and request.get("cwd") == entry["project"]["path"], "session_or_project_mismatch")
-    if is_v2(value):
-        admission._require("device" not in request and "inode" not in request,
-                           "invalid_transcript_binding")
-        admission._require(file_identity.validate(request.get("identity")) == entry["identity"],
-                           "transcript_identity_changed")
-    else:
-        admission._require(all(request.get(key) == entry[key] for key in ("device", "inode")), "transcript_identity_changed")
+    admission._require(all(request.get(key) == entry[key] for key in ("device", "inode")), "transcript_identity_changed")
     return {**entry, "cutoff": value["cutoff"], "policy_sha256": hashlib.sha256(raw).hexdigest(),
-            "state_dir": str(root), "mode": value["mode"]}
+            "state_dir": str(root), "mode": MODE}
 
 
 def enrollment_ids(root):

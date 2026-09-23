@@ -1,0 +1,8 @@
+{
+  "source_commit": "571b47196ae78accf36412aac82f2751c0f11c78",
+  "purpose": "Exact retained v1 policy parsers for migration suspension compatibility tests",
+  "files": {
+    "admission.py": "9ff002bb7644246cbe47cb5cbbf705c1276de5788bde99935fc1c50a4ab3d5f3",
+    "host_admission.py": "a327061097b355a75799977d1d824ab04fee041512c1371742b0fd96690f788f"
+  }
+}

@@ -12,8 +12,6 @@ import re
 import stat
 import uuid
 
-from . import file_identity
-
 MAX_BYTES = 1024 * 1024
 LINEAGE_KEYS = (
     "forked_from_id", "parent_thread_id", "forked_from_ordinal_exclusive",
@@ -61,40 +59,9 @@ def _directory(path):
     return info
 
 
-def _directory_binding(path, *, stable_identity=False):
-    """Capture an owned directory; durable v2 identity comes from its open FD."""
-    path = _canonical(str(path))
-    info = _directory(path)
-    if not stable_identity:
-        return {"path": str(path), "device": info.st_dev, "inode": info.st_ino}
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK | os.O_DIRECTORY
-    fd = os.open(path, flags)
-    try:
-        opened = os.fstat(fd)
-        _require(stat.S_ISDIR(opened.st_mode) and opened.st_uid == os.getuid()
-                 and (opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino),
-                 "directory_identity_changed")
-        identity = file_identity.capture_fd(fd)
-        after = _directory(_canonical(str(path)))
-        final = os.fstat(fd)
-        _require((after.st_dev, after.st_ino, after.st_uid, after.st_mode)
-                 == (final.st_dev, final.st_ino, final.st_uid, final.st_mode)
-                 == (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_mode),
-                 "directory_identity_changed")
-        return {"path": str(path), "identity": identity}
-    finally:
-        os.close(fd)
-
-
-def _bound_directory(value, *, stable_identity=False):
-    fields = {"path", "identity"} if stable_identity else {"path", "device", "inode"}
-    _require(isinstance(value, dict) and set(value) == fields,
+def _bound_directory(value):
+    _require(isinstance(value, dict) and set(value) == {"path", "device", "inode"},
              "invalid_directory_binding")
-    if stable_identity:
-        expected = file_identity.validate(value["identity"])
-        actual = _directory_binding(value["path"], stable_identity=True)
-        _require(actual["identity"] == expected, "directory_identity_changed")
-        return Path(actual["path"])
     path = _canonical(value["path"])
     info = _directory(path)
     _require(all(type(value[key]) is int and value[key] >= 0 for key in ("device", "inode"))
@@ -103,7 +70,7 @@ def _bound_directory(value, *, stable_identity=False):
     return path
 
 
-def _owned_bytes_record(path, *, first_line=False, private=False, stable_identity=False):
+def _owned_bytes(path, *, first_line=False, private=False):
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
     with os.fdopen(os.open(path, flags), "rb") as stream:
         info = os.fstat(stream.fileno())
@@ -111,24 +78,9 @@ def _owned_bytes_record(path, *, first_line=False, private=False, stable_identit
                  "file_not_owned_regular")
         _require(not private or not info.st_mode & 0o022, "policy_writable_by_others")
         _require(first_line or info.st_size <= MAX_BYTES, "record_too_large")
-        identity = file_identity.capture_fd(stream.fileno()) if stable_identity else None
         raw = stream.readline(MAX_BYTES + 1) if first_line else stream.read(MAX_BYTES + 1)
-        if stable_identity:
-            _require(file_identity.capture_fd(stream.fileno()) == identity,
-                     "transcript_identity_changed")
-            after = os.fstat(stream.fileno())
-            current = _canonical(str(path)).stat(follow_symlinks=False)
-            _require((after.st_dev, after.st_ino, after.st_uid, after.st_mode)
-                     == (info.st_dev, info.st_ino, info.st_uid, info.st_mode)
-                     == (current.st_dev, current.st_ino, current.st_uid, current.st_mode),
-                     "transcript_identity_changed")
     _require(len(raw) <= MAX_BYTES, "record_too_large")
     _require(not first_line or raw.endswith(b"\n"), "initial_metadata_incomplete")
-    return raw, info, identity
-
-
-def _owned_bytes(path, *, first_line=False, private=False):
-    raw, info, _ = _owned_bytes_record(path, first_line=first_line, private=private)
     return raw, info
 
 
@@ -221,22 +173,8 @@ def _frontier(origin, offset=None):
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
     with os.fdopen(os.open(origin["transcript_path"], flags), "rb") as stream:
         info = os.fstat(stream.fileno())
-        stable = "identity" in origin
-        if stable:
-            _require("device" not in origin and "inode" not in origin, "invalid_transcript_binding")
-            identity = file_identity.validate(origin["identity"])
-            _require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
-                     and file_identity.capture_fd(stream.fileno()) == identity,
-                     "transcript_identity_changed")
-            _require(type(origin["initial_meta_bytes"]) is int
-                     and 0 < origin["initial_meta_bytes"] <= MAX_BYTES, "invalid_initial_metadata_size")
-            initial = stream.read(origin["initial_meta_bytes"])
-            _require(len(initial) == origin["initial_meta_bytes"]
-                     and hashlib.sha256(initial).hexdigest() == origin["initial_meta_sha256"],
-                     "initial_metadata_changed")
-        else:
-            _require(stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino, info.st_uid)
-                     == (origin["device"], origin["inode"], os.getuid()), "transcript_identity_changed")
+        _require(stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino, info.st_uid)
+                 == (origin["device"], origin["inode"], os.getuid()), "transcript_identity_changed")
         # Capture only the observed EOF. A partial tail is never rounded backwards.
         offset = info.st_size if offset is None else offset
         _require(type(offset) is int and origin["initial_meta_bytes"] <= offset <= info.st_size,
@@ -245,14 +183,6 @@ def _frontier(origin, offset=None):
         stream.seek(start)
         data = stream.read(offset - start)
         _require(len(data) == offset - start and data.endswith(b"\n"), "frontier_not_complete_line")
-        if stable:
-            after = os.fstat(stream.fileno())
-            current = _canonical(origin["transcript_path"]).stat(follow_symlinks=False)
-            _require(file_identity.capture_fd(stream.fileno()) == identity
-                     and (after.st_dev, after.st_ino, after.st_uid, after.st_mode)
-                     == (info.st_dev, info.st_ino, info.st_uid, info.st_mode)
-                     == (current.st_dev, current.st_ino, current.st_uid, current.st_mode),
-                     "transcript_identity_changed")
     return {"frontier_offset": offset, "frontier_anchor_start": start,
             "frontier_anchor_sha256": hashlib.sha256(data).hexdigest()}
 
@@ -310,15 +240,10 @@ def check_activation(root: Path) -> dict:
 
 
 def enrollment_ids(root: Path, policy: dict) -> list[str]:
-    if policy.get("mode") in {"host_sessions_v1", "host_sessions_v2"}:
+    if policy.get("mode") == "host_sessions_v1":
         from .host_admission import enrollment_ids as host_ids
         return host_ids(root)
     return list(policy["enrollments"])
-
-
-def ensure_no_migration_hold(root: Path, sid: str):
-    from . import host_admission
-    host_admission.ensure_no_migration_hold(root, sid)
 
 
 def check(root: Path, request: dict) -> dict:

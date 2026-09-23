@@ -18,6 +18,7 @@ MODULES = (
     "test_budget_guidance", "test_lock_inheritance", "test_hook_parity",
     "test_hook_status", "test_bootstrap", "test_entry_integration",
     "test_memory_policy",
+    "test_file_identity", "test_host_v2", "test_v2_runtime", "test_migration",
 )
 
 def run_module(name):

@@ -53,8 +53,21 @@ class ReleaseWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='engram-workflow-') as temporary:
             root = Path(temporary)
             (root / 'scripts').mkdir()
-            shutil.copyfile(ROOT / 'scripts/run_native_tests.py',
-                            root / 'scripts/run_native_tests.py')
+            # This test checks workflow command contracts. Supervision has its
+            # own tests; a real process inventory can stall on a busy host.
+            (root / 'scripts/run_native_tests.py').write_text('''import argparse, subprocess
+parser = argparse.ArgumentParser()
+parser.add_argument('--diagnostics-dir', required=True)
+parser.add_argument('--timeout-seconds', type=int, required=True)
+parser.add_argument('--silence-seconds', type=int, required=True)
+parser.add_argument('command', nargs=argparse.REMAINDER)
+args = parser.parse_args()
+assert args.diagnostics_dir == 'build/native-test-diagnostics', args
+assert args.timeout_seconds == 1800, args
+assert args.silence_seconds == 300, args
+assert args.command and args.command[0] == '--', args
+raise SystemExit(subprocess.run(args.command[1:], check=False).returncode)
+''')
             bin_dir = root / 'bin'
             bin_dir.mkdir()
             log = root / 'calls.jsonl'
@@ -101,7 +114,7 @@ with open(os.environ['CALL_LOG'],'a') as output:
             self.assertTrue(any('clusters_statementBudget' in call for call in tests))
             self.assertEqual(tests[0], [
                 'swift', 'test', '--force-resolved-versions', '--skip-build', '--filter',
-                'EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests',
+                'EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests|LockedSnapshotTests',
                 '--skip', 'PerfTests', '--skip', 'keyBERTKeywordExtraction',
                 '--skip', 'recall_semanticRelevanceOrdering',
                 '--skip', 'recall_connectedMemory_showsEdgeRelation',
@@ -116,6 +129,48 @@ with open(os.environ['CALL_LOG'],'a') as output:
         cases = match[1].split()
         self.assertEqual(set(cases), {'smoke', 'startup', 'recall', 'idle', 'persistence'})
         self.assertEqual(len(cases), 5)
+
+
+    def test_slack_dispatch_announces_publication_and_checks_acknowledgment(self):
+        workflow = (ROOT / '.github/workflows/release.yml').read_text()
+        step = workflow.split('      - name: Notify Slack\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn("steps.publish.outcome == 'success'", step)
+        self.assertNotIn("github.event_name", step)
+        self.assertIn("SWIFTLM SLACK; do", workflow)
+        with tempfile.TemporaryDirectory(prefix='engram-slack-') as temporary:
+            root = Path(temporary)
+            bin_dir = root / 'bin'
+            bin_dir.mkdir()
+            fake = '#!' + sys.executable + '\n' + """import json,os,sys
+from pathlib import Path
+args=sys.argv[1:]
+assert '--fail' in args and '--max-time' in args,args
+assert '--retry' not in args,args
+payload=json.loads(args[args.index('-d')+1])
+Path(os.environ['CALL_LOG']).write_text(json.dumps(payload))
+print(os.environ['FAKE_ACK'])
+sys.exit(int(os.environ.get('FAKE_EXIT','0')))
+"""
+            command = bin_dir / 'curl'
+            command.write_text(fake)
+            command.chmod(0o755)
+            log = root / 'payload.json'
+            (root / 'CHANGELOG.md').write_text('## [0.14.9]\n### Fixed\n- A "quoted" fix\n## [0.14.8]\n- Old\n')
+            block = run_block('release.yml', 'Notify Slack').replace('${{ github.repository }}', 'owner/Engram')
+            env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
+                       RELEASE_TAG='v0.14.9', SLACK_WEBHOOK_URL='https://example.invalid/webhook')
+            for ack, exit_code, expected in [('ok', '0', 0), ('invalid_payload', '0', 1), ('ok', '22', 22)]:
+                with self.subTest(ack=ack, exit_code=exit_code):
+                    result = subprocess.run(['/bin/bash', '-e', '-c', block], cwd=root,
+                                            env=dict(env, FAKE_ACK=ack, FAKE_EXIT=exit_code),
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+            payload = json.loads(log.read_text())
+            self.assertIn('v0.14.9', payload['blocks'][0]['text']['text'])
+            self.assertEqual(payload['blocks'][1]['accessory']['url'],
+                             'https://github.com/owner/Engram/releases/tag/v0.14.9')
+            self.assertIn('A "quoted" fix', payload['blocks'][1]['text']['text'])
+            self.assertNotIn('Old', payload['blocks'][1]['text']['text'])
 
 
 if __name__ == '__main__':

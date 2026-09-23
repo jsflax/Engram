@@ -64,7 +64,15 @@ REASONS |= {"admission_" + value for value in {
     "session_or_project_mismatch", "state_directory_not_private", "state_directory_symlink",
     "state_file_symlink", "transcript_outside_sessions", "unknown_inherited_boundary",
     "unowned_existing_state", "unqualified_event", "unqualified_source", "unqualified_version",
-    "unsupported_policy"}}
+    "unsupported_policy", "legacy_migration_required", "migration_held",
+    "directory_identity_changed", "invalid_transcript_binding", "invalid_initial_metadata_size",
+    "initial_metadata_changed", "invalid_legacy_event_identity"}}
+REASONS |= {"admission_identity_" + value for value in {
+    "abi_unsupported", "api_unavailable", "attributes_malformed", "attributes_unavailable",
+    "attributes_unsupported", "fd_invalid", "file_type_unsupported", "filesystem_changed",
+    "filesystem_malformed", "filesystem_unavailable", "filesystem_unsupported", "inode_invalid",
+    "invalid", "mount_invalid", "persistence_unsupported", "platform_unsupported", "root_changed",
+    "root_mismatch", "scheme_unsupported", "target_changed", "unavailable", "uuid_invalid", "volume_changed"}}
 FAILURE_PHASES = {"arguments", "config", "state_setup", "input", "payload", "policy",
                   "state_lock", "state_load", "state_reserve", "spawn", "mcp_initialize",
                   "mcp_recall", "mcp_graph", "parse_recall", "parse_graph", "render",
@@ -259,7 +267,7 @@ def runtime_identity(value):
     sources = value.get("sources")
     if isinstance(sources, dict):
         out["sources"] = {key: observed_file(sources[key]) for key in
-                          ("router", "runner", "template", "admission", "host_admission")
+                          ("router", "runner", "template", "admission", "host_admission", "file_identity")
                           if isinstance(sources.get(key), dict)}
     return out
 
@@ -290,6 +298,18 @@ def metadata(record):
     for key in ("status", "pause_reason"):
         if isinstance(record.get(key), str) and record[key] in STATUSES:
             out[key] = record[key]
+    stable = record.get("identity")
+    if (isinstance(stable, dict) and stable.get("scheme") == "macos_volume_uuid_inode_v1"
+            and valid_uuid(stable.get("volume_uuid"))
+            and type(stable.get("inode")) is int and 0 < stable["inode"] < 2 ** 64):
+        out["identity"] = {"scheme": stable["scheme"], "volume_uuid": stable["volume_uuid"],
+                           "inode": stable["inode"]}
+    if record.get("mode") in {"host_sessions_v1", "host_sessions_v2"}:
+        out["mode"] = record["mode"]
+    if record.get("kind") == "identity_migration_hold":
+        out["kind"] = record["kind"]
+        if isinstance(record.get("plan_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", record["plan_sha256"]):
+            out["plan_sha256"] = record["plan_sha256"]
     if isinstance(record.get("reason"), str) and record["reason"] in REASONS:
         out["reason"] = record["reason"]
     for key, allowed in (("failure_phase", FAILURE_PHASES), ("error_kind", ERROR_KINDS)):
@@ -346,10 +366,10 @@ def policy_view(path):
     if value is not None:
         out["metadata"] = {k: v for k, v in metadata(value).items()
                            if k in {"enabled", "activation_id", "cutoff"}}
-        if value.get("mode") == "host_sessions_v1":
-            out["metadata"]["mode"] = "host_sessions_v1"
-        if type(value.get("schema_version")) is int and value["schema_version"] == 1:
-            out["metadata"]["schema_version"] = 1
+        if value.get("mode") in {"host_sessions_v1", "host_sessions_v2"}:
+            out["metadata"]["mode"] = value["mode"]
+        if type(value.get("schema_version")) is int and value["schema_version"] in {1, 2}:
+            out["metadata"]["schema_version"] = value["schema_version"]
     return out
 
 
@@ -400,6 +420,7 @@ def report(session_id=None, environ=None):
     _, admission_view = scoped_json(learner / "admissions" / (sid + ".json"), sid, binding=True)
     _, pending_view = scoped_json(learner / "pending" / (sid + ".json"), sid)
     _, enrollment_view = scoped_json(learner / "enrollments" / (sid + ".json"), sid)
+    _, migration_view = scoped_json(learner / "migration-holds" / (sid + ".json"), sid)
     out = {"status": "ok", "session_id": sid, "session_sha256_prefix": session_hash, "state_root": selection,
            "advice": {"window": advice_window, "receipts": [metadata(v) for v in advice],
                       "delivery_evidence": "receipt_only_not_model_delivery"},
@@ -411,7 +432,7 @@ def report(session_id=None, environ=None):
                        "policy": policy_view(learner / "admission.json"),
                        "events": [metadata(v) for v in events],
                        "session": state_view, "admission": admission_view, "enrollment": enrollment_view,
-                       "pending": pending_view,
+                       "pending": pending_view, "migration_hold": migration_view,
                        "memory_readback": "not_performed"}}
     # A run must be named by a matching event or this exact session's state.
     linked = next((v.get("run_id") for v in reversed(events) if "run_id" in v), None)

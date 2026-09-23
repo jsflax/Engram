@@ -13,6 +13,8 @@ Summarize advice, tool/lifecycle events, routing, policy, and learner completion
 
 `reconciliation_required` means a failed run may already have written memory, or its write status is unknown. Report its linked run, reason, and recorded UUIDs; later events are held to prevent blind replay. The status reader does not clear this gate or establish whether an uncertain write persisted.
 
+`migration_hold` is a separate filesystem-identity migration hold. Report it independently of a reconciliation gate and a paused pending request. `host_sessions_v2` uses persistent APFS volume UUID and inode identities; legacy v1 enrollments remain held until explicitly migrated. A migration hold or `admission_legacy_migration_required` does not authorize a retry, clearing a gate, changing the cursor, or adopting the current end of the transcript. Migration and activation are separately reviewed operations.
+
 Report a returned learner `reason` code when present. The reader exposes only an exact allowlist of source-defined admission codes; it omits other reasons rather than displaying arbitrary error text. A missing reason therefore does not mean the event had no error.
 
 Advice diagnostics and lifecycle failure kinds are exact enums, never exception text. Runtime identity exposes only package version, source hashes, and typed status; it identifies observed package files, not successful execution or saved memory.

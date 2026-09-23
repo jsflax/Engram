@@ -14,11 +14,15 @@ from unittest import mock
 HERE = REPOSITORY_ROOT
 sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 import engram_hook
-from codex_learner import runner
+from codex_learner import runner, file_identity
 
 
 class EntryIntegration(unittest.TestCase):
     def setUp(self):
+        capture = mock.patch.object(file_identity, "capture_fd", side_effect=lambda fd: {
+            "scheme": "macos_volume_uuid_inode_v1",
+            "volume_uuid": "11111111-2222-4333-8444-555555555555", "inode": os.fstat(fd).st_ino})
+        capture.start(); self.addCleanup(capture.stop)
         self.temp = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
