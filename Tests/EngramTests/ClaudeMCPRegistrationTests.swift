@@ -10,7 +10,10 @@ private struct MCPRegistrationFixture {
     let config: URL
 
     init() throws {
-        home = FileManager.default.temporaryDirectory.appendingPathComponent("engram-mcp-\(UUID().uuidString)")
+        let root = ProcessInfo.processInfo.environment["ENGRAM_ADOPTION_TEST_ROOT"]
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? FileManager.default.temporaryDirectory
+        home = root.appendingPathComponent("engram-mcp-\(UUID().uuidString)")
         memory = home.appendingPathComponent(".claude/bin/memory")
         claude = home.appendingPathComponent(".local/bin/claude")
         config = home.appendingPathComponent(".claude.json")
