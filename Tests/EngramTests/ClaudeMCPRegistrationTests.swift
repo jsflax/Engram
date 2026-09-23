@@ -25,7 +25,7 @@ private struct MCPRegistrationFixture {
     func cleanup() { try? FileManager.default.removeItem(at: home) }
 
     func writeExecutable(_ url: URL, _ contents: String) throws {
-        try contents.write(to: url, atomically: true, encoding: .utf8)
+        try contents.write(to: url, atomically: false, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
     }
 
@@ -102,7 +102,7 @@ func claudeMCPRegistrationPreservesMalformedConfiguration() throws {
     let fixture = try MCPRegistrationFixture(); defer { fixture.cleanup() }
     try fixture.successfulClaude()
     for contents in ["{broken", "[]", "{\"mcpServers\":null}"] {
-        try contents.write(to: fixture.config, atomically: true, encoding: .utf8)
+        try contents.write(to: fixture.config, atomically: false, encoding: .utf8)
         #expect(fixture.register() == .invalidConfiguration)
         #expect(try String(contentsOf: fixture.config, encoding: .utf8) == contents)
     }
