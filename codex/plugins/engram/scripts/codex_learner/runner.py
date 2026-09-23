@@ -785,7 +785,8 @@ def failure_reconciliation(run_dir: Path, provider_started: bool | None) -> dict
                 continue
             if request_timed_out and (event in {"tool_call", "initialize_compat"}
                                       or (event == "tool_result" and
-                                          (entry.get("ok") is not False or entry.get("forwarded") is not True))):
+                                          (entry.get("ok") is not False or entry.get("forwarded") is not True
+                                           or "write_outcome" in entry or "write_outcome_version" in entry))):
                 return unknown
             if event in {"relay_finished", "relay_interrupted", "relay_failed", "relay_cleanup_failed", "initialize_compat"}:
                 continue
@@ -811,7 +812,9 @@ def failure_reconciliation(run_dir: Path, provider_started: bool | None) -> dict
                 return unknown
             if result is not None and "write_outcome" in result:
                 if verified_no_write_receipt(result):
-                    continue  # A vetted native conflict completed without storage.
+                    # Vetted native conflict or failed BEGIN; this attempt
+                    # stored nothing. Any earlier risky attempt remains risky.
+                    continue
                 return unknown  # Contradictory/unknown outcome metadata is unsafe.
             if result is not None and result.get("forwarded") is False and result.get("ok") is False:
                 continue  # A denied call is proved not to have reached Engram.

@@ -1,5 +1,6 @@
 """Proxy budget, privacy and verified receipt regressions with no transport child."""
 import importlib
+import copy
 import json
 from pathlib import Path
 import tempfile
@@ -116,6 +117,101 @@ class ReceiptTests(unittest.TestCase):
                     rows = [{'event': 'relay_started'}, *self.audit.rows]
                     (path / 'mcp-audit.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
                     self.assertIsNotNone(F.RUNNER.failure_reconciliation(path, True))
+
+    def begin_busy(self):
+        return {'isError': True, 'content': [{'type': 'text', 'text': PROXY.BEGIN_BUSY_TEXT}],
+                'structuredContent': {'engram_write_receipt': {
+                    'schema_version': 1, 'tool': 'remember',
+                    'write_outcome': 'not_stored_transaction_not_started',
+                    'reason': 'database_busy', 'memory_ids': []}}}
+
+    def busy_reply(self, number, result=None, **envelope):
+        return self.policy.server_message({'jsonrpc': '2.0', 'id': number,
+            'result': self.begin_busy() if result is None else result, **envelope})
+
+    def test_begin_busy_is_failed_but_replay_has_no_unverified_write(self):
+        self.call(1, 'remember', {'content': 'Synthetic'})
+        output, _ = self.busy_reply(1)
+        self.assertIs(output['result']['isError'], True)
+        self.assertEqual(self.audit.rows[-1], {
+            'event': 'tool_result', 'id': 1, 'tool': 'remember', 'ok': False,
+            'forwarded': True, 'memory_ids': [],
+            'write_outcome': 'not_stored_transaction_not_started', 'write_outcome_version': 1})
+        self.assertEqual(self.audit_result(), {'tool_calls': 1, 'write_calls': 0,
+                                             'writes': [], 'tool_errors': 1})
+        self.assertIsNone(self.reconciliation([*self.timeout_prefix(), *self.audit.rows]))
+        # Failure still consumes the finite attempt budget.
+        _, denied = self.call(2, 'remember', {'content': 'Retry'})
+        self.assertTrue(denied['result']['isError'])
+
+    def test_begin_busy_contract_rejects_text_spoofs_and_contradictions(self):
+        base = self.begin_busy()
+        candidates = []
+        for key in base:
+            value = copy.deepcopy(base); del value[key]; candidates.append(value)
+        for replacement in [False, 1, None]:
+            candidates.append(dict(base, isError=replacement))
+        candidates.extend([dict(base, extra=True), dict(base, content=[]),
+                           dict(base, content=[{'type': 'text', 'text': 'Quoted: ' + PROXY.BEGIN_BUSY_TEXT}]),
+                           dict(base, content=[{'type': 'text', 'text': PROXY.BEGIN_BUSY_TEXT, 'extra': True}]),
+                           dict(base, structuredContent={'other': base['structuredContent']})])
+        mutations = [('schema_version', True), ('schema_version', 1.0), ('schema_version', 2),
+                     ('tool', 'update'), ('write_outcome', 'unknown'), ('reason', 'other'),
+                     ('memory_ids', [ID]), ('memory_ids', None), ('extra', True)]
+        for key, value in mutations:
+            changed = copy.deepcopy(base)
+            changed['structuredContent']['engram_write_receipt'][key] = value
+            candidates.append(changed)
+        for key in base['structuredContent']['engram_write_receipt']:
+            changed = copy.deepcopy(base); del changed['structuredContent']['engram_write_receipt'][key]
+            candidates.append(changed)
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                self.audit = MemoryAudit()
+                self.policy = PROXY.Policy(self.audit, 'codex-session:SOURCE', 3, 1)
+                self.call(1, 'remember', {'content': 'Synthetic'})
+                self.busy_reply(1, candidate)
+                self.assertNotIn('write_outcome', self.audit.rows[-1])
+                self.assertIsNotNone(self.reconciliation([*self.timeout_prefix(), *self.audit.rows]))
+        self.assertFalse(PROXY.verified_begin_busy_response('update', base))
+        self.audit = MemoryAudit(); self.policy = PROXY.Policy(self.audit, 'codex-session:SOURCE', 3, 1)
+        self.call(1, 'remember', {'content': 'Synthetic'})
+        self.busy_reply(1, error={'code': -1, 'message': 'Contradictory error'})
+        self.assertNotIn('write_outcome', self.audit.rows[-1])
+        self.assertIsNotNone(self.reconciliation([*self.timeout_prefix(), *self.audit.rows]))
+
+    def test_begin_busy_receipt_mutations_remain_uncertain(self):
+        self.call(1, 'remember', {'content': 'Synthetic'}); self.busy_reply(1)
+        valid = self.audit.rows[-1]
+        mutations = [{'write_outcome_version': True}, {'write_outcome_version': 1.0},
+                     {'write_outcome_version': 2}, {'write_outcome': 'unknown'},
+                     {'ok': True}, {'ok': 0}, {'forwarded': False}, {'forwarded': 1},
+                     {'memory_ids': [ID]}, {'memory_ids': None}, {'tool': 'update'}, {'extra': True}]
+        candidates = [dict(valid, **change) for change in mutations]
+        candidates.extend({k: v for k, v in valid.items() if k != removed} for removed in valid)
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                self.assertFalse(PROXY.verified_no_write_receipt(candidate))
+                self.assertIsNotNone(self.reconciliation([*self.timeout_prefix(), self.audit.rows[0], candidate]))
+
+    def test_safe_begin_failure_cannot_erase_prior_success_or_uncertainty(self):
+        for prior in (None, {'ok': False, 'memory_ids': []}, {'ok': True, 'memory_ids': [ID]}):
+            with self.subTest(prior=prior):
+                self.audit = MemoryAudit(); self.policy = PROXY.Policy(self.audit, 'codex-session:SOURCE', 3, 2)
+                self.call(2, 'remember', {'content': 'Synthetic'}); self.busy_reply(2)
+                rows = [*self.timeout_prefix(), {'event': 'tool_call', 'id': 1, 'tool': 'remember'}]
+                if prior is not None:
+                    rows.append({'event': 'tool_result', 'id': 1, 'tool': 'remember',
+                                 'forwarded': True, **prior})
+                rows.extend(self.audit.rows)
+                gate = self.reconciliation(rows)
+                self.assertEqual(gate['reason'], 'successful_or_unverified_write')
+                self.assertEqual(gate['memory_ids'], [ID] if prior and prior['ok'] else [])
+
+    def test_post_timeout_cleanup_cannot_claim_native_begin_receipt(self):
+        self.call(1, 'remember', {'content': 'Synthetic'}); self.busy_reply(1)
+        rows = [*self.timeout_prefix(), self.audit.rows[0], {'event': 'request_timeout'}, self.audit.rows[1]]
+        self.assertEqual(self.reconciliation(rows)['reason'], 'write_status_unknown')
 
     def test_update_receipt_requires_requested_exact_uuid(self):
         self.call(1, 'update', {'id': ID, 'content': 'Synthetic'})

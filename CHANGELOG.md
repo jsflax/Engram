@@ -6,6 +6,19 @@ All notable changes to Engram are documented in this file.
 
 ## [Unreleased]
 
+## [0.14.9] - 2026-09-23
+
+### Fixed
+- Prevent background and active-use app crashes caused by repeated reads of Galaxy callbacks growing the invocation stack.
+- Repair missing Claude Code memory MCP registration on app launch, including GUI launches without Claude on PATH; verify registration and retry failed setup without requiring an app upgrade.
+- Keep existing customized MCP servers and other user configuration intact during registration repair.
+- Keep memory and graph updates inside one checked transaction and publish bookkeeping only after commit.
+- Let Codex learning recover on a later turn when a busy database prevents the write transaction from starting; preserve reconciliation for uncertain writes.
+- Recognize verified near-duplicate responses without blocking future learning, and classify startup failures separately from uncertain writes.
+- Preserve Codex task identity across APFS device renumbering and provide bounded migration with checks for other active tasks.
+- Include published Lattice Core 2.0.7 fixes for concurrent row-ID generation, text bytes, attachment aliases, numeric defaults, and snapshot initialization.
+- Send and verify the normal Slack release announcement for release-tool dispatches as well as tag pushes.
+
 ## [0.14.8] - 2026-09-19
 
 ### Fixed

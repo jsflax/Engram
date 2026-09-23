@@ -360,7 +360,7 @@ struct LatticeAdoptionRecallTests {
         #expect(lastId == nil)
     }
 
-    @Test(arguments: ["edge-abort", "edge-rollback", "busy-begin"])
+    @Test(arguments: ["edge-abort", "edge-rollback", "edge-begin-spoof", "busy-begin"])
     func remember_graphFailurePreservesMemoryAndBookkeepingUntilCommit(_ failure: String) async throws {
         let fixture = try fixture(seed: false)
         _ = try await fixture.tools.handle(CallTool.Parameters(name: "begin_episode", arguments: [
@@ -382,19 +382,40 @@ struct LatticeAdoptionRecallTests {
         if failure == "busy-begin" {
             try blocker.execute("BEGIN IMMEDIATE")
         } else {
-            let action = failure == "edge-abort" ? "ABORT" : "ROLLBACK"
-            try blocker.execute("CREATE TRIGGER remember_edge_fault BEFORE INSERT ON Edge BEGIN SELECT RAISE(\(action), 'remember-edge-fault'); END")
+            let action = failure == "edge-rollback" ? "ROLLBACK" : "ABORT"
+            let detail = failure == "edge-begin-spoof" ? "Failed to begin transaction: database is locked" : "remember-edge-fault"
+            try blocker.execute("CREATE TRIGGER remember_edge_fault BEFORE INSERT ON Edge BEGIN SELECT RAISE(\(action), '\(detail)'); END")
         }
         defer {
             try? blocker.execute(failure == "busy-begin" ? "ROLLBACK" : "DROP TRIGGER IF EXISTS remember_edge_fault")
         }
         let started = Date()
-        await #expect(throws: (any Error).self) {
-            _ = try await fixture.tools.handle(CallTool.Parameters(name: "remember", arguments: [
-                "content": .string("child must roll back with its required parent edge"),
-                "project": .string("Persistence"), "topic": .string("episode"),
-                "parent_id": .string(parentId.uuidString),
+        let request = CallTool.Parameters(name: "remember", arguments: [
+            "content": .string("child must roll back with its required parent edge"),
+            "project": .string("Persistence"), "topic": .string("episode"),
+            "parent_id": .string(parentId.uuidString),
+        ])
+        if failure == "busy-begin" {
+            let result = try await fixture.tools.handle(request)
+            #expect(result.isError == true)
+            #expect(result.structuredContent == .object([
+                "engram_write_receipt": .object([
+                    "schema_version": .int(1), "tool": .string("remember"),
+                    "write_outcome": .string("not_stored_transaction_not_started"),
+                    "reason": .string("database_busy"), "memory_ids": .array([]),
+                ]),
             ]))
+            // Verify the actual MCP wire shape, including no extra receipt fields.
+            let wire = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(result)) as? [String: Any])
+            #expect(Set(wire.keys) == ["content", "structuredContent", "isError"])
+            let content = try #require(wire["content"] as? [[String: String]])
+            #expect(content == [["type": "text", "text": "Memory was not stored: the database was busy before the write transaction started. Retry on a later turn."]])
+        } else {
+            // Even matching busy text from inside the body is not a no-write
+            // attestation; the caller still receives an unknown storage error.
+            await #expect(throws: (any Error).self) {
+                _ = try await fixture.tools.handle(request)
+            }
         }
         #expect(Date().timeIntervalSince(started) < 5)
         // New independent readers prove committed state, rather than inspecting

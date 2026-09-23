@@ -54,8 +54,9 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           SPARKLE: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           SWIFTLM: ${{ secrets.SWIFTLM_CLONE_TOKEN }}
+          SLACK: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          for key in CERT CERT_PASSWORD TEAM APPLE_ID APPLE_PASSWORD SPARKLE SWIFTLM; do
+          for key in CERT CERT_PASSWORD TEAM APPLE_ID APPLE_PASSWORD SPARKLE SWIFTLM SLACK; do
             if [ -z "${!key}" ]; then echo "::error::Required release credential unavailable: $key"; exit 1; fi
           done
   portable:
@@ -135,7 +136,7 @@ jobs:
           python3 -B scripts/run_native_tests.py
           --diagnostics-dir build/native-test-diagnostics
           --timeout-seconds 1800 --silence-seconds 300 --
-          swift test --force-resolved-versions --skip-build --filter "EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests"
+          swift test --force-resolved-versions --skip-build --filter "EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests|LockedSnapshotTests"
           --skip "PerfTests"
           --skip "keyBERTKeywordExtraction"
           --skip "recall_semanticRelevanceOrdering"
@@ -454,6 +455,7 @@ jobs:
       # Direct dispatch runs the existing native pipeline; it does not depend on
       # a GITHUB_TOKEN-created tag triggering a second workflow.
       - name: Create GitHub Release
+        id: publish
         run: |
           if ! git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then git tag "$RELEASE_TAG" "$EXPECTED_SHA"; fi
           git push origin "refs/tags/$RELEASE_TAG"
@@ -499,7 +501,9 @@ jobs:
           git diff --cached --quiet || (git commit -m "Update engram to ${VERSION}" && git push)
 
       - name: Notify Slack
-        if: github.event_name == 'push' && success() && env.SLACK_WEBHOOK_URL != ''
+        # Both tag pushes and release-train dispatches announce a published release.
+        # A later appcast/tap failure must not suppress the announcement.
+        if: ${{ !cancelled() && steps.publish.outcome == 'success' }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
@@ -520,7 +524,7 @@ jobs:
           # Escape for JSON
           CHANGES_ESCAPED=$(echo "$CHANGES" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read())[1:-1])')
 
-          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+          SLACK_RESPONSE=$(curl --fail --silent --show-error --connect-timeout 10 --max-time 30 -X POST "$SLACK_WEBHOOK_URL" \
             -H 'Content-Type: application/json' \
             -d "{
               \"blocks\": [
@@ -538,18 +542,21 @@ jobs:
                   }
                 }
               ]
-            }"
+            }")
+          test "$SLACK_RESPONSE" = "ok" || { echo "::error::Slack did not acknowledge the release announcement"; exit 1; }
+          echo "Slack acknowledged the release announcement."
 
       # Failed releases were silent (the success notifier is if: success()) —
       # announce failures too, with a link to the run.
       - name: Notify Slack (failure)
-        if: github.event_name == 'push' && failure() && env.SLACK_WEBHOOK_URL != ''
+        if: failure() && steps.publish.outcome != 'success' && env.SLACK_WEBHOOK_URL != ''
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+          SLACK_RESPONSE=$(curl --fail --silent --show-error --connect-timeout 10 --max-time 30 -X POST "$SLACK_WEBHOOK_URL" \
             -H 'Content-Type: application/json' \
-            -d "{\"text\": \"❌ Engram ${RELEASE_TAG} release FAILED — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
+            -d "{\"text\": \"❌ Engram ${RELEASE_TAG} release FAILED — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}")
+          test "$SLACK_RESPONSE" = "ok" || { echo "::error::Slack did not acknowledge the failure announcement"; exit 1; }
 
       - name: Cleanup keychain
         if: always()

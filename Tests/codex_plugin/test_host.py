@@ -333,6 +333,40 @@ class HostTests(unittest.TestCase):
         self.assertEqual(result, 'failed')
         self.assertNotIn('reconciliation_required', state)
 
+    def test_begin_busy_keeps_cursor_and_recovers_on_later_ordinary_event(self):
+        sid, path, payload, result, state = self.failure_with_audit([
+            {'event': 'relay_started'}, {'event': 'tool_call', 'id': 1, 'tool': 'remember'},
+            {'event': 'tool_result', 'id': 1, 'tool': 'remember', 'ok': False,
+             'forwarded': True, 'memory_ids': [], 'write_outcome': 'not_stored_transaction_not_started',
+             'write_outcome_version': 1},
+            {'event': 'relay_finished', 'child_reaped': True, 'cleanup_overrun': False}])
+        self.assertEqual(result, 'failed')
+        self.assertNotIn('reconciliation_required', state)
+        self.assertEqual(state['offset'], self.request(sid)['admission']['frontier_offset'])
+        self.assertGreater(state['retry_after'], time.time())
+        original = F.RUNNER.process_request
+        def process(root, request, config):
+            return original(root, request, config, invoke=self.invoke)
+        with mock.patch.object(F.RUNNER, 'process_request', side_effect=process), \
+                mock.patch.object(F.RUNNER, 'spawn_worker', side_effect=F.forbidden):
+            F.RUNNER.worker(self.root)  # Respect backoff without another provider.
+            paused = self.request(sid)
+            self.assertEqual(paused['paused_request_id'], paused['request_id'])
+            self.assertEqual(self.invocations, [])
+            with mock.patch.object(F.RUNNER.time, 'time', return_value=state['retry_after'] + 1):
+                F.RUNNER.worker(self.root)  # Elapsed time alone does not replay.
+                self.assertEqual(self.invocations, [])
+                self.append(path, 'NEXT NATURAL TURN')
+                self.assertTrue(self.dispatch(payload, turn_id='next-turn'))
+                F.RUNNER.worker(self.root)
+        self.assertEqual(len(self.invocations), 1)
+        self.assertIn('DURABLE NEW TEXT', self.invocations[0][1].text)
+        self.assertIn('NEXT NATURAL TURN', self.invocations[0][1].text)
+        recovered = json.loads((self.root / 'sessions' / (sid + '.json')).read_text())
+        self.assertEqual(recovered['status'], 'succeeded')
+        self.assertGreater(recovered['offset'], state['offset'])
+        self.assertFalse((self.root / 'pending' / (sid + '.json')).exists())
+
     def test_unrecognized_forwarded_no_ids_response_stays_held(self):
         _, _, _, result, state = self.failure_with_audit([
             {'event': 'relay_started'}, {'event': 'tool_call', 'id': 1, 'tool': 'remember'},

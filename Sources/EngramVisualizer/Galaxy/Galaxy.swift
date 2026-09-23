@@ -123,12 +123,12 @@ actor Galaxy: Identifiable {
     // Lattice's background callback thread, outside this actor — without
     // observer-path filtering, every post-load memory appeared in BOTH the
     // personal and synced galaxies until restart.
-    private let nodeFilterLock = OSAllocatedUnfairLock<(@Sendable (Memory) -> Bool)?>(initialState: nil)
+    private let nodeFilterLock = LockedSnapshot<(@Sendable (Memory) -> Bool)?>(nil)
     nonisolated var nodeFilter: (@Sendable (Memory) -> Bool)? {
-        nodeFilterLock.withLock { $0 }
+        nodeFilterLock.read()
     }
     nonisolated func setNodeFilter(_ filter: (@Sendable (Memory) -> Bool)?) {
-        nodeFilterLock.withLock { $0 = filter }
+        nodeFilterLock.set(filter)
     }
 
     /// effectiveProject resolution (decision 13) for GROUP galaxies: members
@@ -139,12 +139,12 @@ actor Galaxy: Identifiable {
     /// one per member. Nil (personal/synced) is identity. Same lock idiom as
     /// nodeFilter — the observer path reads it off-actor.
     private let projectResolverLock =
-        OSAllocatedUnfairLock<(@Sendable (_ author: UUID?, _ local: String) -> String)?>(initialState: nil)
+        LockedSnapshot<(@Sendable (_ author: UUID?, _ local: String) -> String)?>(nil)
     nonisolated var projectResolver: (@Sendable (UUID?, String) -> String)? {
-        projectResolverLock.withLock { $0 }
+        projectResolverLock.read()
     }
     nonisolated func setProjectResolver(_ resolver: (@Sendable (UUID?, String) -> String)?) {
-        projectResolverLock.withLock { $0 = resolver }
+        projectResolverLock.set(resolver)
     }
 
     /// Resolved display project for a memory in this galaxy.
