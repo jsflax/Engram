@@ -1,5 +1,6 @@
 import Testing
 import EngramKit
+import EngramMemoryCore
 import EngramModels
 import Lattice
 import MCP
@@ -14,17 +15,17 @@ import Foundation
 private struct ToolsContext {
     let tools: MemoryTools
     let lattice: Lattice
+    let embedder: any Embedder
 }
 
 private func makeToolsWithLattice() async throws -> ToolsContext {
-    let path = FileManager.default.temporaryDirectory
+    let path = try testFixtureDirectory()
         .appending(path: "engram-tombstone-test-\(UUID().uuidString).sqlite")
     let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, SyncConfig.self, configuration: .init(fileURL: path))
-    let embedder = sharedEmbedder
-    if await !embedder.isLoaded { await embedder.load() }
+    let embedder = try await loadedFixtureEmbedder()
     return ToolsContext(
         tools: MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder),
-        lattice: lattice)
+        lattice: lattice, embedder: embedder)
 }
 
 /// Marks a project as exposed to a group (what setGroupExposure will do).
@@ -145,7 +146,7 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
     let mem = Memory(
         content: "Teammate insight: the flaky test is timezone-dependent",
         topic: "debugging", project: "badge-proj",
-        embedding: Vector<Float>(try await sharedEmbedder.embed(text: "Teammate insight: the flaky test is timezone-dependent")!),
+        embedding: Vector<Float>(try await ctx.embedder.embed(text: "Teammate insight: the flaky test is timezone-dependent")!),
         authorUserId: foreignAuthor)
     try ctx.lattice.add(mem)
     _ = try await remember(ctx.tools, "My own note about test flakiness", project: "badge-proj")
@@ -176,7 +177,7 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
     let mem = Memory(
         content: "Foreign-authored group memory about CI caching",
         topic: "ci", project: "authz-proj",
-        embedding: Vector<Float>(try await sharedEmbedder.embed(text: "Foreign-authored group memory about CI caching")!),
+        embedding: Vector<Float>(try await ctx.embedder.embed(text: "Foreign-authored group memory about CI caching")!),
         authorUserId: foreignAuthor)
     try ctx.lattice.add(mem)
     let gid = mem.globalId!
@@ -200,7 +201,7 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
     let foreign = Memory(
         content: "Teammate memory about connection pooling limits",
         topic: "general", project: "cons-proj",
-        embedding: Vector<Float>(try await sharedEmbedder.embed(text: "Teammate memory about connection pooling limits")!),
+        embedding: Vector<Float>(try await ctx.embedder.embed(text: "Teammate memory about connection pooling limits")!),
         authorUserId: UUID())
     try ctx.lattice.add(foreign)
     let foreignGid = foreign.globalId!

@@ -240,6 +240,7 @@ let package = Package(
                 "EngramMemoryCore",
                 "EngramMemoryContract",
                 .product(name: "Lattice", package: "lattice"),
+                .product(name: "SwiftLM", package: "SwiftLM"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
