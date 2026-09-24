@@ -6,6 +6,10 @@ All notable changes to Engram are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Show Codex session learners only the write options their restricted gateway accepts, including exact memory IDs and preserved privacy for updates.
+- Instruct Codex session learners to stop making tool calls after an MCP error, avoiding follow-up writes after a rejected call; conservative completion and reconciliation checks remain unchanged.
+
 ## [0.14.9] - 2026-09-23
 
 ### Fixed

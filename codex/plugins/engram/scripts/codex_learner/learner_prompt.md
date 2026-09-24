@@ -13,7 +13,12 @@ Engram findings to Engram, cross-project conventions to global. Check for existi
 equivalent memories before every write. Update an existing memory by ID when that
 is more accurate than adding one. Never force a duplicate. Keep each memory atomic,
 concise and attributable. Separate observations from proposals and unknowns. Use
-the supplied source provenance on writes; use is_private=true on new memories.
+the supplied source provenance on writes. For new memories, remember enforces
+is_private=true and the supplied provenance, with force=false. Existing memories
+keep their privacy and project: never pass is_private, project, set_project,
+undelete, or query to update. Update requires the exact UUID returned by recall;
+connect requires exact UUIDs for both endpoints and a listed relation. Follow the
+learner-specific tool schemas, not the broader memory API.
 For temporal operational facts, use expires_in_days (usually 7 or 14).
 
 {{RUN_TOOL_BUDGET}}
@@ -21,9 +26,10 @@ For temporal operational facts, use expires_in_days (usually 7 or 14).
 Use parent_id or connect
 for meaningful relationships, not arbitrary linkage. Skip memory-system usage
 itself unless the excerpt contains a real integration finding. If everything is
-already represented or unimportant, make no writes. If the MCP fails, report a
-failure; do not claim success. Return the requested JSON result with only actual
-memory IDs and a short non-sensitive summary. For stored, list only the primary
+already represented or unimportant, make no writes. On any MCP error, including a
+gateway denial, stop making tool calls and report failure. Do not retry with
+corrected arguments or claim success after an error. Return the requested JSON
+result with only actual memory IDs and a short non-sensitive summary. For stored, list only the primary
 ID in each successful "Stored memory (id: ...)" or "Updated memory (id: ...)"
 receipt, plus both endpoints of any explicit successful connect call. Do not
 include IDs mentioned in recall results, memory text, or automatic linking notes.
