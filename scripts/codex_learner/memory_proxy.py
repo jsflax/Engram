@@ -8,6 +8,7 @@ The child transport is stdio; HTTP configurations are explicitly unsupported.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -45,6 +46,67 @@ def valid_id(value: Any) -> bool:
 
 def id_key(value: Any) -> tuple[type, Any]:
     return type(value), value
+
+
+def learner_tool_descriptor(tool: dict[str, Any], provenance: str) -> dict[str, Any]:
+    """Advertise the learner contract, without changing the native descriptor.
+
+    Build closed write schemas instead of retaining native schema fragments that
+    could require or recommend fields the learner gateway rejects.
+    """
+    name = tool.get("name")
+    if name not in WRITE_TOOLS:
+        return tool
+    exact_uuid = {"type": "string", "pattern": f"^{UUID_PATTERN}$",
+                  "minLength": 36, "maxLength": 36,
+                  "description": "Exact memory UUID returned by recall; not a query or shortened ID."}
+    shared = {
+        "content": {"type": "string", "description": "The atomic memory text to store or replace."},
+        "topic": {"type": "string", "description": "The memory's topic or category."},
+        "source": {"type": "string", "description": "The supplied source provenance for this memory."},
+        "importance": {"type": "integer", "description": "Importance rating, 1–5; 0 uses the default."},
+        "expires_in_days": {"type": "integer", "description": "Expire in this many days; 0 makes the memory permanent."},
+    }
+    if name == "remember":
+        properties = dict(shared, **{
+            "project": {"type": "string", "description": "Project for the new memory; use global for cross-project knowledge."},
+            "parent_id": {"type": "string", "description": "UUID of an existing parent memory, linked by part_of."},
+            "source": {"type": "string", "const": provenance,
+                       "description": "Optional: the gateway always supplies this learner's source provenance."},
+            "is_private": {"type": "boolean", "const": True, "default": True,
+                           "description": "New memories are always private; the gateway enforces true."},
+            "force": {"type": "boolean", "const": False, "default": False,
+                      "description": "Conflict detection stays enabled; omit this field or use false."},
+        })
+        required = ["content"]
+        description = ("Store one new private memory after checking for an existing equivalent. "
+                       "The gateway enforces private storage, session source provenance and conflict detection. "
+                       "A near-duplicate warning is a no-write outcome; never force a duplicate.")
+    elif name == "update":
+        properties = dict(shared, **{
+            "id": exact_uuid,
+            "append": {"type": "string", "description": "Text to append to the existing content."},
+            "prepend": {"type": "string", "description": "Text to prepend to the existing content."},
+            "find": {"type": "string", "description": "Text to find; supply replace together with this field."},
+            "replace": {"type": "string", "description": "Replacement for find; may be empty to remove matched text."},
+        })
+        required = ["id"]
+        description = ("Update an existing memory by its exact UUID from recall. Choose one content edit: "
+                       "replacement, append, prepend, or paired find/replace. Topic, source, importance and "
+                       "expiration may be updated alongside it. Existing privacy and project are preserved; "
+                       "restoration and semantic targeting are unavailable. Do not send privacy fields.")
+    else:
+        properties = {"from": dict(exact_uuid), "to": dict(exact_uuid),
+                      "relation": {"type": "string", "enum": sorted(RELATIONS),
+                                   "description": "The directed relationship between these two memories."}}
+        required = ["from", "to", "relation"]
+        description = ("Connect two existing memories using their exact UUIDs and one listed relation. "
+                       "Duplicate edges with the same endpoints and relation are idempotent.")
+    descriptor = copy.deepcopy(tool)
+    descriptor["description"] = description
+    descriptor["inputSchema"] = {"type": "object", "properties": properties,
+                                 "required": required, "additionalProperties": False}
+    return descriptor
 
 
 class Audit:
@@ -197,6 +259,7 @@ class Policy:
                     return self.deny_tool(request_id, tool, "conflict overrides are not allowed")
                 arguments["is_private"] = True
                 arguments["source"] = self.provenance
+                arguments["force"] = False
             elif tool == "update":
                 if set(arguments) - UPDATE_FIELDS or normalized_uuid(arguments.get("id")) is None:
                     return self.deny_tool(request_id, tool, "updates require an exact UUID and cannot change privacy, restore, or move memories")
@@ -237,7 +300,8 @@ class Policy:
             tools = result.get("tools")
             if not isinstance(tools, list):
                 raise ProxyError("Invalid child tool list")
-            filtered = [tool for tool in tools if isinstance(tool, dict) and tool.get("name") in self.allowed_tools]
+            filtered = [learner_tool_descriptor(tool, self.provenance) for tool in tools
+                        if isinstance(tool, dict) and tool.get("name") in self.allowed_tools]
             return dict(message, result=dict(result, tools=filtered)), None
         if pending["method"] == "tools/call":
             tool = pending["tool"]

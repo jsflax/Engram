@@ -1,5 +1,6 @@
 """Gateway enforcement and real subprocess transport, using a fake memory server."""
 
+import copy
 import importlib.util
 import json
 import os
@@ -59,6 +60,7 @@ class PolicyTests(unittest.TestCase):
         self.assertIsNone(denied)
         self.assertTrue(forwarded["params"]["arguments"]["is_private"])
         self.assertEqual(forwarded["params"]["arguments"]["source"], "codex:session:fixture")
+        self.assertIs(forwarded["params"]["arguments"]["force"], False)
         self.policy.server_message(result(1, f"Stored memory (id: {ID_A}, project: test): PRIVATE_TEST_SENTINEL"))
         self.assertEqual(self.audit.records[-1], {"event": "tool_result", "id": 1, "tool": "remember", "ok": True, "memory_ids": [ID_A]})
         self.assertNotIn("PRIVATE_TEST_SENTINEL", json.dumps(self.audit.records))
@@ -142,6 +144,149 @@ class PolicyTests(unittest.TestCase):
         self.assertIsNone(forwarded)
         self.assertTrue(denied["result"]["isError"])
         self.assertEqual(self.policy.pending[proxy.id_key(1)]["tool"], "recall")
+
+
+class LearnerToolContractTests(unittest.TestCase):
+    def setUp(self):
+        self.audit = CaptureAudit()
+        self.policy = proxy.Policy(self.audit, "codex:session:fixture", 100, 50)
+        # Model the broad native API, including constraints that must not leak
+        # through a property-only filter. These are synthetic descriptors; no
+        # live memory server or provider is needed.
+        self.native_tools = [
+            {"name": "remember", "description": "NATIVE: allow public storage and force duplicates",
+             "inputSchema": {"type": "object", "properties": {
+                 "content": {"type": "string"}, "is_private": {"type": "boolean", "default": False},
+                 "force": {"type": "boolean"}, "source": {"type": "string"}}, "required": ["content"]}},
+            {"name": "update", "description": "NATIVE: query, set_project, is_private and undelete are supported",
+             "inputSchema": {"type": "object", "properties": {
+                 field: {"type": "string"} for field in
+                 ("id", "content", "query", "project", "set_project", "is_private", "undelete")},
+                 "required": ["query"], "anyOf": [{"required": ["query"]}, {"required": ["undelete"]}],
+                 "dependentRequired": {"content": ["set_project"]},
+                 "$defs": {"selector": {"required": ["query"]}}},
+             "annotations": {"fixture": ["native metadata"]}},
+            {"name": "connect", "description": "NATIVE: connect memories",
+             "inputSchema": {"type": "object", "properties": {
+                 "from": {"type": "string"}, "to": {"type": "string"},
+                 "relation": {"type": "string", "enum": ["part_of", "unsupported_relation"]}},
+                 "required": ["from", "to", "relation"]}},
+            {"name": "recall", "description": "Native read description",
+             "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}},
+                             "required": ["query"]}},
+            {"name": "forget", "inputSchema": {"type": "object"}},
+        ]
+
+    def listed(self):
+        self.policy.client_message({"jsonrpc": "2.0", "id": "list", "method": "tools/list"})
+        response, child = self.policy.server_message({"jsonrpc": "2.0", "id": "list",
+                                                     "result": {"tools": self.native_tools}})
+        self.assertIsNone(child)
+        return {tool["name"]: tool for tool in response["result"]["tools"]}
+
+    def test_write_schemas_are_closed_and_drop_native_forbidden_constraints(self):
+        tools = self.listed()
+        expected = {
+            "remember": ({"content", "project", "topic", "source", "expires_in_days",
+                          "importance", "is_private", "parent_id", "force"}, ["content"]),
+            "update": ({"id", "content", "append", "prepend", "find", "replace",
+                        "topic", "source", "importance", "expires_in_days"}, ["id"]),
+            "connect": ({"from", "to", "relation"}, ["from", "to", "relation"]),
+        }
+        self.assertNotIn("forget", tools)
+        for name, (fields, required) in expected.items():
+            with self.subTest(tool=name):
+                schema = tools[name]["inputSchema"]
+                self.assertEqual(schema["type"], "object")
+                self.assertEqual(set(schema["properties"]), fields)
+                self.assertEqual(schema["required"], required)
+                self.assertIs(schema["additionalProperties"], False)
+                self.assertLessEqual(set(required), set(schema["properties"]))
+                self.assertNotIn("NATIVE:", tools[name]["description"])
+                for keyword in ("anyOf", "dependentRequired", "$defs"):
+                    self.assertNotIn(keyword, schema)
+        for field in ("query", "project", "set_project", "is_private", "undelete"):
+            self.assertNotIn(field, tools["update"]["inputSchema"]["properties"])
+        self.assertNotIn("semantic similarity", tools["update"]["description"])
+
+    def test_uuid_and_relation_constraints_match_runtime_exact_targeting(self):
+        tools = self.listed()
+        for tool, field in (("update", "id"), ("connect", "from"), ("connect", "to")):
+            schema = tools[tool]["inputSchema"]["properties"][field]
+            self.assertEqual(schema["type"], "string")
+            for value in (ID_A, ID_B, "ABCDEF01-2345-6789-ABCD-EF0123456789",
+                          "not-uuid", ID_A[:8], ID_A + "\n", "prefix" + ID_A, "{" + ID_A + "}"):
+                with self.subTest(tool=tool, field=field, value=value):
+                    advertised = (schema["minLength"] <= len(value) <= schema["maxLength"]
+                                  and re.search(schema["pattern"], value) is not None)
+                    self.assertEqual(advertised, proxy.normalized_uuid(value) is not None)
+        relation = tools["connect"]["inputSchema"]["properties"]["relation"]
+        self.assertEqual(set(relation["enum"]),
+                         {"relates_to", "contradicts", "supersedes", "derived_from", "part_of", "summarized_by"})
+        self.assertNotIn("unsupported_relation", relation["enum"])
+
+    def test_remember_advertises_and_enforces_private_provenance_and_no_force(self):
+        props = self.listed()["remember"]["inputSchema"]["properties"]
+        self.assertIs(props["is_private"]["const"], True)
+        self.assertIs(props["is_private"]["default"], True)
+        self.assertIs(props["force"]["const"], False)
+        self.assertIs(props["force"]["default"], False)
+        self.assertEqual(props["source"]["const"], "codex:session:fixture")
+        for index, options in enumerate(({}, {"is_private": False, "source": "untrusted"}, {"force": False})):
+            request = call(index, "remember", {"content": "fixture", **options})
+            before = copy.deepcopy(request)
+            forwarded, denied = self.policy.client_message(request)
+            self.assertIsNone(denied)
+            args = forwarded["params"]["arguments"]
+            self.assertIs(args["is_private"], True)
+            self.assertIs(args["force"], False)
+            self.assertEqual(args["source"], "codex:session:fixture")
+            self.assertEqual(request, before)
+
+    def test_listing_does_not_mutate_native_descriptors_or_read_tools(self):
+        before = copy.deepcopy(self.native_tools)
+        tools = self.listed()
+        self.assertEqual(self.native_tools, before)
+        self.assertEqual(tools["recall"], before[3])
+        tools["update"]["annotations"]["fixture"].append("learner-only edit")
+        tools["update"]["inputSchema"]["properties"]["id"]["description"] = "changed"
+        self.assertEqual(self.native_tools, before)
+
+    def test_schema_advertising_does_not_weaken_runtime_denials(self):
+        self.listed()
+        cases = [("update", {"id": ID_A, "content": "fixture", field: value})
+                 for field, value in (("is_private", True), ("undelete", False),
+                                      ("set_project", "other"), ("query", "fixture"), ("project", "other"))]
+        cases += [("update", {"id": ID_A[:8], "append": "fixture"}),
+                  ("connect", {"from": ID_A, "to": ID_B, "relation": "unsupported_relation"}),
+                  ("connect", {"from": ID_A, "to": ID_B + "\n", "relation": "part_of"}),
+                  ("connect", {"from": ID_A, "to": ID_B, "relation": "part_of", "extra": False}),
+                  ("remember", {"content": "fixture", "force": True}),
+                  ("remember", {"content": "fixture", "force": 0}),
+                  ("remember", {"content": "fixture", "unknown": True})]
+        for index, (name, args) in enumerate(cases):
+            with self.subTest(name=name, args=args):
+                forwarded, denied = self.policy.client_message(call(index, name, args))
+                self.assertIsNone(forwarded)
+                self.assertTrue(denied["result"]["isError"])
+                self.assertIs(self.audit.records[-1]["ok"], False)
+        self.assertEqual(self.policy.pending, {})
+
+    def test_a_corrected_write_does_not_erase_the_prior_denial_receipt(self):
+        self.listed()
+        self.policy.client_message(call(1, "update", {"id": ID_A, "content": "fixture", "is_private": True}))
+        forwarded, denied = self.policy.client_message(call(2, "update", {"id": ID_A, "content": "fixture"}))
+        self.assertIsNone(denied)
+        self.assertIsNotNone(forwarded)
+        self.policy.server_message(result(2, f"Updated memory (id: {ID_A}, project: test)."))
+        self.assertEqual([(r["id"], r["ok"]) for r in self.audit.records if r["event"] == "tool_result"],
+                         [(1, False), (2, True)])
+
+
+class PackagedLearnerToolContractTests(LearnerToolContractTests):
+    def setUp(self):
+        super().setUp()
+        self.policy = packaged_proxy.Policy(self.audit, "codex:session:fixture", 100, 50)
 
 
 class NoWriteContractTests(unittest.TestCase):
