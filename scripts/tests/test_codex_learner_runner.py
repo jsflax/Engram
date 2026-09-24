@@ -614,6 +614,20 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["writes"], [])
 
+    def test_native_begin_busy_stays_failed_without_claiming_a_write(self):
+        # Standalone has ordinary failed/backoff handling, not a permanent
+        # reconciliation gate. A known no-write failure is still not success.
+        for tool in ("remember", "update"):
+            with self.subTest(tool=tool):
+                rows = [{"event": "tool_call", "id": 1, "tool": tool},
+                        {"event": "tool_result", "id": 1, "tool": tool, "ok": False,
+                         "forwarded": True, "memory_ids": [],
+                         "write_outcome": "not_stored_transaction_not_started", "write_outcome_version": 1}]
+                result = self.provider_run(events=[{"type": "turn.completed"}], audit_rows=rows)
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["tool_errors"], 1)
+                self.assertEqual(result["writes"], [])
+
     def test_provider_mixed_verified_write_and_conflict_counts_only_write(self):
         rows = self.no_write_rows() + [
             {"event": "tool_call", "id": 2, "tool": "remember"},

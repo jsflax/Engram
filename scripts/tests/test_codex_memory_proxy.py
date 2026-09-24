@@ -32,6 +32,8 @@ CONFLICT_SUFFIX = ('\n\nTo resolve:'
                    '\n  - Use `remember(..., force: true)` to keep both'
                    '\n  - Use `forget(id: "UUID")` to remove the old one, then `remember` the new one')
 CONFLICT_TEXT = CONFLICT_PREFIX + f"\n  [id:{ID_A}] (distance: 0.123, term overlap: 90%) PRIVATE_CONFLICT_SENTINEL" + CONFLICT_SUFFIX
+BEGIN_BUSY_TEXT = "Memory was not stored: the database was busy before the write transaction started. Retry on a later turn."
+BEGIN_BUSY_UPDATE_TEXT = "Memory was not updated: the database was busy before the write transaction started. Retry on a later turn."
 
 
 class CaptureAudit:
@@ -377,6 +379,129 @@ class NoWriteContractTests(unittest.TestCase):
         for module in (proxy, packaged_proxy):
             self.assertEqual(module.NEAR_DUPLICATE_PREFIX, CONFLICT_PREFIX)
             self.assertEqual(module.NEAR_DUPLICATE_SUFFIX, CONFLICT_SUFFIX)
+
+
+class BeginBusyContractTests(unittest.TestCase):
+    def native(self, tool):
+        return {"jsonrpc": "2.0", "id": 1, "result": {
+            "isError": True, "content": [{"type": "text", "text": BEGIN_BUSY_UPDATE_TEXT if tool == "update" else BEGIN_BUSY_TEXT}],
+            "structuredContent": {"engram_write_receipt": {
+                "schema_version": 1, "tool": tool,
+                "write_outcome": "not_stored_transaction_not_started",
+                "reason": "database_busy", "memory_ids": []}}}}
+
+    def exercise(self, module, tool, native):
+        audit = CaptureAudit()
+        policy = module.Policy(audit, "fixture", 3, 1)
+        arguments = {"content": "SYNTHETIC_BODY"} if tool == "remember" else {"id": ID_A, "importance": 3}
+        forwarded, denied = policy.client_message(call(1, tool, arguments))
+        self.assertIsNone(denied)
+        self.assertIsNotNone(forwarded)
+        output, _ = policy.server_message(native)
+        return audit, policy, output
+
+    def test_exact_begin_failure_stays_an_error_with_no_written_ids(self):
+        for module in (proxy, packaged_proxy):
+            for tool in ("remember", "update"):
+                with self.subTest(module=module.__name__, tool=tool):
+                    native = self.native(tool)
+                    audit, policy, output = self.exercise(module, tool, native)
+                    self.assertEqual(output, native)
+                    self.assertEqual(audit.records[-1], {
+                        "event": "tool_result", "id": 1, "tool": tool, "ok": False,
+                        "forwarded": True, "memory_ids": [],
+                        "write_outcome": "not_stored_transaction_not_started", "write_outcome_version": 1})
+                    self.assertTrue(module.verified_no_write_receipt(audit.records[-1]))
+                    self.assertNotIn(ID_A, json.dumps(audit.records))
+                    self.assertNotIn("SYNTHETIC_BODY", json.dumps(audit.records))
+                    _, denied = policy.client_message(call(2, "update", {"id": ID_A, "importance": 4}))
+                    self.assertTrue(denied["result"]["isError"])
+
+    def test_malformed_or_mismatched_native_contract_is_never_safe(self):
+        for tool in ("remember", "update"):
+            base = self.native(tool)
+            candidates = []
+            for flag in (False, 1, 0, None, "true"):
+                value = copy.deepcopy(base); value["result"]["isError"] = flag; candidates.append(value)
+            for field in base["result"]:
+                value = copy.deepcopy(base); del value["result"][field]; candidates.append(value)
+            mutations = [("schema_version", True), ("schema_version", 1.0), ("schema_version", 2),
+                         ("tool", "update" if tool == "remember" else "remember"),
+                         ("tool", "connect"), ("tool", []), ("reason", "commit_failed"),
+                         ("write_outcome", "not_stored"), ("memory_ids", [ID_A]),
+                         ("memory_ids", None), ("extra", True)]
+            for field, value in mutations:
+                changed = copy.deepcopy(base)
+                changed["result"]["structuredContent"]["engram_write_receipt"][field] = value
+                candidates.append(changed)
+            for field in base["result"]["structuredContent"]["engram_write_receipt"]:
+                value = copy.deepcopy(base)
+                del value["result"]["structuredContent"]["engram_write_receipt"][field]
+                candidates.append(value)
+            for content in ([{"type": "text", "text": "Quoted: " + BEGIN_BUSY_TEXT}],
+                            [{"type": "text", "text": BEGIN_BUSY_TEXT, "extra": True}],
+                            [{"type": "text", "text": BEGIN_BUSY_TEXT}, {"type": "text", "text": "extra"}]):
+                value = copy.deepcopy(base); value["result"]["content"] = content; candidates.append(value)
+            value = copy.deepcopy(base); value["result"]["extra"] = True; candidates.append(value)
+            value = copy.deepcopy(base); value["result"]["structuredContent"]["extra"] = True; candidates.append(value)
+            value = copy.deepcopy(base); value["error"] = {"code": -1, "message": "uncertain"}; candidates.append(value)
+            for module in (proxy, packaged_proxy):
+                for native in candidates:
+                    with self.subTest(module=module.__name__, tool=tool, native=native):
+                        audit, _, _ = self.exercise(module, tool, native)
+                        self.assertIs(audit.records[-1]["ok"], False)
+                        self.assertNotIn("write_outcome", audit.records[-1])
+                        self.assertFalse(module.verified_no_write_receipt(audit.records[-1]))
+
+    def test_crossed_remember_update_text_is_never_safe(self):
+        for module in (proxy, packaged_proxy):
+            for tool in ("remember", "update"):
+                with self.subTest(module=module.__name__, tool=tool):
+                    native = self.native(tool)
+                    native["result"]["content"][0]["text"] = BEGIN_BUSY_TEXT if tool == "update" else BEGIN_BUSY_UPDATE_TEXT
+                    audit, _, _ = self.exercise(module, tool, native)
+                    self.assertIs(audit.records[-1]["ok"], False)
+                    self.assertNotIn("write_outcome", audit.records[-1])
+
+    def test_exact_contract_extracted_from_native_source_is_accepted(self):
+        # Parse the producer's actual literals rather than building both sides
+        # from a shared fixture. This catches drift such as stored vs updated.
+        source = (REPO_ROOT / "Sources/EngramKit/MemoryTools+Core.swift").read_text()
+        pattern = (r'content: \[\.text\(("(?:\\.|[^"\\])*")\)\],\s*'
+                   r'structuredContent: \.object\(\[\s*"engram_write_receipt": \.object\(\['
+                   r'(.*?)\]\),\s*\]\),\s*isError: true')
+        contracts = {}
+        for text, fields in re.findall(pattern, source, re.DOTALL):
+            receipt = {}
+            for name, kind, literal in re.findall(r'"(\w+)": \.(int|string|array)\((.*?)\),', fields):
+                self.assertEqual(kind, {"schema_version": "int", "memory_ids": "array"}.get(name, "string"))
+                receipt[name] = json.loads(literal)
+            contracts[receipt["tool"]] = {"isError": True,
+                "content": [{"type": "text", "text": json.loads(text)}],
+                "structuredContent": {"engram_write_receipt": receipt}}
+        self.assertEqual(set(contracts), {"remember", "update"})
+        for tool, contract in contracts.items():
+            self.assertEqual(contract, self.native(tool)["result"])
+            for module in (proxy, packaged_proxy):
+                with self.subTest(module=module.__name__, tool=tool):
+                    audit, _, _ = self.exercise(module, tool, {"jsonrpc": "2.0", "id": 1, "result": contract})
+                    self.assertTrue(module.verified_no_write_receipt(audit.records[-1]))
+
+    def test_exact_audit_contract_rejects_unsupported_tools_and_type_coercions(self):
+        for module in (proxy, packaged_proxy):
+            for tool in ("remember", "update"):
+                audit, _, _ = self.exercise(module, tool, self.native(tool))
+                valid = audit.records[-1]
+                changes = [{"tool": "connect"}, {"tool": []}, {"ok": True}, {"ok": 0},
+                           {"id": True}, {"forwarded": False}, {"forwarded": 1},
+                           {"memory_ids": [ID_A]}, {"memory_ids": None},
+                           {"write_outcome_version": True}, {"write_outcome_version": 1.0},
+                           {"write_outcome_version": 2}, {"extra": True}]
+                candidates = [dict(valid, **change) for change in changes]
+                candidates += [{k: v for k, v in valid.items() if k != field} for field in valid]
+                for candidate in candidates:
+                    with self.subTest(module=module.__name__, candidate=candidate):
+                        self.assertFalse(module.verified_no_write_receipt(candidate))
 
 
 class TransportTests(unittest.TestCase):

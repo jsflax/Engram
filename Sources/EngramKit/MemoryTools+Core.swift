@@ -999,11 +999,13 @@ extension MemoryTools {
 
         // 5. Locate memory
         let mem: Memory
+        let writeLattice: Lattice
         if let gid = a.id?.value {
             guard let found = findMemory(id: gid) else {
                 return CallTool.Result(content: [.text("Memory with id \(gid.uuidString) not found.")], isError: true)
             }
             mem = found.memory
+            writeLattice = found.lattice
         } else {
             let query = a.query!
             let db = readLattice(for: a.project)
@@ -1020,6 +1022,10 @@ extension MemoryTools {
                 return CallTool.Result(content: [.text("No matching memory found to update.")], isError: false)
             }
             mem = match.object
+            // Keep the connection that hydrated the selected row. A union
+            // query can return an attached-store row whose setters must be
+            // covered by this same connection's checked transaction.
+            writeLattice = db
         }
 
         // 5b. Tombstone gate: a soft-deleted memory only accepts undelete —
@@ -1078,79 +1084,106 @@ extension MemoryTools {
             }
         }
 
-        try localLattice.transaction {
-            if let content = a.content {
-                mem.content = content
-                contentChanged = true
-            } else if let append = a.append {
-                mem.content += "\n" + append
-                contentChanged = true
-            } else if let prepend = a.prepend {
-                mem.content = prepend + "\n" + mem.content
-                contentChanged = true
-            } else if let find = a.find {
-                let replace = a.replace!
-                mem.content = mem.content.replacingOccurrences(of: find, with: replace)
-                contentChanged = true
-            }
-
-            if contentChanged {
-                changes.append("content: \(oldContent.prefix(60))... → \(mem.content.prefix(60))...")
-            }
-
-            if let project = a.setProject {
-                let old = mem.project
-                mem.project = project
-                changes.append("project: \(old) → \(project)")
-            }
-            if let topic = a.topic {
-                let old = mem.topic
-                mem.topic = topic
-                changes.append("topic: \(old) → \(topic)")
-            }
-            if let source = a.source {
-                let old = mem.source
-                mem.source = source
-                changes.append("source: \(old) → \(source)")
-            }
-            if let days = a.expiresInDays?.value {
-                let oldExpires = mem.expiresAt == .distantFuture ? "permanent" : Self.dateFormatter.string(from: mem.expiresAt)
-                if days == 0 {
-                    mem.expiresAt = .distantFuture
-                    changes.append("expires: \(oldExpires) → permanent")
-                } else {
-                    mem.expiresAt = Date().addingTimeInterval(Double(days) * 86400)
-                    changes.append("expires: \(oldExpires) → \(Self.dateFormatter.string(from: mem.expiresAt))")
+        var transactionBodyEntered = false
+        do {
+            try writeLattice.withTransaction {
+                transactionBodyEntered = true
+                if let content = a.content {
+                    mem.content = content
+                    contentChanged = true
+                } else if let append = a.append {
+                    mem.content += "\n" + append
+                    contentChanged = true
+                } else if let prepend = a.prepend {
+                    mem.content = prepend + "\n" + mem.content
+                    contentChanged = true
+                } else if let find = a.find {
+                    let replace = a.replace!
+                    mem.content = mem.content.replacingOccurrences(of: find, with: replace)
+                    contentChanged = true
                 }
-            }
-            if let imp = a.importance?.value {
-                let old = mem.importance
-                mem.importance = imp
-                changes.append("importance: \(old) → \(imp)")
-            }
-            if let priv = a.isPrivate {
-                let old = mem.isPrivate
-                mem.isPrivate = priv
-                changes.append("private: \(old) → \(priv)")
-                if priv && !old && isGroupShared(mem) {
-                    changes.append("⚠️ retracted from the group: the group's copy (including any teammate edits) is removed for all members")
+
+                if contentChanged {
+                    changes.append("content: \(oldContent.prefix(60))... → \(mem.content.prefix(60))...")
                 }
-            }
-            if a.undelete == true, mem.deletedAt != nil {
-                mem.deletedAt = nil
-                mem.deletedBy = nil
-                didUndelete = true
-                changes.append("undeleted (restored for all members)")
-            }
 
-            if contentChanged, let emb = newEmbedding {
-                mem.embedding = Vector<Float>(emb)
-            }
+                if let project = a.setProject {
+                    let old = mem.project
+                    mem.project = project
+                    changes.append("project: \(old) → \(project)")
+                }
+                if let topic = a.topic {
+                    let old = mem.topic
+                    mem.topic = topic
+                    changes.append("topic: \(old) → \(topic)")
+                }
+                if let source = a.source {
+                    let old = mem.source
+                    mem.source = source
+                    changes.append("source: \(old) → \(source)")
+                }
+                if let days = a.expiresInDays?.value {
+                    let oldExpires = mem.expiresAt == .distantFuture ? "permanent" : Self.dateFormatter.string(from: mem.expiresAt)
+                    if days == 0 {
+                        mem.expiresAt = .distantFuture
+                        changes.append("expires: \(oldExpires) → permanent")
+                    } else {
+                        mem.expiresAt = Date().addingTimeInterval(Double(days) * 86400)
+                        changes.append("expires: \(oldExpires) → \(Self.dateFormatter.string(from: mem.expiresAt))")
+                    }
+                }
+                if let imp = a.importance?.value {
+                    let old = mem.importance
+                    mem.importance = imp
+                    changes.append("importance: \(old) → \(imp)")
+                }
+                if let priv = a.isPrivate {
+                    let old = mem.isPrivate
+                    mem.isPrivate = priv
+                    changes.append("private: \(old) → \(priv)")
+                    if priv && !old && isGroupShared(mem) {
+                        changes.append("⚠️ retracted from the group: the group's copy (including any teammate edits) is removed for all members")
+                    }
+                }
+                if a.undelete == true, mem.deletedAt != nil {
+                    mem.deletedAt = nil
+                    mem.deletedBy = nil
+                    didUndelete = true
+                    changes.append("undeleted (restored for all members)")
+                }
 
-            mem.lastAccessedAt = Date()
-            // authorUserId is NEVER touched by edits — attribution follows
-            // the original author, and the sync firewall keys on it.
-            mem.modifiedAt = Date()
+                if contentChanged, let emb = newEmbedding {
+                    mem.embedding = Vector<Float>(emb)
+                }
+
+                mem.lastAccessedAt = Date()
+                // authorUserId is NEVER touched by edits — attribution follows
+                // the original author, and the sync firewall keys on it.
+                mem.modifiedAt = Date()
+            }
+        } catch {
+            // Only a failed BEGIN proves that this attempt wrote nothing.
+            // Setter, COMMIT, rollback and notification failures retain an
+            // unknown outcome; never turn those into a safe-retry receipt.
+            guard !transactionBodyEntered,
+                  case LatticeError.transactionError(let detail) = error,
+                  ["database is locked", "database is busy", "database table is locked",
+                   "database schema is locked"].contains(where: {
+                      detail == "Failed to begin transaction: " + $0
+                  }) else { throw error }
+            return CallTool.Result(
+                content: [.text("Memory was not updated: the database was busy before the write transaction started. Retry on a later turn.")],
+                structuredContent: .object([
+                    "engram_write_receipt": .object([
+                        "schema_version": .int(1),
+                        "tool": .string("update"),
+                        "write_outcome": .string("not_stored_transaction_not_started"),
+                        "reason": .string("database_busy"),
+                        "memory_ids": .array([]),
+                    ]),
+                ]),
+                isError: true
+            )
         }
 
         // Restore graph connectivity alongside the memory: edges tombstoned
@@ -1159,7 +1192,9 @@ extension MemoryTools {
         // (didUndelete, not a mem.deletedAt re-read — the materialized
         // snapshot can serve the stale pre-transaction value.)
         if didUndelete, let gid = mem.globalId {
-            let revived = reviveEdgesForMemory(gid)
+            // The memory is already committed. A later graph failure must
+            // propagate as an uncertain partial outcome, never as no write.
+            let revived = try reviveEdgesForMemory(gid)
             if revived > 0 { changes.append("revived \(revived) edge(s)") }
         }
 

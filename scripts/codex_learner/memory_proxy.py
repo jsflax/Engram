@@ -141,6 +141,10 @@ def rpc_error(request_id: Any, message: str) -> dict[str, Any]:
 # branch in MemoryTools+Core.swift. Match the outer native receipt, never a
 # phrase or UUID quoted inside remembered content.
 NO_WRITE_OUTCOME = "not_stored_near_duplicate"
+BEGIN_BUSY_OUTCOME = "not_stored_transaction_not_started"
+BEGIN_BUSY_VERSION = 1
+BEGIN_BUSY_TEXT = "Memory was not stored: the database was busy before the write transaction started. Retry on a later turn."
+BEGIN_BUSY_UPDATE_TEXT = "Memory was not updated: the database was busy before the write transaction started. Retry on a later turn."
 NEAR_DUPLICATE_PREFIX = "⚠️ Near-duplicate memory detected. The new memory was NOT stored.\n\nExisting similar memories:"
 NEAR_DUPLICATE_SUFFIX = ('\n\nTo resolve:'
                          '\n  - Use `update(id: "UUID", ...)` to modify the existing memory'
@@ -164,15 +168,46 @@ def verified_no_write_response(tool: str, result: Any) -> bool:
             and text.endswith(NEAR_DUPLICATE_SUFFIX))
 
 
+def verified_begin_busy_response(tool: str, result: Any) -> bool:
+    """Accept only native remember/update versioned pre-BEGIN no-write contracts.
+
+    Text alone, nested quoted content, and any unknown or contradictory field
+    cannot establish no-write. The native producer checks body entry, not just
+    an error string; post-entry/commit failures never produce this receipt.
+    """
+    expected_text = BEGIN_BUSY_UPDATE_TEXT if tool == "update" else BEGIN_BUSY_TEXT
+    if (tool not in ("remember", "update") or not isinstance(result, dict)
+            or set(result) != {"isError", "content", "structuredContent"}
+            or result["isError"] is not True
+            or result["content"] != [{"type": "text", "text": expected_text}]):
+        return False
+    structured = result["structuredContent"]
+    if not isinstance(structured, dict) or set(structured) != {"engram_write_receipt"}:
+        return False
+    receipt = structured["engram_write_receipt"]
+    return (isinstance(receipt, dict)
+            and set(receipt) == {"schema_version", "tool", "write_outcome", "reason", "memory_ids"}
+            and type(receipt["schema_version"]) is int and receipt["schema_version"] == BEGIN_BUSY_VERSION
+            and receipt["tool"] == tool and receipt["write_outcome"] == BEGIN_BUSY_OUTCOME
+            and receipt["reason"] == "database_busy"
+            and isinstance(receipt["memory_ids"], list) and receipt["memory_ids"] == [])
+
+
 def verified_no_write_receipt(entry: Any) -> bool:
     """Exact gateway metadata shared by completion and failed-run reconciliation."""
-    return (isinstance(entry, dict)
-            and set(entry) == {"event", "id", "tool", "ok", "memory_ids", "forwarded", "write_outcome"}
-            and entry.get("event") == "tool_result" and valid_id(entry.get("id"))
-            and entry.get("tool") == "remember" and entry.get("ok") is True
-            and entry.get("forwarded") is True
-            and isinstance(entry.get("memory_ids"), list) and entry["memory_ids"] == []
-            and entry.get("write_outcome") == NO_WRITE_OUTCOME)
+    fields = {"event", "id", "tool", "ok", "memory_ids", "forwarded", "write_outcome"}
+    if (not isinstance(entry, dict) or entry.get("event") != "tool_result"
+            or not valid_id(entry.get("id"))
+            or entry.get("forwarded") is not True
+            or not isinstance(entry.get("memory_ids"), list) or entry["memory_ids"] != []):
+        return False
+    if entry.get("write_outcome") == NO_WRITE_OUTCOME:
+        return set(entry) == fields and entry.get("tool") == "remember" and entry.get("ok") is True
+    return (entry.get("tool") in ("remember", "update")
+            and set(entry) == fields | {"write_outcome_version"}
+            and entry.get("ok") is False and entry.get("write_outcome") == BEGIN_BUSY_OUTCOME
+            and type(entry.get("write_outcome_version")) is int
+            and entry["write_outcome_version"] == BEGIN_BUSY_VERSION)
 
 
 def verified_write_ids(tool: str, arguments: dict[str, Any], result: dict[str, Any]) -> list[str]:
@@ -209,10 +244,12 @@ class Policy:
         self.pending: dict[tuple[type, Any], dict[str, Any]] = {}
         self.used_ids: set[tuple[type, Any]] = set()
 
-    def record_result(self, request_id: Any, tool: str, ok: bool, memory_ids: list[str] | None = None, *, write_outcome: str | None = None) -> None:
+    def record_result(self, request_id: Any, tool: str, ok: bool, memory_ids: list[str] | None = None, *, write_outcome: str | None = None, write_outcome_version: int | None = None) -> None:
         entry = {"event": "tool_result", "id": request_id, "tool": tool, "ok": ok, "memory_ids": memory_ids or []}
         if write_outcome is not None:
             entry.update(write_outcome=write_outcome, forwarded=True)
+        if write_outcome_version is not None:
+            entry["write_outcome_version"] = write_outcome_version
         self.audit.write(entry)
 
     def deny_tool(self, request_id: Any, tool: str, reason: str) -> tuple[None, dict[str, Any]]:
@@ -307,11 +344,13 @@ class Policy:
             tool = pending["tool"]
             ok = "error" not in message and isinstance(result, dict) and result.get("isError", False) is False
             no_write = ok and verified_no_write_response(tool, result)
+            begin_busy = "error" not in message and verified_begin_busy_response(tool, result)
             memory_ids = verified_write_ids(tool, pending["arguments"], result) if ok and tool in WRITE_TOOLS and not no_write else []
             if tool in WRITE_TOOLS and not memory_ids and not no_write:
                 ok = False
             self.record_result(request_id, tool, ok, memory_ids if ok else [],
-                               write_outcome=NO_WRITE_OUTCOME if no_write else None)
+                               write_outcome=NO_WRITE_OUTCOME if no_write else (BEGIN_BUSY_OUTCOME if begin_busy else None),
+                               write_outcome_version=BEGIN_BUSY_VERSION if begin_busy else None)
             if not ok and "error" not in message and isinstance(result, dict) and result.get("isError", False) is False:
                 return tool_error(request_id, "write was not verified by an Engram receipt; do not retry blindly"), None
         return message, None

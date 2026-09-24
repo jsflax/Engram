@@ -144,6 +144,7 @@ NO_WRITE_OUTCOME = "not_stored_near_duplicate"
 BEGIN_BUSY_OUTCOME = "not_stored_transaction_not_started"
 BEGIN_BUSY_VERSION = 1
 BEGIN_BUSY_TEXT = "Memory was not stored: the database was busy before the write transaction started. Retry on a later turn."
+BEGIN_BUSY_UPDATE_TEXT = "Memory was not updated: the database was busy before the write transaction started. Retry on a later turn."
 NEAR_DUPLICATE_PREFIX = "⚠️ Near-duplicate memory detected. The new memory was NOT stored.\n\nExisting similar memories:"
 NEAR_DUPLICATE_SUFFIX = ('\n\nTo resolve:'
                          '\n  - Use `update(id: "UUID", ...)` to modify the existing memory'
@@ -168,16 +169,17 @@ def verified_no_write_response(tool: str, result: Any) -> bool:
 
 
 def verified_begin_busy_response(tool: str, result: Any) -> bool:
-    """Accept only native remember's versioned pre-BEGIN no-write contract.
+    """Accept only native remember/update versioned pre-BEGIN no-write contracts.
 
     Text alone, nested quoted content, and any unknown or contradictory field
     cannot establish no-write. The native producer checks body entry, not just
     an error string; post-entry/commit failures never produce this receipt.
     """
-    if (tool != "remember" or not isinstance(result, dict)
+    expected_text = BEGIN_BUSY_UPDATE_TEXT if tool == "update" else BEGIN_BUSY_TEXT
+    if (tool not in ("remember", "update") or not isinstance(result, dict)
             or set(result) != {"isError", "content", "structuredContent"}
             or result["isError"] is not True
-            or result["content"] != [{"type": "text", "text": BEGIN_BUSY_TEXT}]):
+            or result["content"] != [{"type": "text", "text": expected_text}]):
         return False
     structured = result["structuredContent"]
     if not isinstance(structured, dict) or set(structured) != {"engram_write_receipt"}:
@@ -186,7 +188,7 @@ def verified_begin_busy_response(tool: str, result: Any) -> bool:
     return (isinstance(receipt, dict)
             and set(receipt) == {"schema_version", "tool", "write_outcome", "reason", "memory_ids"}
             and type(receipt["schema_version"]) is int and receipt["schema_version"] == BEGIN_BUSY_VERSION
-            and receipt["tool"] == "remember" and receipt["write_outcome"] == BEGIN_BUSY_OUTCOME
+            and receipt["tool"] == tool and receipt["write_outcome"] == BEGIN_BUSY_OUTCOME
             and receipt["reason"] == "database_busy"
             and isinstance(receipt["memory_ids"], list) and receipt["memory_ids"] == [])
 
@@ -195,13 +197,14 @@ def verified_no_write_receipt(entry: Any) -> bool:
     """Exact gateway metadata shared by completion and failed-run reconciliation."""
     fields = {"event", "id", "tool", "ok", "memory_ids", "forwarded", "write_outcome"}
     if (not isinstance(entry, dict) or entry.get("event") != "tool_result"
-            or not valid_id(entry.get("id")) or entry.get("tool") != "remember"
+            or not valid_id(entry.get("id"))
             or entry.get("forwarded") is not True
             or not isinstance(entry.get("memory_ids"), list) or entry["memory_ids"] != []):
         return False
     if entry.get("write_outcome") == NO_WRITE_OUTCOME:
-        return set(entry) == fields and entry.get("ok") is True
-    return (set(entry) == fields | {"write_outcome_version"}
+        return set(entry) == fields and entry.get("tool") == "remember" and entry.get("ok") is True
+    return (entry.get("tool") in ("remember", "update")
+            and set(entry) == fields | {"write_outcome_version"}
             and entry.get("ok") is False and entry.get("write_outcome") == BEGIN_BUSY_OUTCOME
             and type(entry.get("write_outcome_version")) is int
             and entry["write_outcome_version"] == BEGIN_BUSY_VERSION)

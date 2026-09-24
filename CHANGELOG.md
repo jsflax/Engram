@@ -6,7 +6,12 @@ All notable changes to Engram are documented in this file.
 
 ## [Unreleased]
 
+## [0.14.10] - 2026-09-24
+
 ### Fixed
+- Report memory updates as successful only after a checked transaction commits on the database connection that owns the selected memory, including synced and group memories.
+- Recognize update attempts that stop before a busy database transaction begins as verified no-write failures; preserve reconciliation for uncertain writes.
+- Check edge restoration during undelete and propagate failures without claiming that an already committed memory update wrote nothing.
 - Show Codex session learners only the write options their restricted gateway accepts, including exact memory IDs and preserved privacy for updates.
 - Instruct Codex session learners to stop making tool calls after an MCP error, avoiding follow-up writes after a rejected call; conservative completion and reconciliation checks remain unchanged.
 

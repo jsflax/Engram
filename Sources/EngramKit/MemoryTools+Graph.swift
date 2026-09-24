@@ -324,20 +324,25 @@ extension MemoryTools {
     /// tombstoned, so restoring one memory never resurrects links into
     /// removed content.
     @discardableResult
-    func reviveEdgesForMemory(_ gid: UUID) -> Int {
+    func reviveEdgesForMemory(_ gid: UUID) throws -> Int {
         var total = 0
         var lattices: [Lattice] = [localLattice]
         if let syncedLattice { lattices.append(syncedLattice) }
         for lattice in lattices {
-            let edges = lattice.objects(Edge.self)
-                .where { ($0.sourceGlobalId == gid || $0.targetGlobalId == gid) && $0.deletedAt != nil }
-                .snapshot()
-            for edge in edges {
-                let otherGid = edge.sourceGlobalId == gid ? edge.targetGlobalId : edge.sourceGlobalId
-                guard let (other, _) = findMemory(id: otherGid), other.deletedAt == nil else { continue }
-                edge.deletedAt = nil
-                total += 1
+            let revived = try lattice.withTransaction {
+                let edges = lattice.objects(Edge.self)
+                    .where { ($0.sourceGlobalId == gid || $0.targetGlobalId == gid) && $0.deletedAt != nil }
+                    .snapshot()
+                var count = 0
+                for edge in edges {
+                    let otherGid = edge.sourceGlobalId == gid ? edge.targetGlobalId : edge.sourceGlobalId
+                    guard let (other, _) = findMemory(id: otherGid), other.deletedAt == nil else { continue }
+                    edge.deletedAt = nil
+                    count += 1
+                }
+                return count
             }
+            total += revived
         }
         return total
     }
