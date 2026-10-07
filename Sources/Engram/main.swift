@@ -89,8 +89,18 @@ lifecycleWatchdog.start()
 // fail fast and visibly, not eat the whole handshake window.
 let mcpBusyTimeoutMs = 2_000
 
+/// Repair stale planner statistics before Lattice opens its connections,
+/// which keep whatever statistics they load at open (see PlannerStatistics).
+/// Bounded by the same busy timeout, so it adds at most one more 2 s wait.
+func refreshPlannerStatistics(at path: String) {
+    let started = Date()
+    let code = PlannerStatistics.refresh(dbPath: path, busyTimeoutMs: Int32(mcpBusyTimeoutMs))
+    log("Planner statistics refresh rc=\(code) in \(Int(Date().timeIntervalSince(started) * 1000))ms for \(path)")
+}
+
 let localLattice: Lattice
 
+refreshPlannerStatistics(at: dbPath)
 do {
     var localConfig: Lattice.Configuration = .init(fileURL: URL(fileURLWithPath: dbPath), migration: engramMigrations)
     localConfig.busyTimeoutMs = mcpBusyTimeoutMs
@@ -112,6 +122,7 @@ let syncedLattice: Lattice?
 let claudeDir = (dbPath as NSString).deletingLastPathComponent
 let syncedDbPath = SyncService.syncedDbPath(claudeDir: claudeDir)
 if FileManager.default.fileExists(atPath: syncedDbPath) {
+    refreshPlannerStatistics(at: syncedDbPath)
     var syncedConfig: Lattice.Configuration = .init(
         fileURL: URL(fileURLWithPath: syncedDbPath),
         migration: engramMigrations
