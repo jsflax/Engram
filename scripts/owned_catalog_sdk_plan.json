@@ -1,7 +1,7 @@
 {
   "schema": "lattice-owned-catalog-sdk-plan/1",
-  "graphSealSHA256": "d3c4d5ce8117ed05f816997bdbf7f9006ef3847dbdf20e923613748e59d13a43",
-  "requiredSHA256": "5774ed3a1c38d24534d41c9b82ca6747af13f70882653ea6f718e6e72d2ddbb1",
+  "graphSealSHA256": "e8ff9f5a9f9115c371d3de0a23128607784438fad61e7a7e5d5aabd13300cab2",
+  "requiredSHA256": "a92ee9d0de143bf3a07d0919f9dca885a2e89621d5af521bc40f5d0a3fb66538",
   "ownerLockSHA256": "1e3527e1de2783bdc3dca11ce108f3bfbfd079648f9e5a670f4822caa379d58b",
   "mirrorSHA256": "a76adb121f43bfaf2fd9e6eef2d45d1c7620f886c3eaed1ef0b3f4905ca1e349",
   "manifestBindings": [
@@ -60,7 +60,7 @@
     {
       "name": "emptyTableStillCarriesPhysicalSchema",
       "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
-      "line": 124,
+      "line": 150,
       "parameterized": false,
       "actualCases": 1,
       "suite": "OwnedCatalogCaptureTests"
@@ -68,7 +68,7 @@
     {
       "name": "consumerFailureJoinsBeforeSameOwnerWriteAndRecapture",
       "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
-      "line": 143,
+      "line": 169,
       "parameterized": false,
       "actualCases": 1,
       "suite": "OwnedCatalogCaptureTests"
@@ -76,7 +76,7 @@
     {
       "name": "cancellationJoinsBlockedConsumerAndOriginalNativeEnding",
       "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
-      "line": 161,
+      "line": 187,
       "parameterized": false,
       "actualCases": 1,
       "suite": "OwnedCatalogCaptureTests"
@@ -84,7 +84,7 @@
     {
       "name": "expiredWorkerWaitDoesNotPublishOrReturnBeforeJoin",
       "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
-      "line": 195,
+      "line": 221,
       "parameterized": false,
       "actualCases": 1,
       "suite": "OwnedCatalogCaptureTests"
@@ -92,7 +92,7 @@
     {
       "name": "typedFactoryRejectsEmptyRepeatedAndMissingTables",
       "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
-      "line": 229,
+      "line": 255,
       "parameterized": false,
       "actualCases": 1,
       "suite": "OwnedCatalogCaptureTests"
@@ -100,7 +100,7 @@
     {
       "name": "swiftCallbackRefusalsStayContainedAndPreserveOriginalOwner",
       "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
-      "line": 248,
+      "line": 275,
       "parameterized": true,
       "actualCases": 9,
       "suite": "OwnedCatalogCaptureTests"
@@ -108,7 +108,7 @@
     {
       "name": "callbackRegistrationRefusalConsumesTransferredContextExactlyOnce",
       "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
-      "line": 323,
+      "line": 355,
       "parameterized": false,
       "actualCases": 1,
       "suite": "OwnedCatalogCaptureTests"
@@ -116,7 +116,7 @@
     {
       "name": "nilContextCallbackClearsNeverInvokeNonnullDestroyEvenWhenRefused",
       "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
-      "line": 355,
+      "line": 387,
       "parameterized": false,
       "actualCases": 1,
       "suite": "OwnedCatalogCaptureTests"
@@ -124,7 +124,7 @@
     {
       "name": "deadlineIsOneBoundedOriginalMonotonicEnd",
       "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
-      "line": 421,
+      "line": 453,
       "parameterized": false,
       "actualCases": 1,
       "suite": "OwnedCatalogDataTests"
@@ -132,7 +132,7 @@
     {
       "name": "metadataRejectsDuplicateEscapedKeysInvalidSurrogatesAndNonStringScalars",
       "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
-      "line": 430,
+      "line": 462,
       "parameterized": false,
       "actualCases": 1,
       "suite": "OwnedCatalogDataTests"
@@ -140,7 +140,7 @@
     {
       "name": "decoderRejectsIncompleteCellsAndUnorderedIdentity",
       "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
-      "line": 440,
+      "line": 472,
       "parameterized": false,
       "actualCases": 1,
       "suite": "OwnedCatalogDataTests"
@@ -179,7 +179,7 @@
     {
       "name": "OwnedCatalogDataTests",
       "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
-      "line": 419
+      "line": 451
     },
     {
       "name": "OwnedCatalogExecutorPrecedenceTests",
@@ -200,15 +200,15 @@
   ],
   "sdkEventStreamVersion": "6.3",
   "sdkEncodedEventVersion": "6.3.0",
-  "sdkResultParserSHA256": "1801e11bf0de0cdfa16102f405b6165dd52cb0597e42a27d4f98221c8b89b600",
+  "sdkResultParserSHA256": "a42659f05290220a44b00b430a92c772d4b4e6bc770a33c3d3b439c93328e3a1",
   "sdkActualInvocationCount": 23,
   "sdkFunctionCount": 15,
   "sdkSourceEnrollment": [
     {
       "original": "SDK/Tests/LatticeTests/OwnedCatalogCaptureTests.swift",
       "enrolled": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
-      "bytes": 22823,
-      "sha256": "66ea67be4fd6c157c737540b85bca5ffe227665fd70841367bd0dc376be0c411",
+      "bytes": 25181,
+      "sha256": "401ce6acd755920b1960c4043e7a1e10688b1c99bb7120b3d909ceaaaf37e09a",
       "mode": 292,
       "byteExact": true
     },
@@ -227,9 +227,19 @@
   "nativeControllerSelected": false,
   "correctedCoreSourceSealSHA256": "0d39283e1fcaa718c86bb4f7d87c40c3cea2ac5d677c11c083d287003c11d924",
   "correctedCoreFollowingSHA256": "89a748d3c732612bfed05641f853b9d40c7598359548f241e62c8306015fd0fd",
-  "correctedGraphFollowingSHA256": "f2c469f21df05038b8122e04971a665e903fe4d4da343d87123d15b07bbf8ea2",
-  "correctedGraphPredecessorSHA256": "f83ff0be5a590afddd48a4a4d2a7ac32af56440176d1691f3ba49eae8065ab92",
+  "correctedGraphFollowingSHA256": "0d772af394f96768810f9f5d322da85614174d379cb94fa3e2af8ae798f6c435",
+  "correctedGraphPredecessorSHA256": "d3c4d5ce8117ed05f816997bdbf7f9006ef3847dbdf20e923613748e59d13a43",
   "nativeQualificationPending": true,
   "swiftActorTestCorrectionSealSHA256": "4915b5c0620700c8371364cb024e5d845f31645e86e50c3b30dbeead2757b496",
-  "genericCustomShadowExclusionNotClaimed": true
+  "genericCustomShadowExclusionNotClaimed": true,
+  "checkedPublicReadMaintenanceSourceSHA256": "fc02b9ebd3212b5b24889c9c25fc5c321b3a279cb9a07da0eca0ec2f4321f609",
+  "checkedPublicReadMaintenanceSealSHA256": "e12fa4f73004c3f5b3d52e0678bff81646e64d196fe5d742a50842dfd2e59eed",
+  "optionalDotParserSourceSHA256": "61ff61e22c70ebc5b3400b236293a7a9b0465184e1aa9591c12addcf7bb67322",
+  "optionalDotParserSealSHA256": "ccc3c100bb88a61762846090ccd5eb70f13199ec03792e187021c29631713153",
+  "selectedNative010TestSourceSealSHA256": "086f5a6db651633a229948b600975d8c97b94735c648624ddd5fe8ffabf6d331",
+  "actualPriorNative99GraphSHA256": "639f28c6e7cb8b2431682ab88e43d85d3816f5dd27c06a85677e7299bfb2c650",
+  "additionalBridgeDeltaFromPriorNative99": "Core/Sources/LatticeSwiftCppBridge/include/lattice.hpp",
+  "native148UsesPriorBridge": true,
+  "automaticCoalescedMaintenanceWakeImplemented": false,
+  "manualCheckedMaintenanceMilestoneOnly": true
 }

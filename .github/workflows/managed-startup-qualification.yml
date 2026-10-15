@@ -83,8 +83,8 @@ jobs:
           [[ "$INPUT_PAYLOAD_SHA" =~ ^[0-9a-f]{64}$ ]]
           [[ "$INPUT_PAYLOAD_BYTES" =~ ^[1-9][0-9]{0,9}$ ]]
           test "$INPUT_PAYLOAD_BYTES" -le 2147483648
-          test "$INPUT_GRAPH_SHA" = d3c4d5ce8117ed05f816997bdbf7f9006ef3847dbdf20e923613748e59d13a43
-          test "$INPUT_REQUIRED_SHA" = 5774ed3a1c38d24534d41c9b82ca6747af13f70882653ea6f718e6e72d2ddbb1
+          test "$INPUT_GRAPH_SHA" = e8ff9f5a9f9115c371d3de0a23128607784438fad61e7a7e5d5aabd13300cab2
+          test "$INPUT_REQUIRED_SHA" = a92ee9d0de143bf3a07d0919f9dca885a2e89621d5af521bc40f5d0a3fb66538
           umask 077
           if test ! -e "$HOME/localdev" && test ! -L "$HOME/localdev"; then
             mkdir -m 0711 "$HOME/localdev"

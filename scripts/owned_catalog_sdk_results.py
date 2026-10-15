@@ -96,7 +96,7 @@ def event_result(raw, functions, suites, arguments, graph):
             suffix = ' to '+item['name']+'(_:) started.'
             require(text.endswith(suffix), 'sdk_argument_observation_shape')
             value = text[:-len(suffix)]
-            match = re.fullmatch(r'(?:[A-Za-z_][A-Za-z_0-9]*\.)*([A-Za-z_][A-Za-z_0-9]*)', value)
+            match = re.fullmatch(r'\.?(?:[A-Za-z_][A-Za-z_0-9]*\.)*([A-Za-z_][A-Za-z_0-9]*)', value)
             require(match and match[1] in arguments and match[1] not in arg_values.get(ident, set()), 'sdk_unknown_or_duplicate_argument')
             open_cases[ident] = match[1]; arg_values.setdefault(ident, set()).add(match[1])
         elif stage == 'testCaseEnded':

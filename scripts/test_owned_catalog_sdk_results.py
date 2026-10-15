@@ -64,6 +64,36 @@ class SDKOutputCases(unittest.TestCase):
         self.assertEqual(observed['observedInvocations'],23)
         self.assertTrue(api.xunit_result(xml(),PLAN['sdkFunctions'])['allPassed'])
 
+    def test_actual_swift633_enum_shorthand_completes_all_nine_argument_invocations(self):
+        # Exact messages retained from actual run38777830237, not a changed
+        # product outcome. The original runtime still has its independent issue.
+        actions = ['path','closed','optimize','add','preservingAdd','checkpoint','reclaim','close','generation']
+        records=fixture();starts=[r for r in records if r['payload']['kind']=='testCaseStarted']
+        self.assertEqual(len(starts),len(actions))
+        for row,action in zip(starts,actions):
+            row['payload']['messages']=[dict(symbol='default',text='Test case passing 1 argument action → .'+action+' to swiftCallbackRefusalsStayContainedAndPreserveOriginalOwner(_:) started.')]
+        observed=result(records)
+        self.assertTrue(observed['allPassed']);self.assertEqual(observed['observedInvocations'],23)
+        self.assertEqual(next(r['arguments']for r in observed['rows']if r['expectedCases']==9),sorted(actions))
+
+    def test_optional_dot_does_not_admit_unknown_empty_double_dot_or_duplicate_action(self):
+        for spelling in ['.unknown','.', '..path', '.CatalogCallbackBoundary..path']:
+            records=fixture();row=next(r for r in records if r['payload']['kind']=='testCaseStarted')
+            row['payload']['messages'][0]['text']='Test case passing 1 argument action → '+spelling+' to swiftCallbackRefusalsStayContainedAndPreserveOriginalOwner(_:) started.'
+            with self.assertRaisesRegex(RuntimeError,'sdk_unknown_or_duplicate_argument'):result(records)
+        records=fixture();starts=[r for r in records if r['payload']['kind']=='testCaseStarted']
+        for row in [starts[0],starts[-1]]:
+            row['payload']['messages'][0]['text']='Test case passing 1 argument action → .path to swiftCallbackRefusalsStayContainedAndPreserveOriginalOwner(_:) started.'
+        with self.assertRaisesRegex(RuntimeError,'sdk_unknown_or_duplicate_argument'):result(records)
+
+    def test_actual_shorthand_with_failed_run_end_never_passes(self):
+        records=fixture()
+        for row in records:
+            if row['payload']['kind']=='testCaseStarted':
+                row['payload']['messages'][0]['text']=row['payload']['messages'][0]['text'].replace('CatalogCallbackBoundary.','.')
+        records[-1]['payload']['messages']=[dict(symbol='fail',text='Test run with 15 tests in 3 suites failed after 4.838 seconds with 1 issue.')]
+        with self.assertRaisesRegex(RuntimeError,'sdk_run_end_without_pass'):result(records)
+
     def test_xunit15_rows_cannot_substitute_for_one_missing_parameter_case(self):
         records=fixture();at=next(i for i,r in enumerate(records)if r['payload']['kind']=='testCaseStarted')
         del records[at:at+2]
