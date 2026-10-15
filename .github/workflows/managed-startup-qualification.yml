@@ -1,19 +1,10 @@
-name: Prepare genuine receiving owner images
+name: First coherent Core and SDK source qualification
 
 on:
   workflow_dispatch:
     inputs:
-      image_kind:
-        description: 'Build both image sets or only the selected changed producer'
-        type: choice
-        required: true
-        default: both
-        options:
-          - both
-          - provider-history
-          - fixed-legacy4
-      image_build_gate:
-        description: 'Build actual provider and fixed legacy images; no account, profile or runtime qualification'
+      coherent_source_qualification:
+        description: 'Fresh coherent compilation and exact661 native population; no legacy profile or lifecycle grant'
         type: boolean
         required: true
         default: false
@@ -26,23 +17,23 @@ on:
         type: string
         required: true
       input_archive_sha256:
-        description: 'Independent exact SHA256 of the downloaded input ZIP'
+        description: 'Independently verified downloaded Actions ZIP SHA256'
         type: string
         required: true
       input_payload_sha256:
-        description: 'Independent exact SHA256 of the single raw lattice-owner-build-inputs-v1.zip payload'
+        description: 'Exact single raw lattice-owner-build-inputs-v1.zip SHA256'
         type: string
         required: true
       input_payload_bytes:
-        description: 'Exact raw payload bytes, positive and at most 2147483648'
+        description: 'Exact raw payload bytes, positive and at most2147483648'
         type: string
         required: true
       source_graph_seal_sha256:
-        description: 'Exact composed current source graph seal SHA256'
+        description: 'Selected coherent source graph seal094f64d9; no old-artifact retarget'
         type: string
         required: true
       required_sources_sha256:
-        description: 'Exact corresponding required-source seal SHA256'
+        description: 'Exact corresponding required-source seal dc99275b'
         type: string
         required: true
 
@@ -51,18 +42,18 @@ permissions:
   actions: read
 
 jobs:
-  actual-image-build:
-    if: inputs.image_build_gate == true
+  coherent-source:
+    if: inputs.coherent_source_qualification == true
     runs-on: macos-26
     timeout-minutes: 235
     strategy:
       fail-fast: false
       matrix:
-        image_kind: ${{ fromJSON(inputs.image_kind == 'provider-history' && '["provider-history"]' || inputs.image_kind == 'fixed-legacy4' && '["fixed-legacy4"]' || '["provider-history","fixed-legacy4"]') }}
+        qualification_kind: [native-core, sdk-importer]
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       ENGRAM_WORKFLOW_SHA: ${{ github.workflow_sha }}
-      IMAGE_KIND: ${{ matrix.image_kind }}
+      QUALIFICATION_KIND: ${{ matrix.qualification_kind }}
       INPUT_ARTIFACT: ${{ inputs.input_artifact_id }}
       INPUT_PRODUCER: ${{ inputs.input_producer_run_id }}
       INPUT_ARCHIVE_SHA: ${{ inputs.input_archive_sha256 }}
@@ -71,7 +62,7 @@ jobs:
       INPUT_GRAPH_SHA: ${{ inputs.source_graph_seal_sha256 }}
       INPUT_REQUIRED_SHA: ${{ inputs.required_sources_sha256 }}
     steps:
-      - name: Retain actual first source and bounded build inputs under localdev
+      - name: Own exact caller and bounded source inputs under localdev
         timeout-minutes: 15
         shell: bash
         env:
@@ -92,113 +83,90 @@ jobs:
           [[ "$INPUT_PAYLOAD_SHA" =~ ^[0-9a-f]{64}$ ]]
           [[ "$INPUT_PAYLOAD_BYTES" =~ ^[1-9][0-9]{0,9}$ ]]
           test "$INPUT_PAYLOAD_BYTES" -le 2147483648
-          [[ "$INPUT_GRAPH_SHA" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$INPUT_REQUIRED_SHA" =~ ^[0-9a-f]{64}$ ]]
+          test "$INPUT_GRAPH_SHA" = 094f64d98a2f8dd6bb500aa6aed982f989dc95e2fe4c7d7b6d3762c50622ff64
+          test "$INPUT_REQUIRED_SHA" = dc99275b6437600a81305ea91eee994e478fb6088652b899522dd4dd346a6366
           umask 077
           if test ! -e "$HOME/localdev" && test ! -L "$HOME/localdev"; then
             mkdir -m 0711 "$HOME/localdev"
           fi
           test -d "$HOME/localdev"
           test ! -L "$HOME/localdev"
-          OWNER_BUILD_NAMESPACE="$HOME/localdev/owner-image-build-${GITHUB_RUN_ID}-${IMAGE_KIND}"
-          test ! -e "$OWNER_BUILD_NAMESPACE"
-          test ! -L "$OWNER_BUILD_NAMESPACE"
-          mkdir -m 0700 "$OWNER_BUILD_NAMESPACE"
-          mkdir "$OWNER_BUILD_NAMESPACE/bootstrap" "$OWNER_BUILD_NAMESPACE/tmp"
-          printf 'OWNER_BUILD_NAMESPACE=%s\n' "$OWNER_BUILD_NAMESPACE" >> "$GITHUB_ENV"
-          export TMPDIR="$OWNER_BUILD_NAMESPACE/tmp"
+          COHERENT_NAMESPACE="$HOME/localdev/coherent-source-${GITHUB_RUN_ID}-${QUALIFICATION_KIND}"
+          test ! -e "$COHERENT_NAMESPACE"
+          test ! -L "$COHERENT_NAMESPACE"
+          mkdir -m 0700 "$COHERENT_NAMESPACE"
+          mkdir "$COHERENT_NAMESPACE/bootstrap" "$COHERENT_NAMESPACE/tmp"
+          printf 'COHERENT_NAMESPACE=%s\n' "$COHERENT_NAMESPACE" >> "$GITHUB_ENV"
+          export TMPDIR="$COHERENT_NAMESPACE/tmp"
           export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
-          git -c core.hooksPath=/dev/null init "$OWNER_BUILD_NAMESPACE/harness" > "$OWNER_BUILD_NAMESPACE/bootstrap/checkout.log" 2>&1
+          git -c core.hooksPath=/dev/null init "$COHERENT_NAMESPACE/harness" > "$COHERENT_NAMESPACE/bootstrap/checkout.log" 2>&1
           export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
           export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$BOOTSTRAP_TOKEN" | base64 | tr -d '\n')"
-          git -c core.hooksPath=/dev/null -C "$OWNER_BUILD_NAMESPACE/harness" fetch --no-tags --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA" >> "$OWNER_BUILD_NAMESPACE/bootstrap/checkout.log" 2>&1
+          git -c core.hooksPath=/dev/null -C "$COHERENT_NAMESPACE/harness" fetch --no-tags --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA" >> "$COHERENT_NAMESPACE/bootstrap/checkout.log" 2>&1
           unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
-          git -c core.hooksPath=/dev/null -C "$OWNER_BUILD_NAMESPACE/harness" checkout --detach "$GITHUB_SHA" >> "$OWNER_BUILD_NAMESPACE/bootstrap/checkout.log" 2>&1
-          test "$(git -C "$OWNER_BUILD_NAMESPACE/harness" rev-parse HEAD)" = "$GITHUB_SHA"
-          test -z "$(git -C "$OWNER_BUILD_NAMESPACE/harness" status --porcelain)"
+          git -c core.hooksPath=/dev/null -C "$COHERENT_NAMESPACE/harness" checkout --detach "$GITHUB_SHA" >> "$COHERENT_NAMESPACE/bootstrap/checkout.log" 2>&1
+          test "$(git -C "$COHERENT_NAMESPACE/harness" rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git -C "$COHERENT_NAMESPACE/harness" status --porcelain)"
+          test "$(shasum -a 256 "$COHERENT_NAMESPACE/harness/scripts/prepare_hosted_owner_build_inputs.py" | cut -d ' ' -f1)" = cdcfa72303cbc0e65d375d145cdaf01074e90f1fa65162070e82a4758f0d42ff
+          test "$(shasum -a 256 "$COHERENT_NAMESPACE/harness/scripts/prepare_hosted_owner_inputs.py" | cut -d ' ' -f1)" = 898584cde6aff6764c089899e77dc51a59a57872d2d1f3933782bf88647d91a6
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 60 --max-filesize 1048576 \
             -H "Authorization: Bearer $BOOTSTRAP_TOKEN" -H 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${INPUT_ARTIFACT}" -o "$OWNER_BUILD_NAMESPACE/bootstrap/artifact.json"
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${INPUT_ARTIFACT}" -o "$COHERENT_NAMESPACE/bootstrap/artifact.json"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 180 --max-filesize 2147483648 \
             -H "Authorization: Bearer $BOOTSTRAP_TOKEN" -H 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${INPUT_ARTIFACT}/zip" -o "$OWNER_BUILD_NAMESPACE/bootstrap/build-inputs.zip"
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${INPUT_ARTIFACT}/zip" -o "$COHERENT_NAMESPACE/bootstrap/inputs.zip"
           unset BOOTSTRAP_TOKEN
-          OWNER_PYTHON="$(command -v python3)"
-          "$OWNER_PYTHON" -I -S -B "$OWNER_BUILD_NAMESPACE/harness/scripts/prepare_hosted_owner_build_inputs.py" prepare \
-            --metadata "$OWNER_BUILD_NAMESPACE/bootstrap/artifact.json" --archive "$OWNER_BUILD_NAMESPACE/bootstrap/build-inputs.zip" \
+          COHERENT_PYTHON="$(command -v python3)"
+          "$COHERENT_PYTHON" -I -S -B "$COHERENT_NAMESPACE/harness/scripts/prepare_hosted_owner_build_inputs.py" prepare \
+            --metadata "$COHERENT_NAMESPACE/bootstrap/artifact.json" --archive "$COHERENT_NAMESPACE/bootstrap/inputs.zip" \
             --archive-sha256 "$INPUT_ARCHIVE_SHA" --payload-sha256 "$INPUT_PAYLOAD_SHA" --payload-bytes "$INPUT_PAYLOAD_BYTES" \
             --artifact-id "$INPUT_ARTIFACT" --producer-run-id "$INPUT_PRODUCER" \
             --graph-seal-sha256 "$INPUT_GRAPH_SHA" --required-sha256 "$INPUT_REQUIRED_SHA" \
-            --root "$OWNER_BUILD_NAMESPACE/inputs" --github-env "$GITHUB_ENV" \
-            > "$OWNER_BUILD_NAMESPACE/bootstrap/input-validation.log" 2>&1
-          printf 'OWNER_PYTHON=%s\n' "$OWNER_PYTHON" >> "$GITHUB_ENV"
+            --root "$COHERENT_NAMESPACE/inputs" --github-env "$GITHUB_ENV" > "$COHERENT_NAMESPACE/bootstrap/inputs.log" 2>&1
+          printf 'COHERENT_PYTHON=%s\n' "$COHERENT_PYTHON" >> "$GITHUB_ENV"
 
-      - name: Run one actual retained image build and preserve its genuine output DATA
+      - name: Run one fresh bounded compiler and selected native population
         timeout-minutes: 215
         shell: bash
         run: |
           set -euo pipefail
           ulimit -c 0
-          TAG="$("$OWNER_PYTHON" -I -S -B -c 'import uuid; print(uuid.uuid4().hex[:8])')"
-          if test "$IMAGE_KIND" = provider-history; then
-            OWNER_IMAGE_BUILD_ROOT="$HOME/localdev/lqb${TAG}"
-          else
-            OWNER_IMAGE_BUILD_ROOT="$HOME/localdev/lql${TAG}"
-          fi
-          printf 'OWNER_IMAGE_BUILD_ROOT=%s\n' "$OWNER_IMAGE_BUILD_ROOT" >> "$GITHUB_ENV"
-          OWNER_DEVELOPER_RAW="$(xcode-select -p)"
-          OWNER_SDK_RAW="$(xcrun --sdk macosx --show-sdk-path)"
-          OWNER_DEVELOPER="$("$OWNER_PYTHON" -I -S -B -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$OWNER_DEVELOPER_RAW")"
-          OWNER_SDK="$("$OWNER_PYTHON" -I -S -B -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$OWNER_SDK_RAW")"
-          "$OWNER_PYTHON" -I -S -B -c '
-          import json, sys
-          values = sys.argv[2:]
-          if len(values) != 4 or any(not value or len(value.encode("utf-8")) > 4096 for value in values):
-              raise RuntimeError("toolchain_directory_observation_bound")
-          record = dict(rawDeveloperDir=values[0], developerDir=values[1], rawSDKRoot=values[2], sdkRoot=values[3])
-          body = (json.dumps(record, sort_keys=True) + "\n").encode("ascii")
-          if len(body) > 131072:
-              raise RuntimeError("toolchain_directory_log_bound")
-          with open(sys.argv[1], "xb") as output:
-              if output.write(body) != len(body):
-                  raise RuntimeError("toolchain_directory_log_short_write")
-          ' "$OWNER_BUILD_NAMESPACE/bootstrap/toolchain-inputs.log" "$OWNER_DEVELOPER_RAW" "$OWNER_DEVELOPER" "$OWNER_SDK_RAW" "$OWNER_SDK"
-          common=(--ephemeral-ci-vm --graph "$OWNER_BUILD_INPUT_ROOT/graph" \
-            --graph-pins "$OWNER_BUILD_INPUT_ROOT/SOURCE-GRAPH-SEAL.json" --graph-pins-sha256 "$OWNER_BUILD_GRAPHSEALSHA256" \
-            --root "$OWNER_IMAGE_BUILD_ROOT" --harness-commit "$GITHUB_SHA" \
-            --evidence-output "$OWNER_BUILD_NAMESPACE/evidence" \
-            --dependency-cache "$OWNER_BUILD_INPUT_ROOT/dependency-cache" --dependency-cache-pins "$OWNER_BUILD_INPUT_ROOT/CACHE-SEAL.json" \
-            --dependency-cache-pins-sha256 "$OWNER_BUILD_CACHESEALSHA256" \
-            --dependency-mirrors "$OWNER_BUILD_INPUT_ROOT/dependency-config/mirrors.json" \
-            --developer-dir "$OWNER_DEVELOPER" --sdk-root "$OWNER_SDK")
+          TAG="$("$COHERENT_PYTHON" -I -S -B -c 'import uuid; print(uuid.uuid4().hex[:8])')"
+          COHERENT_WORK_ROOT="$HOME/localdev/lqc${TAG}"
+          COHERENT_DEVELOPER_RAW="$(xcode-select -p)"
+          COHERENT_SDK_RAW="$(xcrun --sdk macosx --show-sdk-path)"
+          COHERENT_CMAKE_RAW="$(command -v cmake)"
+          COHERENT_DEVELOPER="$("$COHERENT_PYTHON" -I -S -B -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$COHERENT_DEVELOPER_RAW")"
+          COHERENT_SDK="$("$COHERENT_PYTHON" -I -S -B -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$COHERENT_SDK_RAW")"
+          COHERENT_CMAKE="$("$COHERENT_PYTHON" -I -S -B -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$COHERENT_CMAKE_RAW")"
+          printf 'developer=%s\ncanonicalDeveloper=%s\nsdk=%s\ncanonicalSDK=%s\ncmake=%s\ncanonicalCMake=%s\n' \
+            "$COHERENT_DEVELOPER_RAW" "$COHERENT_DEVELOPER" "$COHERENT_SDK_RAW" "$COHERENT_SDK" \
+            "$COHERENT_CMAKE_RAW" "$COHERENT_CMAKE" > "$COHERENT_NAMESPACE/bootstrap/tool-paths.log"
+          # Both this real compiler and its receipt use an original fresh root.
+          # No profile, account, provider, source stamp or product image is run.
           set +e
-          if test "$IMAGE_KIND" = provider-history; then
-            "$OWNER_PYTHON" -I -S -B "$OWNER_BUILD_INPUT_ROOT/graph/FixtureScripts/build_hosted_provider.py" \
-              "${common[@]}" --resolution-mode initial --history > "$OWNER_BUILD_NAMESPACE/bootstrap/build.log" 2>&1
-          else
-            "$OWNER_PYTHON" -I -S -B "$OWNER_BUILD_INPUT_ROOT/graph/FixtureScripts/build_hosted_fixed_legacy.py" \
-              "${common[@]}" --legacy-bundle "$OWNER_BUILD_INPUT_ROOT/legacy.bundle" \
-              --legacy-bundle-sha256 "$OWNER_BUILD_LEGACYBUNDLESHA256" > "$OWNER_BUILD_NAMESPACE/bootstrap/build.log" 2>&1
-          fi
-          BUILD_EXIT=$?
+          "$COHERENT_PYTHON" -I -S -B "$COHERENT_NAMESPACE/harness/scripts/qualify_hosted_coherent_core_sdk.py" \
+            --ephemeral-ci-vm --kind "$QUALIFICATION_KIND" --graph "$OWNER_BUILD_INPUT_ROOT/graph" \
+            --graph-pins "$OWNER_BUILD_INPUT_ROOT/SOURCE-GRAPH-SEAL.json" --graph-pins-sha256 "$OWNER_BUILD_GRAPHSEALSHA256" \
+            --required-sources "$OWNER_BUILD_INPUT_ROOT/OWNER-DEPENDENCIES.json" --required-sources-sha256 "$OWNER_BUILD_REQUIREDSHA256" \
+            --cache "$OWNER_BUILD_INPUT_ROOT/dependency-cache" --cache-pins "$OWNER_BUILD_INPUT_ROOT/CACHE-SEAL.json" --cache-pins-sha256 "$OWNER_BUILD_CACHESEALSHA256" \
+            --config "$OWNER_BUILD_INPUT_ROOT/dependency-config" --config-pins "$OWNER_BUILD_INPUT_ROOT/CONFIG-SEAL.json" --config-pins-sha256 "$OWNER_BUILD_CONFIGSEALSHA256" \
+            --owner-lock "$OWNER_BUILD_INPUT_ROOT/OwnerImages.Package.resolved" --root "$COHERENT_WORK_ROOT" \
+            --evidence "$COHERENT_NAMESPACE/evidence" --cmake "$COHERENT_CMAKE" --developer-dir "$COHERENT_DEVELOPER" \
+            --sdk-root "$COHERENT_SDK" --harness-commit "$GITHUB_SHA" > "$COHERENT_NAMESPACE/bootstrap/qualification.log" 2>&1
+          QUALIFICATION_EXIT=$?
           set -e
-          printf '%s\n' "$BUILD_EXIT" > "$OWNER_BUILD_NAMESPACE/producer-exit.status"
-          test "$BUILD_EXIT" -eq 0
-          "$OWNER_PYTHON" -I -S -B "$OWNER_BUILD_NAMESPACE/harness/scripts/prepare_hosted_owner_build_inputs.py" stage \
-            --kind "$IMAGE_KIND" --build-root "$OWNER_IMAGE_BUILD_ROOT" --evidence-root "$OWNER_BUILD_NAMESPACE/evidence" \
-            --producer-exit-status "$OWNER_BUILD_NAMESPACE/producer-exit.status" \
-            --output "$OWNER_BUILD_NAMESPACE/artifact-products" \
-            --graph-seal-sha256 "$OWNER_BUILD_GRAPHSEALSHA256" > "$OWNER_BUILD_NAMESPACE/bootstrap/stage.log" 2>&1
+          printf '%s\n' "$QUALIFICATION_EXIT" > "$COHERENT_NAMESPACE/qualification-exit.status"
+          test "$QUALIFICATION_EXIT" -eq 0
 
-      - name: Preserve actual first build receipts and unqualified image artifacts
-        if: always() && env.OWNER_BUILD_NAMESPACE != ''
+      - name: Retain bounded first outcomes without stores or build trees
+        if: always() && env.COHERENT_NAMESPACE != ''
         uses: actions/upload-artifact@v4
         with:
-          name: owner-image-build-${{ matrix.image_kind }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: coherent-source-${{ matrix.qualification_kind }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ env.OWNER_BUILD_NAMESPACE }}/bootstrap/*.log
-            ${{ env.OWNER_BUILD_NAMESPACE }}/producer-exit.status
-            ${{ env.OWNER_BUILD_NAMESPACE }}/evidence/**
-            ${{ env.OWNER_BUILD_NAMESPACE }}/artifact-products/**
+            ${{ env.COHERENT_NAMESPACE }}/bootstrap/*.log
+            ${{ env.COHERENT_NAMESPACE }}/qualification-exit.status
+            ${{ env.COHERENT_NAMESPACE }}/evidence/**
           if-no-files-found: warn
           retention-days: 14
