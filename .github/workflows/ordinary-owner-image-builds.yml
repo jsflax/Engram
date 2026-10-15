@@ -137,8 +137,23 @@ jobs:
             OWNER_IMAGE_BUILD_ROOT="$HOME/localdev/lql${TAG}"
           fi
           printf 'OWNER_IMAGE_BUILD_ROOT=%s\n' "$OWNER_IMAGE_BUILD_ROOT" >> "$GITHUB_ENV"
-          OWNER_DEVELOPER="$(xcode-select -p)"
-          OWNER_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          OWNER_DEVELOPER_RAW="$(xcode-select -p)"
+          OWNER_SDK_RAW="$(xcrun --sdk macosx --show-sdk-path)"
+          OWNER_DEVELOPER="$("$OWNER_PYTHON" -I -S -B -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$OWNER_DEVELOPER_RAW")"
+          OWNER_SDK="$("$OWNER_PYTHON" -I -S -B -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$OWNER_SDK_RAW")"
+          "$OWNER_PYTHON" -I -S -B -c '
+          import json, sys
+          values = sys.argv[2:]
+          if len(values) != 4 or any(not value or len(value.encode("utf-8")) > 4096 for value in values):
+              raise RuntimeError("toolchain_directory_observation_bound")
+          record = dict(rawDeveloperDir=values[0], developerDir=values[1], rawSDKRoot=values[2], sdkRoot=values[3])
+          body = (json.dumps(record, sort_keys=True) + "\n").encode("ascii")
+          if len(body) > 131072:
+              raise RuntimeError("toolchain_directory_log_bound")
+          with open(sys.argv[1], "xb") as output:
+              if output.write(body) != len(body):
+                  raise RuntimeError("toolchain_directory_log_short_write")
+          ' "$OWNER_BUILD_NAMESPACE/bootstrap/toolchain-inputs.log" "$OWNER_DEVELOPER_RAW" "$OWNER_DEVELOPER" "$OWNER_SDK_RAW" "$OWNER_SDK"
           common=(--ephemeral-ci-vm --graph "$OWNER_BUILD_INPUT_ROOT/graph" \
             --graph-pins "$OWNER_BUILD_INPUT_ROOT/SOURCE-GRAPH-SEAL.json" --graph-pins-sha256 "$OWNER_BUILD_GRAPHSEALSHA256" \
             --root "$OWNER_IMAGE_BUILD_ROOT" --harness-commit "$GITHUB_SHA" \
