@@ -3,6 +3,15 @@ name: Prepare genuine receiving owner images
 on:
   workflow_dispatch:
     inputs:
+      image_kind:
+        description: 'Build both image sets or only the selected changed producer'
+        type: choice
+        required: true
+        default: both
+        options:
+          - both
+          - provider-history
+          - fixed-legacy4
       image_build_gate:
         description: 'Build actual provider and fixed legacy images; no account, profile or runtime qualification'
         type: boolean
@@ -49,7 +58,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image_kind: [provider-history, fixed-legacy4]
+        image_kind: ${{ fromJSON(inputs.image_kind == 'provider-history' && '["provider-history"]' || inputs.image_kind == 'fixed-legacy4' && '["fixed-legacy4"]' || '["provider-history","fixed-legacy4"]') }}
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       ENGRAM_WORKFLOW_SHA: ${{ github.workflow_sha }}
