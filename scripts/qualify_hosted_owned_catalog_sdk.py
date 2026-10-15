@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fresh exact23 SDK catalog runtime; separate from the full SDK regression gate."""
+"""Fresh exact25 SDK catalog and automatic maintenance runtime; separate from the full SDK regression gate."""
 import sys
 if not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode
         and sys.implementation.name == 'cpython' and sys.version_info >= (3, 11)):
@@ -19,7 +19,7 @@ import threading
 import time
 import types
 
-PLAN_SHA = '5dfc09b8cb34e4511f7f3bf401f885cdf6b7a3d9a388d292719f547fa78460ed'
+PLAN_SHA = 'f71a45253c03c818aa8345c8ec0c7026522a93d92a3de071c4ced75b757aca02'
 HELPER_SHA = 'a3f2349c052f03881a2690077eca84ce85a6bae414f08b3315d87b33b8ea7728'
 COMMAND_SHA = 'aab985543261f94b181a367bce56275c3203048bc2d2030b6e2708ecfca95f1b'
 GATE_SHA = 'b69a4a80b6b2c18653b52f26915ec9e21a0c8c90d41402915d5ec06559a8d8b8'
@@ -252,7 +252,7 @@ class Qualification:
         self.result.update(buildSucceeded=True, importerBuildOnly=False, actualLinkedImages=images,
             actualTestBinary=self.original.file_fact(binaries[0],512*1024**2),
             actualLocalPackages=sorted(local),actualRemotePins=len(remote),nativeRuntimeRun=False,
-            fullSDKRegressionGateQualified=False,actualCatalogInvocationsRequired=23)
+            fullSDKRegressionGateQualified=False,actualCatalogInvocationsRequired=25)
         self.h.save(self.root/'CATALOG-TEST-ENROLLMENT.json',
             dict(files=self.plan['sdkSourceEnrollment'],functions=self.plan['sdkFunctions'],
                  suites=self.plan['sdkSuites'],arguments=self.plan['sdkParameterArguments']))
@@ -280,7 +280,7 @@ class Qualification:
             self.result['sdkAnalysisFailure'] = self.original.exception_fact(analysis_failure)
             if first is None: first = analysis_failure
         if first is not None: raise first
-        require(self.result['focusedTestsPassed'], 'sdk_exact23_runtime_incomplete_or_failed')
+        require(self.result['focusedTestsPassed'], 'sdk_exact25_runtime_incomplete_or_failed')
         # The real test command must not silently resolve a new revision.
         require(self.h.bounded_source_bytes(self.graph/'OwnerImages/Package.resolved',1024**2) == lock,
             'strict39_lock_changed_after_runtime')

@@ -58,10 +58,10 @@ def xml():
 
 
 class SDKOutputCases(unittest.TestCase):
-    def test_complete_real_protocol_shape_requires23_not15_case_invocations(self):
+    def test_complete_real_protocol_shape_requires25_not17_case_invocations(self):
         observed=result(fixture())
-        self.assertTrue(observed['allPassed']);self.assertEqual(observed['functionCount'],15)
-        self.assertEqual(observed['observedInvocations'],23)
+        self.assertTrue(observed['allPassed']);self.assertEqual(observed['functionCount'],17)
+        self.assertEqual(observed['observedInvocations'],25)
         self.assertTrue(api.xunit_result(xml(),PLAN['sdkFunctions'])['allPassed'])
 
     def test_actual_swift633_enum_shorthand_completes_all_nine_argument_invocations(self):
@@ -73,7 +73,7 @@ class SDKOutputCases(unittest.TestCase):
         for row,action in zip(starts,actions):
             row['payload']['messages']=[dict(symbol='default',text='Test case passing 1 argument action → .'+action+' to swiftCallbackRefusalsStayContainedAndPreserveOriginalOwner(_:) started.')]
         observed=result(records)
-        self.assertTrue(observed['allPassed']);self.assertEqual(observed['observedInvocations'],23)
+        self.assertTrue(observed['allPassed']);self.assertEqual(observed['observedInvocations'],25)
         self.assertEqual(next(r['arguments']for r in observed['rows']if r['expectedCases']==9),sorted(actions))
 
     def test_optional_dot_does_not_admit_unknown_empty_double_dot_or_duplicate_action(self):
@@ -94,7 +94,7 @@ class SDKOutputCases(unittest.TestCase):
         records[-1]['payload']['messages']=[dict(symbol='fail',text='Test run with 15 tests in 3 suites failed after 4.838 seconds with 1 issue.')]
         with self.assertRaisesRegex(RuntimeError,'sdk_run_end_without_pass'):result(records)
 
-    def test_xunit15_rows_cannot_substitute_for_one_missing_parameter_case(self):
+    def test_xunit17_rows_cannot_substitute_for_one_missing_parameter_case(self):
         records=fixture();at=next(i for i,r in enumerate(records)if r['payload']['kind']=='testCaseStarted')
         del records[at:at+2]
         self.assertFalse(result(records)['allPassed'])
@@ -117,6 +117,16 @@ class SDKOutputCases(unittest.TestCase):
             records=fixture();row=next(r for r in records if r['kind']=='test'and r['payload']['kind']=='function')
             row['payload']['sourceLocation'][field]=value
             with self.assertRaisesRegex(RuntimeError,'sdk_test_source_provenance'):result(records)
+
+    def test_split_attribute_location_cannot_be_replaced_by_following_function_line(self):
+        # The actual prior Swift6.3 ABI selected @Test rather than the next
+        # func line. New source has the same split declaration, shifted428/429.
+        expected=next(r for r in PLAN['sdkFunctions']if r['parameterized'])
+        self.assertEqual(expected['line'],428)
+        records=fixture()
+        row=next(r for r in records if r['kind']=='test'and r['payload'].get('isParameterized'))
+        row['payload']['sourceLocation']['line']=429
+        with self.assertRaisesRegex(RuntimeError,'sdk_test_source_provenance'):result(records)
 
     def test_issue_skip_or_cancellation_cannot_pass_even_with_final_pass_message(self):
         for kind in ['issueRecorded','testSkipped','testCancelled','testCaseCancelled']:
@@ -149,8 +159,8 @@ class SDKOutputCases(unittest.TestCase):
             self.assertFalse(api.xunit_result(failed,PLAN['sdkFunctions'])['allPassed'])
 
     def test_source_population_is_closed_and_no_function_or_argument_can_disappear(self):
-        self.assertEqual(len(PLAN['sdkFunctions']),15);self.assertEqual(len(PLAN['sdkSuites']),3)
-        self.assertEqual(sum(r['actualCases']for r in PLAN['sdkFunctions']),23)
+        self.assertEqual(len(PLAN['sdkFunctions']),17);self.assertEqual(len(PLAN['sdkSuites']),3)
+        self.assertEqual(sum(r['actualCases']for r in PLAN['sdkFunctions']),25)
         self.assertEqual(set(PLAN['sdkParameterArguments']),{'path','closed','optimize','add','preservingAdd','checkpoint','reclaim','close','generation'})
         self.assertTrue(PLAN['fullSDKRegressionGateStillRequired'])
         self.assertEqual(PLAN['jobs'],2);self.assertEqual(PLAN['workFloorBytes'],12*1024**3)
