@@ -1,7 +1,7 @@
 {
   "schema": "lattice-owned-catalog-sdk-plan/1",
-  "graphSealSHA256": "8999643e1c80197e41c114dc16acb6011bb596b9a624f43db2c7afb0ae7015c3",
-  "requiredSHA256": "35e6b267ec44921efc3d3aba27fc1a4dacb7cfb62c62dcdfb71122ffa3ed0280",
+  "graphSealSHA256": "234b164c1ae5fcc5fadfe3d0d554ec6583e96043620c30b76bfe7408a454904b",
+  "requiredSHA256": "32b78f391a6bcd1af2ea748541371501494532bf3f1dde814a97035de85e59ca",
   "ownerLockSHA256": "1e3527e1de2783bdc3dca11ce108f3bfbfd079648f9e5a670f4822caa379d58b",
   "mirrorSHA256": "a76adb121f43bfaf2fd9e6eef2d45d1c7620f886c3eaed1ef0b3f4905ca1e349",
   "manifestBindings": [
@@ -243,8 +243,8 @@
   "nativeControllerSelected": false,
   "correctedCoreSourceSealSHA256": "0d39283e1fcaa718c86bb4f7d87c40c3cea2ac5d677c11c083d287003c11d924",
   "correctedCoreFollowingSHA256": "89a748d3c732612bfed05641f853b9d40c7598359548f241e62c8306015fd0fd",
-  "correctedGraphFollowingSHA256": "ff6b5b987c9f9188474874944d5019e6e9fe9358cc660d438fe32db08d8f37ec",
-  "correctedGraphPredecessorSHA256": "e8ff9f5a9f9115c371d3de0a23128607784438fad61e7a7e5d5aabd13300cab2",
+  "correctedGraphFollowingSHA256": "3e1efd96d6c1b34249bfe90bedc4c1045a9a7df99c83fd4ea0af9bf5971539c9",
+  "correctedGraphPredecessorSHA256": "8999643e1c80197e41c114dc16acb6011bb596b9a624f43db2c7afb0ae7015c3",
   "nativeQualificationPending": true,
   "swiftActorTestCorrectionSealSHA256": "4915b5c0620700c8371364cb024e5d845f31645e86e50c3b30dbeead2757b496",
   "genericCustomShadowExclusionNotClaimed": true,
@@ -266,9 +266,53 @@
   "actualCoherentNativeRequiredSHA256": "2061481193617d151f6e9d247f696bc5336fdf3710586e8a2aae37475091b9e7",
   "actualCoherentNativeBoundInputSealSHA256": "125b7622c52f3c5a48d642c0fa4cc24be2cbda5b4a249f37cbc19d3f5c8c9211",
   "requiredSourceCount": 184,
-  "allCoreBodiesExactCurrentNative": true,
+  "allCoreBodiesExactCurrentNative": false,
   "manualFirstActual23PassPreserved": true,
   "manualOriginalCIProvenanceFailurePreserved": true,
   "manualAttributeBindingCorrectionSealSHA256": "ca7e7548991a93ad10e742b397ff7dfd6f529473180a4185486b3afd18a8c03c",
-  "automaticSDKRuntimeQualified": false
+  "automaticSDKRuntimeQualified": false,
+  "currentNativeCoreBodyDelta": [
+    "Core/Sources/LatticeSwiftCppBridge/include/lattice.hpp"
+  ],
+  "Native274PreHelperHeaderOnly": true,
+  "creatorAccessFollowing": {
+    "predecessorSourceGraph": {
+      "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/preparation/ordinary-owned-catalog-sdk-hosted-qualification-graph-20261015-005/SOURCE-GRAPH-SEAL.json",
+      "bytes": 499361,
+      "sha256": "8999643e1c80197e41c114dc16acb6011bb596b9a624f43db2c7afb0ae7015c3"
+    },
+    "source": {
+      "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/preparation/ordinary-automatic-read-maintenance-bridge-creator-access-source-20261015-001/SOURCE.patch",
+      "bytes": 1805,
+      "sha256": "3e1efd96d6c1b34249bfe90bedc4c1045a9a7df99c83fd4ea0af9bf5971539c9"
+    },
+    "sourceSeal": {
+      "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/preparation/ordinary-automatic-read-maintenance-bridge-creator-access-source-20261015-001/SEAL.json",
+      "bytes": 2265,
+      "sha256": "ecf982c80654d0a092aa48b1707d4c534a6535b3ea02151edca6940fab8ffc9a"
+    },
+    "wholeTUCompileSeal": {
+      "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/preparation/ordinary-automatic-read-maintenance-bridge-creator-access-qualification-20261015-001/SEAL.json",
+      "bytes": 8361,
+      "sha256": "580e28d5fdaea0a6c06fb3ba0e9375151932ea7c37535f3b3a3be2852a69e359"
+    },
+    "rootReview": {
+      "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/preparation/ordinary-automatic-read-maintenance-bridge-creator-access-root-review-20261015-001/RESULT.json",
+      "bytes": 3365,
+      "sha256": "7eba30a8e576bb4a80f93feb110e07bacb534b9b2a6d62cad1b4891696f1c8b4"
+    },
+    "independentReview": {
+      "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/preparation/ordinary-automatic-read-maintenance-bridge-creator-access-independent-review-20261015-001/RESULT.json",
+      "bytes": 3037,
+      "sha256": "55d17e1f3414daa5b676799b9d600e67b0a9bbf8e1b6e5f96eba72bcf587f3c9"
+    },
+    "onlyChangedGraphPath": "Core/Sources/LatticeSwiftCppBridge/include/lattice.hpp",
+    "CoreClassDefinitionsUnchanged": true,
+    "BridgeFieldLayoutUnchanged": true,
+    "Native274QualifiedPreHelperHeaderOnly": true,
+    "freshSDKConsumersRequired": true,
+    "originalFailedSDK25Run": 38796593679,
+    "originalFailedSupervisorDebtPreserved": true,
+    "SDK25Qualified": false
+  }
 }
