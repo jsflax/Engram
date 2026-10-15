@@ -1,10 +1,10 @@
-name: Changed read-only and contention native661 qualification
+name: Current exact23 owned-catalog SDK qualification
 
 on:
   workflow_dispatch:
     inputs:
       coherent_source_qualification:
-        description: 'Fresh coherent compilation and exact661 native population; no legacy profile or lifecycle grant'
+        description: 'Fresh matched SDK/Bridge compilation and exact23 catalog case invocations; finite SDK scope'
         type: boolean
         required: true
         default: false
@@ -29,7 +29,7 @@ on:
         type: string
         required: true
       source_graph_seal_sha256:
-        description: 'Exact test-only changed source graph; no old-artifact retarget'
+        description: 'Exact corrected source graph; no old-artifact retarget'
         type: string
         required: true
       required_sources_sha256:
@@ -49,7 +49,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        qualification_kind: [native-core]
+        qualification_kind: [sdk-catalog]
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       ENGRAM_WORKFLOW_SHA: ${{ github.workflow_sha }}
@@ -83,8 +83,8 @@ jobs:
           [[ "$INPUT_PAYLOAD_SHA" =~ ^[0-9a-f]{64}$ ]]
           [[ "$INPUT_PAYLOAD_BYTES" =~ ^[1-9][0-9]{0,9}$ ]]
           test "$INPUT_PAYLOAD_BYTES" -le 2147483648
-          test "$INPUT_GRAPH_SHA" = 8cf953d98ab8f399608bb6ad7f65c9275e48201b2259042a07327f5bc528160e
-          test "$INPUT_REQUIRED_SHA" = 0579524463f4d5495388e077ec8c65c5b7001907c3f69dde340f1c7a3ca23146
+          test "$INPUT_GRAPH_SHA" = f83ff0be5a590afddd48a4a4d2a7ac32af56440176d1691f3ba49eae8065ab92
+          test "$INPUT_REQUIRED_SHA" = c0723214ec77591511948da4b9c8403014c1cd07953b17a2ebc778c843b65f5d
           umask 077
           if test ! -e "$HOME/localdev" && test ! -L "$HOME/localdev"; then
             mkdir -m 0711 "$HOME/localdev"
@@ -125,7 +125,7 @@ jobs:
             --root "$COHERENT_NAMESPACE/inputs" --github-env "$GITHUB_ENV" > "$COHERENT_NAMESPACE/bootstrap/inputs.log" 2>&1
           printf 'COHERENT_PYTHON=%s\n' "$COHERENT_PYTHON" >> "$GITHUB_ENV"
 
-      - name: Run one fresh bounded compiler and selected native population
+      - name: Build matched SDK/Bridge and run exact catalog callback population
         timeout-minutes: 215
         shell: bash
         run: |
@@ -142,10 +142,10 @@ jobs:
           printf 'developer=%s\ncanonicalDeveloper=%s\nsdk=%s\ncanonicalSDK=%s\ncmake=%s\ncanonicalCMake=%s\n' \
             "$COHERENT_DEVELOPER_RAW" "$COHERENT_DEVELOPER" "$COHERENT_SDK_RAW" "$COHERENT_SDK" \
             "$COHERENT_CMAKE_RAW" "$COHERENT_CMAKE" > "$COHERENT_NAMESPACE/bootstrap/tool-paths.log"
-          # This native compiler and its receipt use an original fresh root.
+          # This SDK test compiler and its receipt use an original fresh root.
           # No profile, account, provider, source stamp or product image is run.
           set +e
-          "$COHERENT_PYTHON" -I -S -B "$COHERENT_NAMESPACE/harness/scripts/qualify_hosted_coherent_core_sdk.py" \
+          "$COHERENT_PYTHON" -I -S -B "$COHERENT_NAMESPACE/harness/scripts/qualify_hosted_owned_catalog_sdk.py" \
             --ephemeral-ci-vm --kind "$QUALIFICATION_KIND" --graph "$OWNER_BUILD_INPUT_ROOT/graph" \
             --graph-pins "$OWNER_BUILD_INPUT_ROOT/SOURCE-GRAPH-SEAL.json" --graph-pins-sha256 "$OWNER_BUILD_GRAPHSEALSHA256" \
             --required-sources "$OWNER_BUILD_INPUT_ROOT/OWNER-DEPENDENCIES.json" --required-sources-sha256 "$OWNER_BUILD_REQUIREDSHA256" \

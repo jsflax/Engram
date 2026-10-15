@@ -1,0 +1,233 @@
+{
+  "schema": "lattice-owned-catalog-sdk-plan/1",
+  "graphSealSHA256": "f83ff0be5a590afddd48a4a4d2a7ac32af56440176d1691f3ba49eae8065ab92",
+  "requiredSHA256": "c0723214ec77591511948da4b9c8403014c1cd07953b17a2ebc778c843b65f5d",
+  "ownerLockSHA256": "1e3527e1de2783bdc3dca11ce108f3bfbfd079648f9e5a670f4822caa379d58b",
+  "mirrorSHA256": "a76adb121f43bfaf2fd9e6eef2d45d1c7620f886c3eaed1ef0b3f4905ca1e349",
+  "manifestBindings": [
+    {
+      "path": "SDK/Package.swift",
+      "replacements": [
+        [
+          ".package(url: \"https://github.com/jsflax/LatticeCore.git\", from: \"2.0.4\"),",
+          ".package(name: \"LatticeCore\", path: \"../Core\"),"
+        ]
+      ],
+      "boundBody": {
+        "bytes": 11257,
+        "sha256": "7be070ea2ec5769387482051e92e97fd73503465a33038b1249f0c1998527561"
+      }
+    },
+    {
+      "path": "Engram/Package.swift",
+      "replacements": [
+        [
+          ".package(url: \"https://github.com/modelcontextprotocol/swift-sdk.git\", from: \"0.12.0\"),",
+          ".package(url: \"https://github.com/jsflax/swift-sdk.git\", exact: \"0.13.0\"),"
+        ],
+        [
+          ".package(url: \"https://github.com/jsflax/lattice.git\", from: \"1.6.2\"),",
+          ".package(name: \"lattice\", path: \"../SDK\"),"
+        ]
+      ],
+      "boundBody": {
+        "bytes": 11039,
+        "sha256": "6887ee6e05f61e6a3b3076e5b91b4298fe28798e19406f8f2768cc0aa5314ed2"
+      }
+    }
+  ],
+  "originalOverallBudgetSeconds": 12600,
+  "commandBudgets": {
+    "configure": 180,
+    "build": 5400,
+    "inventory": 30,
+    "focus": 1800,
+    "binPath": 30
+  },
+  "workFloorBytes": 12884901888,
+  "jobs": 2,
+  "compilerRuntimeAccepted": false,
+  "legacySemanticProfileRequiredForCompilation": false,
+  "sdkFunctions": [
+    {
+      "name": "completeCatalogExceedsOldRowAndByteCapsWithWorkerLocalState",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
+      "line": 92,
+      "parameterized": false,
+      "actualCases": 1,
+      "suite": "OwnedCatalogCaptureTests"
+    },
+    {
+      "name": "emptyTableStillCarriesPhysicalSchema",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
+      "line": 124,
+      "parameterized": false,
+      "actualCases": 1,
+      "suite": "OwnedCatalogCaptureTests"
+    },
+    {
+      "name": "consumerFailureJoinsBeforeSameOwnerWriteAndRecapture",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
+      "line": 143,
+      "parameterized": false,
+      "actualCases": 1,
+      "suite": "OwnedCatalogCaptureTests"
+    },
+    {
+      "name": "cancellationJoinsBlockedConsumerAndOriginalNativeEnding",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
+      "line": 161,
+      "parameterized": false,
+      "actualCases": 1,
+      "suite": "OwnedCatalogCaptureTests"
+    },
+    {
+      "name": "expiredWorkerWaitDoesNotPublishOrReturnBeforeJoin",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
+      "line": 195,
+      "parameterized": false,
+      "actualCases": 1,
+      "suite": "OwnedCatalogCaptureTests"
+    },
+    {
+      "name": "typedFactoryRejectsEmptyRepeatedAndMissingTables",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
+      "line": 229,
+      "parameterized": false,
+      "actualCases": 1,
+      "suite": "OwnedCatalogCaptureTests"
+    },
+    {
+      "name": "swiftCallbackRefusalsStayContainedAndPreserveOriginalOwner",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
+      "line": 248,
+      "parameterized": true,
+      "actualCases": 9,
+      "suite": "OwnedCatalogCaptureTests"
+    },
+    {
+      "name": "callbackRegistrationRefusalConsumesTransferredContextExactlyOnce",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
+      "line": 323,
+      "parameterized": false,
+      "actualCases": 1,
+      "suite": "OwnedCatalogCaptureTests"
+    },
+    {
+      "name": "nilContextCallbackClearsNeverInvokeNonnullDestroyEvenWhenRefused",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
+      "line": 355,
+      "parameterized": false,
+      "actualCases": 1,
+      "suite": "OwnedCatalogCaptureTests"
+    },
+    {
+      "name": "deadlineIsOneBoundedOriginalMonotonicEnd",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
+      "line": 421,
+      "parameterized": false,
+      "actualCases": 1,
+      "suite": "OwnedCatalogDataTests"
+    },
+    {
+      "name": "metadataRejectsDuplicateEscapedKeysInvalidSurrogatesAndNonStringScalars",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
+      "line": 430,
+      "parameterized": false,
+      "actualCases": 1,
+      "suite": "OwnedCatalogDataTests"
+    },
+    {
+      "name": "decoderRejectsIncompleteCellsAndUnorderedIdentity",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
+      "line": 440,
+      "parameterized": false,
+      "actualCases": 1,
+      "suite": "OwnedCatalogDataTests"
+    },
+    {
+      "name": "observedCleanupFailureSurvivesCancellationAfterOperationAndSignalReturn",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogExecutorPrecedenceTests.swift",
+      "line": 31,
+      "parameterized": false,
+      "actualCases": 1,
+      "suite": "OwnedCatalogExecutorPrecedenceTests"
+    },
+    {
+      "name": "defaultPredicatePreservesExistingProjectionCancellationPrecedence",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogExecutorPrecedenceTests.swift",
+      "line": 59,
+      "parameterized": false,
+      "actualCases": 1,
+      "suite": "OwnedCatalogExecutorPrecedenceTests"
+    },
+    {
+      "name": "preservedCleanupFailureAlsoSurvivesAlreadyExpiredPublication",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogExecutorPrecedenceTests.swift",
+      "line": 83,
+      "parameterized": false,
+      "actualCases": 1,
+      "suite": "OwnedCatalogExecutorPrecedenceTests"
+    }
+  ],
+  "sdkSuites": [
+    {
+      "name": "OwnedCatalogCaptureTests",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
+      "line": 74
+    },
+    {
+      "name": "OwnedCatalogDataTests",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
+      "line": 419
+    },
+    {
+      "name": "OwnedCatalogExecutorPrecedenceTests",
+      "source": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogExecutorPrecedenceTests.swift",
+      "line": 29
+    }
+  ],
+  "sdkParameterArguments": [
+    "path",
+    "closed",
+    "optimize",
+    "add",
+    "preservingAdd",
+    "checkpoint",
+    "reclaim",
+    "close",
+    "generation"
+  ],
+  "sdkEventStreamVersion": "6.3",
+  "sdkEncodedEventVersion": "6.3.0",
+  "sdkResultParserSHA256": "1801e11bf0de0cdfa16102f405b6165dd52cb0597e42a27d4f98221c8b89b600",
+  "sdkActualInvocationCount": 23,
+  "sdkFunctionCount": 15,
+  "sdkSourceEnrollment": [
+    {
+      "original": "SDK/Tests/LatticeTests/OwnedCatalogCaptureTests.swift",
+      "enrolled": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogCaptureTests.swift",
+      "bytes": 22812,
+      "sha256": "dcc804ed46086123f0a9067d5433f9faf74f35778d751f266f4292dcd64b1377",
+      "mode": 292,
+      "byteExact": true
+    },
+    {
+      "original": "SDK/Tests/LatticeTests/OwnedCatalogExecutorPrecedenceTests.swift",
+      "enrolled": "OwnerImages/Tests/CurrentCatalogQualificationTests/OwnedCatalogExecutorPrecedenceTests.swift",
+      "bytes": 4932,
+      "sha256": "56cf41937b9262e819492c7f3c40ea7e3446b8d929bf85eeaf2e9f2b59ce1fe5",
+      "mode": 292,
+      "byteExact": true
+    }
+  ],
+  "fullSDKRegressionGateStillRequired": true,
+  "sdkGraphBaseCompositeSHA256": "97056763b1090c4c00a0dde6ef53df25740817fd6aef5c0186a80ffa58913c04",
+  "core004TestOnlyFollowingSHA256": "987f2d3d5713543e684ffd8246df859030df42cce3791cc35cf2bc2216171096",
+  "nativeControllerSelected": false,
+  "correctedCoreSourceSealSHA256": "cf85149ef9b29145af1e7de04485da62a8c1e0d3bbe8fccd75ecfbb9c913908a",
+  "correctedCoreFollowingSHA256": "7a2a498a436c01b13a89e74ad1a4a4da604292bae175f40cbe6eae04053d56dd",
+  "correctedGraphFollowingSHA256": "b5f5d0efdd3f62ef7d5382297bcad34a49a35fb1cd938dd92b91f380fc5f864e",
+  "correctedGraphPredecessorSHA256": "e4b5a4ae777bfa62d6e3b2bf2322859d23f3d35a429629ef62aebc19ef3e5202",
+  "nativeQualificationPending": true
+}
