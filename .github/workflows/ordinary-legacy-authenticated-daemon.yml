@@ -112,8 +112,8 @@ jobs:
             --metadata "$OWNER_DAEMON_NAMESPACE/bootstrap/source-artifact.json" --archive "$OWNER_DAEMON_NAMESPACE/bootstrap/source-inputs.zip" \
             --archive-sha256 "$INPUT_ARCHIVE_SHA" --payload-sha256 "$INPUT_PAYLOAD_SHA" --payload-bytes "$INPUT_PAYLOAD_BYTES" \
             --artifact-id "$INPUT_ARTIFACT" --producer-run-id "$INPUT_PRODUCER" \
-            --graph-seal-sha256 ed3223d11c80f93ef4127d9a6e051fc294aa75727ac38f333d7f2e15f1fe73ef \
-            --required-sha256 0a81f4b347bc0eb8d1b4bd12a124e99fe43272bfd98624a5759e6a6c675e55a1 \
+            --graph-seal-sha256 e656f78cb89f6fdb1cb6200327c6d52ca8f4a2f3c8a7944f2ab9d01277b6033e \
+            --required-sha256 9864f83bbf0630679e8ac7da67260dc8885546e89376eee272661a5026d9e288 \
             --root "$OWNER_DAEMON_NAMESPACE/source-inputs" --github-env "$GITHUB_ENV" \
             > "$OWNER_DAEMON_NAMESPACE/bootstrap/source-validation.log" 2>&1
           printf 'OWNER_PYTHON=%s\n' "$OWNER_PYTHON" >> "$GITHUB_ENV"
@@ -175,7 +175,7 @@ jobs:
             --root "$OWNER_DAEMON_NAMESPACE/provider-images" --openssl "$OWNER_OPENSSL" --github-env "$GITHUB_ENV" \
             > "$OWNER_DAEMON_NAMESPACE/bootstrap/provider-input-validation.log" 2>&1
           printf 'OWNER_CMAKE=%s\nOWNER_DEVELOPER=%s\nOWNER_SDK=%s\nOWNER_DAEMON_GRAPH_SHA=%s\n' \
-            "$OWNER_CMAKE" "$OWNER_DEVELOPER" "$OWNER_SDK" 'ed3223d11c80f93ef4127d9a6e051fc294aa75727ac38f333d7f2e15f1fe73ef' >> "$GITHUB_ENV"
+            "$OWNER_CMAKE" "$OWNER_DEVELOPER" "$OWNER_SDK" 'e656f78cb89f6fdb1cb6200327c6d52ca8f4a2f3c8a7944f2ab9d01277b6033e' >> "$GITHUB_ENV"
 
       - name: Execute the genuine finite disposable-account daemon guardian
         timeout-minutes: 215
