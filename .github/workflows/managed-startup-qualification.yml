@@ -112,8 +112,8 @@ jobs:
             --metadata "$OWNER_MCP_NAMESPACE/bootstrap/source-artifact.json" --archive "$OWNER_MCP_NAMESPACE/bootstrap/source-inputs.zip" \
             --archive-sha256 "$INPUT_ARCHIVE_SHA" --payload-sha256 "$INPUT_PAYLOAD_SHA" --payload-bytes "$INPUT_PAYLOAD_BYTES" \
             --artifact-id "$INPUT_ARTIFACT" --producer-run-id "$INPUT_PRODUCER" \
-            --graph-seal-sha256 109faf319755cc957592d3fd5104b9c18bb8fbf1e6f31477cc86b525a039443a \
-            --required-sha256 5e3c885cf928c796b53b3f9f00f5ad388d6d39f3e7f5f2dac39172391ac18b7d \
+            --graph-seal-sha256 4eedc08eb9f202fde117bda3ccff82b1ff4a110701bd688318194e646d482239 \
+            --required-sha256 8e5910358c54ff03e4e383a3b1332fbece6456413d1f1048761f787edeab5279 \
             --root "$OWNER_MCP_NAMESPACE/source-inputs" --github-env "$GITHUB_ENV" \
             > "$OWNER_MCP_NAMESPACE/bootstrap/source-validation.log" 2>&1
           printf 'OWNER_PYTHON=%s\n' "$OWNER_PYTHON" >> "$GITHUB_ENV"
@@ -165,7 +165,7 @@ jobs:
           "$OWNER_PYTHON" -I -S -B "$OWNER_BUILD_INPUT_ROOT/graph/FixtureScripts/observe_hosted_legacy_mcp.py" \
             --ephemeral-ci-vm --graph "$OWNER_BUILD_INPUT_ROOT/graph" \
             --graph-pins "$OWNER_BUILD_INPUT_ROOT/SOURCE-GRAPH-SEAL.json" \
-            --graph-pins-sha256 109faf319755cc957592d3fd5104b9c18bb8fbf1e6f31477cc86b525a039443a \
+            --graph-pins-sha256 4eedc08eb9f202fde117bda3ccff82b1ff4a110701bd688318194e646d482239 \
             --harness-commit "$GITHUB_SHA" --root "$OWNER_MCP_ROOT" \
             --legacy-build "$MCP_LEGACY_BUILD" --legacy-build-sha256 "$MCP_LEGACY_BUILD_SHA" \
             --legacy-producer-exit "$MCP_LEGACY_PRODUCER_EXIT" \
