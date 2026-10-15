@@ -1,0 +1,275 @@
+name: Owner input artifact transport bootstrap
+run-name: Owner input ZIP transport ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: 'Exact private transport draft release ID in jsflax/Engram'
+        required: true
+        type: string
+      asset_id:
+        description: 'Exact lattice-owner-build-inputs-v1.zip release asset ID'
+        required: true
+        type: string
+      payload_sha256:
+        description: 'SHA-256 of the original ZIP, not the Actions artifact envelope'
+        required: true
+        type: string
+      payload_bytes:
+        description: 'Exact original ZIP byte count, at most 2147483648'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  transport:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Own an exclusive localdev namespace
+        shell: bash
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_ACTIONS" = true
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = macOS
+          test "$GITHUB_REPOSITORY" = jsflax/Engram
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$WORKFLOW_SHA" = "$GITHUB_SHA"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$GITHUB_REF" == refs/heads/* && "$GITHUB_REF" != refs/heads/main ]]
+          if [ ! -e "$HOME/localdev" ] && [ ! -L "$HOME/localdev" ]; then
+            mkdir -m 0700 "$HOME/localdev"
+          fi
+          test -d "$HOME/localdev" && test ! -L "$HOME/localdev"
+          ROOT="$HOME/localdev/lattice-owner-input-bootstrap-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 0700 "$ROOT"
+          mkdir -m 0700 "$ROOT/tmp" "$ROOT/payload" "$ROOT/receipt"
+          printf 'BOOTSTRAP_ROOT=%s\nTMPDIR=%s/tmp\n' "$ROOT" "$ROOT" >> "$GITHUB_ENV"
+
+      - name: Read and verify exactly one pinned draft asset
+        id: transport
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RELEASE_ID: ${{ inputs.release_id }}
+          INPUT_ASSET_ID: ${{ inputs.asset_id }}
+          INPUT_PAYLOAD_SHA: ${{ inputs.payload_sha256 }}
+          INPUT_PAYLOAD_BYTES: ${{ inputs.payload_bytes }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set +e
+          python3 -I -S -B - <<'PY' > "$BOOTSTRAP_ROOT/receipt/transport.stdout" 2> "$BOOTSTRAP_ROOT/receipt/transport.stderr"
+          import hashlib, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
+          from pathlib import Path
+
+          root = Path(os.environ['BOOTSTRAP_ROOT'])
+          receipt = root / 'receipt'
+          limit = 2 * 1024 * 1024 * 1024
+          result = {
+              'schema': 'lattice.owner-input-transport/1', 'success': False,
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'workflowSHA': os.environ['WORKFLOW_SHA'], 'sourceSHA': os.environ['GITHUB_SHA'],
+              'ref': os.environ['GITHUB_REF'], 'runID': os.environ['GITHUB_RUN_ID'],
+              'runAttempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'payloadName': 'lattice-owner-build-inputs-v1.zip',
+              'downloadAttempted': False, 'downloadBytes': 0,
+              'sourceQualified': False, 'imageQualified': False, 'profileQualified': False,
+          }
+          started = time.monotonic()
+
+          def require(value, message):
+              if not value:
+                  raise ValueError(message)
+
+          def positive(name, maximum):
+              raw = os.environ[name]
+              require(re.fullmatch(r'[1-9][0-9]{0,18}', raw), name + ' is not canonical positive decimal')
+              value = int(raw)
+              require(value <= maximum, name + ' exceeds its bound')
+              return value
+
+          def remaining():
+              value = 1200 - (time.monotonic() - started)
+              require(value > 0, 'transport absolute deadline expired')
+              return min(30, value)
+
+          class Redirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  require(urllib.parse.urlsplit(newurl).scheme == 'https', 'non-HTTPS asset redirect')
+                  redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+                  if redirected is not None and urllib.parse.urlsplit(newurl).netloc != 'api.github.com':
+                      redirected.remove_header('Authorization')
+                  return redirected
+
+          opener = urllib.request.build_opener(Redirect())
+
+          def request(path, accept):
+              remaining()
+              return opener.open(urllib.request.Request(
+                  'https://api.github.com/repos/jsflax/Engram/' + path,
+                  headers={'Accept': accept, 'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'X-GitHub-Api-Version': '2022-11-28',
+                           'User-Agent': 'lattice-owner-input-bootstrap'}, method='GET'), timeout=remaining())
+
+          def metadata(path, name):
+              with request(path, 'application/vnd.github+json') as response:
+                  require(response.status == 200, 'metadata response is not HTTP 200')
+                  data = response.read(1024 * 1024 + 1)
+                  require(len(data) <= 1024 * 1024, 'metadata exceeds 1 MiB')
+              remaining()
+              (receipt / name).write_bytes(data)
+              value = json.loads(data)
+              require(isinstance(value, dict), 'metadata is not an object')
+              return value
+
+          def publication_failure(error):
+              result['success'] = False
+              failure = {'type': type(error).__name__, 'success': False,
+                         'elapsedSeconds': time.monotonic() - started,
+                         'firstTransportReceiptRewritten': False}
+              if isinstance(error, ValueError):
+                  failure['message'] = str(error)
+              if isinstance(error, OSError):
+                  failure['errno'] = error.errno
+              with (receipt / 'VERIFICATION-PUBLICATION-ERROR.json').open('x') as output:
+                  output.write(json.dumps(failure, indent=2) + '\n')
+
+          try:
+              release_id = positive('INPUT_RELEASE_ID', 2**63 - 1)
+              asset_id = positive('INPUT_ASSET_ID', 2**63 - 1)
+              expected_bytes = positive('INPUT_PAYLOAD_BYTES', limit)
+              expected_sha = os.environ['INPUT_PAYLOAD_SHA']
+              require(re.fullmatch(r'[0-9a-f]{64}', expected_sha), 'payload SHA is not lowercase SHA-256')
+              require(os.environ['GH_TOKEN'] != '', 'contents-read token is absent')
+              result.update(releaseID=release_id, assetID=asset_id,
+                            payloadSHA256=expected_sha, payloadBytes=expected_bytes)
+              release = metadata('releases/' + str(release_id), 'release.json')
+              require(type(release.get('id')) is int and release['id'] == release_id, 'release ID mismatch')
+              require(release.get('draft') is True and release.get('published_at') is None,
+                      'transport release is not an unpublished draft')
+              assets = release.get('assets')
+              require(isinstance(assets, list), 'release assets absent')
+              matches = [a for a in assets if isinstance(a, dict) and a.get('id') == asset_id]
+              require(len(matches) == 1, 'exact asset is not unique in pinned draft')
+              asset = metadata('releases/assets/' + str(asset_id), 'asset.json')
+              for value in (matches[0], asset):
+                  require(type(value.get('id')) is int and value['id'] == asset_id, 'asset ID mismatch')
+                  require(value.get('name') == result['payloadName'], 'asset basename mismatch')
+                  require(value.get('state') == 'uploaded', 'asset is not uploaded')
+                  require(type(value.get('size')) is int and value['size'] == expected_bytes,
+                          'asset byte count mismatch')
+                  require(value.get('digest') in (None, 'sha256:' + expected_sha), 'asset digest mismatch')
+              result['downloadAttempted'] = True
+              hasher = hashlib.sha256()
+              partial = root / 'payload' / 'download.partial'
+              with request('releases/assets/' + str(asset_id), 'application/octet-stream') as response:
+                  require(response.status == 200, 'asset response is not HTTP 200')
+                  length = response.headers.get('Content-Length')
+                  if length is not None:
+                      require(length.isdecimal() and int(length) == expected_bytes, 'download Content-Length mismatch')
+                  with partial.open('xb') as output:
+                      while True:
+                          remaining()
+                          chunk = response.read(min(1024 * 1024, expected_bytes - result['downloadBytes'] + 1))
+                          if not chunk:
+                              break
+                          result['downloadBytes'] += len(chunk)
+                          require(result['downloadBytes'] <= expected_bytes, 'download exceeds pinned byte count')
+                          output.write(chunk)
+                          hasher.update(chunk)
+                      output.flush()
+                      os.fsync(output.fileno())
+                  remaining()
+              remaining()
+              require(result['downloadBytes'] == expected_bytes, 'download is truncated')
+              result['observedPayloadSHA256'] = hasher.hexdigest()
+              require(result['observedPayloadSHA256'] == expected_sha, 'download SHA-256 mismatch')
+              remaining()
+              partial.rename(root / 'payload' / result['payloadName'])
+              remaining()
+              result['success'] = True
+          except BaseException as error:
+              result['firstError'] = {'type': type(error).__name__}
+              if isinstance(error, ValueError):
+                  result['firstError']['message'] = str(error)
+              if isinstance(error, urllib.error.HTTPError):
+                  result['firstError']['httpStatus'] = error.code
+              if isinstance(error, OSError):
+                  result['firstError']['errno'] = error.errno
+          finally:
+              result['elapsedSeconds'] = time.monotonic() - started
+              try:
+                  if result['success']:
+                      remaining()
+                  with (receipt / 'TRANSPORT.json').open('x') as output:
+                      output.write(json.dumps(result, indent=2) + '\n')
+                  if result['success']:
+                      remaining()
+              except BaseException as error:
+                  publication_failure(error)
+          if result['success']:
+              try:
+                  remaining()
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                      remaining()
+                      output.write('verified=true\n')
+                  remaining()
+              except BaseException as error:
+                  publication_failure(error)
+          print(json.dumps({'success': result['success'], 'downloadBytes': result['downloadBytes']}))
+          sys.exit(0 if result['success'] else 1)
+          PY
+          status=$?
+          printf '%s\n' "$status" > "$BOOTSTRAP_ROOT/receipt/transport.exit"
+          cat "$BOOTSTRAP_ROOT/receipt/transport.stdout" "$BOOTSTRAP_ROOT/receipt/transport.stderr"
+          exit "$status"
+
+      - name: Upload the exact raw ZIP as the sole input payload
+        id: payload
+        if: ${{ success() && steps.transport.outputs.verified == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lattice-owner-build-inputs-v1
+          path: ${{ env.BOOTSTRAP_ROOT }}/payload/lattice-owner-build-inputs-v1.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+          overwrite: false
+
+      - name: Retain actual artifact publication outcome
+        if: ${{ always() && env.BOOTSTRAP_ROOT != '' }}
+        shell: bash
+        env:
+          PAYLOAD_OUTCOME: ${{ steps.payload.outcome }}
+          ARTIFACT_ID: ${{ steps.payload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.payload.outputs.artifact-digest }}
+        run: |
+          python3 -I -S -B - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path(os.environ['BOOTSTRAP_ROOT'], 'receipt', 'PUBLICATION.json').write_text(json.dumps({
+              'outcome': os.environ['PAYLOAD_OUTCOME'],
+              'artifactID': os.environ['ARTIFACT_ID'] or None,
+              'outerArtifactSHA256': os.environ['ARTIFACT_DIGEST'] or None,
+              'artifactName': 'lattice-owner-build-inputs-v1',
+              'sourceQualified': False, 'imageQualified': False, 'profileQualified': False,
+          }, indent=2) + '\n')
+          PY
+
+      - name: Upload only the owned bounded transport receipts
+        if: ${{ always() && env.BOOTSTRAP_ROOT != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lattice-owner-input-transport-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.BOOTSTRAP_ROOT }}/receipt/
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false
