@@ -1,48 +1,36 @@
-name: Prepare genuine receiving owner images
+name: Qualify one genuine legacy memory MCP role
 
 on:
   workflow_dispatch:
     inputs:
-      image_kind:
-        description: 'Build both image sets or only the selected changed producer'
-        type: choice
+      mcp_role_gate:
+        description: 'Run one real memory MCP handshake, live FD point sample and EOF lifetime on a fresh hosted Mac'
+        type: boolean
         required: true
-        default: both
-        options:
-          - both
-          - provider-history
-          - fixed-legacy4
+        default: false
       image_build_gate:
-        description: 'Build actual provider and fixed legacy images; no account, profile or runtime qualification'
+        description: 'Must remain false; image builds use their separate unchanged workflow'
         type: boolean
         required: true
         default: false
       input_artifact_id:
-        description: 'Actual lattice-owner-build-inputs-v1 artifact ID'
+        description: 'Actual graph031 lattice-owner-build-inputs-v1 artifact ID'
         type: string
         required: true
       input_producer_run_id:
-        description: 'Actual producing run ID of that exact artifact'
+        description: 'Actual producer run of that source-input artifact'
         type: string
         required: true
       input_archive_sha256:
-        description: 'Independent exact SHA256 of the downloaded input ZIP'
+        description: 'Independent SHA256 of the downloaded source-input outer ZIP'
         type: string
         required: true
       input_payload_sha256:
-        description: 'Independent exact SHA256 of the single raw lattice-owner-build-inputs-v1.zip payload'
+        description: 'Independent SHA256 of its single raw lattice-owner-build-inputs-v1.zip payload'
         type: string
         required: true
       input_payload_bytes:
-        description: 'Exact raw payload bytes, positive and at most 2147483648'
-        type: string
-        required: true
-      source_graph_seal_sha256:
-        description: 'Exact composed current source graph seal SHA256'
-        type: string
-        required: true
-      required_sources_sha256:
-        description: 'Exact corresponding required-source seal SHA256'
+        description: 'Exact source-input raw payload bytes, positive and <=2147483648'
         type: string
         required: true
 
@@ -51,39 +39,37 @@ permissions:
   actions: read
 
 jobs:
-  actual-image-build:
-    if: inputs.image_build_gate == true
+  one-real-memory-mcp-role:
+    if: inputs.mcp_role_gate == true || inputs.image_build_gate == true
     runs-on: macos-26
-    timeout-minutes: 235
-    strategy:
-      fail-fast: false
-      matrix:
-        image_kind: ${{ fromJSON(inputs.image_kind == 'provider-history' && '["provider-history"]' || inputs.image_kind == 'fixed-legacy4' && '["fixed-legacy4"]' || '["provider-history","fixed-legacy4"]') }}
+    timeout-minutes: 35
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       ENGRAM_WORKFLOW_SHA: ${{ github.workflow_sha }}
-      IMAGE_KIND: ${{ matrix.image_kind }}
+      MCP_ROLE_GATE: ${{ inputs.mcp_role_gate }}
+      IMAGE_BUILD_GATE: ${{ inputs.image_build_gate }}
       INPUT_ARTIFACT: ${{ inputs.input_artifact_id }}
       INPUT_PRODUCER: ${{ inputs.input_producer_run_id }}
       INPUT_ARCHIVE_SHA: ${{ inputs.input_archive_sha256 }}
       INPUT_PAYLOAD_SHA: ${{ inputs.input_payload_sha256 }}
       INPUT_PAYLOAD_BYTES: ${{ inputs.input_payload_bytes }}
-      INPUT_GRAPH_SHA: ${{ inputs.source_graph_seal_sha256 }}
-      INPUT_REQUIRED_SHA: ${{ inputs.required_sources_sha256 }}
     steps:
-      - name: Retain actual first source and bounded build inputs under localdev
+      - name: Bind actual first dispatch and graph031 source inputs under localdev
         timeout-minutes: 15
         shell: bash
         env:
           BOOTSTRAP_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          test "$MCP_ROLE_GATE" = true
+          test "$IMAGE_BUILD_GATE" = false
           test "$GITHUB_ACTIONS" = true
           test "$RUNNER_ENVIRONMENT" = github-hosted
           test "$GITHUB_EVENT_NAME" = workflow_dispatch
           test "$GITHUB_RUN_ATTEMPT" = 1
           test "$GITHUB_REPOSITORY" = jsflax/Engram
           test "$RUNNER_OS" = macOS
+          test "$(uname -m)" = arm64
           test "$ENGRAM_WORKFLOW_SHA" = "$GITHUB_SHA"
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$INPUT_ARTIFACT" =~ ^[1-9][0-9]{0,19}$ ]]
@@ -92,113 +78,132 @@ jobs:
           [[ "$INPUT_PAYLOAD_SHA" =~ ^[0-9a-f]{64}$ ]]
           [[ "$INPUT_PAYLOAD_BYTES" =~ ^[1-9][0-9]{0,9}$ ]]
           test "$INPUT_PAYLOAD_BYTES" -le 2147483648
-          [[ "$INPUT_GRAPH_SHA" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$INPUT_REQUIRED_SHA" =~ ^[0-9a-f]{64}$ ]]
           umask 077
           if test ! -e "$HOME/localdev" && test ! -L "$HOME/localdev"; then
             mkdir -m 0711 "$HOME/localdev"
           fi
           test -d "$HOME/localdev"
           test ! -L "$HOME/localdev"
-          OWNER_BUILD_NAMESPACE="$HOME/localdev/owner-image-build-${GITHUB_RUN_ID}-${IMAGE_KIND}"
-          test ! -e "$OWNER_BUILD_NAMESPACE"
-          test ! -L "$OWNER_BUILD_NAMESPACE"
-          mkdir -m 0700 "$OWNER_BUILD_NAMESPACE"
-          mkdir "$OWNER_BUILD_NAMESPACE/bootstrap" "$OWNER_BUILD_NAMESPACE/tmp"
-          printf 'OWNER_BUILD_NAMESPACE=%s\n' "$OWNER_BUILD_NAMESPACE" >> "$GITHUB_ENV"
-          export TMPDIR="$OWNER_BUILD_NAMESPACE/tmp"
+          OWNER_MCP_NAMESPACE="$HOME/localdev/legacy-mcp-qualification-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$OWNER_MCP_NAMESPACE"
+          test ! -L "$OWNER_MCP_NAMESPACE"
+          mkdir -m 0700 "$OWNER_MCP_NAMESPACE"
+          printf 'OWNER_MCP_NAMESPACE=%s\n' "$OWNER_MCP_NAMESPACE" >> "$GITHUB_ENV"
+          mkdir "$OWNER_MCP_NAMESPACE/bootstrap" "$OWNER_MCP_NAMESPACE/tmp"
+          export TMPDIR="$OWNER_MCP_NAMESPACE/tmp"
           export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
-          git -c core.hooksPath=/dev/null init "$OWNER_BUILD_NAMESPACE/harness" > "$OWNER_BUILD_NAMESPACE/bootstrap/checkout.log" 2>&1
+          git -c core.hooksPath=/dev/null init "$OWNER_MCP_NAMESPACE/harness" > "$OWNER_MCP_NAMESPACE/bootstrap/checkout.log" 2>&1
           export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
           export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$BOOTSTRAP_TOKEN" | base64 | tr -d '\n')"
-          git -c core.hooksPath=/dev/null -C "$OWNER_BUILD_NAMESPACE/harness" fetch --no-tags --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA" >> "$OWNER_BUILD_NAMESPACE/bootstrap/checkout.log" 2>&1
+          git -c core.hooksPath=/dev/null -C "$OWNER_MCP_NAMESPACE/harness" fetch --no-tags --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA" >> "$OWNER_MCP_NAMESPACE/bootstrap/checkout.log" 2>&1
           unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
-          git -c core.hooksPath=/dev/null -C "$OWNER_BUILD_NAMESPACE/harness" checkout --detach "$GITHUB_SHA" >> "$OWNER_BUILD_NAMESPACE/bootstrap/checkout.log" 2>&1
-          test "$(git -C "$OWNER_BUILD_NAMESPACE/harness" rev-parse HEAD)" = "$GITHUB_SHA"
-          test -z "$(git -C "$OWNER_BUILD_NAMESPACE/harness" status --porcelain)"
+          git -c core.hooksPath=/dev/null -C "$OWNER_MCP_NAMESPACE/harness" checkout --detach "$GITHUB_SHA" >> "$OWNER_MCP_NAMESPACE/bootstrap/checkout.log" 2>&1
+          test "$(git -C "$OWNER_MCP_NAMESPACE/harness" rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git -C "$OWNER_MCP_NAMESPACE/harness" status --porcelain)"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 60 --max-filesize 1048576 \
             -H "Authorization: Bearer $BOOTSTRAP_TOKEN" -H 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${INPUT_ARTIFACT}" -o "$OWNER_BUILD_NAMESPACE/bootstrap/artifact.json"
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${INPUT_ARTIFACT}" -o "$OWNER_MCP_NAMESPACE/bootstrap/source-artifact.json"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 180 --max-filesize 2147483648 \
             -H "Authorization: Bearer $BOOTSTRAP_TOKEN" -H 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${INPUT_ARTIFACT}/zip" -o "$OWNER_BUILD_NAMESPACE/bootstrap/build-inputs.zip"
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${INPUT_ARTIFACT}/zip" -o "$OWNER_MCP_NAMESPACE/bootstrap/source-inputs.zip"
           unset BOOTSTRAP_TOKEN
           OWNER_PYTHON="$(command -v python3)"
-          "$OWNER_PYTHON" -I -S -B "$OWNER_BUILD_NAMESPACE/harness/scripts/prepare_hosted_owner_build_inputs.py" prepare \
-            --metadata "$OWNER_BUILD_NAMESPACE/bootstrap/artifact.json" --archive "$OWNER_BUILD_NAMESPACE/bootstrap/build-inputs.zip" \
+          "$OWNER_PYTHON" -I -S -B "$OWNER_MCP_NAMESPACE/harness/scripts/prepare_hosted_owner_build_inputs.py" prepare \
+            --metadata "$OWNER_MCP_NAMESPACE/bootstrap/source-artifact.json" --archive "$OWNER_MCP_NAMESPACE/bootstrap/source-inputs.zip" \
             --archive-sha256 "$INPUT_ARCHIVE_SHA" --payload-sha256 "$INPUT_PAYLOAD_SHA" --payload-bytes "$INPUT_PAYLOAD_BYTES" \
             --artifact-id "$INPUT_ARTIFACT" --producer-run-id "$INPUT_PRODUCER" \
-            --graph-seal-sha256 "$INPUT_GRAPH_SHA" --required-sha256 "$INPUT_REQUIRED_SHA" \
-            --root "$OWNER_BUILD_NAMESPACE/inputs" --github-env "$GITHUB_ENV" \
-            > "$OWNER_BUILD_NAMESPACE/bootstrap/input-validation.log" 2>&1
+            --graph-seal-sha256 1eca0211201922691698b888b878d022f3905eac7808703f6f33bee8d208849b \
+            --required-sha256 fd09cda7642e5b9e5bcc938c6bc89f5ed23ad58c338ad602eb431b942a391976 \
+            --root "$OWNER_MCP_NAMESPACE/source-inputs" --github-env "$GITHUB_ENV" \
+            > "$OWNER_MCP_NAMESPACE/bootstrap/source-validation.log" 2>&1
           printf 'OWNER_PYTHON=%s\n' "$OWNER_PYTHON" >> "$GITHUB_ENV"
 
-      - name: Run one actual retained image build and preserve its genuine output DATA
-        timeout-minutes: 215
+      - name: Retain and bind the exact actual graph030 signed app artifact as DATA
+        timeout-minutes: 5
+        shell: bash
+        env:
+          ARTIFACT_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export TMPDIR="$OWNER_MCP_NAMESPACE/tmp"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 60 --max-filesize 1048576 \
+            -H "Authorization: Bearer $ARTIFACT_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/jsflax/Engram/actions/artifacts/11954047235" -o "$OWNER_MCP_NAMESPACE/bootstrap/legacy-artifact.json"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 180 --max-filesize 167333147 \
+            -H "Authorization: Bearer $ARTIFACT_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/jsflax/Engram/actions/artifacts/11954047235/zip" -o "$OWNER_MCP_NAMESPACE/bootstrap/legacy-images.zip"
+          unset ARTIFACT_TOKEN
+          "$OWNER_PYTHON" -I -S -B "$OWNER_MCP_NAMESPACE/harness/scripts/prepare_hosted_legacy_mcp_inputs.py" \
+            --graph "$OWNER_BUILD_INPUT_ROOT/graph" --graph-pins "$OWNER_BUILD_INPUT_ROOT/SOURCE-GRAPH-SEAL.json" \
+            --required "$OWNER_BUILD_INPUT_ROOT/OWNER-DEPENDENCIES.json" \
+            --metadata "$OWNER_MCP_NAMESPACE/bootstrap/legacy-artifact.json" --archive "$OWNER_MCP_NAMESPACE/bootstrap/legacy-images.zip" \
+            --root "$OWNER_MCP_NAMESPACE/legacy-images" --github-env "$GITHUB_ENV" \
+            > "$OWNER_MCP_NAMESPACE/bootstrap/legacy-input-validation.log" 2>&1
+
+      - name: Run one genuine memory MCP role with original command custody and 600 second budget
+        timeout-minutes: 12
         shell: bash
         run: |
           set -euo pipefail
           ulimit -c 0
-          TAG="$("$OWNER_PYTHON" -I -S -B -c 'import uuid; print(uuid.uuid4().hex[:8])')"
-          if test "$IMAGE_KIND" = provider-history; then
-            OWNER_IMAGE_BUILD_ROOT="$HOME/localdev/lqb${TAG}"
-          else
-            OWNER_IMAGE_BUILD_ROOT="$HOME/localdev/lql${TAG}"
-          fi
-          printf 'OWNER_IMAGE_BUILD_ROOT=%s\n' "$OWNER_IMAGE_BUILD_ROOT" >> "$GITHUB_ENV"
+          export TMPDIR="$OWNER_MCP_NAMESPACE/tmp"
+          OWNER_MCP_ROOT="$HOME/localdev/lqm$("$OWNER_PYTHON" -I -S -B -c 'import uuid;print(uuid.uuid4().hex[:8])')"
+          test ! -e "$OWNER_MCP_ROOT"
+          test ! -L "$OWNER_MCP_ROOT"
+          printf 'OWNER_MCP_ROOT=%s\n' "$OWNER_MCP_ROOT" >> "$GITHUB_ENV"
+          OWNER_CMAKE_RAW="$(command -v cmake)"
           OWNER_DEVELOPER_RAW="$(xcode-select -p)"
           OWNER_SDK_RAW="$(xcrun --sdk macosx --show-sdk-path)"
-          OWNER_DEVELOPER="$("$OWNER_PYTHON" -I -S -B -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$OWNER_DEVELOPER_RAW")"
-          OWNER_SDK="$("$OWNER_PYTHON" -I -S -B -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$OWNER_SDK_RAW")"
-          "$OWNER_PYTHON" -I -S -B -c '
-          import json, sys
-          values = sys.argv[2:]
-          if len(values) != 4 or any(not value or len(value.encode("utf-8")) > 4096 for value in values):
-              raise RuntimeError("toolchain_directory_observation_bound")
-          record = dict(rawDeveloperDir=values[0], developerDir=values[1], rawSDKRoot=values[2], sdkRoot=values[3])
-          body = (json.dumps(record, sort_keys=True) + "\n").encode("ascii")
-          if len(body) > 131072:
-              raise RuntimeError("toolchain_directory_log_bound")
-          with open(sys.argv[1], "xb") as output:
-              if output.write(body) != len(body):
-                  raise RuntimeError("toolchain_directory_log_short_write")
-          ' "$OWNER_BUILD_NAMESPACE/bootstrap/toolchain-inputs.log" "$OWNER_DEVELOPER_RAW" "$OWNER_DEVELOPER" "$OWNER_SDK_RAW" "$OWNER_SDK"
-          common=(--ephemeral-ci-vm --graph "$OWNER_BUILD_INPUT_ROOT/graph" \
-            --graph-pins "$OWNER_BUILD_INPUT_ROOT/SOURCE-GRAPH-SEAL.json" --graph-pins-sha256 "$OWNER_BUILD_GRAPHSEALSHA256" \
-            --root "$OWNER_IMAGE_BUILD_ROOT" --harness-commit "$GITHUB_SHA" \
-            --evidence-output "$OWNER_BUILD_NAMESPACE/evidence" \
-            --dependency-cache "$OWNER_BUILD_INPUT_ROOT/dependency-cache" --dependency-cache-pins "$OWNER_BUILD_INPUT_ROOT/CACHE-SEAL.json" \
-            --dependency-cache-pins-sha256 "$OWNER_BUILD_CACHESEALSHA256" \
-            --dependency-mirrors "$OWNER_BUILD_INPUT_ROOT/dependency-config/mirrors.json" \
-            --developer-dir "$OWNER_DEVELOPER" --sdk-root "$OWNER_SDK")
+          OWNER_CMAKE="$("$OWNER_PYTHON" -I -S -B -c 'from pathlib import Path;import sys;print(Path(sys.argv[1]).resolve(strict=True))' "$OWNER_CMAKE_RAW")"
+          OWNER_DEVELOPER="$("$OWNER_PYTHON" -I -S -B -c 'from pathlib import Path;import sys;print(Path(sys.argv[1]).resolve(strict=True))' "$OWNER_DEVELOPER_RAW")"
+          OWNER_SDK="$("$OWNER_PYTHON" -I -S -B -c 'from pathlib import Path;import sys;print(Path(sys.argv[1]).resolve(strict=True))' "$OWNER_SDK_RAW")"
+          printf 'cmake_raw=%s\ncmake_resolved=%s\ndeveloper_raw=%s\ndeveloper_resolved=%s\nsdk_raw=%s\nsdk_resolved=%s\n' \
+            "$OWNER_CMAKE_RAW" "$OWNER_CMAKE" "$OWNER_DEVELOPER_RAW" "$OWNER_DEVELOPER" "$OWNER_SDK_RAW" "$OWNER_SDK" \
+            > "$OWNER_MCP_NAMESPACE/bootstrap/toolchain-inputs.log"
+          test "$(wc -c < "$OWNER_MCP_NAMESPACE/bootstrap/toolchain-inputs.log")" -le 32768
           set +e
-          if test "$IMAGE_KIND" = provider-history; then
-            "$OWNER_PYTHON" -I -S -B "$OWNER_BUILD_INPUT_ROOT/graph/FixtureScripts/build_hosted_provider.py" \
-              "${common[@]}" --resolution-mode initial --history > "$OWNER_BUILD_NAMESPACE/bootstrap/build.log" 2>&1
-          else
-            "$OWNER_PYTHON" -I -S -B "$OWNER_BUILD_INPUT_ROOT/graph/FixtureScripts/build_hosted_fixed_legacy.py" \
-              "${common[@]}" --legacy-bundle "$OWNER_BUILD_INPUT_ROOT/legacy.bundle" \
-              --legacy-bundle-sha256 "$OWNER_BUILD_LEGACYBUNDLESHA256" > "$OWNER_BUILD_NAMESPACE/bootstrap/build.log" 2>&1
-          fi
-          BUILD_EXIT=$?
+          "$OWNER_PYTHON" -I -S -B "$OWNER_BUILD_INPUT_ROOT/graph/FixtureScripts/observe_hosted_legacy_mcp.py" \
+            --ephemeral-ci-vm --graph "$OWNER_BUILD_INPUT_ROOT/graph" \
+            --graph-pins "$OWNER_BUILD_INPUT_ROOT/SOURCE-GRAPH-SEAL.json" \
+            --graph-pins-sha256 1eca0211201922691698b888b878d022f3905eac7808703f6f33bee8d208849b \
+            --harness-commit "$GITHUB_SHA" --root "$OWNER_MCP_ROOT" \
+            --legacy-build "$MCP_LEGACY_BUILD" --legacy-build-sha256 "$MCP_LEGACY_BUILD_SHA" \
+            --legacy-producer-exit "$MCP_LEGACY_PRODUCER_EXIT" \
+            --legacy-build-only "$MCP_LEGACY_BUILD_ONLY" --legacy-build-only-sha256 "$MCP_LEGACY_BUILD_ONLY_SHA" \
+            --legacy-app-archive "$MCP_LEGACY_APP_ARCHIVE" --legacy-app-archive-sha256 "$MCP_LEGACY_APP_ARCHIVE_SHA" \
+            --legacy-app-archive-bytes "$MCP_LEGACY_APP_ARCHIVE_BYTES" \
+            --cmake "$OWNER_CMAKE" --developer-dir "$OWNER_DEVELOPER" --sdk-root "$OWNER_SDK" \
+            > "$OWNER_MCP_NAMESPACE/bootstrap/mcp-role.log" 2>&1
+          MCP_EXIT=$?
           set -e
-          printf '%s\n' "$BUILD_EXIT" > "$OWNER_BUILD_NAMESPACE/producer-exit.status"
-          test "$BUILD_EXIT" -eq 0
-          "$OWNER_PYTHON" -I -S -B "$OWNER_BUILD_NAMESPACE/harness/scripts/prepare_hosted_owner_build_inputs.py" stage \
-            --kind "$IMAGE_KIND" --build-root "$OWNER_IMAGE_BUILD_ROOT" --evidence-root "$OWNER_BUILD_NAMESPACE/evidence" \
-            --producer-exit-status "$OWNER_BUILD_NAMESPACE/producer-exit.status" \
-            --output "$OWNER_BUILD_NAMESPACE/artifact-products" \
-            --graph-seal-sha256 "$OWNER_BUILD_GRAPHSEALSHA256" > "$OWNER_BUILD_NAMESPACE/bootstrap/stage.log" 2>&1
+          printf '%s\n' "$MCP_EXIT" > "$OWNER_MCP_NAMESPACE/mcp-producer-exit.status"
+          test "$MCP_EXIT" -eq 0
 
-      - name: Preserve actual first build receipts and unqualified image artifacts
-        if: always() && env.OWNER_BUILD_NAMESPACE != ''
+      - name: Preserve actual first role outcome and bounded command evidence
+        if: always() && env.OWNER_MCP_NAMESPACE != ''
         uses: actions/upload-artifact@v4
         with:
-          name: owner-image-build-${{ matrix.image_kind }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: legacy-memory-mcp-inputs-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ env.OWNER_BUILD_NAMESPACE }}/bootstrap/*.log
-            ${{ env.OWNER_BUILD_NAMESPACE }}/producer-exit.status
-            ${{ env.OWNER_BUILD_NAMESPACE }}/evidence/**
-            ${{ env.OWNER_BUILD_NAMESPACE }}/artifact-products/**
+            ${{ env.OWNER_MCP_NAMESPACE }}/bootstrap/*.log
+            ${{ env.OWNER_MCP_NAMESPACE }}/bootstrap/*.json
+            ${{ env.OWNER_MCP_NAMESPACE }}/mcp-producer-exit.status
+            ${{ env.OWNER_MCP_NAMESPACE }}/legacy-images/IMAGE-INPUT.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Preserve actual retained role receipts only after its root was named
+        if: always() && env.OWNER_MCP_ROOT != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-memory-mcp-role-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.OWNER_MCP_ROOT }}/ROLE.json
+            ${{ env.OWNER_MCP_ROOT }}/EXTRACTED-LEGACY-APP.json
+            ${{ env.OWNER_MCP_ROOT }}/legacy-mcp-fd.json
+            ${{ env.OWNER_MCP_ROOT }}/receipts/**
+            ${{ env.OWNER_MCP_ROOT }}/negative-receipts/**
+            ${{ env.OWNER_MCP_ROOT }}/private/**
+            ${{ env.OWNER_MCP_ROOT }}/negative-private/**
           if-no-files-found: warn
           retention-days: 14
