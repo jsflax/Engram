@@ -1,0 +1,237 @@
+name: Qualify actual authenticated legacy daemon
+
+on:
+  workflow_dispatch:
+    inputs:
+      daemon_role_gate:
+        description: 'Run the real original authenticated daemon population in one genuinely disposable account on a fresh hosted Mac'
+        type: boolean
+        required: true
+        default: false
+      image_build_gate:
+        description: 'Must remain false; image builds use their separate unchanged workflow'
+        type: boolean
+        required: true
+        default: false
+      input_artifact_id:
+        description: 'Actual selected daemon-source lattice-owner-build-inputs-v1 artifact ID'
+        type: string
+        required: true
+      input_producer_run_id:
+        description: 'Actual producer run of that source-input artifact'
+        type: string
+        required: true
+      input_archive_sha256:
+        description: 'Independent SHA256 of the downloaded source-input outer ZIP'
+        type: string
+        required: true
+      input_payload_sha256:
+        description: 'Independent SHA256 of its single raw lattice-owner-build-inputs-v1.zip payload'
+        type: string
+        required: true
+      input_payload_bytes:
+        description: 'Exact source-input raw payload bytes, positive and <=2147483648'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  one-real-authenticated-daemon-role:
+    if: inputs.daemon_role_gate == true || inputs.image_build_gate == true
+    runs-on: macos-26
+    timeout-minutes: 235
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      ENGRAM_WORKFLOW_SHA: ${{ github.workflow_sha }}
+      DAEMON_ROLE_GATE: ${{ inputs.daemon_role_gate }}
+      IMAGE_BUILD_GATE: ${{ inputs.image_build_gate }}
+      INPUT_ARTIFACT: ${{ inputs.input_artifact_id }}
+      INPUT_PRODUCER: ${{ inputs.input_producer_run_id }}
+      INPUT_ARCHIVE_SHA: ${{ inputs.input_archive_sha256 }}
+      INPUT_PAYLOAD_SHA: ${{ inputs.input_payload_sha256 }}
+      INPUT_PAYLOAD_BYTES: ${{ inputs.input_payload_bytes }}
+    steps:
+      - name: Bind actual first dispatch and exact daemon source inputs under localdev
+        timeout-minutes: 15
+        shell: bash
+        env:
+          BOOTSTRAP_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$DAEMON_ROLE_GATE" = true
+          test "$IMAGE_BUILD_GATE" = false
+          test "$GITHUB_ACTIONS" = true
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_REPOSITORY" = jsflax/Engram
+          test "$RUNNER_OS" = macOS
+          test "$(uname -m)" = arm64
+          test "$ENGRAM_WORKFLOW_SHA" = "$GITHUB_SHA"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$INPUT_ARTIFACT" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$INPUT_PRODUCER" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$INPUT_ARCHIVE_SHA" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$INPUT_PAYLOAD_SHA" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$INPUT_PAYLOAD_BYTES" =~ ^[1-9][0-9]{0,9}$ ]]
+          test "$INPUT_PAYLOAD_BYTES" -le 2147483648
+          umask 077
+          if test ! -e "$HOME/localdev" && test ! -L "$HOME/localdev"; then
+            mkdir -m 0711 "$HOME/localdev"
+          fi
+          test -d "$HOME/localdev"
+          test ! -L "$HOME/localdev"
+          OWNER_DAEMON_NAMESPACE="$HOME/localdev/legacy-daemon-qualification-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$OWNER_DAEMON_NAMESPACE"
+          test ! -L "$OWNER_DAEMON_NAMESPACE"
+          mkdir -m 0700 "$OWNER_DAEMON_NAMESPACE"
+          printf 'OWNER_DAEMON_NAMESPACE=%s\n' "$OWNER_DAEMON_NAMESPACE" >> "$GITHUB_ENV"
+          mkdir "$OWNER_DAEMON_NAMESPACE/bootstrap" "$OWNER_DAEMON_NAMESPACE/tmp"
+          export TMPDIR="$OWNER_DAEMON_NAMESPACE/tmp"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+          git -c core.hooksPath=/dev/null init "$OWNER_DAEMON_NAMESPACE/harness" > "$OWNER_DAEMON_NAMESPACE/bootstrap/checkout.log" 2>&1
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$BOOTSTRAP_TOKEN" | base64 | tr -d '\n')"
+          git -c core.hooksPath=/dev/null -C "$OWNER_DAEMON_NAMESPACE/harness" fetch --no-tags --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA" >> "$OWNER_DAEMON_NAMESPACE/bootstrap/checkout.log" 2>&1
+          unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+          git -c core.hooksPath=/dev/null -C "$OWNER_DAEMON_NAMESPACE/harness" checkout --detach "$GITHUB_SHA" >> "$OWNER_DAEMON_NAMESPACE/bootstrap/checkout.log" 2>&1
+          test "$(git -C "$OWNER_DAEMON_NAMESPACE/harness" rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git -C "$OWNER_DAEMON_NAMESPACE/harness" status --porcelain)"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 60 --max-filesize 1048576 \
+            -H "Authorization: Bearer $BOOTSTRAP_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${INPUT_ARTIFACT}" -o "$OWNER_DAEMON_NAMESPACE/bootstrap/source-artifact.json"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 180 --max-filesize 2147483648 \
+            -H "Authorization: Bearer $BOOTSTRAP_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${INPUT_ARTIFACT}/zip" -o "$OWNER_DAEMON_NAMESPACE/bootstrap/source-inputs.zip"
+          unset BOOTSTRAP_TOKEN
+          OWNER_PYTHON="$(command -v python3)"
+          "$OWNER_PYTHON" -I -S -B "$OWNER_DAEMON_NAMESPACE/harness/scripts/prepare_hosted_owner_build_inputs.py" prepare \
+            --metadata "$OWNER_DAEMON_NAMESPACE/bootstrap/source-artifact.json" --archive "$OWNER_DAEMON_NAMESPACE/bootstrap/source-inputs.zip" \
+            --archive-sha256 "$INPUT_ARCHIVE_SHA" --payload-sha256 "$INPUT_PAYLOAD_SHA" --payload-bytes "$INPUT_PAYLOAD_BYTES" \
+            --artifact-id "$INPUT_ARTIFACT" --producer-run-id "$INPUT_PRODUCER" \
+            --graph-seal-sha256 ed3223d11c80f93ef4127d9a6e051fc294aa75727ac38f333d7f2e15f1fe73ef \
+            --required-sha256 0a81f4b347bc0eb8d1b4bd12a124e99fe43272bfd98624a5759e6a6c675e55a1 \
+            --root "$OWNER_DAEMON_NAMESPACE/source-inputs" --github-env "$GITHUB_ENV" \
+            > "$OWNER_DAEMON_NAMESPACE/bootstrap/source-validation.log" 2>&1
+          printf 'OWNER_PYTHON=%s\n' "$OWNER_PYTHON" >> "$GITHUB_ENV"
+
+      - name: Retain and bind the exact actual graph030 signed app artifact as DATA
+        timeout-minutes: 5
+        shell: bash
+        env:
+          ARTIFACT_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export TMPDIR="$OWNER_DAEMON_NAMESPACE/tmp"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 60 --max-filesize 1048576 \
+            -H "Authorization: Bearer $ARTIFACT_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/jsflax/Engram/actions/artifacts/11954047235" -o "$OWNER_DAEMON_NAMESPACE/bootstrap/legacy-artifact.json"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 180 --max-filesize 167333147 \
+            -H "Authorization: Bearer $ARTIFACT_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/jsflax/Engram/actions/artifacts/11954047235/zip" -o "$OWNER_DAEMON_NAMESPACE/bootstrap/legacy-images.zip"
+          unset ARTIFACT_TOKEN
+          "$OWNER_PYTHON" -I -S -B "$OWNER_DAEMON_NAMESPACE/harness/scripts/prepare_hosted_legacy_mcp_inputs.py" \
+            --graph "$OWNER_BUILD_INPUT_ROOT/graph" --graph-pins "$OWNER_BUILD_INPUT_ROOT/SOURCE-GRAPH-SEAL.json" \
+            --required "$OWNER_BUILD_INPUT_ROOT/OWNER-DEPENDENCIES.json" \
+            --metadata "$OWNER_DAEMON_NAMESPACE/bootstrap/legacy-artifact.json" --archive "$OWNER_DAEMON_NAMESPACE/bootstrap/legacy-images.zip" \
+            --root "$OWNER_DAEMON_NAMESPACE/legacy-images" --github-env "$GITHUB_ENV" \
+            > "$OWNER_DAEMON_NAMESPACE/bootstrap/legacy-input-validation.log" 2>&1
+
+      - name: Bind original provider build DATA and create genuine loopback TLS inputs
+        timeout-minutes: 8
+        shell: bash
+        env:
+          ARTIFACT_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export TMPDIR="$OWNER_DAEMON_NAMESPACE/tmp"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 60 --max-filesize 1048576 \
+            -H "Authorization: Bearer $ARTIFACT_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/jsflax/Engram/actions/artifacts/11970489149" -o "$OWNER_DAEMON_NAMESPACE/bootstrap/provider-artifact.json"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 180 --max-filesize 44913234 \
+            -H "Authorization: Bearer $ARTIFACT_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/jsflax/Engram/actions/artifacts/11970489149/zip" -o "$OWNER_DAEMON_NAMESPACE/bootstrap/provider-images.zip"
+          unset ARTIFACT_TOKEN
+          OWNER_CMAKE_RAW="$(command -v cmake)"
+          OWNER_DEVELOPER_RAW="$(xcode-select -p)"
+          OWNER_SDK_RAW="$(xcrun --sdk macosx --show-sdk-path)"
+          OWNER_OPENSSL_RAW=/opt/homebrew/opt/openssl@3/bin/openssl
+          test -x "$OWNER_OPENSSL_RAW"
+          OWNER_CMAKE="$("$OWNER_PYTHON" -I -S -B -c 'from pathlib import Path;import sys;print(Path(sys.argv[1]).resolve(strict=True))' "$OWNER_CMAKE_RAW")"
+          OWNER_DEVELOPER="$("$OWNER_PYTHON" -I -S -B -c 'from pathlib import Path;import sys;print(Path(sys.argv[1]).resolve(strict=True))' "$OWNER_DEVELOPER_RAW")"
+          OWNER_SDK="$("$OWNER_PYTHON" -I -S -B -c 'from pathlib import Path;import sys;print(Path(sys.argv[1]).resolve(strict=True))' "$OWNER_SDK_RAW")"
+          OWNER_OPENSSL="$("$OWNER_PYTHON" -I -S -B -c 'from pathlib import Path;import sys;print(Path(sys.argv[1]).resolve(strict=True))' "$OWNER_OPENSSL_RAW")"
+          printf 'cmake_raw=%s\ncmake_resolved=%s\ndeveloper_raw=%s\ndeveloper_resolved=%s\nsdk_raw=%s\nsdk_resolved=%s\nopenssl_raw=%s\nopenssl_resolved=%s\n' \
+            "$OWNER_CMAKE_RAW" "$OWNER_CMAKE" "$OWNER_DEVELOPER_RAW" "$OWNER_DEVELOPER" "$OWNER_SDK_RAW" "$OWNER_SDK" "$OWNER_OPENSSL_RAW" "$OWNER_OPENSSL" \
+            > "$OWNER_DAEMON_NAMESPACE/bootstrap/toolchain-inputs.log"
+          test "$(wc -c < "$OWNER_DAEMON_NAMESPACE/bootstrap/toolchain-inputs.log")" -le 32768
+          "$OWNER_PYTHON" -I -S -B "$OWNER_DAEMON_NAMESPACE/harness/scripts/prepare_hosted_legacy_daemon_provider_inputs.py" \
+            --graph "$OWNER_BUILD_INPUT_ROOT/graph" --graph-pins "$OWNER_BUILD_INPUT_ROOT/SOURCE-GRAPH-SEAL.json" \
+            --required "$OWNER_BUILD_INPUT_ROOT/OWNER-DEPENDENCIES.json" \
+            --metadata "$OWNER_DAEMON_NAMESPACE/bootstrap/provider-artifact.json" --archive "$OWNER_DAEMON_NAMESPACE/bootstrap/provider-images.zip" \
+            --root "$OWNER_DAEMON_NAMESPACE/provider-images" --openssl "$OWNER_OPENSSL" --github-env "$GITHUB_ENV" \
+            > "$OWNER_DAEMON_NAMESPACE/bootstrap/provider-input-validation.log" 2>&1
+          printf 'OWNER_CMAKE=%s\nOWNER_DEVELOPER=%s\nOWNER_SDK=%s\nOWNER_DAEMON_GRAPH_SHA=%s\n' \
+            "$OWNER_CMAKE" "$OWNER_DEVELOPER" "$OWNER_SDK" 'ed3223d11c80f93ef4127d9a6e051fc294aa75727ac38f333d7f2e15f1fe73ef' >> "$GITHUB_ENV"
+
+      - name: Execute the genuine finite disposable-account daemon guardian
+        timeout-minutes: 215
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$DAEMON_ROLE_GATE" = true
+          test "$IMAGE_BUILD_GATE" = false
+          export TMPDIR="$OWNER_DAEMON_NAMESPACE/tmp"
+          # Transfer only the fresh staged inputs. Private keys remain0600;
+          # only the original executable's actual search chain is exposed.
+          sudo -n chown -R -P 0 "$OWNER_DAEMON_NAMESPACE/harness" "$OWNER_BUILD_INPUT_ROOT" \
+            "$OWNER_DAEMON_NAMESPACE/legacy-images" "$OWNER_DAEMON_NAMESPACE/provider-images"
+          sudo -n chmod 0711 "$OWNER_BUILD_INPUT_ROOT" "$OWNER_BUILD_INPUT_ROOT/graph" "$OWNER_BUILD_INPUT_ROOT/graph/Core" \
+            "$OWNER_BUILD_INPUT_ROOT/graph/FixtureScripts" "$OWNER_DAEMON_NAMESPACE/legacy-images" \
+            "$OWNER_BUILD_INPUT_ROOT/graph/Core/Tools" "$OWNER_BUILD_INPUT_ROOT/graph/Core/Tools/LatticeManagedTargetReclamationFixture" \
+            "$OWNER_BUILD_INPUT_ROOT/graph/Core/Tools/LatticeManagedTargetReclamationFixture/HostedCustody" \
+            "$OWNER_BUILD_INPUT_ROOT/graph/Core/Tools/LatticeManagedTargetReclamationFixture/HostedCustody/scripts" \
+            "$OWNER_DAEMON_NAMESPACE/provider-images" "$OWNER_DAEMON_PROVIDER_INPUT"
+          # Preserve readable first transport/TLS receipts; never transfer the
+          # actual private key or provider credentials back into upload paths.
+          OWNER_DAEMON_RUNNER_UID="$(id -u)"
+          [[ "$OWNER_DAEMON_RUNNER_UID" =~ ^[1-9][0-9]*$ ]]
+          sudo -n chown "$OWNER_DAEMON_RUNNER_UID" "$OWNER_DAEMON_NAMESPACE/provider-images/PROVIDER-INPUT.json" \
+            "$OWNER_DAEMON_NAMESPACE/provider-images/TLS-INPUT.json" "$OWNER_DAEMON_NAMESPACE/legacy-images/IMAGE-INPUT.json"
+          sudo -n chown -R -P "$OWNER_DAEMON_RUNNER_UID" "$OWNER_DAEMON_NAMESPACE/provider-images/tls-receipts" \
+            "$OWNER_DAEMON_NAMESPACE/provider-images/tls-private" "$OWNER_DAEMON_NAMESPACE/provider-images/tls-negative-receipts" \
+            "$OWNER_DAEMON_NAMESPACE/provider-images/tls-negative-private"
+          chmod 0711 "$OWNER_DAEMON_NAMESPACE"
+          /bin/bash "$OWNER_BUILD_INPUT_ROOT/graph/FixtureScripts/run_hosted_legacy_daemon.sh"
+
+      - name: Retain exact first input and TLS command evidence without private keys
+        if: always() && env.OWNER_DAEMON_NAMESPACE != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-authenticated-daemon-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.OWNER_DAEMON_NAMESPACE }}/bootstrap/*.log
+            ${{ env.OWNER_DAEMON_NAMESPACE }}/bootstrap/*.json
+            ${{ env.OWNER_DAEMON_NAMESPACE }}/daemon-guardian-exit.status
+            ${{ env.OWNER_DAEMON_NAMESPACE }}/legacy-images/IMAGE-INPUT.json
+            ${{ env.OWNER_DAEMON_NAMESPACE }}/provider-images/PROVIDER-INPUT.json
+            ${{ env.OWNER_DAEMON_NAMESPACE }}/provider-images/TLS-INPUT.json
+            ${{ env.OWNER_DAEMON_NAMESPACE }}/provider-images/tls-receipts/**
+            ${{ env.OWNER_DAEMON_NAMESPACE }}/provider-images/tls-private/**
+            ${{ env.OWNER_DAEMON_NAMESPACE }}/provider-images/tls-negative-receipts/**
+            ${{ env.OWNER_DAEMON_NAMESPACE }}/provider-images/tls-negative-private/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Retain first actual guardian public DATA only
+        if: always() && env.OWNER_DAEMON_CONTROL_ROOT != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-authenticated-daemon-role-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.OWNER_DAEMON_CONTROL_ROOT }}/public/*.json
+          if-no-files-found: warn
+          retention-days: 14
