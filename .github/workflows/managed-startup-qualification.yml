@@ -26,6 +26,10 @@ permissions:
 
 jobs:
   transport:
+    # Draft assets require push access. Grant it only to this transport job;
+    # its pinned download uses GET requests and never publishes the draft.
+    permissions:
+      contents: write
     runs-on: macos-26
     timeout-minutes: 30
     steps:
@@ -148,7 +152,7 @@ jobs:
               expected_bytes = positive('INPUT_PAYLOAD_BYTES', limit)
               expected_sha = os.environ['INPUT_PAYLOAD_SHA']
               require(re.fullmatch(r'[0-9a-f]{64}', expected_sha), 'payload SHA is not lowercase SHA-256')
-              require(os.environ['GH_TOKEN'] != '', 'contents-read token is absent')
+              require(os.environ['GH_TOKEN'] != '', 'job token is absent')
               result.update(releaseID=release_id, assetID=asset_id,
                             payloadSHA256=expected_sha, payloadBytes=expected_bytes)
               release = metadata('releases/' + str(release_id), 'release.json')
