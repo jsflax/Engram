@@ -16,6 +16,7 @@ import copy
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import stat
 import uuid
 
 from . import admission, migration as durable, publication_journal as publication
@@ -143,9 +144,9 @@ def _immutable(path, value, label):
 def _outcome(value):
     _require(type(value) is dict and set(value) == {"result", "queue_action", "pause_reason"}, "invalid_outcome")
     _require(value["result"] in {"processing", "succeeded", "no_change", "more", "failed",
-                                 "reconciliation_required", "backoff", "blocked", "deferred"}, "invalid_outcome")
+                                 "reconciliation_required", "backoff", "blocked", "deferred", "legacy_reconciled_no_new_mutation"}, "invalid_outcome")
     _require(value["queue_action"] in {"none", "delete", "pause", "keep"}, "invalid_outcome")
-    expected_action = {"processing": "none", "more": "keep", "succeeded": "delete", "no_change": "delete",
+    expected_action = {"legacy_reconciled_no_new_mutation": "keep", "processing": "none", "more": "keep", "succeeded": "delete", "no_change": "delete",
                        "deferred": "delete", "failed": "pause", "reconciliation_required": "pause",
                        "backoff": "pause", "blocked": "pause"}
     _require(value["queue_action"] == expected_action[value["result"]], "outcome_action_mismatch")
@@ -406,6 +407,29 @@ def _check_completion(paths, active, plan, intent, raw):
     _require(position[0] in {"none", "original", "target", "newer"}, "invalid_completion")
     if completion["pending"] is not None:
         position = (position[0], publication._raw(completion["pending"], old=True), completion["pending"]["identity"])
+        identity = position[2]
+        _require(stat.S_ISREG(identity["mode"]) and not identity["mode"] & 0o077
+                 and identity["uid"] == os.getuid() and identity["nlink"] == 1
+                 and identity["size"] == len(position[1]) and identity["inode"] > 0,
+                 "invalid_completion_pending_identity")
+    action = intent["action"]
+    if position[0] == "none":
+        _require(action == "none" and completion["pending"] is None, "invalid_completion_position")
+    elif position[0] == "original":
+        _require(action == "keep" and _same(completion["pending"], intent["original"]),
+                 "invalid_completion_position")
+    elif position[0] == "newer":
+        _require(action != "none" and completion["pending"] is not None, "invalid_completion_position")
+        pending = _pending(position[1], active[0]["session_id"])
+        _require(pending["request_id"] != active[0]["request_id"]
+                 and _same(pending.get("admission"), active[0]["binding"]), "invalid_completion_newer")
+    else:
+        _require(action in {"delete", "pause"}, "invalid_completion_position")
+        if action == "delete":
+            _require(completion["pending"] is None, "invalid_completion_position")
+        else:
+            _require(completion["pending"] is not None
+                     and position[1] == publication._raw(intent["target"]), "invalid_completion_position")
     _require(raw == durable.encode(_complete(paths, active, plan, intent, position)), "completion_changed")
     return completion
 

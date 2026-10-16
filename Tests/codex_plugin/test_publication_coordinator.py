@@ -280,11 +280,103 @@ class PublicationCoordinatorTests(unittest.TestCase):
         self.assertEqual(before, (self.paths.state.read_bytes(), self.paths.admission.read_bytes(), self.paths.pending.read_bytes()))
 
     def test_more_cannot_delete_pending_and_failed_cannot_drop_its_pause(self):
-        for result in ("more", "failed", "reconciliation_required"):
+        for result in ("more", "failed", "reconciliation_required", "legacy_reconciled_no_new_mutation"):
             with self.subTest(result=result), self.assertRaisesRegex(ValueError, "outcome_action_mismatch"):
                 self.start(outcome={"result": result, "queue_action": "delete", "pause_reason": None})
             self.assertFalse(self.active().exists())
             self.assertEqual(json.loads(self.paths.pending.read_bytes()), self.pending)
+
+    def test_legacy_reconciliation_keeps_original_pause_and_distinct_outcome(self):
+        self.pending.update(paused_request_id=self.request, pause_reason="batch_limit", provenance="retained")
+        self.paths.pending.write_bytes(C.durable.encode(self.pending))
+        original = self.paths.pending.read_bytes()
+        self.outcome = {"result": "legacy_reconciled_no_new_mutation", "queue_action": "keep", "pause_reason": None}
+        started = self.start()
+        acknowledged = self.ack()
+        completed = C.read_completed(self.paths, session_id=self.sid,
+            **{key: started[key] for key in ("ticket_id", "ticket_sha256")})
+        self.assertEqual(acknowledged["disposition"], "original")
+        self.assertEqual(completed["completion"]["outcome"], self.outcome)
+        self.assertEqual(self.paths.pending.read_bytes(), original)
+
+    def test_completion_proof_rejects_forged_legal_queue_positions(self):
+        for forgery in ("none", "target", "same-id-newer", "changed-original", "unadmitted-newer"):
+            with self.subTest(forgery=forgery):
+                self.setUp()
+                self.outcome = {"result": "legacy_reconciled_no_new_mutation", "queue_action": "keep", "pause_reason": None}
+                started = self.start()
+                self.interrupt(self.ack, "before_retire")
+                completion = json.loads(self.record("completion").read_bytes())
+                if forgery in ("none", "target"):
+                    completion.update(disposition=forgery, pending=None)
+                elif forgery == "same-id-newer":
+                    completion["disposition"] = "newer"
+                else:
+                    pending = json.loads(P._raw(completion["pending"], old=True))
+                    pending["provenance"] = "altered"
+                    if forgery == "unadmitted-newer":
+                        completion["disposition"] = "newer"
+                        pending["request_id"] = "another-request"
+                        pending["admission"] = {**self.binding, "activation_id": "unrelated-activation"}
+                    raw = C.durable.encode(pending)
+                    identity = {**completion["pending"]["identity"], "size": len(raw)}
+                    completion["pending"] = P._image(raw, identity)
+                self.record("completion").write_bytes(C.durable.encode(completion))
+                current = [path.read_bytes() for path in (self.paths.state, self.paths.admission, self.paths.pending)]
+                with self.assertRaisesRegex(ValueError, "invalid_completion"):
+                    C.read_completed(self.paths, session_id=self.sid,
+                        **{key: started[key] for key in ("ticket_id", "ticket_sha256")})
+                with self.assertRaisesRegex(ValueError, "invalid_completion"):
+                    self.ack()
+                self.assertTrue(self.active().exists())
+                self.assertEqual(current, [path.read_bytes() for path in (self.paths.state, self.paths.admission, self.paths.pending)])
+
+    def test_completion_proof_binds_delete_and_pause_to_their_actual_target(self):
+        for action in ("delete", "pause"):
+            with self.subTest(action=action):
+                self.setUp()
+                self.outcome = {"result": "failed" if action == "pause" else "succeeded", "queue_action": action,
+                                "pause_reason": "failed" if action == "pause" else None}
+                started = self.start()
+                self.interrupt(self.ack, "before_retire")
+                completion = json.loads(self.record("completion").read_bytes())
+                if action == "delete":
+                    completion["disposition"] = "none"
+                else:
+                    pending = json.loads(P._raw(completion["pending"], old=True))
+                    pending["pause_reason"] = "backoff"
+                    raw = C.durable.encode(pending)
+                    completion["pending"] = P._image(raw, {**completion["pending"]["identity"], "size": len(raw)})
+                self.record("completion").write_bytes(C.durable.encode(completion))
+                with self.assertRaisesRegex(ValueError, "invalid_completion_position"):
+                    C.read_completed(self.paths, session_id=self.sid,
+                        **{key: started[key] for key in ("ticket_id", "ticket_sha256")})
+
+    def test_completion_proof_does_not_accept_pending_for_processing_marker(self):
+        reference, original = self.completed_marker()
+        path = self.paths.session_directory / "records" / reference["ticket_id"] / "completion.json"
+        completion = json.loads(path.read_bytes())
+        completion.update(disposition="newer", pending=original)
+        path.write_bytes(C.durable.encode(completion))
+        with self.assertRaisesRegex(ValueError, "invalid_completion_position"):
+            C.read_completed(self.paths, session_id=self.sid, **reference)
+
+    def test_completed_newer_queue_proof_requires_safe_file_identity(self):
+        for key, value in (("mode", 0o100644), ("mode", 0o010600), ("uid", os.getuid() + 1),
+                           ("nlink", 2), ("size", 0), ("inode", 0)):
+            with self.subTest(key=key, value=value):
+                self.setUp()
+                started = self.start()
+                newer = {**self.pending, "request_id": "newer-request"}
+                self.paths.pending.write_bytes(C.durable.encode(newer))
+                self.interrupt(self.ack, "before_retire")
+                completion = json.loads(self.record("completion").read_bytes())
+                self.assertEqual(completion["disposition"], "newer")
+                completion["pending"]["identity"][key] = value
+                self.record("completion").write_bytes(C.durable.encode(completion))
+                with self.assertRaisesRegex(ValueError, "invalid_completion_pending_identity"):
+                    C.read_completed(self.paths, session_id=self.sid,
+                        **{field: started[field] for field in ("ticket_id", "ticket_sha256")})
 
     def test_unindexed_orphan_is_inert_and_never_adopted(self):
         self.interrupt(self.start, "ticket_directory_fsynced")
