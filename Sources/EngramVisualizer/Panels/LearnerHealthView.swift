@@ -82,6 +82,9 @@ struct LearnerHealthView: View {
         row("Queue", label(health.outcomes.queue.state))
         row("Provider", label(health.outcomes.providerCompletion.state))
         row("Native writes", label(health.outcomes.nativeAcknowledgement.state))
+        if let settlement = health.outcomes.recordedSettlement {
+            row("Run verification", label(settlement.state))
+        }
         row("Readback", label(health.outcomes.independentReadback.state))
         Text(health.recoveryText).foregroundStyle(.secondary)
 
@@ -99,10 +102,28 @@ struct LearnerHealthView: View {
                 Text("Backlog uses the pending snapshot; newer transcript content is not inspected.")
                 if let cursor = health.progress.cursorOffset { row("Cursor", cursor.formatted()) }
                 if let frontier = health.progress.enrollmentFrontierOffset { row("Enrollment frontier", frontier.formatted()) }
-                if let offset = health.progress.lastCompletedInterval.endOffset {
-                    row("Completed end", "\(offset.formatted()) (receipt)")
+                let interval = health.progress.lastCompletedInterval
+                if let start = interval.startOffset, let end = interval.endOffset {
+                    row("Completed interval", "\(start.formatted())–\(end.formatted())")
+                    row("Interval evidence", label(interval.evidence))
+                } else if let end = interval.endOffset {
+                    row("Completed end", "\(end.formatted()) (legacy receipt)")
                 } else {
-                    row("Completed interval", "No receipt in this window")
+                    row("Completed interval", "No qualifying receipt in this window")
+                }
+                if let counts = health.outcomes.writeAttempts,
+                   counts.attemptedWriteCalls != nil || counts.appliedWriteCalls != nil || counts.unchangedWriteCalls != nil {
+                    Text("Run receipt counts").fontWeight(.semibold)
+                    writeCounts(attempted: counts.attemptedWriteCalls, applied: counts.appliedWriteCalls,
+                                unchanged: counts.unchangedWriteCalls)
+                }
+                if let settlement = health.outcomes.recordedSettlement, let receipt = settlement.receipt {
+                    Text("Saved run receipt counts").fontWeight(.semibold)
+                    row("Task link", label(settlement.state))
+                    row("Recorded outcome", label(receipt.status))
+                    writeCounts(attempted: receipt.attemptedWriteCalls, applied: receipt.appliedWriteCalls,
+                                unchanged: receipt.unchangedWriteCalls)
+                    Text("This saved receipt is not an independent check of the stored memories.")
                 }
                 if let timestamp = health.progress.lastSuccessTimestampClaim {
                     Text("Historical success timestamp: \(timestamp)")
@@ -117,6 +138,13 @@ struct LearnerHealthView: View {
         }
     }
 
+    @ViewBuilder
+    private func writeCounts(attempted: Int?, applied: Int?, unchanged: Int?) -> some View {
+        if let attempted { row("Attempted writes", attempted.formatted()) }
+        if let applied { row("Applied writes", applied.formatted()) }
+        if let unchanged { row("Unchanged writes", unchanged.formatted()) }
+    }
+
     private func row(_ name: String, _ value: String) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Text(name).foregroundStyle(.secondary)
@@ -129,6 +157,12 @@ struct LearnerHealthView: View {
     private func label(_ code: String) -> String {
         switch code {
         case "processing_unverified", "processing_marker": "Processing recorded; activity unverified"
+        case "publication_recovery_pending": "Unfinished progress update"
+        case "session_hash_match": "Linked to this task"
+        case "recorded_in_anchored_settlement": "Recorded in linked receipt"
+        case "anchored_settlement_receipt": "Run receipt linked to this task"
+        case "unanchored": "No matching task link"
+        case "hash_mismatch": "Does not match this task"
         case "completed_in_run_receipt": "Completed (receipt)"
         case "not_completed_in_run_receipt": "Incomplete (receipt)"
         case "acknowledged_in_run_receipt": "Acknowledged (receipt)"

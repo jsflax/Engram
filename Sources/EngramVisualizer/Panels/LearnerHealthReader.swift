@@ -20,8 +20,30 @@ struct LearnerHealthSnapshot: Decodable, Sendable {
     struct Interval: Decodable, Sendable {
         let evidence: String
         let runId: String?
+        let startOffset: Int64?
         let endOffset: Int64?
         let endedAt: String?
+
+        enum CodingKeys: String, CodingKey { case evidence, runId, startOffset, endOffset, endedAt }
+
+        init(from decoder: any Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            evidence = try values.decode(String.self, forKey: .evidence)
+            runId = try values.decodeIfPresent(String.self, forKey: .runId)
+            endOffset = try values.decodeIfPresent(Int64.self, forKey: .endOffset)
+            endedAt = try values.decodeIfPresent(String.self, forKey: .endedAt)
+            if !values.contains(.startOffset) || (try? values.decodeNil(forKey: .startOffset)) == true {
+                startOffset = nil
+            } else if let offset = try? values.decode(Int64.self, forKey: .startOffset) {
+                startOffset = offset
+            } else if (try? values.decode(String.self, forKey: .startOffset)) == "not_recorded" {
+                // The existing legacy receipt projection uses this exact value.
+                startOffset = nil
+            } else {
+                throw DecodingError.dataCorruptedError(forKey: .startOffset, in: values,
+                                                       debugDescription: "Invalid interval start")
+            }
+        }
     }
     struct Progress: Decodable, Sendable {
         let backlog: Backlog
@@ -39,10 +61,37 @@ struct LearnerHealthSnapshot: Decodable, Sendable {
         }
     }
     struct Recovery: Decodable, Sendable { let action: String }
+    struct WriteCounts: Decodable, Sendable {
+        let attemptedWriteCalls: Int?
+        let appliedWriteCalls: Int?
+        let unchangedWriteCalls: Int?
+    }
+    struct NativeAcknowledgement: Decodable, Sendable {
+        let state: String
+        let attemptedWriteCalls: Int?
+        let appliedWriteCalls: Int?
+        let unchangedWriteCalls: Int?
+    }
+    struct SourceInterval: Decodable, Sendable { let startOffset: Int64; let endOffset: Int64 }
+    struct SettlementReceipt: Decodable, Sendable {
+        let status: String
+        let reason: String
+        let runId: String
+        let source: SourceInterval
+        let attemptedWriteCalls: Int
+        let appliedWriteCalls: Int
+        let unchangedWriteCalls: Int
+    }
+    struct RecordedSettlement: Decodable, Sendable {
+        let state: String
+        let receipt: SettlementReceipt?
+    }
     struct Outcomes: Decodable, Sendable {
         let queue: State
         let providerCompletion: State
-        let nativeAcknowledgement: State
+        let nativeAcknowledgement: NativeAcknowledgement
+        let writeAttempts: WriteCounts?
+        let recordedSettlement: RecordedSettlement?
         let independentReadback: State
     }
     struct Health: Decodable, Sendable {
@@ -60,6 +109,7 @@ struct LearnerHealthSnapshot: Decodable, Sendable {
             switch headline {
             case "reconciliation_required": "Held for reconciliation"
             case "identity_migration_hold": "Held for identity migration"
+            case "publication_recovery_pending": "Progress update needs recovery"
             case "processing_unverified": "Processing marker — activity unverified"
             case "failed": "Needs inspection"
             case "disabled": "Disabled"
@@ -76,6 +126,7 @@ struct LearnerHealthSnapshot: Decodable, Sendable {
             switch recovery.action {
             case "reconcile_held_run": "Reconcile the held run before resuming."
             case "review_identity_migration": "Review the identity migration hold."
+            case "recover_publication": "Recover the unfinished progress update before learning from this task again."
             case "inspect_processing_attempt": "Inspect the recorded processing attempt before retrying."
             case "wait_for_backoff_then_resume": "Wait for backoff to expire, then resume the pending request."
             case "resume_pending": "The pending request needs a supported resume."

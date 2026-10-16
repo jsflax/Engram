@@ -31,6 +31,47 @@ enum LearnerHealthReaderChecks {
         object["learner"] = learner
         let processing = try LearnerHealthSnapshot.decode(JSONSerialization.data(withJSONObject: object), sessionID: sessionID)
         require(processing.learner.health.title.contains("unverified"), "A processing marker cannot prove running")
+        model["headline"] = "publication_recovery_pending"
+        model["recovery"] = ["action": "recover_publication", "automatic_replay_authorized": false]
+        var outcomes = model["outcomes"] as! [String: Any]
+        outcomes["native_acknowledgement"] = ["state": "recorded_in_anchored_settlement",
+            "attempted_write_calls": 3, "applied_write_calls": 2, "unchanged_write_calls": 1]
+        outcomes["write_attempts"] = ["evidence": "run_receipt_only", "attempted_write_calls": 3,
+                                      "applied_write_calls": 2, "unchanged_write_calls": 1]
+        outcomes["recorded_settlement"] = ["state": "session_hash_match", "receipt": [
+            "status": "succeeded", "reason": "verified_completion", "run_id": "fixture-run",
+            "source": ["start_offset": 10, "end_offset": 20],
+            "attempted_write_calls": 3, "applied_write_calls": 2, "unchanged_write_calls": 1]]
+        model["outcomes"] = outcomes
+        var progress = model["progress"] as! [String: Any]
+        progress["last_completed_interval"] = ["evidence": "anchored_settlement_receipt", "run_id": "fixture-run",
+                                              "start_offset": 10, "end_offset": 20]
+        model["progress"] = progress
+        learner["health"] = model
+        object["learner"] = learner
+        let publication = try LearnerHealthSnapshot.decode(JSONSerialization.data(withJSONObject: object), sessionID: sessionID).learner.health
+        require(publication.title == "Progress update needs recovery", "An unfinished publication must be visible")
+        require(publication.recoveryText.contains("Recover the unfinished progress update"), "Recovery action must be explicit")
+        require(publication.progress.lastCompletedInterval.startOffset == 10, "Recorded interval start must decode")
+        require(publication.progress.lastCompletedInterval.endOffset == 20, "Recorded interval end must decode")
+        require(publication.outcomes.recordedSettlement?.receipt?.appliedWriteCalls == 2, "Applied writes remain distinct")
+        require(publication.outcomes.recordedSettlement?.receipt?.unchangedWriteCalls == 1, "Unchanged writes remain distinct")
+        require(publication.outcomes.writeAttempts?.attemptedWriteCalls == 3, "Run attempts remain separate from settlement")
+        require(publication.outcomes.nativeAcknowledgement.attemptedWriteCalls == 3, "Recorded native counts must decode")
+        require(publication.outcomes.independentReadback.state == "not_performed", "Settlement is not independent readback")
+        progress["last_completed_interval"] = ["evidence": "receipt_only", "start_offset": "not_recorded", "end_offset": 20]
+        model["progress"] = progress
+        learner["health"] = model
+        object["learner"] = learner
+        let legacy = try LearnerHealthSnapshot.decode(JSONSerialization.data(withJSONObject: object), sessionID: sessionID)
+        require(legacy.learner.health.progress.lastCompletedInterval.startOffset == nil, "Legacy unknown start remains unknown")
+        progress["last_completed_interval"] = ["evidence": "anchored_settlement_receipt", "start_offset": "private invalid offset", "end_offset": 20]
+        model["progress"] = progress
+        learner["health"] = model
+        object["learner"] = learner
+        expect(.invalidReport) { _ = try LearnerHealthSnapshot.decode(JSONSerialization.data(withJSONObject: object), sessionID: sessionID) }
+        progress["last_completed_interval"] = ["evidence": "not_available_in_window"]
+        model["progress"] = progress
         model["schema_version"] = 2
         learner["health"] = model
         object["learner"] = learner
