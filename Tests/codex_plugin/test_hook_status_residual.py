@@ -10,7 +10,7 @@ import test_hook_status as base
 STATUS = base.STATUS
 RID = '01234567-89ab-4cde-8f01-23456789abcd'
 MEMORY = '01234567-89ab-4cde-8f01-23456789abce'
-NEW_MEMORY = '01234567-89ab-4cde-8f01-23456789abcf'
+NEW_MEMORIES = [f'01234567-89ab-4cde-8f01-23456789abd{i}' for i in range(5)]
 RESIDUAL_RUN = '20261016T210000Z-' + 'd' * 32
 
 
@@ -37,11 +37,11 @@ class ResidualHealthTests(unittest.TestCase):
             'evidence_heads': {f'R{i}': '1'*64 for i in range(1,6)},
             'operations': [{'label': f'R{i}', 'operation_id': f'01234567-89ab-4cde-8f01-23456789abc{i}',
                             'receipt_sha256': '2'*64} for i in range(1,6)],
-            'preserved_memory_ids': [MEMORY], 'new_memory_ids': [NEW_MEMORY], 'successful_coverage': False}
+            'preserved_memory_ids': [MEMORY], 'new_memory_ids': NEW_MEMORIES, 'successful_coverage': False}
         self.reference = {'version': 1, 'id': RID, 'legacy_run_id': base.RUN, **execution,
             'settlement_sha256': '0'*64, 'interval': {'start_offset': 100, 'end_offset': 200,
                 'excerpt_sha256': '3'*64, 'interval_sha256': '4'*64},
-            'preserved_memory_ids': [MEMORY], 'new_memory_ids': [NEW_MEMORY]}
+            'preserved_memory_ids': [MEMORY], 'new_memory_ids': NEW_MEMORIES}
         self.root = self.learner_fixture(session={'offset': 200, 'status': 'legacy_reconciled_with_residuals',
             'last_run': base.RUN, 'last_residual_reconciliation': self.reference}, pending=pending)
         self.private(self.root/'runs'/base.RUN/'run.json', {'session_id': base.SID, 'status': 'failed',
@@ -105,7 +105,9 @@ class ResidualHealthTests(unittest.TestCase):
     def test_missing_null_or_unsafe_reference_never_selects_arbitrary_paths(self):
         self.fixture()
         for reference in (None, {}, {**self.reference, 'run_id': '../PRIVATE'},
-                          {**self.reference, 'id': RID.upper()}, {**self.reference, 'version': True}):
+                          {**self.reference, 'id': RID.upper()}, {**self.reference, 'version': True},
+                          {**self.reference, 'new_memory_ids': NEW_MEMORIES[:1]},
+                          {**self.reference, 'new_memory_ids': [MEMORY, *NEW_MEMORIES[1:]]}):
             with self.subTest(reference=reference):
                 self.update_state(last_residual_reconciliation=reference)
                 with patch.object(STATUS, 'read_bounded', wraps=STATUS.read_bounded) as reads:

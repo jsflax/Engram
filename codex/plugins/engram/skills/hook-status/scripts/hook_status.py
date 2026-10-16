@@ -606,8 +606,9 @@ def residual_reference(value):
             or len(value["preserved_memory_ids"]) != 1):
         raise ValueError("invalid_reference")
     ids = value["new_memory_ids"]
-    if (type(ids) is not list or not 1 <= len(ids) <= 5 or any(not valid_uuid(i) for i in ids)
-            or len(set(i.lower() for i in ids)) != len(ids)):
+    if (type(ids) is not list or len(ids) != 5 or any(not valid_uuid(i) for i in ids)
+            or len(set(i.lower() for i in ids)) != len(ids)
+            or {i.lower() for i in ids} & {i.lower() for i in value["preserved_memory_ids"]}):
         raise ValueError("invalid_ids")
     return json.loads(json.dumps(value, allow_nan=False))
 
