@@ -92,7 +92,7 @@ def verify_audit_receipt(run_dir, request_id, tool, entry):
     fields = {key for key in entry if key.startswith("operation_")}
     _require(fields == {"operation_version", "operation_id", "operation_outcome", "operation_payload_digest"}
              and type(entry["operation_version"]) is int and entry["operation_version"] == 1
-             and entry["operation_id"] == operation and entry.get("forwarded") is True
+             and journal._uuid(entry["operation_id"]) == operation and entry.get("forwarded") is True
              and entry.get("ok") is True and entry.get("tool") == tool
              and "write_outcome" not in entry and "write_outcome_version" not in entry, "invalid_audit_receipt")
     _, request = journal.read_intent(run_dir, operation)

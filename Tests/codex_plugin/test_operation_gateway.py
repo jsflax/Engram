@@ -250,6 +250,27 @@ class OperationGatewayTests(unittest.TestCase):
         self.assertIs(audit.entries[-1]["forwarded"], False)
         self.assertEqual(list(self.run.glob("operation-*")), [])
 
+    def test_native_uppercase_uuids_preserve_receipts_and_pass_audit(self):
+        policy, audit = self.policy()
+        forwarded, _ = self.policy_call(policy)
+        operation = forwarded["params"]["arguments"]["operationID"]
+        receipt = self.receipt(operation.upper())
+        receipt["scope"]["storeID"] = STORE.upper()
+        receipt["memoryIDs"] = ["E3BA9094-0A1C-4D91-9190-91832B280FAF"]
+        message = self.message(operation, receipt)
+        self.assertEqual(policy.server_message(message), (message, None))
+        retained = J.read_evidence(self.run, operation)[-1]["evidence"]["receipt"]
+        self.assertEqual(retained, receipt)
+        entry = audit.entries[-1]
+        self.assertEqual(entry["operation_id"], operation.upper())
+        self.assertEqual(G.verify_audit_receipt(self.run, 1, "remember", entry), receipt)
+        summary = self.audited(audit.entries)
+        self.assertEqual((summary["tool_errors"], summary["attempted_write_calls"],
+                          summary["applied_write_calls"], summary["unchanged_write_calls"]), (0, 1, 1, 0))
+        altered = copy.deepcopy(audit.entries)
+        altered[-1]["operation_id"] = STORE.upper()
+        self.assertGreater(self.audited(altered)["tool_errors"], 0)
+
     def test_policy_unchanged_receipt_is_not_counted_as_new_memory(self):
         policy, audit = self.policy()
         forwarded, _ = self.policy_call(policy)
