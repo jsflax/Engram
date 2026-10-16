@@ -1,7 +1,8 @@
 """Native hooks enqueue work; one worker learns bounded incremental excerpts.
 
-No memory database is opened here. All learning uses the installed Codex account
-and the configured Engram MCP, with other integrations and shell access disabled.
+Learning uses the installed Codex account and configured Engram MCP, with other
+integrations and shell access disabled. Explicit retrospective recovery may read
+exact historical memory rows through the separate read-only reconciliation API.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -33,6 +35,7 @@ GUARD = "ENGRAM_CODEX_LEARNER"
 _PROVIDER_LOCK_FD = contextvars.ContextVar("engram_provider_lock_fd", default=None)
 _PROVIDER_STARTED = contextvars.ContextVar("engram_provider_started", default=None)
 _EXECUTION = contextvars.ContextVar("engram_execution", default=None)
+_HELD_LOCKS = contextvars.ContextVar("engram_held_locks", default=())
 READ_TOOLS = {"recall", "graph", "list_topics", "stats", "timeline"}
 WRITE_TOOLS = {"remember", "update", "connect"}
 DEFAULTS = learner_settings.DEFAULTS
@@ -102,21 +105,26 @@ def lock_file(path: Path, blocking: bool = True, *, descriptor: bool = False):
     private_dir(path.parent)
     flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
     f = os.fdopen(os.open(path, flags, 0o600), "a+")
-    import stat
     info = os.fstat(f.fileno())
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
         f.close()
         raise ValueError("lock_not_owned_regular")
     os.fchmod(f.fileno(), 0o600)
     acquired = False
+    token = None
     try:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
             acquired = True
         except BlockingIOError:
             pass
+        if acquired:
+            token = _HELD_LOCKS.set((*_HELD_LOCKS.get(), (str(path.absolute()), f.fileno(),
+                                                        info.st_dev, info.st_ino)))
         yield f.fileno() if acquired and descriptor else acquired
     finally:
+        if token is not None:
+            _HELD_LOCKS.reset(token)
         if acquired:
             fcntl.flock(f, fcntl.LOCK_UN)
         f.close()
@@ -149,7 +157,53 @@ def codex_home() -> Path:
 
 def publications(root: Path):
     return runner_publication.Publications(root, codex_home() / "config.toml",
-                                           Path(__file__).resolve().parents[2])
+        Path(__file__).resolve().parents[2], legacy_paths=lambda: legacy_paths(root),
+        legacy_verify_locks=lambda: publication_locks_owned(root))
+
+
+def publication_locks_owned(root: Path) -> bool:
+    """Verify the current caller still owns its worker -> enqueue descriptors."""
+    required = [str((root / name).absolute()) for name in ("worker.lock", "enqueue.lock")]
+    found = []
+    try:
+        for path, fd, device, inode in _HELD_LOCKS.get():
+            if path not in required:
+                continue
+            descriptor, current = os.fstat(fd), os.stat(path, follow_symlinks=False)
+            if (not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid()
+                    or current.st_nlink != 1 or (descriptor.st_dev, descriptor.st_ino) != (device, inode)
+                    or (current.st_dev, current.st_ino) != (device, inode)):
+                return False
+            found.append(path)
+    except OSError:
+        return False
+    return found == required
+
+
+def legacy_paths(root: Path):
+    """Choose a current local store lazily; never follow a retained plan path."""
+    from . import legacy_reconciliation, stdio_bridge
+    package = Path(__file__).resolve().parents[2]
+    _, memory = memory_config.resolve(codex_home() / "config.toml", package)
+    if memory.get("enabled") is not True:
+        raise ValueError("legacy_reconciliation_memory_disabled")
+    argv, environment, _ = stdio_bridge._transport(memory_config.transport(memory))
+    # Arbitrary wrapper arguments may choose another store. Only the same
+    # no-argument route supported by durable execution is eligible here.
+    if len(argv) != 1:
+        raise ValueError("legacy_reconciliation_store_selection_unavailable")
+    if "CLAUDE_MEMORY_DB" in environment:
+        store = Path(environment["CLAUDE_MEMORY_DB"])
+        if not environment["CLAUDE_MEMORY_DB"] or not store.is_absolute():
+            raise ValueError("legacy_reconciliation_store_selection_unavailable")
+    else:
+        # A different child home cannot be inferred safely from parent state.
+        if environment.get("HOME", str(Path.home())) != str(Path.home()):
+            raise ValueError("legacy_reconciliation_store_selection_unavailable")
+        store = Path.home() / ".claude" / "memory.sqlite"
+    # evidence_directory is unused during recovery; all review bytes are frozen
+    # in the plan beneath this current trusted root.
+    return legacy_reconciliation.LegacyPaths(root, root, package, store)
 
 
 def has_recoverable_transition(root: Path, session_id: str) -> bool:
@@ -157,7 +211,10 @@ def has_recoverable_transition(root: Path, session_id: str) -> bool:
         return True
     try:
         record = load_json(admission.state_paths(root, session_id)["admissions"])
-        return isinstance(record, dict) and record.get("processing_execution") is not None
+        if isinstance(record, dict) and record.get("processing_execution") is not None:
+            return True
+        from . import legacy_reconciliation
+        return legacy_reconciliation.needs_recovery(root, session_id)
     except (OSError, ValueError):
         return False
 
@@ -1081,14 +1138,8 @@ def worker(root: Path) -> int:
         for sid in admission.enrollment_ids(root, active_policy):
             if sid in recovery_failures:
                 continue
-            if os.path.lexists(root / "publications" / sid / "active.json"):
+            if has_recoverable_transition(root, sid):
                 return sid
-            try:
-                record = load_json(admission.state_paths(root, sid)["admissions"])
-                if isinstance(record, dict) and record.get("processing_execution") is not None:
-                    return sid
-            except (OSError, ValueError):
-                continue
         return None
 
     more = {}

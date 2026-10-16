@@ -60,6 +60,7 @@ RUNTIME_SCRIPTS = (
     "codex_learner/operation_probe.py", "codex_learner/parser_context.py",
     "codex_learner/publication_coordinator.py", "codex_learner/publication_journal.py",
     "codex_learner/runner_publication.py", "codex_learner/settlement.py", "codex_learner/writer_fence.py",
+    "codex_learner/legacy_reconciliation.py", "learner_reconcile.py",
 )
 VERSION = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:alpha|beta|rc)\.[1-9]\d*)?")
 PRIVATE_PATH = re.compile(r"(?:/Users/|/home/)[^\s\"'<>/]+/|[A-Za-z]:\\{1,2}Users\\{1,2}", re.I)

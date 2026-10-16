@@ -23,10 +23,12 @@ MODULES = (
     "test_fenced_relay", "test_operation_gateway", "test_operation_probe",
     "test_operation_recovery_probe", "test_execution_context", "test_parser_context",
     "test_publication_coordinator", "test_settlement", "test_proxy_execution",
-    "test_runner_publication", "test_runner_durable",
+    "test_runner_publication", "test_runner_durable", "test_runner_legacy_entry", "test_runner_legacy_dispatch",
+    "test_legacy_acceptance", "test_legacy_report_dates", "test_legacy_cli",
 )
 FSYNC_MODULES = {"test_host", "test_migration", "test_execution_context", "test_parser_context",
-                 "test_publication_coordinator", "test_settlement", "test_runner_publication"}
+                 "test_publication_coordinator", "test_settlement", "test_runner_publication",
+                 "test_legacy_acceptance"}
 
 def run_module(name):
     module = importlib.import_module(name)
