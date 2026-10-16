@@ -68,6 +68,23 @@ struct MemoryOperationContractTests {
         #expect(mutation["kind"] as? String == "update")
     }
 
+    @Test(arguments: [nil, "", "source\r\ne\u{0301}"] as [String?])
+    func updateSourceRoundTripPreservesOmissionAndExactBytes(_ source: String?) throws {
+        let original = try request(.update(.init(id: UUID(), topic: "metadata", source: source)))
+        let raw = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(MemoryOperationRequest.self, from: raw)
+        guard case .update(let value) = decoded.mutation else {
+            Issue.record("Expected update mutation")
+            return
+        }
+        #expect(value.source?.utf8.elementsEqual(source?.utf8 ?? "".utf8) ?? (source == nil))
+        #expect((value.source == nil) == (source == nil))
+        let object = try #require(JSONSerialization.jsonObject(with: raw) as? [String: Any])
+        let mutation = try #require(object["mutation"] as? [String: Any])
+        let payload = try #require(mutation["request"] as? [String: Any])
+        #expect((payload["source"] == nil) == (source == nil))
+    }
+
     @Test func unknownVersionsAreRejectedAtDecodeBoundary() throws {
         let operation = try request(.remember(.init(content: "fact")))
         var object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(operation)) as? [String: Any])

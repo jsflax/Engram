@@ -97,16 +97,21 @@ final class SyncManager {
                 let syncedDbPath = SyncService.syncedDbPath(claudeDir: claudeDir)
                 if Self.waitForDaemonExit(claudeDir: claudeDir, timeout: 5.0) {
                     let config = Lattice.Configuration(fileURL: URL(fileURLWithPath: syncedDbPath))
-                    try? Lattice.delete(for: config)
+                    do {
+                        try Lattice.delete(for: config)
+                        // Reset only this now-absent destination. A filter
+                        // update does not reset its replication cursor, and
+                        // nil means "upload every table", including local
+                        // operation receipts. Group channel state is separate.
+                        localLattice?.removeSyncChannelState(ipcChannel: "engram-sync")
+                    } catch {
+                        NSLog("[SyncManager] could not delete synced DB: %@", String(describing: error))
+                    }
                 } else {
                     NSLog("[SyncManager] daemon still holds sync lock after 5s — skipping synced-DB deletion")
                 }
             }
 
-            // Clear sync state on local DB so next sign-in does a full re-sync.
-            // Without this, the local DB thinks rows are already synced to a DB that no longer exists.
-            localLattice?.updateSyncFilter(nil)
-            
             Task { @MainActor in
                 parent?.statusMessage = nil
                 parent?.ipcProgress = nil

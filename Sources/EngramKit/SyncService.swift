@@ -6,6 +6,30 @@ import Lattice
 /// Used by both the Visualizer and the standalone sync daemon.
 public enum SyncService {
 
+    /// Tables permitted to leave the personal relay, either for the cloud or
+    /// back to the local hub. Use an explicit list even though this relay is
+    /// normally opened with just these models: unregistered tables can survive
+    /// a schema-subset reopen, and `nil` would upload those tables as well.
+    /// Local operation identities and receipts must never become sync data.
+    public static func buildPersonalRelaySyncFilter() -> Lattice.SyncFilter {
+        var filter = Lattice.SyncFilter()
+        filter.include(Memory.self)
+        filter.include(Edge.self)
+        filter.include(SyncConfig.self)
+        return filter
+    }
+
+    /// Tables permitted on the group's cloud channel. Its IPC upload filter
+    /// remains the narrower authored-by-me filter below; project maps belong
+    /// to this group and must never pass through the personal hub.
+    public static func buildGroupRelaySyncFilter() -> Lattice.SyncFilter {
+        var filter = Lattice.SyncFilter()
+        filter.include(Memory.self)
+        filter.include(Edge.self)
+        filter.include(GroupProjectMap.self)
+        return filter
+    }
+
     /// Build a SyncFilter from SyncConfig rows in the given database.
     /// Includes non-private memories for projects with `.sync` policy,
     /// edges where both endpoints match, and all SyncConfig rows.
@@ -204,7 +228,8 @@ public enum SyncService {
             fileURL: URL(fileURLWithPath: dbPath),
             authorizationToken: authToken,
             wssEndpoint: endpoint,
-            migration: engramMigrations
+            migration: engramMigrations,
+            syncFilter: buildGroupRelaySyncFilter()
         )
         // Filter at CONFIGURATION time, not after open: a spoke that
         // connects before its filter lands would run unfiltered, which on a
@@ -256,9 +281,11 @@ public enum SyncService {
             fileURL: URL(fileURLWithPath: dbPath),
             authorizationToken: authToken,
             wssEndpoint: wssEndpoint,
-            migration: engramMigrations
+            migration: engramMigrations,
+            syncFilter: buildPersonalRelaySyncFilter()
         )
-        syncedConfig.ipcTargets = [.init(channel: channel)]
+        syncedConfig.ipcTargets = [.init(channel: channel,
+                                        syncFilter: buildPersonalRelaySyncFilter())]
         return try? Lattice(
             Memory.self, Edge.self, SyncConfig.self,
             configuration: syncedConfig

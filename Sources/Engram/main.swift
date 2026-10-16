@@ -3,6 +3,19 @@ import Lattice
 import MCP
 import Foundation
 
+// Consume the inherited shared fence before any initialization can open a
+// store or log. Its retained duplicate keeps the proxy's writer admission alive
+// even if the proxy exits while this server is finishing a transaction.
+let inheritedWriterFence: InheritedWriterFence?
+do {
+    inheritedWriterFence = try InheritedWriterFence.consume(
+        environment: ProcessInfo.processInfo.environment)
+} catch {
+    FileHandle.standardError.write(Data("Engram: invalid inherited writer fence\n".utf8))
+    exit(1)
+}
+defer { inheritedWriterFence?.close() }
+
 // Keep MCP framing separate from process-wide stdout. Native model libraries
 // can emit diagnostics with printf, including from background loading threads.
 // Reserve the original stdout pipe before explicit startup initialization, then route
@@ -94,7 +107,12 @@ let localLattice: Lattice
 do {
     var localConfig: Lattice.Configuration = .init(fileURL: URL(fileURLWithPath: dbPath), migration: engramMigrations)
     localConfig.busyTimeoutMs = mcpBusyTimeoutMs
-    localLattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self, SyncConfig.self, configuration: localConfig)
+    try MemoryOperationLedger.preflightLocalStore(at: URL(fileURLWithPath: dbPath))
+    localLattice = try Lattice(
+        for: [Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self, SyncConfig.self]
+            + MemoryOperationLedger.localModels,
+        configuration: localConfig)
+    try MemoryOperationLedger(lattice: localLattice).bootstrapStoreID()
     log("Database at \(dbPath)")
 } catch {
     log("EXIT: Failed to initialize database at \(dbPath): \(error)")
@@ -160,7 +178,8 @@ let tools = MemoryTools(
     localRef: localLattice.sendableReference,
     syncedRef: syncedLattice?.sendableReference,
     groupRefs: groupRefs,
-    embedder: embedder
+    embedder: embedder,
+    enableLocalMutationOperations: true
 )
 
 // v2 embedding-space backstop: the daemon owns the migration for

@@ -220,6 +220,8 @@ public struct UpdateRequest: Sendable, Codable {
     public var replace: String?
     public var topic: String?
     public var project: String?
+    /// Nil leaves the source unchanged; an empty string explicitly clears it.
+    public var source: String?
     public var importance: Int?
     public var expiresInDays: Int?
     public var isPrivate: Bool?
@@ -228,7 +230,7 @@ public struct UpdateRequest: Sendable, Codable {
     public init(id: UUID, content: String? = nil, append: String? = nil,
                 prepend: String? = nil, find: String? = nil,
                 replace: String? = nil, topic: String? = nil,
-                project: String? = nil, importance: Int? = nil,
+                project: String? = nil, source: String? = nil, importance: Int? = nil,
                 expiresInDays: Int? = nil, isPrivate: Bool? = nil,
                 undelete: Bool = false) {
         self.id = id
@@ -239,6 +241,7 @@ public struct UpdateRequest: Sendable, Codable {
         self.replace = replace
         self.topic = topic
         self.project = project
+        self.source = source
         self.importance = importance
         self.expiresInDays = expiresInDays
         self.isPrivate = isPrivate
