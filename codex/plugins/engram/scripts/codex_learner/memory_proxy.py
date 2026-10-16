@@ -259,7 +259,8 @@ def compatible_initialize(message: dict[str, Any]) -> dict[str, Any]:
 
 
 class Policy:
-    def __init__(self, audit: Audit, provenance: str, max_tool_calls: int, max_writes: int, allowed_tools: list[str] | None = None):
+    def __init__(self, audit: Audit, provenance: str, max_tool_calls: int, max_writes: int, allowed_tools: list[str] | None = None,
+                 *, operations=None):
         self.audit = audit
         self.provenance = provenance
         self.max_tool_calls = max_tool_calls
@@ -273,13 +274,21 @@ class Policy:
         # denied calls too, so pings or denied retries cannot grow audit/ID state.
         self.message_count = 0
         self.max_messages = max(64, max_tool_calls * 4 + 8)
+        self.operations = operations
+        self.operation_tools_available = False
 
-    def record_result(self, request_id: Any, tool: str, ok: bool, memory_ids: list[str] | None = None, *, forwarded: bool = True, write_outcome: str | None = None, write_outcome_version: int | None = None) -> None:
+    def record_result(self, request_id: Any, tool: str, ok: bool, memory_ids: list[str] | None = None, *, forwarded: bool = True, write_outcome: str | None = None, write_outcome_version: int | None = None, operation_receipt=None) -> None:
         entry = {"event": "tool_result", "id": request_id, "tool": tool, "ok": ok, "memory_ids": memory_ids or [], "forwarded": forwarded}
         if write_outcome is not None:
             entry["write_outcome"] = write_outcome
         if write_outcome_version is not None:
             entry["write_outcome_version"] = write_outcome_version
+        if operation_receipt is not None:
+            # Content-free correlation; the private durable journal retains the
+            # authoritative receipt and its complete scope/identity binding.
+            entry.update(operation_version=1, operation_id=operation_receipt["operationID"],
+                         operation_outcome=operation_receipt["outcome"],
+                         operation_payload_digest=operation_receipt["payloadDigest"])
         self.audit.write(entry)
 
     def deny_tool(self, request_id: Any, tool: str, reason: str) -> tuple[None, dict[str, Any]]:
@@ -337,9 +346,19 @@ class Policy:
                 if set(arguments) != {"from", "to", "relation"} or normalized_uuid(arguments.get("from")) is None or normalized_uuid(arguments.get("to")) is None or arguments.get("relation") not in RELATIONS:
                     return self.deny_tool(request_id, tool, "invalid connection endpoints or relation")
             forwarded = dict(message, params=dict(params, arguments=arguments))
+            operation = None
+            if self.operations is not None and tool in WRITE_TOOLS:
+                if not self.operation_tools_available:
+                    return self.deny_tool(request_id, tool, "durable native operation capability is unavailable")
+                # Errors after intent/dispatch publication stop the relay. They
+                # cannot be disguised as a denied/no-write call or fall back to
+                # a legacy mutation, because forwarding may be ambiguous.
+                operation, forwarded = self.operations.prepare(request_id, tool, arguments)
             verification_fields = {"update": ("id",), "connect": ("from", "to", "relation")}.get(tool, ())
             verification = {field: arguments[field] for field in verification_fields}
             self.pending[key] = {"id": request_id, "method": method, "tool": tool, "arguments": verification}
+            if operation is not None:
+                self.pending[key]["operation"] = operation
             return forwarded, None
         if not valid_id(request_id) or id_key(request_id) in self.used_ids:
             return None, rpc_error(request_id if valid_id(request_id) else None, "Invalid or repeated request ID")
@@ -375,11 +394,23 @@ class Policy:
             tools = result.get("tools")
             if not isinstance(tools, list):
                 raise ProxyError("Invalid child tool list")
+            if self.operations is not None:
+                names = {tool.get("name") for tool in tools if isinstance(tool, dict)
+                         and isinstance(tool.get("name"), str)}
+                self.operation_tools_available = {"operation_scope", "operation_apply", "operation_status"} <= names
             filtered = [learner_tool_descriptor(tool, self.provenance) for tool in tools
                         if isinstance(tool, dict) and tool.get("name") in self.allowed_tools]
             return dict(message, result=dict(result, tools=filtered)), None
         if pending["method"] == "tools/call":
             tool = pending["tool"]
+            if "operation" in pending:
+                receipt = self.operations.finish(pending["operation"], message)
+                if receipt is None:
+                    self.record_result(request_id, tool, False)
+                    return tool_error(request_id, "durable write outcome is unavailable; do not retry blindly"), None
+                ids = receipt["memoryIDs"] if receipt["outcome"] == "applied" else []
+                self.record_result(request_id, tool, True, ids, operation_receipt=receipt)
+                return message, None
             ok = "error" not in message and isinstance(result, dict) and result.get("isError", False) is False
             no_write = ok and verified_no_write_response(tool, result)
             begin_busy = "error" not in message and verified_begin_busy_response(tool, result)
@@ -396,6 +427,8 @@ class Policy:
     def fail_pending(self) -> None:
         for pending in self.pending.values():
             if pending["method"] == "tools/call":
+                if "operation" in pending:
+                    self.operations.unavailable(pending["operation"], "transport_error")
                 self.record_result(pending["id"], pending["tool"], False)
         self.pending.clear()
 

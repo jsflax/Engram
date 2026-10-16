@@ -25,7 +25,7 @@ import uuid
 
 from .transcript import inspect_rollout, read_excerpt
 from .memory_proxy import verified_no_write_receipt
-from . import admission, memory_config, host_admission
+from . import admission, memory_config, host_admission, operation_gateway
 
 EVENTS = {"Stop", "SubagentStop", "PreCompact", "SessionEnd"}
 GUARD = "ENGRAM_CODEX_LEARNER"
@@ -634,10 +634,25 @@ def audit_tools(path: Path, *, allow_clean_interrupt: bool = False) -> dict:
     if interrupt_seen and not interrupt_finished:
         errors += 1
     writes = []
+    durable_run = os.path.lexists(path.parent / "execution-manifest.json")
+    durable_receipts = durable_run or any(any(key.startswith("operation_") for key in result)
+                                         for result in results.values())
+    unchanged = operation_failures = 0
     for key, tool in calls.items():
         result = results.get(key, {})
         if result.get("ok") is not True or result.get("tool") != tool:
             errors += 1
+            operation_failures += tool in WRITE_TOOLS
+        elif tool in WRITE_TOOLS and (durable_run or any(key.startswith("operation_") for key in result)):
+            try:
+                receipt = operation_gateway.verify_audit_receipt(path.parent, key[1], tool, result)
+                if receipt["outcome"] == "applied":
+                    writes.append({"tool": tool, "memory_ids": receipt["memoryIDs"]})
+                else:
+                    unchanged += 1
+            except (OSError, ValueError, KeyError, TypeError):
+                errors += 1
+                operation_failures += 1
         elif "write_outcome" in result:
             if not verified_no_write_receipt(result):
                 errors += 1
@@ -648,7 +663,18 @@ def audit_tools(path: Path, *, allow_clean_interrupt: bool = False) -> dict:
             else:
                 writes.append({"tool": tool, "memory_ids": ids})
     errors += len(set(results) - set(calls))
-    return {"tool_calls": len(calls), "write_calls": len(writes), "writes": writes, "tool_errors": errors}
+    if durable_run:
+        try:
+            operation_gateway.verify_audit_coverage(path.parent, [key[1] for key, tool in calls.items()
+                if tool in WRITE_TOOLS and results.get(key, {}).get("forwarded") is True])
+        except (OSError, ValueError, KeyError, TypeError):
+            errors += 1
+    summary = {"tool_calls": len(calls), "write_calls": len(writes), "writes": writes, "tool_errors": errors}
+    if durable_receipts:
+        summary.update(attempted_write_calls=sum(tool in WRITE_TOOLS for tool in calls.values()),
+                       applied_write_calls=len(writes), unchanged_write_calls=unchanged,
+                       operation_failures=operation_failures)
+    return summary
 
 
 def render_learner_prompt(template: str, config: dict) -> str:
