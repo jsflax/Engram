@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import signal
@@ -182,7 +183,7 @@ def publication_locks_owned(root: Path) -> bool:
 
 def legacy_paths(root: Path):
     """Choose a current local store lazily; never follow a retained plan path."""
-    from . import legacy_reconciliation, stdio_bridge
+    from . import legacy_reconciliation, stdio_bridge, execution_context
     package = Path(__file__).resolve().parents[2]
     _, memory = memory_config.resolve(codex_home() / "config.toml", package)
     if memory.get("enabled") is not True:
@@ -192,15 +193,28 @@ def legacy_paths(root: Path):
     # no-argument route supported by durable execution is eligible here.
     if len(argv) != 1:
         raise ValueError("legacy_reconciliation_store_selection_unavailable")
+    try:
+        execution_context._runtime(argv[0])
+    except (OSError, ValueError):
+        raise ValueError("legacy_reconciliation_store_selection_unavailable") from None
     if "CLAUDE_MEMORY_DB" in environment:
         store = Path(environment["CLAUDE_MEMORY_DB"])
         if not environment["CLAUDE_MEMORY_DB"] or not store.is_absolute():
             raise ValueError("legacy_reconciliation_store_selection_unavailable")
     else:
-        # A different child home cannot be inferred safely from parent state.
-        if environment.get("HOME", str(Path.home())) != str(Path.home()):
+        # Foundation's default home is the account home, whereas Path.home()
+        # can follow an overridden HOME. Require an explicit store for those
+        # environments instead of guessing which database native will open.
+        try:
+            account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        except (KeyError, OSError):
+            raise ValueError("legacy_reconciliation_store_selection_unavailable") from None
+        if ("CFFIXED_USER_HOME" in environment
+                or not account_home.is_absolute()
+                or Path.home() != account_home
+                or environment.get("HOME", str(account_home)) != str(account_home)):
             raise ValueError("legacy_reconciliation_store_selection_unavailable")
-        store = Path.home() / ".claude" / "memory.sqlite"
+        store = account_home / ".claude" / "memory.sqlite"
     # evidence_directory is unused during recovery; all review bytes are frozen
     # in the plan beneath this current trusted root.
     return legacy_reconciliation.LegacyPaths(root, root, package, store)
@@ -213,6 +227,11 @@ def has_recoverable_transition(root: Path, session_id: str) -> bool:
         record = load_json(admission.state_paths(root, session_id)["admissions"])
         if isinstance(record, dict) and record.get("processing_execution") is not None:
             return True
+    except (OSError, ValueError):
+        # A damaged admission must not hide a retained legacy recovery proof
+        # when its pending request is paused. Recovery will surface the hold.
+        pass
+    try:
         from . import legacy_reconciliation
         return legacy_reconciliation.needs_recovery(root, session_id)
     except (OSError, ValueError):

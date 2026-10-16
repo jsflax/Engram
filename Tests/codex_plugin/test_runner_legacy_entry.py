@@ -3,6 +3,7 @@ import importlib
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -17,6 +18,10 @@ class RunnerLegacyEntryTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="runner-legacy-entry-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
+        self.account_home = Path.home()
+        self.native = self.root / "native-fixture"
+        self.native.write_bytes(b"\xcf\xfa\xed\xfe" + b"never executed")
+        self.native.chmod(0o700)
 
     def test_guard_requires_live_worker_then_enqueue_locks(self):
         self.assertFalse(R.publication_locks_owned(self.root))
@@ -44,9 +49,10 @@ class RunnerLegacyEntryTests(unittest.TestCase):
             self.assertFalse(R.publication_locks_owned(self.root))
 
     def select(self, **changes):
-        declaration = {"enabled": True, "command": "/trusted/engram", "args": [], "env": {},
+        declaration = {"enabled": True, "command": str(self.native), "args": [], "env": {},
                        "env_vars": [], **changes}
-        with mock.patch.object(R.memory_config, "resolve", return_value=({}, declaration)):
+        with mock.patch.object(R.memory_config, "resolve", return_value=({}, declaration)), \
+             mock.patch.object(R.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(self.account_home))):
             return R.legacy_paths(self.root)
 
     def test_explicit_store_comes_from_effective_transport(self):
@@ -76,6 +82,36 @@ class RunnerLegacyEntryTests(unittest.TestCase):
         self.assertTrue(callable(arguments["legacy_paths"]))
         self.assertTrue(callable(arguments["legacy_verify_locks"]))
         self.assertFalse(arguments["legacy_verify_locks"]())
+
+    def test_wrapper_missing_runtime_and_unmodelled_home_refuse(self):
+        wrapper = self.root / "wrapper"
+        wrapper.write_text("#!/bin/sh\nexit 1\n")
+        wrapper.chmod(0o700)
+        for changes in ({"command": str(wrapper)}, {"command": str(self.root / "missing")},
+                        {"env": {"CFFIXED_USER_HOME": str(self.root / "other")}}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "legacy_reconciliation_"):
+                self.select(**changes)
+        path = self.root / "explicit.sqlite"
+        self.assertEqual(self.select(env={"CFFIXED_USER_HOME": str(self.root / "other"),
+            "CLAUDE_MEMORY_DB": str(path)}).candidate_store, path)
+
+    def test_malformed_admission_cannot_hide_legacy_recovery(self):
+        sid = "019b7a00-0000-7123-8000-000000000021"
+        state = self.root / "sessions" / (sid + ".json")
+        admission = self.root / "admissions" / (sid + ".json")
+        R.atomic_json(state, {"status": "legacy_reconciled_no_new_mutation"})
+        admission.parent.mkdir(mode=0o700)
+        admission.write_bytes(b"{")
+        before = (state.read_bytes(), admission.read_bytes())
+        self.assertIs(R.has_recoverable_transition(self.root, sid), True)
+        self.assertEqual((state.read_bytes(), admission.read_bytes()), before)
+
+    def test_overridden_parent_home_requires_explicit_store(self):
+        path = self.root / "explicit.sqlite"
+        with mock.patch.dict(os.environ, {"HOME": str(self.root / "other")}):
+            with self.assertRaisesRegex(ValueError, "legacy_reconciliation_"):
+                self.select()
+            self.assertEqual(self.select(env={"CLAUDE_MEMORY_DB": str(path)}).candidate_store, path)
 
 
 if __name__ == "__main__":
