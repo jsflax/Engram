@@ -1,10 +1,13 @@
 """Private immutable execution evidence, not a worker or a replay authority.
 
-The caller supplies already admitted, frozen bytes and holds the worker/provider
-fence. Every publication rechecks that fence through a mandatory callback. This
+The caller supplies already admitted, frozen bytes and holds a live writer or
+recovery fence plus the appropriate worker coordination. Every publication
+rechecks that fence through a mandatory callback. This
 module does not validate admission policy, acquire the fence, contact a backend,
-run a provider, mutate memory, or publish a cursor. A recorded fence epoch is
-correlation evidence, not proof that a process is currently fenced.
+run a provider, mutate memory, or publish a cursor. Pinned lock identity and
+generation bind the evidence; the callback must establish the actual held fence.
+Dispatch requires the caller's shared writer authority. An exclusive recovery
+handle may record status evidence but cannot provide a native writer descriptor.
 
 Native requests are retained byte-for-byte and must be forwarded using the bytes
 returned by ``publish_intent``. SHA256 of those bytes and sorted-key JSON are
@@ -20,6 +23,7 @@ No timestamps or mutable defaults participate in operation UUID derivation.
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import math
@@ -29,7 +33,7 @@ import re
 import unicodedata
 import uuid
 
-from . import admission, file_identity, migration as durable
+from . import admission, file_identity, migration as durable, writer_fence
 
 VERSION = 1
 MAX_RECORD = 8 * 1024 * 1024
@@ -37,7 +41,7 @@ MAX_INPUT = 1024 * 1024
 MAX_EVENTS = 1024
 INPUT_NAMES = {"request", "admission", "cursor", "parser_state", "next_parser_state",
                "backend_route", "backend_config"}
-FENCE_PROTOCOL = "exclusive_worker_provider_v1"
+FENCE_PROTOCOL = writer_fence.PROTOCOL
 _NAMESPACE = uuid.UUID("02574c4d-46a3-531c-bc5c-9be624aa45f3")
 
 
@@ -165,10 +169,9 @@ def _scope(value):
 
 
 def _fencing(value):
-    _keys(value, {"protocol", "epoch_id", "owner_id"})
-    _require(value["protocol"] == FENCE_PROTOCOL, "unsupported_fencing_protocol")
-    _uuid(value["epoch_id"])
-    _uuid(value["owner_id"])
+    # Pin the exact writer lock inode/content, not just correlation UUIDs.
+    # Structural validity is distinct from the mandatory live held-fence check.
+    writer_fence.validate_binding(value)
 
 
 def _manifest(value):
@@ -207,8 +210,9 @@ def _private(path):
 
 def _check_fence(manifest, verify_fence):
     _require(callable(verify_fence), "fence_verifier_required")
-    # Pass a copy so a callback cannot change the persisted epoch binding.
-    _require(verify_fence(dict(manifest["fencing"])) is True, "fence_not_held")
+    # Nested lock identity is immutable evidence too: a shallow copy aliases it
+    # into the frozen manifest and lets a callback rewrite its internal binding.
+    _require(verify_fence(copy.deepcopy(manifest["fencing"])) is True, "fence_not_held")
 
 
 def _boundary(label):
@@ -437,9 +441,10 @@ def read_evidence(run_dir, operation):
         _require(type(evidence) is dict, "invalid_evidence")
         if evidence.get("kind") == "dispatch":
             _keys(evidence, {"kind", "request_sha256", "fencing"})
+            _fencing(evidence["fencing"])
             _require(not dispatched and prior is None, "redispatch_requires_reconciliation")
             _require(evidence["request_sha256"] == sha256(read_intent(run_dir, operation)[0])
-                     and evidence["fencing"] == manifest["fencing"], "dispatch_binding_mismatch")
+                     and encode(evidence["fencing"]) == encode(manifest["fencing"]), "dispatch_binding_mismatch")
             dispatched = True
         else:
             prior = _response(evidence, request, prior)

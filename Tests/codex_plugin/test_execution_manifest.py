@@ -17,13 +17,10 @@ from suite_support import PLUGIN_ROOT, TEMP_ROOT
 
 sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 M = importlib.import_module("codex_learner.execution_manifest")
+F = importlib.import_module("codex_learner.writer_fence")
 SID = "01a0ad92-ed03-7ee1-b9bb-ccc17d2e3e05"
 STORE = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 MEMORY = "11111111-2222-4333-8444-555555555555"
-
-
-def held(_binding):
-    return True
 
 
 class ExecutionManifestTests(unittest.TestCase):
@@ -31,6 +28,9 @@ class ExecutionManifestTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="manifest-", dir=TEMP_ROOT)
         self.addCleanup(self.temporary.cleanup)
         self.run = Path(self.temporary.name).resolve()
+        self.binding = F.create(self.run, generation_id=STORE, owner_id=MEMORY)
+        self.fence = F.acquire_shared(self.run, self.binding)
+        self.addCleanup(self.fence.close)
         inputs = {name: M.seal_json(M.encode({"fixture": name})) for name in M.INPUT_NAMES}
         self.scope = {"version": 1, "storeID": STORE, "principal": {
             "id": None, "kind": "agent", "groupIds": [MEMORY], "scopes": ["memory", "café"]}}
@@ -43,7 +43,7 @@ class ExecutionManifestTests(unittest.TestCase):
                              "route_id": "fixture-local", "runtime_sha256": "b" * 64,
                              "route_sha256": inputs["backend_route"]["sha256"],
                              "config_sha256": inputs["backend_config"]["sha256"]},
-                         "fencing": {"protocol": M.FENCE_PROTOCOL, "epoch_id": STORE, "owner_id": MEMORY}}
+                         "fencing": self.binding}
         self.publish()
         self.operation = M.operation_id(self.run, "call-1")
         self.request = {"version": 1, "operationID": self.operation, "expectedScope": self.scope,
@@ -55,11 +55,11 @@ class ExecutionManifestTests(unittest.TestCase):
         self.raw = M.encode(self.request)
 
     def publish(self, manifest=None, **kwargs):
-        return M.publish_manifest(self.run, manifest or self.manifest, verify_fence=kwargs.get("verify_fence", held))
+        return M.publish_manifest(self.run, manifest or self.manifest, verify_fence=kwargs.get("verify_fence", self.fence.verify))
 
     def intent(self, raw=None, **kwargs):
         return M.publish_intent(self.run, "call-1", self.raw if raw is None else raw,
-                                verify_fence=kwargs.get("verify_fence", held))
+                                verify_fence=kwargs.get("verify_fence", self.fence.verify))
 
     def receipt(self):
         return {"version": 1, "operationID": self.operation, "scope": copy.deepcopy(self.scope),
@@ -68,7 +68,7 @@ class ExecutionManifestTests(unittest.TestCase):
 
     def respond(self, receipt=None):
         return M.record_response(self.run, self.operation,
-                                 {"kind": "committed", "receipt": receipt or self.receipt()}, verify_fence=held)
+                                 {"kind": "committed", "receipt": receipt or self.receipt()}, verify_fence=self.fence.verify)
 
     def snapshots(self):
         return {str(p.relative_to(self.run)): p.read_bytes() for p in self.run.rglob("*") if p.is_file()}
@@ -93,13 +93,13 @@ class ExecutionManifestTests(unittest.TestCase):
         other.mkdir(mode=0o700)
         changed = copy.deepcopy(self.manifest)
         changed["run_id"] += "-different"
-        M.publish_manifest(other, changed, verify_fence=held)
+        M.publish_manifest(other, changed, verify_fence=self.fence.verify)
         self.assertNotEqual(self.operation, M.operation_id(other, "call-1"))
 
     def test_exact_request_bytes_private_before_dispatch_and_receipt(self):
         raw = b" \n" + self.raw + b"\n"
         self.assertEqual(self.intent(raw), raw)
-        self.assertEqual(M.record_dispatch(self.run, self.operation, verify_fence=held), raw)
+        self.assertEqual(M.record_dispatch(self.run, self.operation, verify_fence=self.fence.verify), raw)
         self.respond()
         self.assertEqual(len(M.read_evidence(self.run, self.operation)), 2)
         self.assertEqual(M.read_intent(self.run, self.operation)[0], raw)
@@ -135,7 +135,7 @@ class ExecutionManifestTests(unittest.TestCase):
             mutate(request)
             with self.assertRaises(ValueError):
                 self.intent(M.encode(request))
-        self.assertEqual(len(self.snapshots()), 1)
+        self.assertEqual(set(self.snapshots()), {"execution-manifest.json", F.LOCK_NAME})
 
     def test_supported_mutations_preserve_optional_and_signed_semantics(self):
         mutations = [
@@ -150,7 +150,7 @@ class ExecutionManifestTests(unittest.TestCase):
             request = copy.deepcopy(self.request)
             request.update(operationID=M.operation_id(self.run, call), mutation=mutation)
             raw = M.encode(request)
-            self.assertEqual(M.publish_intent(self.run, call, raw, verify_fence=held), raw)
+            self.assertEqual(M.publish_intent(self.run, call, raw, verify_fence=self.fence.verify), raw)
 
     def test_invalid_mutation_fields_fail_closed(self):
         mutations = [
@@ -170,7 +170,7 @@ class ExecutionManifestTests(unittest.TestCase):
             with self.assertRaises(ValueError) as error:
                 self.intent(M.encode(request))
             self.assertNotIn("PRIVATE", str(error.exception))
-        self.assertEqual(len(self.snapshots()), 1)
+        self.assertEqual(set(self.snapshots()), {"execution-manifest.json", F.LOCK_NAME})
 
     def test_receipt_scope_uuid_kind_digest_and_results_are_bound(self):
         self.intent()
@@ -200,15 +200,15 @@ class ExecutionManifestTests(unittest.TestCase):
 
     def test_absence_never_permits_redispatch(self):
         self.intent()
-        M.record_dispatch(self.run, self.operation, verify_fence=held)
+        M.record_dispatch(self.run, self.operation, verify_fence=self.fence.verify)
         M.record_response(self.run, self.operation, {"kind": "absent", "operationID": self.operation,
-                                                   "scope": self.scope}, verify_fence=held)
+                                                   "scope": self.scope}, verify_fence=self.fence.verify)
         with self.assertRaisesRegex(ValueError, "redispatch_requires_reconciliation"):
-            M.record_dispatch(self.run, self.operation, verify_fence=held)
+            M.record_dispatch(self.run, self.operation, verify_fence=self.fence.verify)
         self.respond()
         with self.assertRaisesRegex(ValueError, "committed_operation_became_absent"):
             M.record_response(self.run, self.operation, {"kind": "absent", "operationID": self.operation,
-                                                       "scope": self.scope}, verify_fence=held)
+                                                       "scope": self.scope}, verify_fence=self.fence.verify)
 
     def test_fencing_required_and_checked_before_every_publication(self):
         before = self.snapshots()
@@ -242,6 +242,74 @@ class ExecutionManifestTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.publish(value)
 
+    def test_every_pinned_fence_field_is_checked_against_real_shared_handle(self):
+        before = self.snapshots()
+        mutations = []
+        for field in ("protocol", "epoch_id", "owner_id", "lock_sha256"):
+            value = copy.deepcopy(self.manifest)
+            value["fencing"][field] = "0" * 64 if field == "lock_sha256" else "changed"
+            mutations.append(value)
+        for field in self.binding["lock_identity"]:
+            value = copy.deepcopy(self.manifest)
+            value["fencing"]["lock_identity"][field] += 1
+            mutations.append(value)
+        old_protocol = copy.deepcopy(self.manifest)
+        old_protocol["fencing"] = {"protocol": "exclusive_worker_provider_v1", "epoch_id": STORE, "owner_id": MEMORY}
+        mutations.append(old_protocol)
+        alias = copy.deepcopy(self.manifest)
+        alias["fencing"]["lock_identity"]["inode"] = float(alias["fencing"]["lock_identity"]["inode"])
+        mutations.append(alias)
+        for value in mutations:
+            with self.subTest(fencing=value["fencing"]), self.assertRaises(ValueError):
+                self.publish(value)
+        self.assertEqual(self.snapshots(), before)
+
+    def test_fence_callback_cannot_rewrite_nested_immutable_identity(self):
+        expected = copy.deepcopy(self.binding)
+        calls = []
+        def verifier(binding):
+            self.assertIs(self.fence.verify(binding), True)
+            calls.append(copy.deepcopy(binding))
+            binding["lock_identity"]["inode"] += 1
+            return True
+        self.intent(verify_fence=verifier)
+        self.assertEqual(M.record_dispatch(self.run, self.operation, verify_fence=verifier), self.raw)
+        self.assertEqual(M.read_manifest(self.run)[0]["fencing"], expected)
+        self.assertTrue(all(binding == expected for binding in calls))
+        self.assertEqual(M.read_evidence(self.run, self.operation)[0]["evidence"]["fencing"], expected)
+
+    def test_dispatch_evidence_rejects_changed_or_numeric_alias_fence_identity(self):
+        self.intent()
+        M.record_dispatch(self.run, self.operation, verify_fence=self.fence.verify)
+        path = self.run / ("evidence-" + self.operation) / "000000.json"
+        event = M._json(path.read_bytes())
+        for change in (lambda value: value + 1, float):
+            changed = copy.deepcopy(event)
+            identity = changed["evidence"]["fencing"]["lock_identity"]
+            identity["inode"] = change(identity["inode"])
+            path.write_bytes(M.encode(changed))
+            with self.assertRaises(ValueError):
+                M.read_evidence(self.run, self.operation)
+        path.write_bytes(M.encode(event))
+        self.assertEqual(len(M.read_evidence(self.run, self.operation)), 1)
+
+    def test_revoked_generation_allows_status_evidence_but_never_absence_based_redispatch(self):
+        self.intent()
+        M.record_dispatch(self.run, self.operation, verify_fence=self.fence.verify)
+        self.fence.close()
+        with self.assertRaisesRegex(ValueError, "closed"):
+            self.intent()
+        with F.revoke(self.run, self.binding, validate=lambda _binding, _phase: True) as recovery:
+            with self.assertRaisesRegex(ValueError, "recovery_descriptor_not_writable"):
+                recovery.pass_fds()
+            M.record_response(self.run, self.operation,
+                              {"kind": "absent", "operationID": self.operation, "scope": self.scope},
+                              verify_fence=recovery.verify)
+            with self.assertRaisesRegex(ValueError, "redispatch_requires_reconciliation"):
+                M.record_dispatch(self.run, self.operation, verify_fence=recovery.verify)
+        with self.assertRaisesRegex(ValueError, "generation_revoked"):
+            F.acquire_shared(self.run, self.binding)
+
     def test_duplicate_json_nonfinite_surrogates_and_oversize_rejected(self):
         for raw in (b'{"version":1,"version":1}', b'{"x":NaN}', b'{"x":"\\ud800"}',
                     b'{"x":' + b'1' * (M.MAX_INPUT + 1) + b'}', b'{}\n{}', b'[]'):
@@ -254,7 +322,7 @@ class ExecutionManifestTests(unittest.TestCase):
         path.chmod(0o600)
         before = self.snapshots()
         for action in (self.intent, lambda: M.read_intent(self.run, self.operation),
-                       lambda: M.record_dispatch(self.run, self.operation, verify_fence=held)):
+                       lambda: M.record_dispatch(self.run, self.operation, verify_fence=self.fence.verify)):
             with self.assertRaises(ValueError) as error:
                 action()
             self.assertNotIn("PRIVATE", str(error.exception))
@@ -262,7 +330,7 @@ class ExecutionManifestTests(unittest.TestCase):
 
     def test_event_truncation_gap_and_chain_tampering_fail_closed(self):
         self.intent()
-        M.record_dispatch(self.run, self.operation, verify_fence=held)
+        M.record_dispatch(self.run, self.operation, verify_fence=self.fence.verify)
         self.respond()
         directory = self.run / ("evidence-" + self.operation)
         last = directory / "000001.json"
@@ -307,15 +375,16 @@ class ExecutionManifestTests(unittest.TestCase):
 import os,signal,sys
 from pathlib import Path
 sys.path.insert(0,sys.argv[1])
-from codex_learner import execution_manifest as m
+from codex_learner import execution_manifest as m, writer_fence as f
 root=Path(sys.argv[2]); phase=sys.argv[3]
 def boundary(label):
     if label==phase: os.kill(os.getpid(),signal.SIGKILL)
 m._boundary=boundary
-if sys.argv[4]=='dispatch':
-    m.record_dispatch(root,m.operation_id(root,'call-1'),verify_fence=lambda _:True)
-else:
-    m.publish_intent(root,'call-1',(root/'fixture-native.json').read_bytes(),verify_fence=lambda _:True)
+with f.acquire_shared(root,m.read_manifest(root)[0]['fencing']) as fence:
+    if sys.argv[4]=='dispatch':
+        m.record_dispatch(root,m.operation_id(root,'call-1'),verify_fence=fence.verify)
+    else:
+        m.publish_intent(root,'call-1',(root/'fixture-native.json').read_bytes(),verify_fence=fence.verify)
 raise SystemExit(23)
 """
         result = subprocess.run([sys.executable, "-B", "-c", code, str(PLUGIN_ROOT / "scripts"),
@@ -327,7 +396,7 @@ raise SystemExit(23)
     def test_actual_crash_before_intent_publish_never_dispatches(self):
         self.child("before_create")
         with self.assertRaises(ValueError):
-            M.record_dispatch(self.run, self.operation, verify_fence=held)
+            M.record_dispatch(self.run, self.operation, verify_fence=self.fence.verify)
         self.assertEqual(self.intent(), self.raw)
         self.assertEqual(M.read_evidence(self.run, self.operation), [])
 
@@ -338,20 +407,20 @@ raise SystemExit(23)
         with self.assertRaisesRegex(ValueError, "immutable_record_conflict"):
             self.intent()
         with self.assertRaises(ValueError):
-            M.record_dispatch(self.run, self.operation, verify_fence=held)
+            M.record_dispatch(self.run, self.operation, verify_fence=self.fence.verify)
 
     def test_actual_crash_after_intent_durability_retains_exact_stable_request(self):
         self.child("after_directory_fsync")
         self.assertEqual(M.read_intent(self.run, self.operation)[0], self.raw)
         self.assertEqual(self.intent(), self.raw)
-        self.assertEqual(M.record_dispatch(self.run, self.operation, verify_fence=held), self.raw)
+        self.assertEqual(M.record_dispatch(self.run, self.operation, verify_fence=self.fence.verify), self.raw)
 
     def test_actual_crash_after_dispatch_durable_is_ambiguous_not_retryable(self):
         self.intent()
         self.child("after_directory_fsync", dispatch=True)
         self.assertEqual(len(M.read_evidence(self.run, self.operation)), 1)
         with self.assertRaisesRegex(ValueError, "redispatch_requires_reconciliation"):
-            M.record_dispatch(self.run, self.operation, verify_fence=held)
+            M.record_dispatch(self.run, self.operation, verify_fence=self.fence.verify)
 
     def test_actual_crash_during_dispatch_publication_fails_closed(self):
         self.intent()
@@ -361,7 +430,7 @@ raise SystemExit(23)
         with self.assertRaises(ValueError):
             M.read_evidence(self.run, self.operation)
         with self.assertRaises(ValueError):
-            M.record_dispatch(self.run, self.operation, verify_fence=held)
+            M.record_dispatch(self.run, self.operation, verify_fence=self.fence.verify)
 
     def test_fence_lost_after_durable_record_prevents_forwarding_return(self):
         self.intent()
@@ -373,7 +442,7 @@ raise SystemExit(23)
             M.record_dispatch(self.run, self.operation, verify_fence=fence)
         self.assertEqual(len(M.read_evidence(self.run, self.operation)), 1)
         with self.assertRaisesRegex(ValueError, "redispatch_requires_reconciliation"):
-            M.record_dispatch(self.run, self.operation, verify_fence=held)
+            M.record_dispatch(self.run, self.operation, verify_fence=self.fence.verify)
 
 
 if __name__ == "__main__":

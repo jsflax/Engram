@@ -24,6 +24,7 @@ the bridge itself; the configured stdio server is the only child it launches.
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import deque
 import json
 import math
@@ -37,6 +38,10 @@ import sys
 import threading
 import time
 from typing import Any, Callable
+
+FENCE_DESCRIPTOR_ENV = "ENGRAM_WRITER_FENCE_FD"
+FENCE_BINDING_ENV = "ENGRAM_WRITER_FENCE_BINDING_B64"
+_FENCE_ENVIRONMENT = {FENCE_DESCRIPTOR_ENV, FENCE_BINDING_ENV}
 
 
 class RelayError(Exception):
@@ -157,6 +162,8 @@ def _transport(transport: dict[str, Any]) -> tuple[list[str], dict[str, str], st
         raise RelayError("invalid_transport")
     if not isinstance(names, list) or any(not isinstance(k, str) for k in names):
         raise RelayError("invalid_transport")
+    if _FENCE_ENVIRONMENT.intersection(supplied) or _FENCE_ENVIRONMENT.intersection(names):
+        raise RelayError("reserved_fence_environment")
     cwd = transport.get("cwd")
     if cwd is not None and (not isinstance(cwd, str) or not Path(cwd).is_absolute()):
         raise RelayError("invalid_transport")
@@ -164,6 +171,34 @@ def _transport(transport: dict[str, Any]) -> tuple[list[str], dict[str, str], st
     env = {key: value for key, value in os.environ.items() if key in inherited}
     env.update(supplied)
     return [command, *args], env, cwd
+
+
+def _fenced_transport(transport, writer_fence=None):
+    """Trusted launch context, shared by relay and bounded native probes.
+
+    Never accepts an FD or binding from transport JSON. The caller owns the
+    in-memory shared handle and must keep it open through child cleanup. The
+    returned FD is borrowed; neither this helper nor relay closes/unlocks it.
+    """
+    argv, env, cwd = _transport(transport)
+    if writer_fence is None:
+        return argv, env, cwd, ()
+    if __package__:
+        from . import writer_fence as fences
+    else:
+        # Direct packaged script execution. Resolve only the executing package,
+        # never an environment-supplied import or lock path.
+        scripts = str(Path(__file__).resolve().parent.parent)
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        from codex_learner import writer_fence as fences
+    if type(writer_fence) is not fences.HeldFence or writer_fence.mode != "shared":
+        raise RelayError("invalid_writer_fence")
+    descriptor, = writer_fence.pass_fds()
+    binding = writer_fence.binding()
+    env[FENCE_DESCRIPTOR_ENV] = str(descriptor)
+    env[FENCE_BINDING_ENV] = base64.b64encode(fences.durable.encode(binding)).decode("ascii")
+    return argv, env, cwd, (descriptor,)
 
 
 def _cleanup(child: subprocess.Popen, timeout: float):
@@ -222,15 +257,18 @@ def _cleanup(child: subprocess.Popen, timeout: float):
 
 def run_relay(transport: dict[str, Any], client_message: Callable, server_message: Callable,
               *, limits: RelayLimits | None = None, audit: Callable | None = None,
-              client_input=None, client_output=None) -> int:
+              client_input=None, client_output=None, writer_fence=None) -> int:
     """Run a policy-controlled relay; return 0 on clean EOF, 1 on failure.
 
     Callers own policy cleanup (e.g. fail_pending) in their own finally block.
     Audit is best effort and cannot affect transport execution. It never receives
     IDs, method/tool names, arguments, results, paths, environment, or stderr.
+    Optional writer_fence is an acquired, caller-owned shared HeldFence. Its FD
+    reaches only the native child via pass_fds. The caller closes its own copy
+    after relay returns; a surviving child retains its copy after proxy death.
     """
     limits = limits or RelayLimits()
-    argv, env, cwd = _transport(transport)
+    _fenced_transport(transport, writer_fence)
     client_input = sys.stdin.buffer if client_input is None else client_input
     client_output = sys.stdout.buffer if client_output is None else client_output
     child = None
@@ -259,9 +297,11 @@ def run_relay(transport: dict[str, Any], client_message: Callable, server_messag
                 previous_signals[sig] = signal.signal(sig, interrupted)
         if cancelled:
             raise KeyboardInterrupt
+        # Revalidate immediately before Popen, after installing cleanup guards.
+        argv, env, cwd, inherited = _fenced_transport(transport, writer_fence)
         child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.DEVNULL, env=env, cwd=cwd,
-                                 bufsize=0, start_new_session=True)
+                                 bufsize=0, start_new_session=True, pass_fds=inherited)
         inputs = {"client": client_input.fileno(), "server": child.stdout.fileno()}
         outputs = {"client": client_output.fileno(), "server": child.stdin.fileno()}
         for fd in (*inputs.values(), *outputs.values()):
