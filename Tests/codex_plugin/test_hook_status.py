@@ -491,6 +491,121 @@ class StatusTests(unittest.TestCase):
                               health["metadata_issues"])
                 self.assertNotIn("private status", json.dumps(health))
 
+    def durable_fixture(self, *, anchored=True, status="succeeded", **changes):
+        root = self.learner_fixture(session={"offset":20,"status":status,"last_run":RUN})
+        self.write(root / "runs" / RUN / "run.json", {"session_id":SID,"status":"succeeded",
+            "execution_manifest_sha256":DIGEST,"turn_completed":True,"write_calls":2,
+            "attempted_write_calls":3,"applied_write_calls":2,"unchanged_write_calls":1})
+        self.write(root / "events.jsonl", [{"session_id":SID,"event":"learner_finished","run_id":RUN,
+                                           "status":"succeeded"}], log=True)
+        record = {"version":1,"kind":"learner_settlement","session_id":SID,"run_id":RUN,
+            "status":status,"reason":"verified_completion" if status=="succeeded" else "unverified_completion",
+            "source":{"start_offset":10,"end_offset":20},"attempted_write_calls":3,
+            "applied_write_calls":2,"unchanged_write_calls":1, "private":"never display", **changes}
+        path = root / "runs" / RUN / "settlement.json"
+        self.write(path,record)
+        if anchored:
+            self.learner_fixture(session={"offset":20,"status":status,"last_run":RUN,
+                                          "settlement_sha256":hashlib.sha256(path.read_bytes()).hexdigest()})
+        return root,path
+
+    def test_durable_completed_interval_requires_anchored_settlement_and_separate_counts(self):
+        self.durable_fixture()
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["progress"]["last_completed_interval"], {
+            "evidence":"anchored_settlement_receipt","run_id":RUN,"start_offset":10,"end_offset":20})
+        self.assertEqual(health["outcomes"]["native_acknowledgement"], {
+            "state":"recorded_in_anchored_settlement","independent_persistence":"not_verified",
+            "attempted_write_calls":3,"applied_write_calls":2,"unchanged_write_calls":1})
+        self.assertEqual(health["outcomes"]["recorded_settlement"]["state"], "session_hash_match")
+        self.assertEqual(health["outcomes"]["write_attempts"]["evidence"],"run_receipt_only")
+        self.assertEqual(health["outcomes"]["provider_completion"]["state"],"completed_in_run_receipt")
+        self.assertEqual(health["outcomes"]["independent_readback"]["state"],"not_performed")
+        self.assertNotIn("never display", json.dumps(self.report()))
+
+    def test_durable_provider_success_cannot_replace_missing_unanchored_or_changed_settlement(self):
+        for mode in ("missing","unanchored","changed","invalid_anchor"):
+            with self.subTest(mode=mode):
+                root,path = self.durable_fixture(anchored=mode!="unanchored")
+                if mode=="missing": path.unlink()
+                if mode=="changed": path.write_bytes(path.read_bytes()+b" ")
+                if mode=="invalid_anchor": self.learner_fixture(session={"last_run":RUN,"settlement_sha256":True})
+                health = self.report()["learner"]["health"]
+                self.assertEqual(health["progress"]["last_completed_interval"]["evidence"],"not_available_in_window")
+                self.assertEqual(health["outcomes"]["native_acknowledgement"]["state"],"unknown")
+                self.assertNotEqual(health["headline"],"idle")
+
+    def test_failed_settlement_and_new_exact_gate_reason_preserve_hold(self):
+        self.durable_fixture(status="reconciliation_required")
+        root = self.modern / "learner"
+        state_path = root / "sessions" / (SID+".json")
+        state=json.loads(state_path.read_text())
+        state["reconciliation_required"]={"run_id":RUN,"reason":"unverified_completion"}
+        self.write(state_path,state)
+        learner=self.report()["learner"]
+        self.assertNotIn("invalid_fields",learner["session"])
+        self.assertEqual(learner["health"]["headline"],"reconciliation_required")
+        self.assertEqual(learner["health"]["failure"]["reason"],"unverified_completion")
+        self.assertEqual(learner["health"]["progress"]["last_completed_interval"]["evidence"],"not_available_in_window")
+        self.assertFalse(learner["health"]["recovery"]["automatic_replay_authorized"])
+
+    def test_settlement_schema_is_typed_scoped_bounded_and_never_reads_private_evidence(self):
+        for change in ({"session_id":OTHER,"hook_session_id":SID},{"run_id":"../private"},
+                       {"version":True},{"reason":"private reason"},{"attempted_write_calls":True},
+                       {"applied_write_calls":4},{"source":{"start_offset":True,"end_offset":20}},
+                       {"source":{"start_offset":20,"end_offset":10}}):
+            with self.subTest(change=change):
+                self.durable_fixture(**change)
+                health=self.report()["learner"]["health"]
+                self.assertEqual(health["progress"]["last_completed_interval"]["evidence"],"not_available_in_window")
+                self.assertNotEqual(health["headline"],"idle")
+                self.assertNotIn("private",json.dumps(health))
+        root,path=self.durable_fixture()
+        path.write_bytes(b"x"*(STATUS.MAX_SETTLEMENT_BYTES+1))
+        self.assertEqual(self.report()["learner"]["latest_run"]["recorded_settlement"]["read"]["read_status"],"oversize")
+        root,path=self.durable_fixture()
+        opened=[]
+        original=STATUS.open_regular
+        def checked(path):
+            opened.append(path.name)
+            self.assertNotIn(path.name,{"execution-manifest.json","mcp-audit.jsonl","provider-observation.json","prompt.txt"})
+            return original(path)
+        with patch.object(STATUS,"open_regular",side_effect=checked): self.report()
+        self.assertIn("settlement.json",opened)
+
+    def test_active_publication_prevents_idle_after_processing_clear_and_pending_delete(self):
+        for active in ({"ticket_id":OTHER,"ticket_sha256":DIGEST},
+                       {"ticket_id":"../../private","ticket_sha256":DIGEST}, {}, None):
+            with self.subTest(active=active):
+                root=self.learner_fixture(session={"offset":10},admission={"processing":None})
+                self.write(root/"publications"/SID/"active.json",active)
+                learner=self.report()["learner"]
+                self.assertEqual(learner["health"]["headline"],"publication_recovery_pending")
+                self.assertEqual(learner["health"]["recovery"]["action"],"recover_publication")
+                self.assertIn({"kind":"publication_recovery_pending","liveness":"not_checked"},learner["health"]["holds"])
+                self.assertNotIn("private",json.dumps(learner))
+
+    def test_active_index_symlink_duplicate_fields_and_oversize_are_recovery_pending(self):
+        root=self.learner_fixture(session={"offset":10})
+        path=root/"publications"/SID/"active.json"
+        self.write(path,{"ticket_id":OTHER,"ticket_sha256":DIGEST})
+        for raw in (b'{"ticket_id":"x","ticket_id":"y"}', b'x'*(STATUS.MAX_JSON_BYTES+1)):
+            path.write_bytes(raw)
+            self.assertEqual(self.report()["learner"]["health"]["headline"],"publication_recovery_pending")
+        path.unlink()
+        path.symlink_to(root/"private-ticket.json")
+        self.assertEqual(self.report()["learner"]["health"]["headline"],"publication_recovery_pending")
+        path.unlink()
+        self.assertEqual(self.report()["learner"]["health"]["headline"],"idle")
+
+    def test_processing_execution_and_orphan_anchor_are_not_idle(self):
+        for reference in ({"run_id":RUN,"manifest_sha256":DIGEST}, {"run_id":"private"}, None):
+            with self.subTest(reference=reference):
+                self.learner_fixture(session={"offset":10},admission={"processing":None,"processing_execution":reference})
+                self.assertEqual(self.report()["learner"]["health"]["headline"],"processing_unverified")
+        self.learner_fixture(session={"offset":10,"settlement_sha256":DIGEST})
+        self.assertNotEqual(self.report()["learner"]["health"]["headline"],"idle")
+
     def test_missing_held_run_receipt_stays_in_metadata_issues(self):
         self.learner_fixture(session={"reconciliation_required": {"run_id": RUN, "reason": "write_status_unknown"}})
         health = self.report()["learner"]["health"]
