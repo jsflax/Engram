@@ -446,6 +446,20 @@ do {
 // before the first database open (top of file) — a cooperative-pool Task
 // here would starve under blocking SQLite calls.
 
-// Keep alive
-await server.waitUntilCompleted()
-log("EXIT: Transport completed (stdin closed)")
+private func retainFailedShutdownOwnership() -> Never {
+    // Synchronous fail-closed parking is intentional: no cleanup may release
+    // the writer fence unless the SDK's external owner has confirmed its join.
+    DispatchSemaphore(value: 0).wait()
+    fatalError("Unreachable shutdown wait")
+}
+
+// Keep the inherited writer fence until every entered handler and response
+// write has joined. EOF alone only completes the SDK's receive loop.
+guard await waitForMCPServerShutdown(server) else {
+    log("Shutdown ownership refused; retaining process and writer fence")
+    // The external main task cannot normally hit the SDK's ancestor guard.
+    // If it does, do not unwind and unlock while an operation remains alive.
+    // The lifecycle watchdog or supervising process can still reap us.
+    retainFailedShutdownOwnership()
+}
+log("EXIT: Transport and owned tasks completed")
