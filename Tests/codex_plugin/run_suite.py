@@ -16,7 +16,7 @@ from suite_support import PLUGIN_ROOT, TEST_ROOT
 MODULES = (
     "test_frontier", "test_router", "test_host", "test_receipts",
     "test_budget_guidance", "test_lock_inheritance", "test_hook_parity",
-    "test_hook_status", "test_bootstrap", "test_entry_integration",
+    "test_hook_status", "test_hook_status_legacy", "test_bootstrap", "test_entry_integration",
     "test_memory_policy",
     "test_file_identity", "test_host_v2", "test_v2_runtime", "test_migration",
     "test_execution_manifest", "test_publication_journal", "test_writer_fence",

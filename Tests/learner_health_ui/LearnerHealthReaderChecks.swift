@@ -72,6 +72,44 @@ enum LearnerHealthReaderChecks {
         expect(.invalidReport) { _ = try LearnerHealthSnapshot.decode(JSONSerialization.data(withJSONObject: object), sessionID: sessionID) }
         progress["last_completed_interval"] = ["evidence": "not_available_in_window"]
         model["progress"] = progress
+        model["headline"] = "batch_limit"
+        outcomes["provider_completion"] = ["state": "completed_in_run_receipt", "run_status": "failed"]
+        outcomes["legacy_reconciliation"] = ["state": "recorded_completed",
+            "historical_run_status": "failed", "historical_execution_sealed": false,
+            "source_binding_grade": "current_bounded_reconstruction", "native_mutations_performed": 0]
+        outcomes["independent_readback"] = ["state": "not_performed"]
+        model["outcomes"] = outcomes
+        progress["last_reconciled_interval"] = ["evidence": "recorded_legacy_reconciliation",
+            "legacy_run_id": "legacy-failed-run", "start_offset": 100, "end_offset": 200]
+        model["progress"] = progress
+        learner["health"] = model
+        object["learner"] = learner
+        let reconciled = try LearnerHealthSnapshot.decode(JSONSerialization.data(withJSONObject: object), sessionID: sessionID).learner.health
+        require(reconciled.title == "Paused at batch limit", "Reconciliation cannot erase a current pause")
+        require(reconciled.progress.lastCompletedInterval.endOffset == nil, "A legacy review cannot create successful coverage")
+        require(reconciled.progress.lastReconciledInterval?.startOffset == 100, "Reconciled start must remain separate")
+        require(reconciled.progress.lastReconciledInterval?.endOffset == 200, "Reconciled end must remain separate")
+        require(reconciled.progress.lastReconciledInterval?.legacyRunId == "legacy-failed-run", "Historical run link must survive")
+        require(reconciled.outcomes.providerCompletion.runStatus == "failed", "Original provider failure remains visible")
+        require(reconciled.outcomes.legacyReconciliation?.historicalExecutionSealed == false, "Historical seal cannot be invented")
+        require(reconciled.outcomes.legacyReconciliation?.nativeMutationsPerformed == 0, "Review records no new mutation")
+        require(reconciled.outcomes.legacyReconciliation?.title == "Recorded review; no new memory write", "Review presentation must avoid a success claim")
+        require(reconciled.outcomes.legacyReconciliation?.qualification.contains("original provider run remains failed") == true, "Qualification must retain the original failure")
+        require(reconciled.outcomes.independentReadback.state == "not_performed", "Review is not independent readback")
+        outcomes["legacy_reconciliation"] = ["state": "recovery_pending"]
+        model["outcomes"] = outcomes
+        model["headline"] = "publication_recovery_pending"
+        learner["health"] = model
+        object["learner"] = learner
+        let unfinishedReview = try LearnerHealthSnapshot.decode(JSONSerialization.data(withJSONObject: object), sessionID: sessionID).learner.health
+        require(unfinishedReview.title == "Progress update needs recovery", "Missing review receipt stays recoverable")
+        require(unfinishedReview.outcomes.legacyReconciliation?.title == "Review receipt needs recovery", "The missing legacy receipt stays distinct")
+        outcomes["legacy_reconciliation"] = ["state": "absent"]
+        model["outcomes"] = outcomes
+        learner["health"] = model
+        object["learner"] = learner
+        let noReview = try LearnerHealthSnapshot.decode(JSONSerialization.data(withJSONObject: object), sessionID: sessionID)
+        require(noReview.learner.health.outcomes.legacyReconciliation?.title == "None recorded", "Absent review remains absent")
         model["schema_version"] = 2
         learner["health"] = model
         object["learner"] = learner

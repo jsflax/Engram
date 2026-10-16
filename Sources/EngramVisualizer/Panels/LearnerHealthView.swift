@@ -81,9 +81,15 @@ struct LearnerHealthView: View {
         row("Activity", label(health.activity.state))
         row("Queue", label(health.outcomes.queue.state))
         row("Provider", label(health.outcomes.providerCompletion.state))
+        if let status = health.outcomes.providerCompletion.runStatus {
+            row("Provider run result", label(status))
+        }
         row("Native writes", label(health.outcomes.nativeAcknowledgement.state))
         if let settlement = health.outcomes.recordedSettlement {
             row("Run verification", label(settlement.state))
+        }
+        if let review = health.outcomes.legacyReconciliation, review.state != "absent" {
+            row("Legacy review", review.title)
         }
         row("Readback", label(health.outcomes.independentReadback.state))
         Text(health.recoveryText).foregroundStyle(.secondary)
@@ -110,6 +116,18 @@ struct LearnerHealthView: View {
                     row("Completed end", "\(end.formatted()) (legacy receipt)")
                 } else {
                     row("Completed interval", "No qualifying receipt in this window")
+                }
+                if let interval = health.progress.lastReconciledInterval {
+                    row("Reconciled interval", "\(interval.startOffset.formatted())–\(interval.endOffset.formatted())")
+                    row("Review evidence", label(interval.evidence))
+                    Text("Historical run: \(interval.legacyRunId)").textSelection(.enabled)
+                }
+                if let review = health.outcomes.legacyReconciliation, review.state == "recorded_completed" {
+                    Text(review.qualification)
+                    if let status = review.historicalRunStatus { row("Historical run result", label(status)) }
+                    if review.historicalExecutionSealed == false { row("Historical input seal", "Not available") }
+                    if let grade = review.sourceBindingGrade { row("Reconstruction", label(grade)) }
+                    if let count = review.nativeMutationsPerformed { row("New writes from review", count.formatted()) }
                 }
                 if let counts = health.outcomes.writeAttempts,
                    counts.attemptedWriteCalls != nil || counts.appliedWriteCalls != nil || counts.unchangedWriteCalls != nil {
@@ -158,6 +176,9 @@ struct LearnerHealthView: View {
         switch code {
         case "processing_unverified", "processing_marker": "Processing recorded; activity unverified"
         case "publication_recovery_pending": "Unfinished progress update"
+        case "legacy_reconciliation_recovery_pending": "Unfinished legacy review receipt"
+        case "recorded_legacy_reconciliation": "Recorded retrospective review"
+        case "current_bounded_reconstruction": "Reconstructed from current bounded evidence"
         case "session_hash_match": "Linked to this task"
         case "recorded_in_anchored_settlement": "Recorded in linked receipt"
         case "anchored_settlement_receipt": "Run receipt linked to this task"

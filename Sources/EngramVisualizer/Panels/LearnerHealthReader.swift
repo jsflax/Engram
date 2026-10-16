@@ -45,9 +45,16 @@ struct LearnerHealthSnapshot: Decodable, Sendable {
             }
         }
     }
+    struct ReconciledInterval: Decodable, Sendable {
+        let evidence: String
+        let legacyRunId: String
+        let startOffset: Int64
+        let endOffset: Int64
+    }
     struct Progress: Decodable, Sendable {
         let backlog: Backlog
         let lastCompletedInterval: Interval
+        let lastReconciledInterval: ReconciledInterval?
         let cursorOffset: Int64?
         let enrollmentFrontierOffset: Int64?
         let pendingSnapshotOffset: Int64?
@@ -86,12 +93,38 @@ struct LearnerHealthSnapshot: Decodable, Sendable {
         let state: String
         let receipt: SettlementReceipt?
     }
+    struct ProviderCompletion: Decodable, Sendable {
+        let state: String
+        let runStatus: String?
+    }
+    struct LegacyReconciliation: Decodable, Sendable {
+        let state: String
+        let historicalRunStatus: String?
+        let historicalExecutionSealed: Bool?
+        let sourceBindingGrade: String?
+        let nativeMutationsPerformed: Int?
+
+        var title: String {
+            switch state {
+            case "recorded_completed": "Recorded review; no new memory write"
+            case "recovery_pending": "Review receipt needs recovery"
+            case "absent": "None recorded"
+            default: "Review status unknown"
+            }
+        }
+
+        var qualification: String {
+            "Retrospective review of reconstructed input. The original provider run remains failed; "
+                + "this disposition records no successful learning coverage."
+        }
+    }
     struct Outcomes: Decodable, Sendable {
         let queue: State
-        let providerCompletion: State
+        let providerCompletion: ProviderCompletion
         let nativeAcknowledgement: NativeAcknowledgement
         let writeAttempts: WriteCounts?
         let recordedSettlement: RecordedSettlement?
+        let legacyReconciliation: LegacyReconciliation?
         let independentReadback: State
     }
     struct Health: Decodable, Sendable {
