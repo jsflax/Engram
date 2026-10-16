@@ -201,12 +201,16 @@ class RecoveryProbeTests(unittest.TestCase):
             self.assertNotIn('private',str(raised.exception))
             self.assertEqual(self.kinds(),['dispatch'])
 
-    def test_deadline_and_cleanup_failure_refuse_all_observations(self):
+    def test_deadline_refuses_all_observations(self):
         self.limits = P.ProbeLimits(deadline_seconds=0.2,terminate_timeout_seconds=0.05)
         start = time.monotonic()
         with self.assertRaisesRegex(P.ProbeError,'deadline'): self.reconcile(mode='delay')
         self.assertLess(time.monotonic()-start,2)
         self.assertEqual(self.kinds(),['dispatch'])
+
+    def test_cleanup_failure_refuses_all_observations(self):
+        # Keep normal probe time for this independent failure injection. The
+        # deadline test's 0.2s limit can mask cleanup on a loaded host.
         cleanup = P.bridge._cleanup
         def failed(child,timeout):
             result = cleanup(child,timeout)
