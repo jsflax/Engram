@@ -173,22 +173,29 @@ def _check_validator(validate, plan, phase):
 
 def prepare(paths, *, transition_id, session_id, request_id, binding,
             expected_old_state_sha256, expected_old_admission_sha256,
-            new_state, new_admission, validate):
+            new_state, new_admission, validate, preserve_state_bytes=False):
     """Freeze an already-authorized proposal before either target changes.
 
     Expected old hashes bind the caller's inspected inputs, including formatting.
     This does not create a missing enrollment/state pair. The return value must
     be pinned by the caller's durable execution evidence before publication.
+    A processing-marker transition may preserve an otherwise identical state's
+    exact encoding; this requires canonical JSON equality, not Python equality.
     """
     path_binding = _paths(paths, session_id, transition_id)
     _sha(expected_old_state_sha256)
     _sha(expected_old_admission_sha256)
+    _require(type(preserve_state_bytes) is bool, "invalid_preserve_state_bytes")
     records = {}
     for role, expected, proposed in (("admission", expected_old_admission_sha256, new_admission),
                                       ("state", expected_old_state_sha256, new_state)):
         raw, identity = durable._read(getattr(paths, role))
         _require(durable.digest(raw) == expected, "preimage_changed")
-        records[role] = {"old": _image(raw, identity), "new": _image(durable.encode(proposed))}
+        next_raw = durable.encode(proposed)
+        if role == "state" and preserve_state_bytes:
+            _require(durable.encode(_json(raw)) == next_raw, "preserved_state_changed")
+            next_raw = raw
+        records[role] = {"old": _image(raw, identity), "new": _image(next_raw)}
     plan = {"schema_version": 1, "kind": KIND, "status": "prepared", "transition_id": transition_id,
             "session_id": session_id, "request_id": request_id, "binding": copy.deepcopy(binding),
             "paths": path_binding, "records": records, "publication_order": list(ORDER)}

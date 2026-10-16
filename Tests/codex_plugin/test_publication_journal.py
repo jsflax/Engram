@@ -270,6 +270,24 @@ class PublicationJournalTests(unittest.TestCase):
         self.assertEqual([getattr(self.paths, role).stat().st_ino for role in P.ORDER], identities)
         self.assert_old_pair()
 
+    def test_preserve_state_bytes_keeps_indentation_and_rejects_json_type_aliases(self):
+        self.old_state["fixture_value"] = 1
+        self.old_raw["state"] = (json.dumps(self.old_state, indent=2) + "\n").encode()
+        self.old_record["state_sha256"] = P.durable.object_digest(self.old_state)
+        self.old_raw["admission"] = P.durable.encode(self.old_record)
+        for role, raw in self.old_raw.items():
+            getattr(self.paths, role).write_bytes(raw)
+        self.new_state = copy.deepcopy(self.old_state)
+        self.new_record = {**self.old_record, "processing": None}
+        original_inode = self.paths.state.stat().st_ino
+        with self.assertRaisesRegex(ValueError, "preserved_state_changed"):
+            self.prepare(preserve_state_bytes=True, new_state={**self.new_state, "fixture_value": True})
+        sha = self.prepare(preserve_state_bytes=True)
+        self.interrupt(sha, "admission_replaced")
+        self.publish(sha)
+        self.assertEqual(self.paths.state.read_bytes(), self.old_raw["state"])
+        self.assertEqual(self.paths.state.stat().st_ino, original_inode)
+
     def test_validator_requires_exact_true_before_prepare_and_every_replacement(self):
         for refused in (False, None, 1, "yes"):
             with self.subTest(phase="prepare", refused=refused):
