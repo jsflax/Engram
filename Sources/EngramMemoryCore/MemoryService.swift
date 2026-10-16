@@ -309,7 +309,9 @@ public struct ToolReply: Sendable, Codable {
 
 /// Operations a backend may legitimately not support. The transport omits
 /// unsupported tools from its tool list; direct calls receive a typed
-/// `MemoryServiceError.unsupported`.
+/// `MemoryServiceError.unsupported` (or `MemoryOperationError.unsupported`
+/// for durable operations). `allCases` is an inventory, never a backend support
+/// declaration: conformances must opt into each implemented capability.
 public enum MemoryCapability: String, Sendable, Codable, CaseIterable {
     /// sqlite-file maintenance (vacuum, checkpoint, vector-index rebuild).
     case fileMaintenance
@@ -320,6 +322,11 @@ public enum MemoryCapability: String, Sendable, Codable, CaseIterable {
     /// Cluster analysis + consolidation (find_clusters, detect_communities,
     /// organize, consolidate).
     case clustering
+    /// Atomic, durable remember/update/connect operations in the local owning
+    /// store, with exact replay and status lookup. Excludes foreign-store
+    /// targets and undelete. Never advertise until the implementation exists;
+    /// the protocol defaults throw MemoryOperationError.unsupported.
+    case localMutationOperationsV1
 }
 
 public enum MemoryServiceError: Error, Sendable {
@@ -352,6 +359,12 @@ public protocol MemoryService: Sendable {
     /// Merge `ids` into one memory whose body is `content` (the tool's
     /// replacement-content semantics — there is no "absorb into target").
     func merge(ids: [UUID], content: String, topic: String?, project: String?) async throws -> ToolReply
+
+    // Durable writes — additive, explicitly capability-gated. The defaults
+    // throw unsupported and NEVER invoke the legacy core write methods.
+    func operationScope() async throws -> MemoryOperationScope
+    func applyOperation(_ request: MemoryOperationRequest) async throws -> MemoryOperationReceipt
+    func operationStatus(operationID: UUID, scope: MemoryOperationScope) async throws -> MemoryOperationStatus
 
     // Rendered-text surface (structured in 1b as handlers migrate).
     // `sessionKey` scopes conversational state (episodes) — the CLI passes
