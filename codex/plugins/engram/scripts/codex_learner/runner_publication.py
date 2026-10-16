@@ -17,7 +17,7 @@ import uuid
 from . import admission, execution_context as contexts, execution_manifest as journal
 from . import host_admission, memory_config, migration as durable, operation_probe, parser_context
 from . import publication_coordinator as coordinator, publication_journal as publication
-from . import writer_fence, settlement
+from . import writer_fence, settlement, legacy_reconciliation
 
 
 class Outcome(str):
@@ -77,7 +77,7 @@ class Execution:
 
 
 class Publications:
-    def __init__(self, root, config_path, plugin_root):
+    def __init__(self, root, config_path, plugin_root, *, legacy_paths=None, legacy_verify_locks=None):
         for path in (root, plugin_root):
             _require(isinstance(path, Path) and path.is_absolute()
                      and path.resolve(strict=True) == path, "untrusted_paths")
@@ -86,6 +86,7 @@ class Publications:
                  and not config_path.is_symlink(), "untrusted_paths")
         _require(not durable._directory(root).st_mode & 0o077, "untrusted_root")
         self.root, self.config_path, self.plugin_root = root, config_path, plugin_root
+        self._legacy_paths, self._legacy_verify_locks = legacy_paths, legacy_verify_locks
 
     def paths(self, session_id):
         selected = admission.state_paths(self.root, session_id)
@@ -375,6 +376,20 @@ class Publications:
         """
         selected = self.paths(session_id)
         active = coordinator._active(selected, session_id)
+        legacy_selected = active is not None and active[0]["input_evidence"].get("kind") == legacy_reconciliation.KIND
+        if active is None:
+            legacy_selected = legacy_reconciliation.needs_recovery(self.root, session_id)
+        if legacy_selected:
+            _require(callable(self._legacy_paths) and callable(self._legacy_verify_locks),
+                     "legacy_trusted_paths_and_locks_required")
+            legacy_paths = self._legacy_paths()
+            _require(type(legacy_paths) is legacy_reconciliation.LegacyPaths and legacy_paths.root == self.root
+                     and legacy_paths.package_root == self.plugin_root, "legacy_paths_changed")
+            resolved = legacy_reconciliation.recover_locked(legacy_paths, session_id=session_id,
+                verify_locks=self._legacy_verify_locks)
+            if resolved is not None:
+                completed = coordinator.read_completed(selected, session_id=session_id, **resolved["publication"])
+                return Outcome(legacy_reconciliation.RESULT, completed["ticket"]["request_id"])
         if active is not None:
             ticket = active[0]
             view = {**ticket, "publication": coordinator._plan(selected, ticket)}
