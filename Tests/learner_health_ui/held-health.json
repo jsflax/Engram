@@ -1,0 +1,79 @@
+{
+  "status": "ok",
+  "session_id": "11111111-2222-4333-8444-555555555555",
+  "learner": {
+    "health": {
+      "schema_version": 1,
+      "headline": "reconciliation_required",
+      "evidence": "bounded_metadata_non_atomic_snapshot",
+      "policy": {
+        "state": "enabled",
+        "mode": "host_sessions_v2"
+      },
+      "activity": {
+        "state": "held",
+        "evidence": "bounded_metadata_not_worker_liveness",
+        "pending_pause_reason": "batch_limit"
+      },
+      "holds": [
+        {
+          "kind": "reconciliation_required",
+          "run_id": "20260924T083200Z-b8af2a1f05fd497394bd99ea768a54cb",
+          "reason": "successful_or_unverified_write",
+          "memory_ids": [
+            "4e2a56cf-92a1-41b8-be82-98d3a0755e4a"
+          ]
+        }
+      ],
+      "progress": {
+        "backlog": {
+          "state": "known_at_pending_snapshot",
+          "current_transcript_size": "not_inspected",
+          "bytes": 14536673
+        },
+        "last_completed_interval": {
+          "evidence": "not_available_in_window"
+        },
+        "cursor_offset": 685463327,
+        "pending_snapshot_offset": 700000000,
+        "last_success_timestamp_claim": "2026-09-17T12:00:00Z"
+      },
+      "failure": {
+        "class": "uncertain_or_partial_write",
+        "reason": "successful_or_unverified_write",
+        "run_reason": "unverified_completion",
+        "diagnostic_error_count": 3,
+        "error_count_semantics": "aggregate_provider_gateway_transport_not_unique_operations"
+      },
+      "metadata_issues": [],
+      "recovery": {
+        "action": "reconcile_held_run",
+        "automatic_replay_authorized": false
+      },
+      "outcomes": {
+        "queue": {
+          "state": "paused"
+        },
+        "provider_completion": {
+          "state": "completed_in_run_receipt"
+        },
+        "native_acknowledgement": {
+          "state": "acknowledged_in_run_receipt",
+          "independent_persistence": "not_verified",
+          "acknowledged_write_count": 1,
+          "writes": [
+            {
+              "tool": "remember",
+              "memory_ids": [
+                "4e2a56cf-92a1-41b8-be82-98d3a0755e4a"
+              ]
+            }
+          ]
+        },
+        "independent_readback": {
+          "state": "not_performed"
+        }
+      }
+    }
+  }
+}

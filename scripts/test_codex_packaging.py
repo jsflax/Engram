@@ -138,6 +138,9 @@ esac
         for name in ("codex_learner.py", "codex_learner/__init__.py", "codex_learner/transcript.py",
                      "codex_learner/runner.py", "codex_learner/memory_proxy.py", "codex_learner/learner_prompt.md"):
             (scripts / name).write_text("# packaged fixture\n")
+        health = source / "codex/plugins/engram/skills/hook-status/scripts/hook_status.py"
+        health.parent.mkdir(parents=True)
+        shutil.copy(SCRIPTS.parent / "codex/plugins/engram/skills/hook-status/scripts/hook_status.py", health)
         self.fake_command("swift", """
 mkdir -p .build/release/Engram_EngramKit.bundle .build/release/swift-transformers_Hub.bundle .build/release/SwiftLM_SwiftLM.bundle
 for binary in Engram EngramHooks EngramDaemon; do echo local-build > ".build/release/$binary"; done
@@ -161,6 +164,14 @@ for binary in Engram EngramHooks EngramDaemon; do echo local-build > ".build/rel
         files = [p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_file()]
         self.assertIn("codex_learner/learner_prompt.md", files)
         self.assertIn("codex_learner/memory_proxy.py", files)
+        self.assertEqual((target / "hook_status.py").read_bytes(),
+                         (SCRIPTS.parent / "codex/plugins/engram/skills/hook-status/scripts/hook_status.py").read_bytes())
+        # The UI helper must also run from the isolated installed payload.
+        result = subprocess.run([sys.executable, "-I", "-B", str(target / "hook_status.py"),
+                                 "--session-id", "11111111-2222-4333-8444-555555555555"],
+                                cwd=self.root, env=self.env, text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["learner"]["health"]["schema_version"], 1)
         self.assertFalse(any("test_" in p or "__pycache__" in p for p in files), files)
 
     def test_packaged_install_registers_memory_and_preserves_user_settings(self):

@@ -511,6 +511,19 @@ class RunnerTests(unittest.TestCase):
                     self.assertEqual(process.call_count, 1)
                     spawn.assert_not_called()
 
+    def test_worker_preserves_failure_after_an_earlier_successful_batch(self):
+        for outcome in ('failed', 'backoff', 'blocked'):
+            with self.subTest(outcome=outcome):
+                runner.enqueue(self.root, self.payload(), spawn=False)
+                process = mock.Mock(side_effect=['more', outcome])
+                with mock.patch.object(runner, 'process_request', process), mock.patch.object(runner, 'spawn_worker') as spawn:
+                    self.assertEqual(runner.worker(self.root), 0)
+                    paused = runner.load_json(self.root / 'pending' / (self.sid + '.json'))
+                    self.assertEqual(paused['pause_reason'], outcome)
+                    self.assertEqual(runner.worker(self.root), 0)
+                self.assertEqual(process.call_count, 2)
+                spawn.assert_not_called()
+
     def test_new_request_arriving_during_processing_is_not_lost(self):
         runner.enqueue(self.root, self.payload(), spawn=False)
         seen = []

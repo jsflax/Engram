@@ -292,6 +292,12 @@ def commit_admitted_state(root: Path, request: dict, state: dict) -> None:
         atomic_json(root / "sessions" / (sid + ".json"), state)
 
 
+def requires_reconciliation(state: dict) -> bool:
+    # Only a supported recovery transition may remove a gate. A malformed or
+    # partially published gate cannot grant permission to replay uncertain work.
+    return "reconciliation_required" in state or state.get("status") == "reconciliation_required"
+
+
 def enqueue(root: Path, payload: dict, *, spawn: bool = True, expected_admission: dict | None = None,
             route_guard=None) -> bool:
     if os.environ.get(GUARD) or os.environ.get("CLAUDE_MEMORY_LEARNER") or os.environ.get("ENGRAM_LEARNER_ORCHESTRATED") == "1":
@@ -316,8 +322,9 @@ def enqueue(root: Path, payload: dict, *, spawn: bool = True, expected_admission
                 route_guard()
             record = admitted_record(root, request, create=True)
             state = load_json(root / "sessions" / (sid + ".json"))
-            if state.get("reconciliation_required"):
-                gate = state["reconciliation_required"]
+            if requires_reconciliation(state):
+                gate = state.get("reconciliation_required")
+                gate = gate if isinstance(gate, dict) else {}
                 event_log(root, "reconciliation_required", session_id=sid,
                           run_id=state.get("last_run"), reason=gate.get("reason"), memory_ids=gate.get("memory_ids", []))
                 return False
@@ -345,6 +352,73 @@ def enqueue(root: Path, payload: dict, *, spawn: bool = True, expected_admission
     event_log(root, "queued", session_id=sid, hook_event=request["event"], request_id=request["request_id"])
     if spawn:
         spawn_worker(root)
+    return True
+
+
+def resume_pending(root: Path, session_id: str, *, spawn: bool = True) -> bool:
+    """Resume the same paused request without treating it as a new hook event.
+
+    Reconciliation and interrupted execution need their own recovery evidence.
+    This path only releases an ordinary pause after rechecking its exact cursor,
+    admission and transcript identity. Lock order matches the worker.
+    """
+    if (os.environ.get(GUARD) or os.environ.get("CLAUDE_MEMORY_LEARNER")
+            or os.environ.get("ENGRAM_LEARNER_ORCHESTRATED") == "1"):
+        return False
+    if not isinstance(session_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,100}", session_id) is None:
+        return False
+    try:
+        admission.check_activation(root)
+        paths = admission.state_paths(root, session_id)
+        pending_path, state_path = paths["pending"], paths["sessions"]
+        expected_request = load_pending(pending_path)
+        expected_state = load_json(state_path)
+        if not expected_request or not isinstance(expected_state, dict):
+            raise ValueError("resume_missing_request_or_state")
+        with lock_file(root / "worker.lock", blocking=False) as acquired:
+            if not acquired:
+                raise ValueError("resume_worker_active")
+            with lock_file(root / "enqueue.lock"):
+                admission.state_paths(root, session_id)
+                request = load_pending(pending_path)
+                state = load_json(state_path)
+                if request != expected_request or state != expected_state:
+                    raise ValueError("resume_request_or_state_changed")
+                record = admitted_record(root, request)
+                if record["processing"] is not None:
+                    raise ValueError("admission_interrupted_processing")
+                if requires_reconciliation(state):
+                    raise ValueError("reconciliation_required")
+                if (request.get("paused_request_id") != request["request_id"]
+                        or request.get("pause_reason") not in {"failed", "backoff", "blocked", "batch_limit"}):
+                    raise ValueError("resume_request_not_safely_paused")
+                retry_after = state.get("retry_after", 0)
+                if type(retry_after) not in (int, float) or not 0 <= retry_after <= time.time():
+                    raise ValueError("resume_backoff")
+                stable = request["admission"].get("mode") == host_admission.MODE_V2
+                meta = inspect_rollout(request["transcript_path"], **({"stable_identity": True} if stable else {}))
+                identity = {"identity": meta.identity} if stable else {"device": meta.device, "inode": meta.inode}
+                if (meta.session_id != session_id
+                        or any(request.get(k) != v or state.get(k) != v for k, v in identity.items())):
+                    raise ValueError("resume_transcript_identity_changed")
+                size = request.get("size_bytes")
+                if type(size) is not int or size < 0 or meta.size_bytes < max(state["offset"], size):
+                    raise ValueError("resume_transcript_truncated")
+                resumed = dict(request)
+                resumed.pop("paused_request_id")
+                resumed.pop("pause_reason")
+                atomic_json(pending_path, resumed)
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        event_log(root, "resume_refused", session_id=session_id, reason=str(exc)[:160])
+        return False
+    # Queue publication already succeeded. A diagnostic failure must neither
+    # describe this as a refused/no-change resume nor suppress its wakeup.
+    try:
+        event_log(root, "resumed", session_id=session_id, request_id=request["request_id"],
+                  previous_pause_reason=request["pause_reason"], state_sha256=record["state_sha256"])
+    finally:
+        if spawn:
+            spawn_worker(root)
     return True
 
 
@@ -839,7 +913,7 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=run_codex
         state = load_json(state_path)
         if state and state.get("admission") != request["admission"]:
             raise ValueError("admission_cursor_binding_changed")
-    if state.get("reconciliation_required"):
+    if requires_reconciliation(state):
         return "reconciliation_required"
     if state.get("retry_after", 0) > time.time():
         return "backoff"
@@ -891,7 +965,7 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=run_codex
             if record["processing"] is not None:
                 raise ValueError("admission_interrupted_processing")
             current = load_json(state_path)
-            if current.get("reconciliation_required"):
+            if requires_reconciliation(current):
                 return "reconciliation_required"
             if admission_digest(current) != admission_digest(state):
                 raise ValueError("admission_cursor_changed_while_waiting")
@@ -964,6 +1038,9 @@ def worker(root: Path) -> int:
                 event_log(root, "worker_error", session_id=request.get("session_id"), reason=type(exc).__name__)
                 outcome = "blocked"
             handled += 1
+            # Only the latest outcome for this queue slot may pause it for the
+            # batch limit. An earlier successful batch must not mask a hold.
+            more.pop(pending, None)
             with lock_file(root / "enqueue.lock"):
                 current = load_pending(pending)
                 if current.get("request_id") == request.get("request_id"):
@@ -978,7 +1055,8 @@ def worker(root: Path) -> int:
         with lock_file(root / "enqueue.lock"):
             for pending, request_id in more.items():
                 current = load_pending(pending)
-                if current.get("request_id") == request_id:
+                if (current.get("request_id") == request_id
+                        and current.get("paused_request_id") != request_id):
                     atomic_json(pending, {**current, "paused_request_id": request_id, "pause_reason": "batch_limit"})
         event_log(root, "worker_idle", handled=handled, pending=len(list(pending_dir.glob("*.json"))),
                   invalid_pending=len(invalid_pending))
@@ -1018,12 +1096,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "retry":
         if not args.session_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", args.session_id):
             parser.error("retry requires a valid --session-id")
-        request = load_json(root / "pending" / (args.session_id + ".json"))
-        if not request:
-            parser.error("no pending request for this session")
-        # Explicit retry respects the same backoff and transcript identity checks.
-        payload = {**request, "hook_event_name": request["event"]}
-        return 0 if enqueue(root, payload) else 1
+        return 0 if resume_pending(root, args.session_id) else 1
     states = [load_json(p) for p in sorted((root / "sessions").glob("*.json"))] if (root / "sessions").exists() else []
     pending = [load_json(p) for p in (root / "pending").glob("*.json")]
     print(json.dumps({"state_dir": str(root), "pending": len(pending),

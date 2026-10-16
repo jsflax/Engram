@@ -22,6 +22,9 @@ OTHER = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 DIGEST = "a" * 64
 STAMP = "2026-09-17T12:00:00Z"
 RUN = "20260917T120000Z-" + "b" * 32
+REQUEST = "c" * 32
+IDENTITY = {"scheme": "macos_volume_uuid_inode_v1", "volume_uuid": OTHER, "inode": 123}
+DEFAULT_ADMISSION = object()
 
 
 class StatusTests(unittest.TestCase):
@@ -46,6 +49,22 @@ class StatusTests(unittest.TestCase):
 
     def report(self):
         return STATUS.report(environ={"CODEX_HOME": str(self.home), "CODEX_THREAD_ID": SID})
+
+    def learner_fixture(self, *, enabled=True, session=None, pending=None, admission=DEFAULT_ADMISSION):
+        root = self.modern / "learner"
+        self.write(root / "admission.json", {"enabled": enabled, "mode": "host_sessions_v2"})
+        self.write(root / "enrollments" / (SID + ".json"), {"session_id": SID, "frontier_offset": 0})
+        if session is not None:
+            self.write(root / "sessions" / (SID + ".json"), {"session_id": SID, "identity": IDENTITY, "offset": 0, **session})
+        if pending is not None:
+            self.write(root / "pending" / (SID + ".json"),
+                       {"session_id": SID, "identity": IDENTITY, "request_id": REQUEST, **pending})
+        if admission is DEFAULT_ADMISSION:
+            admission = {"processing": None}
+        if admission is not None:
+            self.write(root / "admissions" / (SID + ".json"),
+                       {"binding": {"session_id": SID}, "state_sha256": DIGEST, **admission})
+        return root
 
     def test_absent_modern_uses_legacy(self):
         self.write(self.legacy / "learner/admission.json", {"enabled": False})
@@ -206,6 +225,278 @@ class StatusTests(unittest.TestCase):
         result = STATUS.metadata({"enabled": 1, "writes": True, "status": "secret", "reason": ["queued"],
                                   "failure_kind": {"mcp_error": True}, "runtime_identity": {"status": ["complete"]}})
         self.assertEqual(result, {"runtime_identity": {}})
+
+    def test_exact_held_case_overrides_batch_limit_and_historical_success(self):
+        held_run = "20260924T083200Z-b8af2a1f05fd497394bd99ea768a54cb"
+        memory_id = "4e2a56cf-92a1-41b8-be82-98d3a0755e4a"
+        root = self.learner_fixture(session={"offset": 685463327, "status": "reconciliation_required",
+            "last_success_at": STAMP, "last_run": held_run,
+            "reconciliation_required": {"run_id": held_run, "reason": "successful_or_unverified_write", "memory_ids": [memory_id]}},
+            pending={"size_bytes": 700000000, "paused_request_id": REQUEST, "pause_reason": "batch_limit"})
+        self.write(root / "runs" / held_run / "run.json", {"session_id": SID, "status": "failed",
+            "event": "PreCompact", "end_offset": 693703649, "outcome": "failed", "tool_calls": 6,
+            "write_calls": 1, "tool_errors": 3, "reason": "unverified_completion", "turn_completed": True,
+            "writes": [{"tool": "remember", "memory_ids": [memory_id]}]})
+        self.write(root / "events.jsonl", [{"session_id": SID, "event": "reconciliation_required", "run_id": held_run}] * 15, log=True)
+        self.write(self.modern / "router-receipts.jsonl", [{"session_id": SID, "event": "Stop",
+            "status": "not_queued", "reason": "enqueue_refused"}], log=True)
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["headline"], "reconciliation_required")
+        self.assertEqual(health["policy"]["state"], "enabled")
+        self.assertEqual(health["activity"]["state"], "held")
+        self.assertEqual(health["activity"]["pending_pause_reason"], "batch_limit")
+        self.assertEqual(health["holds"][0]["run_id"], held_run)
+        self.assertEqual(health["progress"]["cursor_offset"], 685463327)
+        self.assertEqual(health["progress"]["last_completed_interval"]["evidence"], "not_available_in_window")
+        self.assertEqual(health["progress"]["last_success_timestamp_claim"], STAMP)
+        self.assertEqual(health["failure"]["run_reason"], "unverified_completion")
+        self.assertEqual(health["failure"]["diagnostic_error_count"], 3)
+        self.assertEqual(health["failure"]["error_count_semantics"], "aggregate_provider_gateway_transport_not_unique_operations")
+        self.assertEqual(health["outcomes"]["native_acknowledgement"]["acknowledged_write_count"], 1)
+        self.assertEqual(health["outcomes"]["native_acknowledgement"]["writes"][0]["memory_ids"], [memory_id])
+        self.assertEqual(health["outcomes"]["independent_readback"]["state"], "not_performed")
+        self.assertFalse(health["recovery"]["automatic_replay_authorized"])
+
+    def test_all_missing_means_unknown_not_disabled_or_caught_up(self):
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["headline"], "unknown")
+        self.assertEqual(health["policy"]["state"], "unknown")
+        self.assertEqual(health["progress"]["backlog"]["state"], "unknown")
+        self.assertEqual(health["outcomes"]["queue"]["state"], "absent")
+        self.assertEqual(health["outcomes"]["provider_completion"]["state"], "unknown")
+
+    def test_disabled_policy_does_not_hide_retained_queue_or_hold(self):
+        self.learner_fixture(enabled=False, session={"offset": 10}, pending={"size_bytes": 20})
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["headline"], "disabled")
+        self.assertEqual(health["outcomes"]["queue"]["state"], "queued")
+        self.learner_fixture(enabled=False, session={"status": "reconciliation_required"})
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["headline"], "reconciliation_required")
+        self.assertEqual(health["policy"]["state"], "disabled")
+
+    def test_processing_marker_is_not_proof_of_running_or_interrupted_worker(self):
+        self.learner_fixture(session={"last_success_at": STAMP},
+                             pending={"paused_request_id": REQUEST, "pause_reason": "batch_limit"},
+                             admission={"processing": REQUEST})
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["headline"], "processing_unverified")
+        self.assertEqual(health["holds"][0]["liveness"], "not_checked")
+        self.assertEqual(health["recovery"]["action"], "inspect_processing_attempt")
+        self.assertEqual(health["outcomes"]["provider_completion"]["state"], "unknown")
+
+    def test_migration_and_reconciliation_remain_separate_holds(self):
+        root = self.learner_fixture(session={"status": "reconciliation_required"},
+                                    admission={"processing": REQUEST})
+        self.write(root / "migration-holds" / (SID + ".json"), {"session_id": SID, "kind": "identity_migration_hold"})
+        health = self.report()["learner"]["health"]
+        self.assertEqual([v["kind"] for v in health["holds"]],
+                         ["reconciliation_required", "identity_migration_hold", "processing_marker"])
+        self.learner_fixture(session={"offset": 10})
+        self.assertEqual(self.report()["learner"]["health"]["headline"], "identity_migration_hold")
+
+    def test_stale_pause_cannot_pause_replacement_queue(self):
+        self.learner_fixture(session={"offset": 10},
+                             pending={"size_bytes": 20, "paused_request_id": "d" * 32, "pause_reason": "batch_limit"})
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["headline"], "queued")
+        self.assertNotIn("pending_pause_reason", health["activity"])
+        self.assertEqual(health["progress"]["backlog"]["bytes"], 10)
+        self.learner_fixture(pending={"paused_request_id": REQUEST, "pause_reason": "batch_limit"})
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["headline"], "batch_limit")
+        self.assertEqual(health["recovery"]["action"], "resume_pending")
+
+    def test_backoff_uses_current_clock_and_expires_to_retained_pause(self):
+        self.learner_fixture(session={"status": "failed", "retry_after": 100},
+                             pending={"paused_request_id": REQUEST, "pause_reason": "failed"})
+        with patch.object(STATUS.time, "time", return_value=99):
+            self.assertEqual(self.report()["learner"]["health"]["headline"], "backoff")
+        with patch.object(STATUS.time, "time", return_value=101):
+            self.assertEqual(self.report()["learner"]["health"]["headline"], "paused")
+
+    def test_completed_interval_requires_matching_successful_run_receipt(self):
+        root = self.learner_fixture(session={"offset": 30, "status": "failed", "last_success_at": STAMP})
+        self.write(root / "events.jsonl", [{"session_id": SID, "event": "learner_finished",
+                                           "run_id": RUN, "status": "succeeded"}], log=True)
+        self.write(root / "runs" / RUN / "run.json", {"session_id": SID, "status": "failed", "end_offset": 20})
+        self.assertEqual(self.report()["learner"]["health"]["progress"]["last_completed_interval"]["evidence"], "not_available_in_window")
+        self.write(root / "runs" / RUN / "run.json", {"session_id": SID, "status": "succeeded", "end_offset": 20,
+            "ended_at": STAMP, "turn_completed": True, "write_calls": 0})
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["progress"]["last_completed_interval"], {"evidence": "receipt_only", "run_id": RUN,
+            "end_offset": 20, "ended_at": STAMP, "start_offset": "not_recorded"})
+        self.assertEqual(health["headline"], "failed")
+        self.assertEqual(health["outcomes"]["independent_readback"]["state"], "not_performed")
+
+    def test_gate_run_wins_over_newer_unrelated_linked_event(self):
+        held_run = "20260924T083200Z-" + "e" * 32
+        root = self.learner_fixture(session={"reconciliation_required": {"run_id": held_run, "reason": "write_status_unknown"}})
+        self.write(root / "events.jsonl", [{"session_id": SID, "run_id": RUN, "event": "learner_finished", "status": "succeeded"}], log=True)
+        self.write(root / "runs" / RUN / "run.json", {"session_id": SID, "status": "succeeded", "turn_completed": True})
+        self.write(root / "runs" / held_run / "run.json", {"session_id": SID, "status": "failed", "turn_completed": False, "tool_errors": 2})
+        learner = self.report()["learner"]
+        self.assertEqual(learner["latest_run"]["run_id"], RUN)
+        self.assertEqual(learner["held_run"]["run_id"], held_run)
+        self.assertEqual(learner["health"]["outcomes"]["provider_completion"]["state"], "not_completed_in_run_receipt")
+        self.assertEqual(learner["health"]["failure"]["diagnostic_error_count"], 2)
+
+    def test_backlog_never_reads_transcript_and_requires_recorded_identity(self):
+        state = {"offset": 10, "identity": IDENTITY}
+        pending = {"size_bytes": 20, "identity": IDENTITY}
+        self.assertEqual(STATUS.backlog_view(state, pending)["bytes"], 10)
+        self.assertEqual(STATUS.backlog_view(state, {"size_bytes": 20})["state"], "unknown")
+        self.assertEqual(STATUS.backlog_view(state, {**pending, "identity": {**IDENTITY, "inode": 124}})["state"], "identity_mismatch")
+        self.assertEqual(STATUS.backlog_view(state, {**pending, "size_bytes": 9})["state"], "stale_snapshot")
+        self.assertEqual(STATUS.backlog_view(state, {**pending, "size_bytes": True})["state"], "unknown")
+        self.assertEqual(STATUS.backlog_view({"offset": 10, "device": 1, "inode": 2},
+                                             {"size_bytes": 20, "device": 1, "inode": 2})["bytes"], 10)
+
+    def test_unavailable_hold_metadata_cannot_be_idle(self):
+        root = self.learner_fixture(session={"offset": 10, "status": "succeeded"})
+        held = root / "migration-holds" / (SID + ".json")
+        held.parent.mkdir(parents=True)
+        held.write_text("not json")
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["headline"], "unknown")
+        self.assertEqual(health["failure"]["class"], "metadata_unavailable")
+        self.assertEqual(health["metadata_issues"], [{"component": "migration_hold", "status": "invalid_json"}])
+
+    def test_idle_requires_explicit_absent_processing_and_is_not_caught_up(self):
+        self.learner_fixture(session={"offset": 10, "status": "succeeded"}, admission=None)
+        self.assertEqual(self.report()["learner"]["health"]["headline"], "unknown")
+        self.learner_fixture(admission={"processing": None})
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["headline"], "idle")
+        self.assertEqual(health["progress"]["backlog"]["state"], "unknown")
+        self.assertEqual(health["outcomes"]["independent_readback"]["state"], "not_performed")
+
+    def test_missing_linked_run_and_unsafe_links_do_not_report_idle(self):
+        root = self.learner_fixture(session={"offset": 10, "status": "succeeded", "last_run": RUN},
+                                    admission={"processing": None})
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["headline"], "unknown")
+        self.assertIn({"component": "latest_run", "status": "missing"}, health["metadata_issues"])
+        self.write(root / "events.jsonl", [{"session_id": SID, "run_id": "../private"}], log=True)
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["headline"], "unknown")
+        self.assertIn({"component": "latest_run", "status": "unsafe_link"}, health["metadata_issues"])
+        self.assertNotIn("../private", json.dumps(health))
+
+    def test_queue_with_conflicting_file_identity_reports_failure(self):
+        self.learner_fixture(session={"offset": 10},
+                             pending={"size_bytes": 20, "identity": {**IDENTITY, "inode": 124}})
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["failure"]["class"], "transcript_identity_mismatch")
+        self.assertEqual(health["outcomes"]["queue"]["state"], "queued")
+        self.assertEqual(health["headline"], "failed")
+        self.assertEqual(health["recovery"]["action"], "inspect_failure")
+
+    def test_reason_count_and_timestamp_allowlists_remain_typed(self):
+        self.assertEqual(STATUS.metadata({"reason": "unverified_completion"}), {"reason": "unverified_completion"})
+        self.assertEqual(STATUS.metadata({"reason": "unverified_completion private text"}), {})
+        self.assertEqual(STATUS.metadata({"tool_errors": -1, "write_calls": True, "retry_after": float("inf"),
+                                           "offset": -1, "size_bytes": True}), {})
+        self.assertEqual(STATUS.metadata({"reason": "resume_backoff", "previous_pause_reason": "backoff"}),
+                         {"reason": "resume_backoff", "previous_pause_reason": "backoff"})
+        self.assertEqual(STATUS.metadata({"previous_pause_reason": "private detail"}), {})
+        self.assertEqual(STATUS.metadata({"previous_pause_reason": "emitted"}), {})
+
+    def test_success_claim_is_not_native_acknowledgement_or_readback(self):
+        root = self.learner_fixture(session={"last_run": RUN})
+        self.write(root / "runs" / RUN / "run.json", {"session_id": SID, "status": "failed", "reason": "unverified_completion"})
+        self.write(root / "runs" / RUN / "result.json", {"outcome": "stored", "memory_ids": [OTHER]})
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["failure"]["class"], "unverified_completion")
+        self.assertEqual(health["outcomes"]["provider_completion"]["result_claim"]["outcome"], "stored")
+        self.assertEqual(health["outcomes"]["native_acknowledgement"]["state"], "unknown")
+        self.assertEqual(health["outcomes"]["independent_readback"]["state"], "not_performed")
+
+    def test_malformed_processing_and_gate_remain_visible_without_private_text(self):
+        self.learner_fixture(session={"reconciliation_required": "private gate"}, admission={"processing": "private processing"})
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["headline"], "reconciliation_required")
+        self.assertEqual([v["kind"] for v in health["holds"]], ["reconciliation_required", "processing_marker"])
+        self.assertNotIn("private", json.dumps(health))
+
+    def test_empty_or_malformed_gate_cannot_be_sanitized_into_resume(self):
+        for gate in ({}, None, False, [], {"reason": ["private gate"]}):
+            with self.subTest(gate=gate):
+                self.learner_fixture(session={"reconciliation_required": gate},
+                                     pending={"paused_request_id": REQUEST, "pause_reason": "batch_limit"})
+                learner = self.report()["learner"]
+                self.assertIn("reconciliation_required", learner["session"]["metadata"])
+                health = learner["health"]
+                self.assertEqual(health["headline"], "reconciliation_required")
+                self.assertEqual(health["recovery"]["action"], "reconcile_held_run")
+                self.assertIn({"component": "session", "status": "invalid_fields",
+                               "fields": ["reconciliation_required"]}, health["metadata_issues"])
+                self.assertNotIn("private gate", json.dumps(learner))
+
+    def test_missing_required_records_cannot_look_queued_or_idle(self):
+        for queue in (True, False):
+            for component, directory in (("session", "sessions"), ("admission", "admissions"),
+                                         ("enrollment", "enrollments")):
+                with self.subTest(queue=queue, component=component):
+                    root = self.learner_fixture(session={"offset": 10}, pending={"size_bytes": 20} if queue else None)
+                    if not queue:
+                        (root / "pending" / (SID + ".json")).unlink(missing_ok=True)
+                    (root / directory / (SID + ".json")).unlink()
+                    health = self.report()["learner"]["health"]
+                    self.assertEqual(health["headline"], "unknown")
+                    self.assertEqual(health["recovery"]["action"], "inspect_metadata")
+                    self.assertIn({"component": component, "status": "missing"}, health["metadata_issues"])
+
+    def test_invalid_backoff_and_pause_reason_do_not_offer_resume(self):
+        for field, values in (("retry_after", ["private backoff", None, True, -1, float("inf")]),
+                              ("pause_reason", ["private reason", None, ["private reason"], "emitted"])):
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    session = {"retry_after": value} if field == "retry_after" else {}
+                    pending = {"paused_request_id": REQUEST, "pause_reason": "batch_limit"}
+                    if field == "pause_reason":
+                        pending[field] = value
+                    self.learner_fixture(session=session, pending=pending)
+                    learner = self.report()["learner"]
+                    health = learner["health"]
+                    self.assertEqual(health["headline"], "unknown")
+                    self.assertEqual(health["recovery"]["action"], "inspect_metadata")
+                    component = "session" if field == "retry_after" else "pending"
+                    self.assertIn({"component": component, "status": "invalid_fields", "fields": [field]},
+                                  health["metadata_issues"])
+                    self.assertNotIn("private", json.dumps(learner))
+
+    def test_incomplete_admission_and_cursor_fields_cannot_look_idle(self):
+        for directory, fields in (("sessions", ["offset"]),
+                                  ("admissions", ["processing", "state_sha256"]),
+                                  ("enrollments", ["frontier_offset"])):
+            with self.subTest(directory=directory):
+                root = self.learner_fixture(session={"offset": 10})
+                path = root / directory / (SID + ".json")
+                value = json.loads(path.read_text())
+                for field in fields:
+                    value.pop(field)
+                self.write(path, value)
+                health = self.report()["learner"]["health"]
+                self.assertEqual(health["headline"], "unknown")
+                self.assertTrue(any(issue.get("fields") == fields for issue in health["metadata_issues"]))
+
+    def test_unknown_session_status_is_not_sanitized_into_idle(self):
+        for status in ("private status", ["private status"]):
+            with self.subTest(status=status):
+                self.learner_fixture(session={"status": status})
+                health = self.report()["learner"]["health"]
+                self.assertEqual(health["headline"], "unknown")
+                self.assertIn({"component": "session", "status": "invalid_fields", "fields": ["status"]},
+                              health["metadata_issues"])
+                self.assertNotIn("private status", json.dumps(health))
+
+    def test_missing_held_run_receipt_stays_in_metadata_issues(self):
+        self.learner_fixture(session={"reconciliation_required": {"run_id": RUN, "reason": "write_status_unknown"}})
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["headline"], "reconciliation_required")
+        self.assertIn({"component": "held_run", "status": "missing"}, health["metadata_issues"])
+        self.assertEqual(health["outcomes"]["native_acknowledgement"]["state"], "unknown")
 
 
 if __name__ == "__main__":

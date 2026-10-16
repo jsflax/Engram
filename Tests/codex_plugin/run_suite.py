@@ -53,7 +53,10 @@ def main():
         child = subprocess.run(
             [sys.executable, "-B", str(Path(__file__).resolve()), "--module", name],
             cwd=TEST_ROOT, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
-            capture_output=True, text=True, timeout=180)
+            # Migration exercises repeated durable publication for 64-task
+            # cohorts. Its fixture/fsync cost exceeds the small-module budget
+            # on a busy host; the CLI's own 30-second deadline remains tested.
+            capture_output=True, text=True, timeout=900 if name == "test_migration" else 180)
         try:
             row = json.loads(child.stdout.splitlines()[-1])
             if row["module"] != name or (child.returncode and not (row["failures"] or row["errors"])):

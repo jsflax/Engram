@@ -1150,7 +1150,7 @@ class PublicationEfficiencyTests(unittest.TestCase):
         started = time.monotonic()
         with mock.patch.object(M, "_validate_candidates", side_effect=validate), mock.patch("builtins.print") as output:
             result = M.main(["recover", "--state-dir", str(self.root), "--plan", str(plan_path), "--plan-sha256", sha])
-        self.assertEqual(result, 0)
+        self.assertEqual(result, 0, output.call_args)
         self.assertLess(time.monotonic() - started, 30)
         self.assertEqual(json.loads(output.call_args.args[0])["status"], "migration_complete_held")
         self.assertEqual(candidate_calls.count(None), 3)  # Entry, pre-activation, completed chain.

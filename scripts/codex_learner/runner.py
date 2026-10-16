@@ -565,6 +565,9 @@ def worker(root: Path) -> int:
                 event_log(root, "worker_error", session_id=request.get("session_id"), reason=type(exc).__name__)
                 outcome = "blocked"
             handled += 1
+            # Only the latest outcome for this queue slot may pause it for the
+            # batch limit. An earlier successful batch must not mask a failure.
+            more.pop(pending, None)
             with lock_file(root / "enqueue.lock"):
                 current = load_json(pending)
                 if current.get("request_id") == request.get("request_id"):
@@ -579,7 +582,8 @@ def worker(root: Path) -> int:
         with lock_file(root / "enqueue.lock"):
             for pending, request_id in more.items():
                 current = load_json(pending)
-                if current.get("request_id") == request_id:
+                if (current.get("request_id") == request_id
+                        and current.get("paused_request_id") != request_id):
                     atomic_json(pending, {**current, "paused_request_id": request_id, "pause_reason": "batch_limit"})
         event_log(root, "worker_idle", handled=handled, pending=len(list(pending_dir.glob("*.json"))))
     # Recheck after releasing the leader lock: a concurrent hook may have queued

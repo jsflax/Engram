@@ -563,6 +563,10 @@ struct SidebarView: View {
                 }
             }
 
+            section("Codex learner") {
+                LearnerHealthView()
+            }
+
             section("Storage") {
                 VStack(alignment: .leading, spacing: 10) {
                     statRow("Database", value: dbFileSize)
