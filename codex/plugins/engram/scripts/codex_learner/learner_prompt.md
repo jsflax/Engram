@@ -29,9 +29,16 @@ itself unless the excerpt contains a real integration finding. If everything is
 already represented or unimportant, make no writes. On any MCP error, including a
 gateway denial, stop making tool calls and report failure. Do not retry with
 corrected arguments or claim success after an error. Return the requested JSON
-result with only actual memory IDs and a short non-sensitive summary. For stored, list only the primary
-ID in each successful "Stored memory (id: ...)" or "Updated memory (id: ...)"
-receipt, plus both endpoints of any explicit successful connect call. Do not
+result with only actual memory IDs and a short non-sensitive summary.
+The write tools return an engram_operation object. A kind=committed receipt with
+outcome=applied confirms the write: include its memoryIDs in the stored result.
+A committed outcome=unchanged confirms no new write: do not include any IDs from
+that receipt, even if it identifies an existing memory. If all writes were
+unchanged, return no_new_memories and an empty ID list. An unavailable or error
+outcome is a failure; do not retry it.
+For legacy text receipts, list only the primary ID in each successful
+"Stored memory (id: ...)" or "Updated memory (id: ...)" receipt, plus both
+endpoints of any explicit successful connect call. Do not
 include IDs mentioned in recall results, memory text, or automatic linking notes.
 A near-duplicate warning saying the new memory was NOT stored is a successful
 no-write outcome, not a saved memory. Its existing IDs are context only. Review

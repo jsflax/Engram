@@ -25,17 +25,17 @@ import uuid
 
 from .transcript import inspect_rollout, read_excerpt
 from .memory_proxy import verified_no_write_receipt
-from . import admission, memory_config, host_admission, operation_gateway
+from . import admission, memory_config, host_admission, operation_gateway, learner_settings
+from . import runner_publication, settlement
 
 EVENTS = {"Stop", "SubagentStop", "PreCompact", "SessionEnd"}
 GUARD = "ENGRAM_CODEX_LEARNER"
 _PROVIDER_LOCK_FD = contextvars.ContextVar("engram_provider_lock_fd", default=None)
 _PROVIDER_STARTED = contextvars.ContextVar("engram_provider_started", default=None)
+_EXECUTION = contextvars.ContextVar("engram_execution", default=None)
 READ_TOOLS = {"recall", "graph", "list_topics", "stats", "timeline"}
 WRITE_TOOLS = {"remember", "update", "connect"}
-DEFAULTS = {"min_chars": 400, "max_chars": 24000, "max_scan_bytes": 8 * 1024 * 1024,
-            "wall_seconds": 600, "max_tool_calls": 12, "max_writes": 5,
-            "max_runs_per_worker": 4, "retry_seconds": 300}
+DEFAULTS = learner_settings.DEFAULTS
 
 
 def utc() -> str:
@@ -140,19 +140,26 @@ def provider_slot():
 
 
 def settings(root: Path) -> dict:
-    result = {**DEFAULTS, **load_json(root / "settings.json")}
-    # Local configuration can lower budgets, not accidentally remove bounds.
-    for key, low, high in (("min_chars", 0, 10000), ("max_chars", 1000, 48000),
-                           ("max_scan_bytes", 4096, 32 * 1024 * 1024),
-                           ("wall_seconds", 10, 900), ("max_tool_calls", 1, 20),
-                           ("max_writes", 1, 5), ("max_runs_per_worker", 1, 8),
-                           ("retry_seconds", 10, 3600)):
-        result[key] = max(low, min(high, int(result[key])))
-    return result
+    return learner_settings.bounded(load_json(root / "settings.json"))
 
 
 def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser().resolve()
+
+
+def publications(root: Path):
+    return runner_publication.Publications(root, codex_home() / "config.toml",
+                                           Path(__file__).resolve().parents[2])
+
+
+def has_recoverable_transition(root: Path, session_id: str) -> bool:
+    if os.path.lexists(root / "publications" / session_id / "active.json"):
+        return True
+    try:
+        record = load_json(admission.state_paths(root, session_id)["admissions"])
+        return isinstance(record, dict) and record.get("processing_execution") is not None
+    except (OSError, ValueError):
+        return False
 
 
 def validate_request(payload: dict, root: Path) -> dict:
@@ -348,6 +355,10 @@ def enqueue(root: Path, payload: dict, *, spawn: bool = True, expected_admission
             atomic_json(pending, request)
     except (ValueError, OSError) as exc:
         event_log(root, "rejected", session_id=sid, reason=str(exc)[:160])
+        # Only the worker may recover a known interrupted pair; it owns the
+        # worker -> enqueue lock order and checks the pinned publication.
+        if spawn and os.path.lexists(root / "publications" / sid / "active.json"):
+            spawn_worker(root)
         return False
     event_log(root, "queued", session_id=sid, hook_event=request["event"], request_id=request["request_id"])
     if spawn:
@@ -470,11 +481,21 @@ def learner_command(root: Path, run_dir: Path, request: dict, config: dict) -> l
     tool_policies = {tool: {**memory["tools"].get(tool, {}), "approval_mode": "approve"}
                      for tool in sorted(allowed)}
     memory = memory_config.transport(memory)
+    execution = _EXECUTION.get()
+    execution_config = {}
+    if execution is not None:
+        if execution.paths.root != root or execution.paths.run_dir != run_dir:
+            raise ValueError("execution_paths_changed")
+        manifest, _ = runner_publication.journal.read_manifest(run_dir)
+        execution.context.validate_inputs(manifest, "before_intent")
+        memory = execution.context.transport
+        execution_config = {"execution": execution.specification()}
     transport_path = run_dir / "transport.json"
     atomic_json(transport_path, {"transport": memory, "audit_path": str(run_dir / "mcp-audit.jsonl"),
                                "provenance": "codex-session:" + request["session_id"],
                                "allowed_tools": sorted(allowed),
-                               "max_tool_calls": config["max_tool_calls"], "max_writes": config["max_writes"]})
+                               "max_tool_calls": config["max_tool_calls"], "max_writes": config["max_writes"],
+                               **execution_config})
     memory = {"command": sys.executable, "args": [str(Path(__file__).with_name("memory_proxy.py")), str(transport_path)],
               "enabled": True, "required": True, "enabled_tools": sorted(allowed),
               "default_tools_approval_mode": "prompt",
@@ -718,6 +739,9 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict) -
                 "tool_errors": 0, "provider_error": False, "unexpected_tool": False, "turn_completed": False}
     initial = {"status": "running", "started_at": utc(), "session_id": request["session_id"],
                "event": request["event"], "end_offset": excerpt.next_offset}
+    execution = _EXECUTION.get()
+    if execution is not None:
+        initial["execution_manifest_sha256"] = execution.context.manifest_sha256
     atomic_json(run_dir / "run.json", initial)
     stdout_path, stderr_path = run_dir / "provider.jsonl", run_dir / "stderr.log"
     prompt_path = run_dir / "prompt.txt"
@@ -728,6 +752,9 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict) -
     with stdout_path.open("wb") as output, stderr_path.open("wb") as error, prompt_path.open("rb") as prompt_input:
         stdout_path.chmod(0o600)
         stderr_path.chmod(0o600)
+        if execution is not None:
+            settlement.record_provider_dispatch(run_dir, execution.context.manifest_sha256,
+                lambda manifest, _phase: execution.context.validate_inputs(manifest, "before_intent"))
         proc = subprocess.Popen(argv, stdin=prompt_input, stdout=output, stderr=error,
                                 cwd=run_dir / "workspace", env=env, start_new_session=True,
                                 pass_fds=(() if _PROVIDER_LOCK_FD.get() is None else (_PROVIDER_LOCK_FD.get(),)))
@@ -792,6 +819,12 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict) -
                     os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
     observed.pop("seen")
+    if execution is not None:
+        settlement.persist_observation(run_dir, {
+            "started": True, "terminated": proc.poll() is not None,
+            "returncode": proc.returncode, "turn_completed": observed["turn_completed"],
+            "provider_error": observed["provider_error"], "unexpected_tool": observed["unexpected_tool"],
+            "tool_errors": observed["tool_errors"], "reason": reason})
     # Completed MCP calls have their own receipts even when Codex wraps them in
     # code-mode events. Never accept a claimed write without an Engram response.
     provider_tool_errors = observed["tool_errors"]
@@ -932,7 +965,11 @@ def failure_reconciliation(run_dir: Path, provider_started: bool | None) -> dict
 def process_request(root: Path, request: dict, config: dict, *, invoke=run_codex) -> str:
     sid = request["session_id"]
     state_path = root / "sessions" / (sid + ".json")
+    publisher = publications(root)
     with lock_file(root / "enqueue.lock"):
+        recovered = publisher.recover(sid, config)
+        if recovered is not None:
+            return recovered
         record = admitted_record(root, request)
         if record["processing"] is not None:
             raise ValueError("admission_interrupted_processing")
@@ -972,20 +1009,18 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=run_codex
         event_log(root, "blocked", session_id=sid, reason=excerpt.blocked_reason, offset=offset)
         return "blocked"
     if not excerpt.text:
-        commit_admitted_state(root, request, {**state, **next_state, "status": "no_visible_content"})
-        return "more" if excerpt.has_more else "no_change"
+        with lock_file(root / "enqueue.lock"):
+            return publisher.parser(request, state, excerpt, next_state, config, reason="no_visible_content")
     if len(excerpt.text) < config["min_chars"] and request["event"] in {"Stop", "SubagentStop"} and not excerpt.has_more:
         event_log(root, "deferred_short", session_id=sid, chars=len(excerpt.text))
         return "deferred"
-    digest = hashlib.sha256(excerpt.text.encode()).hexdigest()
-    if digest == state.get("last_excerpt_sha256"):
-        commit_admitted_state(root, request, {**state, **next_state, "status": "duplicate", "last_excerpt_sha256": digest})
-        return "more" if excerpt.has_more else "no_change"
+    # Equal visible text at a different byte interval is not prior successful
+    # coverage. The parser already deduplicates mirrored transcript records;
+    # any remaining visible interval must receive its own verified completion.
     # Do not seal a processing marker while waiting for a provider. Pausing a
     # policy during that wait must be reversible without implying a write began.
     with provider_slot():
         admission.check(root, request)
-        run_dir = private_dir(root / "runs" / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex))
         with lock_file(root / "enqueue.lock"):
             record = admitted_record(root, request)
             if record["processing"] is not None:
@@ -995,44 +1030,39 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=run_codex
                 return "reconciliation_required"
             if admission_digest(current) != admission_digest(state):
                 raise ValueError("admission_cursor_changed_while_waiting")
-            atomic_json(root / "admissions" / (sid + ".json"), {**record, "processing": request["request_id"]})
+            execution = publisher.begin(request, state, excerpt, config)
+            run_dir = execution.paths.run_dir
         token = _PROVIDER_STARTED.set(None)
+        execution_token = _EXECUTION.set(execution)
         try:
             result = invoke(root, run_dir, request, excerpt, config)
         except Exception as exc:
             result = {"status": "failed", "reason": type(exc).__name__, "ended_at": utc()}
             atomic_json(run_dir / "run.json", result)
         finally:
-            provider_started = _PROVIDER_STARTED.get()
+            _EXECUTION.reset(execution_token)
             _PROVIDER_STARTED.reset(token)
             (run_dir / "prompt.txt").unlink(missing_ok=True)
+            execution.close()
     event_log(root, "learner_finished", session_id=sid, run_id=run_dir.name,
               status=result["status"], writes=result.get("write_calls", 0))
-    if result["status"] != "succeeded":
-        reconciliation = failure_reconciliation(run_dir, provider_started)
-        failure_state = {**state, "session_id": sid, **observed_identity,
-                         "status": "failed", "last_run": run_dir.name,
-                         "retry_after": time.time() + config["retry_seconds"]}
-        if reconciliation is not None:
-            reconciliation = {"run_id": run_dir.name, **reconciliation}
-            failure_state.update(status="reconciliation_required", reconciliation_required=reconciliation)
-            atomic_json(run_dir / "run.json", {**result, "reconciliation_required": reconciliation})
-            event_log(root, "reconciliation_required", session_id=sid, **reconciliation)
-        commit_admitted_state(root, request, failure_state)
-        return failure_state["status"]
-    commit_admitted_state(root, request, {**next_state, "status": "succeeded", "last_run": run_dir.name,
-                            "last_excerpt_sha256": digest, "last_success_at": utc()})
-    return "more" if excerpt.has_more else "succeeded"
+    with lock_file(root / "enqueue.lock"):
+        outcome = publisher.finish(execution, config)
+    event_log(root, "learner_settled", session_id=sid, run_id=run_dir.name, status=str(outcome))
+    return outcome
 
 
 def worker(root: Path) -> int:
     # A missing/inactive policy must not even inspect or pause an old queue.
     active_policy = admission.check_activation(root)
     invalid_pending = set()
+    recovery_failures = set()
 
     def ready_pending():
         values = []
         for sid in admission.enrollment_ids(root, active_policy):
+            if sid in recovery_failures:
+                continue
             p = admission.state_paths(root, sid)["pending"]
             if not p.exists():
                 continue
@@ -1046,6 +1076,21 @@ def worker(root: Path) -> int:
                 continue
         return sorted(values, key=lambda v: v[0])
 
+    def recovery_session():
+        # A missing or paused queue slot cannot hide an active publication.
+        for sid in admission.enrollment_ids(root, active_policy):
+            if sid in recovery_failures:
+                continue
+            if os.path.lexists(root / "publications" / sid / "active.json"):
+                return sid
+            try:
+                record = load_json(admission.state_paths(root, sid)["admissions"])
+                if isinstance(record, dict) and record.get("processing_execution") is not None:
+                    return sid
+            except (OSError, ValueError):
+                continue
+        return None
+
     more = {}
     with lock_file(root / "worker.lock", blocking=False) as acquired:
         if not acquired:
@@ -1054,6 +1099,22 @@ def worker(root: Path) -> int:
         handled = 0
         pending_dir = private_dir(root / "pending")
         while handled < config["max_runs_per_worker"]:
+            with lock_file(root / "enqueue.lock"):
+                sid = recovery_session()
+                if sid is not None:
+                    try:
+                        recovered = publications(root).recover(sid, config)
+                        if recovered == "more":
+                            path = admission.state_paths(root, sid)["pending"]
+                            if load_pending(path).get("request_id") == recovered.request_id:
+                                more[path] = recovered.request_id
+                    except Exception as exc:
+                        # Preserve an unfinished transition's pending preimage.
+                        recovery_failures.add(sid)
+                        event_log(root, "publication_recovery_held", session_id=sid, reason=type(exc).__name__)
+                    handled += 1
+            if sid is not None:
+                continue
             candidates = ready_pending()
             if not candidates:
                 break
@@ -1063,12 +1124,23 @@ def worker(root: Path) -> int:
             except Exception as exc:
                 event_log(root, "worker_error", session_id=request.get("session_id"), reason=type(exc).__name__)
                 outcome = "blocked"
+                if has_recoverable_transition(root, request["session_id"]):
+                    recovery_failures.add(request["session_id"])
             handled += 1
             # Only the latest outcome for this queue slot may pause it for the
             # batch limit. An earlier successful batch must not mask a hold.
             more.pop(pending, None)
             with lock_file(root / "enqueue.lock"):
                 current = load_pending(pending)
+                if request["session_id"] in recovery_failures:
+                    continue
+                if isinstance(outcome, runner_publication.Outcome):
+                    # The coordinator already sealed the old request's queue
+                    # decision. A recovered older run may have preserved this
+                    # newer pending request, which must be processed next.
+                    if outcome == "more" and current.get("request_id") == outcome.request_id:
+                        more[pending] = outcome.request_id
+                    continue
                 if current.get("request_id") == request.get("request_id"):
                     if outcome in {"failed", "backoff", "blocked", "reconciliation_required"}:
                         atomic_json(pending, {**current, "paused_request_id": request["request_id"], "pause_reason": outcome})
@@ -1080,6 +1152,8 @@ def worker(root: Path) -> int:
         # the next event for this source resumes it without replaying successes.
         with lock_file(root / "enqueue.lock"):
             for pending, request_id in more.items():
+                if pending.stem in recovery_failures:
+                    continue
                 current = load_pending(pending)
                 if (current.get("request_id") == request_id
                         and current.get("paused_request_id") != request_id):

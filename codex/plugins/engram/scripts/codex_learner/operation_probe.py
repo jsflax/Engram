@@ -1,7 +1,8 @@
 """Read-only, bounded pre-dispatch probe of the trusted native MCP route.
 
-Only initialize, notifications/initialized and operation_scope are sent. The
-returned scope is an observation to seal in execution_manifest.expected_scope;
+Only initialize, notifications/initialized, operation_scope and (for recovery)
+operation_status are sent. The returned scope is an observation to seal in
+execution_manifest.expected_scope;
 it is not replay authority or proof a later process has the same identity. The
 actual mutation gateway must still bind each native request to that scope.
 
@@ -89,10 +90,57 @@ def probe_scope(transport, *, writer_fence: HeldFence, expected_binding, limits=
     No installed runtime is selected implicitly: transport must be pre-resolved
     and trusted by the caller. The native child inherits the same shared lock.
     """
+    return _exchange(transport, fence=writer_fence, expected_binding=expected_binding,
+                     limits=limits)
+
+
+def probe_statuses(transport, *, recovery_fence: HeldFence, expected_binding,
+                   expected_scope, requests, validate_inputs, limits=None):
+    """Read at most 32 retained operation statuses while the caller retains EX.
+
+    Requests are already-retained intents, never new dispatches. The recovery
+    descriptor is never inherited by the read-only native child. Only committed
+    receipts or exact scope/ID-bound absence observations are returned, after
+    owned child cleanup. Neither result authorizes replay or cursor advancement.
+    The callback receives a phase string and must return exactly True.
+    """
+    try:
+        scope = manifest._scope(expected_scope)
+        _require(type(requests) is list and 0 < len(requests) <= 32, "invalid_requests")
+        frozen = copy.deepcopy(requests)
+        ids = []
+        for request in frozen:
+            _require(type(request) is dict, "invalid_requests")
+            ids.append(manifest._uuid(request["operationID"]))
+            _require(manifest._scope(request["expectedScope"]) == scope, "scope_changed")
+            manifest._mutation(request["mutation"])
+        _require(len(ids) == len(set(ids)), "duplicate_requests")
+        _require(callable(validate_inputs), "input_validation_refused")
+    except ProbeError:
+        raise
+    except (ValueError, TypeError, KeyError, RecursionError):
+        raise ProbeError("operation_probe_invalid_requests") from None
+    return _exchange(transport, fence=recovery_fence, expected_binding=expected_binding,
+                     expected_scope=copy.deepcopy(expected_scope), requests=frozen,
+                     validate_inputs=validate_inputs, limits=limits)
+
+
+def _status_result(result, request):
+    payload = envelope(result)
+    _require(payload.get("kind") in ("committed", "absent"), "status_unavailable")
+    response = {key: value for key, value in payload.items() if key != "version"}
+    manifest._response(response, request, None)
+    return response
+
+
+def _exchange(transport, *, fence, expected_binding, limits=None,
+              expected_scope=None, requests=None, validate_inputs=None):
     limits = ProbeLimits() if limits is None else limits
     _require(type(limits) is ProbeLimits, "invalid_limits")
     binding = copy.deepcopy(expected_binding)
-    _require(isinstance(writer_fence, HeldFence) and writer_fence.mode == "shared", "writer_unfenced")
+    recovery = requests is not None
+    mode = "exclusive" if recovery else "shared"
+    _require(type(fence) is HeldFence and fence.mode == mode, "writer_unfenced")
     child = None
     selector = selectors.DefaultSelector()
     old_signals = {}
@@ -100,7 +148,7 @@ def probe_scope(transport, *, writer_fence: HeldFence, expected_binding, limits=
     deadline = time.monotonic() + limits.deadline_seconds
     buffer = bytearray()
     output_bytes = 0
-    scope = None
+    result = None
 
     def interrupt(_signal, _frame):
         nonlocal interrupted
@@ -122,9 +170,15 @@ def probe_scope(transport, *, writer_fence: HeldFence, expected_binding, limits=
         finally:
             selector.unregister(fd)
 
+    def verify(phase):
+        _require(fence.verify(binding) is True, "writer_unfenced")
+        if recovery:
+            _require(validate_inputs(phase) is True, "input_validation_refused")
+            _require(fence.verify(binding) is True, "writer_unfenced")
+
     def send(message):
         check()
-        _require(writer_fence.verify(binding) is True, "writer_unfenced")
+        verify("before_probe_send")
         raw = manifest.encode(message)
         _require(len(raw) <= limits.max_frame_bytes, "frame_limit")
         pending = memoryview(raw + b"\n")
@@ -167,8 +221,11 @@ def probe_scope(transport, *, writer_fence: HeldFence, expected_binding, limits=
             buffer.extend(chunk)
 
     try:
-        _require(writer_fence.verify(binding) is True, "writer_unfenced")
-        argv, env, cwd, pass_fds = bridge._fenced_transport(transport, writer_fence)
+        verify("before_probe_launch")
+        # An exclusive recovery lock never enters the child. The parent holds
+        # it for the whole bounded read-only exchange and cleanup.
+        argv, env, cwd, pass_fds = bridge._fenced_transport(transport, None if recovery else fence)
+        _require(not recovery or pass_fds == (), "invalid_recovery_inheritance")
         if threading.current_thread() is threading.main_thread():
             for sig in (signal.SIGTERM, signal.SIGINT):
                 old_signals[sig] = signal.signal(sig, interrupt)
@@ -186,13 +243,25 @@ def probe_scope(transport, *, writer_fence: HeldFence, expected_binding, limits=
         send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
               "params": {"name": "operation_scope", "arguments": {}}})
         scope = _scope_result(receive(2))
+        verify("after_probe_scope")
+        result = scope
+        if recovery:
+            _require(manifest._scope(scope) == manifest._scope(expected_scope), "scope_changed")
+            result = []
+            for request_id, request in enumerate(requests, start=3):
+                send({"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": {
+                    "name": "operation_status", "arguments": {
+                        "operationID": request["operationID"], "scope": expected_scope}}})
+                response = _status_result(receive(request_id), request)
+                verify("after_probe_status")
+                result.append(response)
         check()
-        _require(writer_fence.verify(binding) is True, "writer_unfenced")
+        verify("before_probe_cleanup")
     except ProbeError:
         raise
     except KeyboardInterrupt:
         raise ProbeError("operation_probe_interrupted") from None
-    except (OSError, ValueError, TypeError, RecursionError, bridge.RelayError, subprocess.SubprocessError):
+    except (OSError, ValueError, TypeError, KeyError, RecursionError, bridge.RelayError, subprocess.SubprocessError):
         raise ProbeError("operation_probe_transport_or_protocol_failure") from None
     finally:
         cleanup_failed = False
@@ -213,4 +282,10 @@ def probe_scope(transport, *, writer_fence: HeldFence, expected_binding, limits=
                     cleanup_failed = True
         _require(not cleanup_failed, "cleanup_failed")
         _require(not interrupted, "interrupted")
-    return scope
+    try:
+        verify("after_probe_cleanup")
+    except ProbeError:
+        raise
+    except (OSError, ValueError, TypeError, KeyError):
+        raise ProbeError("operation_probe_post_cleanup_validation_failed") from None
+    return result

@@ -9,6 +9,7 @@ The child transport is stdio; HTTP configurations are explicitly unsupported.
 from __future__ import annotations
 
 import copy
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -472,18 +473,67 @@ def run(config: dict[str, Any]) -> int:
         from .stdio_bridge import RelayLimits, run_relay
     except ImportError:  # Direct execution from a packaged runtime.
         from stdio_bridge import RelayLimits, run_relay
-    audit = Audit(Path(config["audit_path"]))
-    policy = Policy(audit, config["provenance"], config["max_tool_calls"],
-                    config["max_writes"], config.get("allowed_tools"))
-    try:
-        return run_relay(config["transport"], policy.client_message,
-                         policy.server_message, limits=RelayLimits(max_inflight=64),
-                         audit=audit.write)
-    finally:
+    with contextlib.ExitStack() as cleanup:
+        operations, fence, transport = None, None, config["transport"]
+        if "execution" in config:
+            operations, fence, transport = durable_execution(config, cleanup)
+        audit = Audit(Path(config["audit_path"]))
+        cleanup.callback(audit.close)
+        policy = Policy(audit, config["provenance"], config["max_tool_calls"],
+                        config["max_writes"], config.get("allowed_tools"), operations=operations)
         try:
-            policy.fail_pending()
+            return run_relay(transport, policy.client_message,
+                             policy.server_message, limits=RelayLimits(max_inflight=64),
+                             audit=audit.write, writer_fence=fence)
         finally:
-            audit.close()
+            # Record transport uncertainty while the shared fence is still held.
+            policy.fail_pending()
+
+
+def durable_execution(config, cleanup):
+    """Load a runner-issued manifest; JSON never supplies a lock descriptor.
+
+    The gateway reacquires the sealed generation and validates the live marker
+    before starting native Engram. A revoked/interrupted generation cannot fall
+    back to ordinary unjournaled writes.
+    """
+    if __package__:
+        from . import execution_context as contexts, execution_manifest as journal
+        from . import learner_settings, memory_config, operation_gateway, writer_fence
+    else:
+        scripts = str(Path(__file__).resolve().parent.parent)
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        from codex_learner import execution_context as contexts, execution_manifest as journal
+        from codex_learner import learner_settings, memory_config, operation_gateway, writer_fence
+    specification = config["execution"]
+    if type(specification) is not dict or set(specification) != {
+            "root", "run_dir", "config_path", "plugin_root", "manifest_sha256"}:
+        raise ProxyError("Invalid durable execution configuration")
+    if any(type(value) is not str for value in specification.values()):
+        raise ProxyError("Invalid durable execution configuration")
+    paths = contexts.ContextPaths(**{name: Path(specification[name]) for name in
+                                    ("root", "run_dir", "config_path", "plugin_root")})
+    paths.check()
+    manifest, digest = journal.read_manifest(paths.run_dir)
+    if digest != specification["manifest_sha256"]:
+        raise ProxyError("Durable execution manifest changed")
+    fence = cleanup.enter_context(writer_fence.acquire_shared(paths.run_dir, manifest["fencing"]))
+    context = contexts.load_execution(paths, manifest_sha256=digest, writer_fence=fence)
+    backend = journal._json(journal._unseal(manifest["inputs"]["backend_config"]))
+    allowed = sorted(memory_config.allowed_tools(backend["memory"], ALLOWED_TOOLS))
+    settings = learner_settings.bounded({} if backend["settings"] is None else backend["settings"]["value"])
+    if any(type(config[name]) is not int or not 0 <= config[name] <= settings[name]
+           for name in ("max_tool_calls", "max_writes")):
+        raise ProxyError("Durable execution budgets changed")
+    if (journal.encode(config["transport"]) != journal.encode(context.transport)
+            or config["audit_path"] != str(paths.run_dir / "mcp-audit.jsonl")
+            or config["provenance"] != "codex-session:" + manifest["session_id"]
+            or config.get("allowed_tools") != allowed):
+        raise ProxyError("Durable execution policy changed")
+    operations = operation_gateway.OperationGateway(paths.run_dir, manifest_sha256=digest,
+        writer_fence=fence, validate_inputs=context.validate_inputs)
+    return operations, fence, context.transport
 
 
 def main(argv: list[str] | None = None) -> int:

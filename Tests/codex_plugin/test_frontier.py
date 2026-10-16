@@ -218,27 +218,32 @@ class FrontierTests(unittest.TestCase):
         with self.fixture() as f:
             request = self.queued(f)
             self.assertEqual(json.loads(f.state.read_text())["offset"], f.frontier)
-            self.assertEqual(RUNNER.process_request(f.root, request, f.config, invoke=f.invoke), "no_change")
+            before = {path: path.read_bytes() for path in (f.state, f.record, f.pending)}
+            self.assertEqual(ADMISSION.check(f.root, request), request["admission"])
+            with self.assertRaises(ValueError):
+                RUNNER.process_request(f.root, request, f.config, invoke=f.invoke)
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
             self.assertEqual(f.invocations, [])
 
-    def test_only_bytes_after_frontier_are_learned_then_cursor_resumes(self):
+    def test_explicit_frontier_is_readable_but_execution_waits_for_supported_migration(self):
         with self.fixture() as f:
             f.append_turn(TURN2, "NEW ONLY: synthetic color cobalt.")
             f.payload["turn_id"] = TURN2
-            self.queued(f)
-            f.worker()
-            self.assertEqual(len(f.invocations), 1)
-            self.assertIn("NEW ONLY", f.invocations[0]["text"])
-            self.assertNotIn("amber", f.invocations[0]["text"])
-            first_offset = json.loads(f.state.read_text())["offset"]
+            request = self.queued(f)
+            before = {path: path.read_bytes() for path in (f.state, f.record, f.pending)}
+            excerpt = RUNNER.read_excerpt(f.path, f.frontier)
+            self.assertIn("NEW ONLY", excerpt.text)
+            self.assertNotIn("amber", excerpt.text)
+            with self.assertRaisesRegex(ValueError, "v2_required"):
+                RUNNER.process_request(f.root, request, f.config, invoke=f.invoke)
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
             f.append_turn("turn-three", "NEXT ONLY: synthetic color jade.")
-            f.payload["turn_id"] = "turn-three"
-            self.queued(f)
-            f.worker()
-            self.assertEqual(len(f.invocations), 2)
-            self.assertIn("NEXT ONLY", f.invocations[1]["text"])
-            self.assertNotIn("NEW ONLY", f.invocations[1]["text"])
-            self.assertGreater(json.loads(f.state.read_text())["offset"], first_offset)
+            next_excerpt = RUNNER.read_excerpt(f.path, excerpt.next_offset,
+                recent_messages=excerpt.recent_messages, current_turn_id=excerpt.current_turn_id)
+            self.assertIn("NEXT ONLY", next_excerpt.text)
+            self.assertNotIn("NEW ONLY", next_excerpt.text)
+            self.assertEqual(json.loads(f.state.read_text())["offset"], f.frontier)
+            self.assertEqual(f.invocations, [])
 
     def test_partial_eof_is_rejected_without_rounding_back(self):
         with self.fixture() as f:

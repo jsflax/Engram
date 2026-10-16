@@ -19,7 +19,14 @@ MODULES = (
     "test_hook_status", "test_bootstrap", "test_entry_integration",
     "test_memory_policy",
     "test_file_identity", "test_host_v2", "test_v2_runtime", "test_migration",
+    "test_execution_manifest", "test_publication_journal", "test_writer_fence",
+    "test_fenced_relay", "test_operation_gateway", "test_operation_probe",
+    "test_operation_recovery_probe", "test_execution_context", "test_parser_context",
+    "test_publication_coordinator", "test_settlement", "test_proxy_execution",
+    "test_runner_publication", "test_runner_durable",
 )
+FSYNC_MODULES = {"test_host", "test_migration", "test_execution_context", "test_parser_context",
+                 "test_publication_coordinator", "test_settlement", "test_runner_publication"}
 
 def run_module(name):
     module = importlib.import_module(name)
@@ -53,10 +60,10 @@ def main():
         child = subprocess.run(
             [sys.executable, "-B", str(Path(__file__).resolve()), "--module", name],
             cwd=TEST_ROOT, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
-            # Migration exercises repeated durable publication for 64-task
-            # cohorts. Its fixture/fsync cost exceeds the small-module budget
-            # on a busy host; the CLI's own 30-second deadline remains tested.
-            capture_output=True, text=True, timeout=900 if name == "test_migration" else 180)
+            # These suites repeatedly fsync migrated cohorts or process-death
+            # fixtures. Allow scheduling delay on a busy development host;
+            # production command deadlines remain independently tested.
+            capture_output=True, text=True, timeout=900 if name in FSYNC_MODULES else 180)
         try:
             row = json.loads(child.stdout.splitlines()[-1])
             if row["module"] != name or (child.returncode and not (row["failures"] or row["errors"])):
