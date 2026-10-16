@@ -92,6 +92,20 @@ class LegacyAcceptanceTests(unittest.TestCase):
         self.assertEqual(json.loads(history["runs/" + RUN_ID + "/run.json"][0])["write_calls"], 1)
         self.assertEqual(len(f.review["attempts"]), 2)
 
+    def test_first_upgrade_creates_publications_only_when_applying(self):
+        f = self.fixture()
+        (f.root / "publications").rmdir()
+        before, history, database = f.current(), f.history_snapshot(), f.store.read_bytes()
+        with self.no_external_effects(f):
+            plan = f.prepare()
+            self.assertEqual(f.current(), before)
+            self.assertFalse((f.root / "publications").exists())
+            result = f.apply(plan)
+            self.completed(f, plan, result)
+            self.assertEqual(f.recover(plan), result)
+        self.assertEqual(f.history_snapshot(), history)
+        self.assertEqual(f.store.read_bytes(), database)
+
     def test_source_append_and_unrelated_database_access_changes_are_allowed(self):
         f = self.fixture()
         plan = f.prepare()

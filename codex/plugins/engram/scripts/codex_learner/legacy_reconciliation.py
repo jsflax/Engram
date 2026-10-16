@@ -493,6 +493,17 @@ def _selected(paths, session_id):
                              paths.root / "publications" / session_id)
 
 
+def _active_if_present(selected, session_id):
+    # Older installed learners have no publication container. Read-only
+    # preparation must not create one, and absence cannot contain an active
+    # ticket. Existing containers still receive the coordinator's full checks.
+    parent = selected.session_directory.parent
+    if not os.path.lexists(parent):
+        durable._directory(parent.parent)
+        return None
+    return coordinator._active(selected, session_id)
+
+
 def _pending_pause(request):
     _identifier(request.get("request_id"))
     if "paused_request_id" in request or "pause_reason" in request:
@@ -587,7 +598,7 @@ def prepare(paths, *, session_id, legacy_run_id, reviewed_bundle_sha256, reconci
         review = _review(_json(review_raw))
         _require(review["session_id"] == session_id and review["legacy_run_id"] == legacy_run_id, "selection_changed")
         selected = _selected(paths, session_id)
-        _require(coordinator._active(selected, session_id) is None, "active_publication")
+        _require(_active_if_present(selected, session_id) is None, "active_publication")
         inputs = {}
         for role in ("state", "admission", "pending"):
             raw, identity = durable._read(getattr(selected, role))
@@ -719,12 +730,12 @@ def apply(paths, *, plan, plan_sha256):
         coordinator._immutable(work / "plan.json", plan, "legacy_plan")
         locks.verify()
         _boundary("plan_durable")
+        durable._mkdir(paths.root / "publications")
         active = coordinator._active(selected, review["session_id"])
         if active is None and not os.path.lexists(work / "publication-reference.json"):
             for role, image in plan["inputs"].items():
                 _require(durable._read(getattr(selected, role)) == (publication._raw(image, old=True), image["identity"]),
                          "preimage_changed")
-            durable._mkdir(paths.root / "publications")
             coordinator.start(selected, ticket_id=plan["id"], session_id=review["session_id"],
                 request_id=values["pending"]["request_id"], binding=values["pending"]["admission"],
                 expected_old_state_sha256=plan["inputs"]["state"]["sha256"],
@@ -860,7 +871,7 @@ def recover_locked(paths, *, session_id, verify_locks):
     locks = _CallerLocks(verify_locks)
     locks.verify()
     selected = _selected(paths, session_id)
-    active = coordinator._active(selected, session_id)
+    active = _active_if_present(selected, session_id)
     if active is not None:
         evidence = active[0]["input_evidence"]
         if evidence.get("kind") != KIND:

@@ -69,6 +69,19 @@ class LegacyCLITests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue()), {"status": "held",
             "reason": "legacy_reconciliation_missing_prepare_arguments"})
 
+    def test_older_installation_prepare_does_not_create_publication_container(self):
+        f = self.fixture()
+        (f.root / "publications").rmdir()
+        before, history, database = f.current(), f.history_snapshot(), f.store.read_bytes()
+        output = f.base / "reviewable-plan.json"
+        status, result = self.prepare(f, output)
+        self.assertEqual(status, 0)
+        self.assertFalse(result["live_changes"])
+        self.assertFalse((f.root / "publications").exists())
+        self.assertEqual(f.current(), before)
+        self.assertEqual(f.history_snapshot(), history)
+        self.assertEqual(f.store.read_bytes(), database)
+
 
 if __name__ == "__main__":
     unittest.main()
