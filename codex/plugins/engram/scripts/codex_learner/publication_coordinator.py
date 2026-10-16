@@ -68,8 +68,15 @@ def _paths(paths, session_id, *, create=False):
             durable._mkdir(paths.session_directory / name)
     if os.path.lexists(paths.session_directory):
         _require(not durable._directory(paths.session_directory).st_mode & 0o077, "directory_not_private")
+        active = os.path.lexists(paths.session_directory / "active.json")
         for name in ("tickets", "journals", "records"):
-            _require(not durable._directory(paths.session_directory / name).st_mode & 0o077,
+            child = paths.session_directory / name
+            # Container creation precedes all authority. A crash between these
+            # mkdirs leaves no active ticket and may safely be completed by the
+            # next start; never adopt an orphan ticket or journal in doing so.
+            if not os.path.lexists(child) and not active:
+                continue
+            _require(not durable._directory(child).st_mode & 0o077,
                      "directory_not_private")
     return {name: str(getattr(paths, name)) for name in paths.__dataclass_fields__}
 

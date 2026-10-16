@@ -122,6 +122,36 @@ class PublicationCoordinatorTests(unittest.TestCase):
         self.assertIsNone(self.recover())
         self.assertIsNone(self.ack())
 
+    def test_incomplete_unindexed_container_can_resume_without_adopting_orphans(self):
+        for count in range(3):
+            with self.subTest(created_children=count):
+                self.setUp()
+                self.paths.session_directory.mkdir(mode=0o700)
+                for name in ("tickets", "journals", "records")[:count]:
+                    (self.paths.session_directory / name).mkdir(mode=0o700)
+                before = [path.read_bytes() for path in (self.paths.state, self.paths.admission, self.paths.pending)]
+                self.assertIsNone(self.recover())
+                self.assertEqual(before, [path.read_bytes() for path in (self.paths.state, self.paths.admission, self.paths.pending)])
+                self.start()
+                self.ack()
+                self.assert_new_pair()
+
+    def test_active_or_unsafe_partial_container_never_authorizes_repair(self):
+        for kind in ("active", "file", "symlink"):
+            with self.subTest(kind=kind):
+                self.setUp()
+                self.paths.session_directory.mkdir(mode=0o700)
+                if kind == "active":
+                    C.durable._new(self.active(), b"{}\n")
+                elif kind == "file":
+                    C.durable._new(self.paths.session_directory / "tickets", b"{}\n")
+                else:
+                    (self.paths.session_directory / "tickets").symlink_to(self.base / "pending")
+                before = [path.read_bytes() for path in (self.paths.state, self.paths.admission, self.paths.pending)]
+                with self.assertRaises((OSError, ValueError)):
+                    self.recover()
+                self.assertEqual(before, [path.read_bytes() for path in (self.paths.state, self.paths.admission, self.paths.pending)])
+
     def test_pause_is_frozen_and_more_keeps_original_then_allows_next_batch(self):
         for action in ("pause", "keep"):
             with self.subTest(action=action):
