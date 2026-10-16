@@ -139,6 +139,24 @@ class RunnerLegacyDispatchTests(unittest.TestCase):
         write_json(receipt, recorded)
         self.assertTrue(L.needs_recovery(f.root, SID))
 
+    def test_missing_or_null_reference_is_an_explicit_hold_without_fallthrough(self):
+        for change in ({"status": L.RESULT}, {"last_reconciliation": None}):
+            with self.subTest(change=change):
+                f = self.fixture()
+                write_json(f.state_path, {**f.state, **change})
+                before = f.current()
+                self.assertTrue(L.needs_recovery(f.root, SID))
+                with L.durable.Locks(f.root) as held:
+                    def guard():
+                        held.verify()
+                        return True
+                    with mock.patch.object(R, "_record", side_effect=AssertionError("ordinary recovery fallthrough")), \
+                         mock.patch("subprocess.Popen", side_effect=AssertionError("provider/native invocation")):
+                        with self.assertRaisesRegex(ValueError, "missing_reconciliation_reference"):
+                            self.publications(f, legacy_paths=lambda: f.paths,
+                                legacy_verify_locks=guard).recover(SID, {})
+                self.assertEqual(f.current(), before)
+
     def test_malformed_reference_cannot_select_an_arbitrary_path(self):
         f = self.fixture()
         write_json(f.state_path, {**f.state, "last_reconciliation": {"id": "../../outside"}})

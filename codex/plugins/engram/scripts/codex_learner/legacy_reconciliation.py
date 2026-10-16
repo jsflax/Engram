@@ -878,6 +878,8 @@ def recover_locked(paths, *, session_id, verify_locks):
     state = _json(state_raw)
     reference = state.get("last_reconciliation")
     if reference is None:
+        _require("last_reconciliation" not in state and state.get("status") != RESULT,
+                 "missing_reconciliation_reference")
         return None
     codec._keys(reference, {"version", "id", "legacy_run_id", "evidence_sha256", "interval", "memory_ids"})
     work = _work(paths, reference["id"])
