@@ -110,6 +110,24 @@ enum LearnerHealthReaderChecks {
         object["learner"] = learner
         let noReview = try LearnerHealthSnapshot.decode(JSONSerialization.data(withJSONObject: object), sessionID: sessionID)
         require(noReview.learner.health.outcomes.legacyReconciliation?.title == "None recorded", "Absent review remains absent")
+        outcomes["residual_reconciliation"] = ["state": "recorded_completed", "historical_run_status": "failed",
+            "provider_invoked": false, "applied_write_count": 5, "unchanged_write_count": 0]
+        model["outcomes"] = outcomes
+        learner["health"] = model
+        object["learner"] = learner
+        let residual = try LearnerHealthSnapshot.decode(JSONSerialization.data(withJSONObject: object), sessionID: sessionID).learner.health
+        require(residual.outcomes.residualReconciliation?.appliedWriteCount == 5, "Residual writes remain separate from old provider counts")
+        require(residual.outcomes.residualReconciliation?.providerInvoked == false, "Residual recovery does not invent a provider run")
+        require(residual.outcomes.residualReconciliation?.title == "Recorded review with residual writes", "Residual review has a distinct label")
+        require(residual.outcomes.providerCompletion.runStatus == "failed", "Residual recovery retains the historical provider failure")
+        require(residual.outcomes.independentReadback.state == "not_performed", "Residual receipt is not independent readback")
+        require(residual.progress.lastCompletedInterval.endOffset == nil, "Residual review cannot create modern successful coverage")
+        outcomes["residual_reconciliation"] = ["state": "recovery_pending"]
+        model["outcomes"] = outcomes
+        learner["health"] = model
+        object["learner"] = learner
+        let residualPending = try LearnerHealthSnapshot.decode(JSONSerialization.data(withJSONObject: object), sessionID: sessionID).learner.health
+        require(residualPending.outcomes.residualReconciliation?.title == "Residual review receipt needs recovery", "Missing residual receipt remains visible")
         model["schema_version"] = 2
         learner["health"] = model
         object["learner"] = learner

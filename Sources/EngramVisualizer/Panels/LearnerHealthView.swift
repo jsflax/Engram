@@ -91,6 +91,9 @@ struct LearnerHealthView: View {
         if let review = health.outcomes.legacyReconciliation, review.state != "absent" {
             row("Legacy review", review.title)
         }
+        if let review = health.outcomes.residualReconciliation, review.state != "absent" {
+            row("Residual review", review.title)
+        }
         row("Readback", label(health.outcomes.independentReadback.state))
         Text(health.recoveryText).foregroundStyle(.secondary)
 
@@ -128,6 +131,12 @@ struct LearnerHealthView: View {
                     if review.historicalExecutionSealed == false { row("Historical input seal", "Not available") }
                     if let grade = review.sourceBindingGrade { row("Reconstruction", label(grade)) }
                     if let count = review.nativeMutationsPerformed { row("New writes from review", count.formatted()) }
+                }
+                if let review = health.outcomes.residualReconciliation, review.state == "recorded_completed" {
+                    Text(review.qualification)
+                    if let status = review.historicalRunStatus { row("Historical run result", label(status)) }
+                    if let count = review.appliedWriteCount { row("Reviewed residual writes", count.formatted()) }
+                    if review.providerInvoked == false { row("New provider run", "Not invoked") }
                 }
                 if let counts = health.outcomes.writeAttempts,
                    counts.attemptedWriteCalls != nil || counts.appliedWriteCalls != nil || counts.unchangedWriteCalls != nil {
@@ -177,7 +186,9 @@ struct LearnerHealthView: View {
         case "processing_unverified", "processing_marker": "Processing recorded; activity unverified"
         case "publication_recovery_pending": "Unfinished progress update"
         case "legacy_reconciliation_recovery_pending": "Unfinished legacy review receipt"
+        case "residual_reconciliation_recovery_pending": "Unfinished residual review receipt"
         case "recorded_legacy_reconciliation": "Recorded retrospective review"
+        case "recorded_residual_reconciliation": "Recorded residual review"
         case "current_bounded_reconstruction": "Reconstructed from current bounded evidence"
         case "session_hash_match": "Linked to this task"
         case "recorded_in_anchored_settlement": "Recorded in linked receipt"

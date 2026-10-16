@@ -36,7 +36,7 @@ STATUSES = {"emitted", "empty", "invalid", "timeout", "cancelled", "cleanup_time
             "enrolled", "observed", "queued", "not_queued", "rejected", "tool_not_agent",
             "cleaned", "already_clean", "nudge_disabled", "nudge", "counted",
             "success_ignored", "unclassified_ignored", "reconciliation_required", "backoff",
-            "legacy_reconciled_no_new_mutation"}
+            "legacy_reconciled_no_new_mutation", "legacy_reconciled_with_residuals"}
 OUTCOMES = {"stored", "no_new_memories", "failed"}
 SETTLEMENT_REASONS = {"verified_completion", "never_dispatched", "provider_not_started", "unverified_completion"}
 GATE_REASONS = {"successful_or_unverified_write", "write_status_unknown"} | SETTLEMENT_REASONS
@@ -312,6 +312,12 @@ def metadata(record):
             out["last_reconciliation"] = legacy_reference(record["last_reconciliation"])
         except (ValueError, TypeError, KeyError):
             pass
+    if "last_residual_reconciliation" in record:
+        out["last_residual_reconciliation_present"] = True
+        try:
+            out["last_residual_reconciliation"] = residual_reference(record["last_residual_reconciliation"])
+        except (ValueError, TypeError, KeyError):
+            pass
     if "processing_execution" in record:
         out["processing_execution_present"] = True
         reference = record["processing_execution"]
@@ -447,6 +453,9 @@ def scoped_json(path, sid, binding=False):
         if (("last_reconciliation" in value or value.get("status") == "legacy_reconciled_no_new_mutation")
                 and "last_reconciliation" not in out["metadata"]):
             invalid.append("last_reconciliation")
+        if (("last_residual_reconciliation" in value or value.get("status") == "legacy_reconciled_with_residuals")
+                and "last_residual_reconciliation" not in out["metadata"]):
+            invalid.append("last_residual_reconciliation")
         if "settlement_sha256" in value:
             if "settlement_sha256" not in out["metadata"]:
                 invalid.append("settlement_sha256")
@@ -583,6 +592,115 @@ def legacy_reconciliation_view(learner, sid, state):
     return view
 
 
+def residual_reference(value):
+    """Validate a content-free reference before selecting fixed receipt paths."""
+    keys = {"version", "id", "legacy_run_id", "run_id", "manifest_sha256", "context_sha256",
+            "review_sha256", "settlement_sha256", "interval", "preserved_memory_ids", "new_memory_ids"}
+    if type(value) is not dict or set(value) != keys:
+        raise ValueError("invalid_reference")
+    legacy_reference({"version": value["version"], "id": value["id"], "legacy_run_id": value["legacy_run_id"],
+        "evidence_sha256": value["review_sha256"], "interval": value["interval"], "memory_ids": value["preserved_memory_ids"]})
+    if (type(value["run_id"]) is not str or RUN_ID.fullmatch(value["run_id"]) is None
+            or value["run_id"] == value["legacy_run_id"]
+            or any(not _sha256(value[k]) for k in ("manifest_sha256", "context_sha256", "settlement_sha256"))
+            or len(value["preserved_memory_ids"]) != 1):
+        raise ValueError("invalid_reference")
+    ids = value["new_memory_ids"]
+    if (type(ids) is not list or not 1 <= len(ids) <= 5 or any(not valid_uuid(i) for i in ids)
+            or len(set(i.lower() for i in ids)) != len(ids)):
+        raise ValueError("invalid_ids")
+    return json.loads(json.dumps(value, allow_nan=False))
+
+
+def residual_reconciliation_view(learner, sid, state):
+    """Read bounded recorded pins; never load the private review or run native."""
+    view = {"state": "absent", "evidence": "recorded_residual_reconciliation_not_evidence_revalidation"}
+    if type(state) is not dict or ("last_residual_reconciliation" not in state
+                                  and state.get("status") != "legacy_reconciled_with_residuals"):
+        return view
+    view.update(state="recovery_pending", read={"read_status": "invalid_reference"})
+    try:
+        ref = residual_reference(state.get("last_residual_reconciliation"))
+        view["reference"] = ref
+        directory = learner / "runs" / ref["run_id"]
+        def bounded(path, maximum):
+            raw, result = read_bounded(path, maximum, private=True)
+            if raw is None:
+                view["read"] = result
+                return None, None
+            return raw, _strict_object(raw)
+        raw, receipt = bounded(directory / "residual-receipt.json", MAX_JSON_BYTES)
+        if raw is None:
+            return view
+        keys = {"version", "kind", "status", "session_id", "request_id", "reference", "publication",
+                "completion_sha256", "historical_run_status", "historical_execution_sealed", "source_binding_grade",
+                "provider_invoked", "applied_write_count", "unchanged_write_count"}
+        if (set(receipt) != keys or type(receipt["version"]) is not int or receipt["version"] != 1
+                or receipt["kind"] != "legacy_residual_interval_reconciliation"
+                or receipt["status"] != "reconciled_with_residuals" or receipt["session_id"] != sid
+                or type(receipt["request_id"]) is not str or re.fullmatch(r"[0-9a-f]{32}", receipt["request_id"]) is None
+                or not _json_equal(receipt["reference"], ref) or not _sha256(receipt["completion_sha256"])):
+            raise ValueError("invalid_receipt")
+        qualification = {"historical_run_status": "failed", "historical_execution_sealed": False,
+                         "source_binding_grade": "current_bounded_reconstruction", "provider_invoked": False,
+                         "applied_write_count": 5, "unchanged_write_count": 0}
+        if not _json_equal({k: receipt[k] for k in qualification}, qualification):
+            raise ValueError("invalid_qualification")
+        publication = receipt["publication"]
+        if (type(publication) is not dict or set(publication) != {"ticket_id", "ticket_sha256"}
+                or publication["ticket_id"] != ref["id"] or not _sha256(publication["ticket_sha256"])):
+            raise ValueError("invalid_publication")
+        pinned, reference = bounded(directory / "residual-publication-reference.json", MAX_JSON_BYTES)
+        if pinned is None:
+            return view
+        if not _json_equal(reference, publication):
+            raise ValueError("publication_mismatch")
+        settled_raw, settled = bounded(directory / "residual-settlement.json", MAX_SETTLEMENT_BYTES)
+        if settled_raw is None:
+            return view
+        execution = {k: ref[k] for k in ("run_id", "manifest_sha256", "context_sha256", "review_sha256")}
+        settlement_keys = {"version", "kind", *execution, *qualification, "authorization_sha256", "generation_sha256s",
+                           "checkpoint_sha256", "evidence_heads", "operations", "preserved_memory_ids", "new_memory_ids",
+                           "successful_coverage"}
+        labels = ["R1", "R2", "R3", "R4", "R5"]
+        if (hashlib.sha256(settled_raw).hexdigest() != ref["settlement_sha256"] or set(settled) != settlement_keys
+                or type(settled["version"]) is not int or settled["version"] != 1
+                or settled["kind"] != "reviewed_residual_settlement" or settled["successful_coverage"] is not False
+                or not _json_equal({k: settled[k] for k in execution}, execution)
+                or not _json_equal({k: settled[k] for k in qualification}, qualification)
+                or not _sha256(settled["authorization_sha256"]) or not _sha256(settled["checkpoint_sha256"])
+                or type(settled["generation_sha256s"]) is not list or not 1 <= len(settled["generation_sha256s"]) <= 64
+                or any(not _sha256(v) for v in settled["generation_sha256s"])
+                or type(settled["evidence_heads"]) is not dict or set(settled["evidence_heads"]) != set(labels)
+                or any(not _sha256(v) for v in settled["evidence_heads"].values())
+                or any(not _json_equal(settled[k], ref[k]) for k in ("preserved_memory_ids", "new_memory_ids"))
+                or type(settled["operations"]) is not list or len(settled["operations"]) != 5):
+            raise ValueError("settlement_mismatch")
+        for label, operation in zip(labels, settled["operations"]):
+            if (type(operation) is not dict or set(operation) != {"label", "operation_id", "receipt_sha256"}
+                    or operation["label"] != label or not valid_uuid(operation["operation_id"])
+                    or not _sha256(operation["receipt_sha256"])):
+                raise ValueError("operation_mismatch")
+        complete_raw, complete = bounded(learner / "publications" / sid / "records" / ref["id"] / "completion.json",
+                                         MAX_SETTLEMENT_BYTES)
+        if complete_raw is None:
+            return view
+        if (hashlib.sha256(complete_raw).hexdigest() != receipt["completion_sha256"]
+                or set(complete) != {"version", "ticket_id", "ticket_sha256", "published_sha256", "ack_intent_sha256",
+                                    "outcome", "disposition", "pending"}
+                or type(complete["version"]) is not int or complete["version"] != 1
+                or any(complete[k] != publication[k] for k in publication)
+                or any(not _sha256(complete[k]) for k in ("published_sha256", "ack_intent_sha256"))
+                or not _json_equal(complete["outcome"], {"result": "legacy_reconciled_with_residuals",
+                                                       "queue_action": "keep", "pause_reason": None})
+                or complete["disposition"] not in ("original", "newer") or type(complete["pending"]) is not dict):
+            raise ValueError("completion_mismatch")
+        view.update(state="recorded_completed", read={"read_status": "ok"}, **qualification)
+    except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+        view["read"] = {"read_status": "invalid_reconciliation_proof"}
+    return view
+
+
 def publication_view(learner, sid):
     """Observe only the fixed active index; never follow its ticket reference."""
     raw, read = read_bounded(learner / "publications" / sid / "active.json", MAX_JSON_BYTES)
@@ -714,7 +832,11 @@ def health_summary(learner, *, backlog=None, now=None):
     publication_pending = publication.get("state", "absent") != "absent"
     legacy = learner.get("legacy_reconciliation", {})
     legacy_pending = legacy.get("state") == "recovery_pending"
-    legacy_completed = legacy.get("state") == "recorded_completed"
+    residual = learner.get("residual_reconciliation", {})
+    residual_pending = residual.get("state") == "recovery_pending"
+    reviewed = [(legacy, "recorded_legacy_reconciliation"), (residual, "recorded_residual_reconciliation")]
+    completed_reviews = [(item["reference"], evidence) for item, evidence in reviewed
+                         if item.get("state") == "recorded_completed"]
     pending_present = pending_view.get("read", {}).get("read_status") == "ok"
     pending_missing = pending_view.get("read", {}).get("read_status") == "missing"
     # A pause applies only to this request. A leftover pause from an older
@@ -724,11 +846,11 @@ def health_summary(learner, *, backlog=None, now=None):
     policy_state = "enabled" if policy.get("enabled") is True else "disabled" if policy.get("enabled") is False else "unknown"
     current = learner.get("held_run", {}) if held else learner.get("latest_run", {})
     receipt = current.get("run_receipt", {})
-    legacy_reference = legacy.get("reference", {})
-    old_failure_resolved = (legacy_completed and session.get("last_run") == legacy_reference.get("legacy_run_id")
-                            and current.get("run_id") == legacy_reference.get("legacy_run_id")
-                            and type(session.get("offset")) is int
-                            and session["offset"] >= legacy_reference.get("interval", {}).get("end_offset", 2**63))
+    old_failure_resolved = any(session.get("last_run") == ref.get("legacy_run_id")
+                              and current.get("run_id") == ref.get("legacy_run_id")
+                              and type(session.get("offset")) is int
+                              and session["offset"] >= ref.get("interval", {}).get("end_offset", 2**63)
+                              for ref, _ in completed_reviews)
     holds = []
     if held:
         holds.append({"kind": "reconciliation_required", **gate})
@@ -740,6 +862,8 @@ def health_summary(learner, *, backlog=None, now=None):
         holds.append({"kind": "publication_recovery_pending", "liveness": "not_checked"})
     if legacy_pending:
         holds.append({"kind": "legacy_reconciliation_recovery_pending", "liveness": "not_checked"})
+    if residual_pending:
+        holds.append({"kind": "residual_reconciliation_recovery_pending", "liveness": "not_checked"})
 
     queue_state = "paused" if paused else "queued" if pending_present and pending.get("request_id") else "absent" if pending_missing else "unknown"
     progress = {"backlog": backlog or {"state": "unknown", "current_transcript_size": "not_inspected"},
@@ -750,10 +874,10 @@ def health_summary(learner, *, backlog=None, now=None):
                                ("last_success_timestamp_claim", session, "last_success_at")):
         if field in source:
             progress[key] = source[field]
-    if legacy_completed:
-        progress["last_reconciled_interval"] = {"evidence": "recorded_legacy_reconciliation",
-            "legacy_run_id": legacy_reference["legacy_run_id"],
-            **{key: legacy_reference["interval"][key] for key in ("start_offset", "end_offset")}}
+    if completed_reviews:
+        reference, evidence = max(completed_reviews, key=lambda item: item[0]["interval"]["end_offset"])
+        progress["last_reconciled_interval"] = {"evidence": evidence, "legacy_run_id": reference["legacy_run_id"],
+            **{key: reference["interval"][key] for key in ("start_offset", "end_offset")}}
     completed = learner.get("completed_run", {})
     completed_receipt = completed.get("run_receipt", {})
     completed_settlement = completed.get("recorded_settlement", {})
@@ -801,7 +925,8 @@ def health_summary(learner, *, backlog=None, now=None):
     if policy.get("mode") in {"host_sessions_v1", "host_sessions_v2"}:
         required.add("enrollment")
     for component in ("policy", "session", "admission", "enrollment", "pending", "migration_hold",
-                      "latest_run", "held_run", "completed_run", "publication", "legacy_reconciliation"):
+                      "latest_run", "held_run", "completed_run", "publication", "legacy_reconciliation",
+                      "residual_reconciliation"):
         component_view = learner.get(component, {})
         read = component_view.get("read", component_view)
         status = read.get("read_status")
@@ -822,7 +947,7 @@ def health_summary(learner, *, backlog=None, now=None):
         failure = {"class": "uncertain_or_partial_write", "reason": gate.get("reason", "reconciliation_required")}
     elif migration_held:
         failure = {"class": "identity_migration"}
-    elif publication_pending or legacy_pending:
+    elif publication_pending or legacy_pending or residual_pending:
         failure = {"class": "publication_requires_recovery"}
     elif processing:
         failure = {"class": "processing_requires_inspection"}
@@ -846,7 +971,7 @@ def health_summary(learner, *, backlog=None, now=None):
         headline, activity, action = "reconciliation_required", "held", "reconcile_held_run"
     elif migration_held:
         headline, activity, action = "identity_migration_hold", "held", "review_identity_migration"
-    elif publication_pending or legacy_pending:
+    elif publication_pending or legacy_pending or residual_pending:
         headline, activity, action = "publication_recovery_pending", "held", "recover_publication"
     elif processing:
         headline, activity, action = "processing_unverified", "processing_unverified", "inspect_processing_attempt"
@@ -886,6 +1011,7 @@ def health_summary(learner, *, backlog=None, now=None):
                          "native_acknowledgement": acknowledgement,
                          "write_attempts": write_attempts, "recorded_settlement": settlement_outcome,
                          "legacy_reconciliation": legacy,
+                         "residual_reconciliation": residual,
                          "independent_readback": {"state": "not_performed"}}}
 
 
@@ -938,6 +1064,7 @@ def report(session_id=None, environ=None):
                        "pending": pending_view, "migration_hold": migration_view,
                        "publication": publication_view(learner, sid),
                        "legacy_reconciliation": legacy_reconciliation_view(learner, sid, state),
+                       "residual_reconciliation": residual_reconciliation_view(learner, sid, state),
                        "memory_readback": "not_performed"}}
     # A run must be named by a matching event or this exact session's state.
     linked = next((v.get("run_id") for v in reversed(events) if "run_id" in v), None)

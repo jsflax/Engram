@@ -118,6 +118,27 @@ struct LearnerHealthSnapshot: Decodable, Sendable {
                 + "this disposition records no successful learning coverage."
         }
     }
+    struct ResidualReconciliation: Decodable, Sendable {
+        let state: String
+        let historicalRunStatus: String?
+        let providerInvoked: Bool?
+        let appliedWriteCount: Int?
+        let unchangedWriteCount: Int?
+
+        var title: String {
+            switch state {
+            case "recorded_completed": "Recorded review with residual writes"
+            case "recovery_pending": "Residual review receipt needs recovery"
+            case "absent": "None recorded"
+            default: "Residual review status unknown"
+            }
+        }
+
+        var qualification: String {
+            "Reviewed residual writes are recorded separately. The historical provider run remains failed; "
+                + "these receipts do not establish a successful provider run or independent memory readback."
+        }
+    }
     struct Outcomes: Decodable, Sendable {
         let queue: State
         let providerCompletion: ProviderCompletion
@@ -125,6 +146,7 @@ struct LearnerHealthSnapshot: Decodable, Sendable {
         let writeAttempts: WriteCounts?
         let recordedSettlement: RecordedSettlement?
         let legacyReconciliation: LegacyReconciliation?
+        let residualReconciliation: ResidualReconciliation?
         let independentReadback: State
     }
     struct Health: Decodable, Sendable {
