@@ -16,10 +16,31 @@ from suite_support import PLUGIN_ROOT, TEST_ROOT
 MODULES = (
     "test_frontier", "test_router", "test_host", "test_receipts",
     "test_budget_guidance", "test_lock_inheritance", "test_hook_parity",
-    "test_hook_status", "test_bootstrap", "test_entry_integration",
+    "test_hook_status", "test_hook_status_legacy", "test_hook_status_residual", "test_bootstrap", "test_entry_integration",
     "test_memory_policy",
     "test_file_identity", "test_host_v2", "test_v2_runtime", "test_migration",
+    "test_execution_manifest", "test_publication_journal", "test_writer_fence",
+    "test_fenced_relay", "test_operation_gateway", "test_operation_probe",
+    "test_operation_recovery_probe", "test_execution_context", "test_parser_context",
+    "test_publication_coordinator", "test_settlement", "test_proxy_execution",
+    "test_runner_publication", "test_runner_durable", "test_runner_legacy_entry", "test_runner_legacy_dispatch",
+    "test_legacy_acceptance", "test_legacy_report_dates", "test_legacy_cli",
+    'test_runner_residual_dispatch',
+    'test_residual_driver',
+    'test_residual_cache',
+    'test_residual_cleanup',
+    'test_residual_crashes',
+    'test_residual_status_retention',
+    'test_residual_independent',
+    'test_residual_context_acceptance',
+    'test_residual_policy',
+    'test_residual_publication_contract',
+    'test_learner_residual',
 )
+FSYNC_MODULES = {"test_host", "test_migration", "test_execution_context", "test_parser_context",
+                 "test_publication_coordinator", "test_settlement", "test_runner_publication",
+                 "test_legacy_acceptance", "test_residual_context_acceptance", "test_learner_residual",
+                 "test_residual_driver", "test_residual_independent", "test_residual_crashes"}
 
 def run_module(name):
     module = importlib.import_module(name)
@@ -53,7 +74,10 @@ def main():
         child = subprocess.run(
             [sys.executable, "-B", str(Path(__file__).resolve()), "--module", name],
             cwd=TEST_ROOT, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
-            capture_output=True, text=True, timeout=180)
+            # These suites repeatedly fsync migrated cohorts or process-death
+            # fixtures. Allow scheduling delay on a busy development host;
+            # production command deadlines remain independently tested.
+            capture_output=True, text=True, timeout=900 if name in FSYNC_MODULES else 180)
         try:
             row = json.loads(child.stdout.splitlines()[-1])
             if row["module"] != name or (child.returncode and not (row["failures"] or row["errors"])):

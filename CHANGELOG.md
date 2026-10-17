@@ -6,6 +6,29 @@ All notable changes to Engram are documented in this file.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-16
+
+### Added
+- Durable native memory operations commit mutations and operation receipts
+  together. Stable operation IDs resolve lost acknowledgements without repeating
+  an append or replaying a provider run; changed payloads under the same ID are
+  rejected.
+- Explicit reviewed recovery commands for supported legacy holds. Recovery
+  preserves successful memory IDs, original failures and lifetimes, and advances
+  only reviewed history. Uncertain writes and changed evidence remain held.
+
+### Fixed
+- Preserve a learner reconciliation hold when an earlier batch reached its run
+  limit; allow explicit resume of an eligible unchanged pending request.
+- Seal Codex learner inputs before dispatch, retain native writer ownership until
+  handlers drain, and recover interrupted cursor and queue publication while
+  preserving newer pending work.
+- Bind V2 transcript identity to its APFS volume and inode, with explicit bounded
+  migration that preserves the original enrollment frontier and held history.
+- Show held learning, partial writes, interrupted publication and retrospective
+  recovery separately in hook-status and the app. An old success timestamp or
+  enabled hook is no longer presented as evidence of current successful learning.
+
 ## [0.14.10] - 2026-09-24
 
 ### Fixed

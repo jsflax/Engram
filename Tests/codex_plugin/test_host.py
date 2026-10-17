@@ -17,6 +17,7 @@ from unittest import mock
 import uuid
 
 import test_frontier as F
+from durable_host_support import DurableHost
 
 ROUTER = None
 HOST = None
@@ -62,6 +63,7 @@ class HostTests(unittest.TestCase):
         env = mock.patch.dict(os.environ, {'CODEX_HOME': str(self.home)})
         env.start(); self.addCleanup(env.stop)
         self.invocations = []
+        self.durable = None
 
     def task(self, n=1, *, source='vscode', version='future-codex-version', parent=None, created='2026-01-02T00:00:00Z'):
         sid = F.uuid7('2026-01-02T00:00:00Z', suffix=n)
@@ -95,10 +97,243 @@ class HostTests(unittest.TestCase):
 
     def invoke(self, root, run_dir, request, excerpt, config):
         self.invocations.append((request, excerpt))
+        self.durable.provider()
         return {'status': 'succeeded', 'write_calls': 0}
 
+    def enable_durable(self):
+        if self.durable is None:
+            self.durable = DurableHost(self, F)
+        self.durable.migrate()
+
     def process(self, sid):
+        state = F.RUNNER.load_json(self.root / 'sessions' / (sid + '.json'))
+        if not F.RUNNER.requires_reconciliation(state):
+            self.enable_durable()
         return F.RUNNER.process_request(self.root, self.request(sid), F.RUNNER.settings(self.root), invoke=self.invoke)
+
+    def paused_for_resume(self, n=1, *, durable=False):
+        sid, path, payload = self.task(n)
+        self.dispatch(payload, 'SessionStart')
+        self.append(path, 'DURABLE RESUME CONTENT')
+        self.assertTrue(self.dispatch(payload))
+        if durable:
+            self.enable_durable()
+        request = self.request(sid)
+        F.RUNNER.atomic_json(self.root / 'pending' / (sid + '.json'),
+                            {**request, 'paused_request_id': request['request_id'], 'pause_reason': 'batch_limit'})
+        return sid, path, payload
+
+    def resume_records(self, sid):
+        return {name: (self.root / name / (sid + '.json')).read_bytes()
+                for name in ('enrollments', 'admissions', 'sessions', 'pending')}
+
+    def test_resume_same_snapshot_keeps_request_and_cursor_then_processes_once(self):
+        sid, path, payload = self.paused_for_resume(durable=True)
+        before = self.resume_records(sid)
+        paused = self.request(sid)
+        with mock.patch.object(F.RUNNER, 'spawn_worker') as spawn:
+            self.assertEqual(F.RUNNER.main(['retry', '--state-dir', str(self.root), '--session-id', sid]), 0)
+            self.assertEqual(F.RUNNER.main(['retry', '--state-dir', str(self.root), '--session-id', sid]), 1)
+        spawn.assert_called_once_with(self.root)
+        expected = {k: v for k, v in paused.items() if k not in ('paused_request_id', 'pause_reason')}
+        self.assertEqual(self.request(sid), expected)
+        self.assertEqual({k: v for k, v in self.resume_records(sid).items() if k != 'pending'},
+                         {k: v for k, v in before.items() if k != 'pending'})
+        self.assertFalse(self.dispatch(payload))  # Ordinary hooks still deduplicate.
+        original = F.RUNNER.process_request
+        with mock.patch.object(F.RUNNER, 'process_request', side_effect=lambda r,q,c: original(r,q,c,invoke=self.invoke)), \
+                mock.patch.object(F.RUNNER, 'spawn_worker', side_effect=F.forbidden):
+            F.RUNNER.worker(self.root)
+            F.RUNNER.worker(self.root)
+        self.assertEqual(len(self.invocations), 1)
+        self.assertEqual(self.invocations[0][0]['request_id'], paused['request_id'])
+        self.assertIn('DURABLE RESUME CONTENT', self.invocations[0][1].text)
+        self.assertFalse((self.root / 'pending' / (sid + '.json')).exists())
+
+    def test_resume_preserves_concurrently_replaced_pending_or_cursor(self):
+        for index, changed in enumerate(('pending', 'cursor'), start=1):
+            with self.subTest(changed=changed):
+                sid, path, payload = self.paused_for_resume(index)
+                original_lock = F.RUNNER.lock_file
+                captured = {}
+                @contextlib.contextmanager
+                def race(path_to_lock, *args, **kwargs):
+                    if path_to_lock.name == 'worker.lock':
+                        if changed == 'pending':
+                            self.append(path, 'CONCURRENT NEW TURN', ordinal=12)
+                            self.assertTrue(self.dispatch(payload, turn_id='turn-two'))
+                        else:
+                            state = F.RUNNER.load_json(self.root / 'sessions' / (sid + '.json'))
+                            F.RUNNER.commit_admitted_state(self.root, self.request(sid),
+                                                          {**state, 'status': 'no_visible_content'})
+                        captured.update(self.resume_records(sid))
+                    with original_lock(path_to_lock, *args, **kwargs) as acquired:
+                        yield acquired
+                with mock.patch.object(F.RUNNER, 'lock_file', side_effect=race), \
+                        mock.patch.object(F.RUNNER, 'spawn_worker') as spawn:
+                    self.assertFalse(F.RUNNER.resume_pending(self.root, sid))
+                spawn.assert_not_called()
+                self.assertEqual(self.resume_records(sid), captured)
+
+    def test_resume_refuses_active_worker_processing_and_reconciliation(self):
+        for index, hold in enumerate(('worker', 'processing', 'reconciliation', 'pause_only'), start=1):
+            with self.subTest(hold=hold):
+                sid, _, _ = self.paused_for_resume(index)
+                if hold == 'processing':
+                    record_path = self.root / 'admissions' / (sid + '.json')
+                    record = F.RUNNER.load_json(record_path)
+                    F.write_json(record_path, {**record, 'processing': self.request(sid)['request_id']})
+                elif hold == 'reconciliation':
+                    state = F.RUNNER.load_json(self.root / 'sessions' / (sid + '.json'))
+                    F.RUNNER.commit_admitted_state(self.root, self.request(sid),
+                        {**state, 'status': 'reconciliation_required',
+                         'reconciliation_required': {'reason': 'write_status_unknown', 'memory_ids': []}})
+                elif hold == 'pause_only':
+                    F.write_json(self.root / 'pending' / (sid + '.json'),
+                                 {**self.request(sid), 'pause_reason': 'reconciliation_required'})
+                before = self.resume_records(sid)
+                lock = F.RUNNER.lock_file(self.root / 'worker.lock') if hold == 'worker' else contextlib.nullcontext()
+                with lock, mock.patch.object(F.RUNNER, 'spawn_worker') as spawn:
+                    self.assertFalse(F.RUNNER.resume_pending(self.root, sid))
+                spawn.assert_not_called()
+                self.assertEqual(self.resume_records(sid), before)
+
+    def test_resume_respects_backoff_and_disabled_policy(self):
+        sid, _, _ = self.paused_for_resume()
+        state = F.RUNNER.load_json(self.root / 'sessions' / (sid + '.json'))
+        deadline = time.time() + 300
+        F.RUNNER.commit_admitted_state(self.root, self.request(sid), {**state, 'retry_after': deadline})
+        before = self.resume_records(sid)
+        with mock.patch.object(F.RUNNER, 'spawn_worker') as spawn:
+            self.assertFalse(F.RUNNER.resume_pending(self.root, sid))
+            self.assertEqual(self.resume_records(sid), before)
+            self.policy['enabled'] = False
+            F.write_json(self.root / 'admission.json', self.policy)
+            with mock.patch.object(F.RUNNER.time, 'time', return_value=deadline + 1):
+                self.assertFalse(F.RUNNER.resume_pending(self.root, sid))
+                self.assertEqual(self.resume_records(sid), before)
+                self.policy['enabled'] = True
+                F.write_json(self.root / 'admission.json', self.policy)
+                self.assertTrue(F.RUNNER.resume_pending(self.root, sid))
+            spawn.assert_called_once_with(self.root)
+
+    def test_resume_rejects_replaced_or_truncated_transcript(self):
+        for index, change in enumerate(('replace', 'truncate'), start=1):
+            with self.subTest(change=change):
+                sid, path, _ = self.paused_for_resume(index)
+                if change == 'replace':
+                    replacement = path.with_suffix('.replacement')
+                    replacement.write_bytes(path.read_bytes())
+                    replacement.replace(path)
+                else:
+                    path.write_bytes(path.read_bytes().splitlines(keepends=True)[0])
+                before = self.resume_records(sid)
+                with mock.patch.object(F.RUNNER, 'spawn_worker') as spawn:
+                    self.assertFalse(F.RUNNER.resume_pending(self.root, sid))
+                spawn.assert_not_called()
+                self.assertEqual(self.resume_records(sid), before)
+
+    def test_resume_rejects_invalid_backoff_partial_gate_and_cursor_hash_mismatch(self):
+        for index, hold in enumerate(('backoff', 'status_only', 'gate_only', 'cursor_hash'), start=1):
+            with self.subTest(hold=hold):
+                sid, _, _ = self.paused_for_resume(index)
+                state_path = self.root / 'sessions' / (sid + '.json')
+                state = F.RUNNER.load_json(state_path)
+                if hold == 'backoff':
+                    state['retry_after'] = 'invalid'
+                elif hold == 'status_only':
+                    state['status'] = 'reconciliation_required'
+                elif hold == 'gate_only':
+                    state['reconciliation_required'] = {'reason': 'successful_or_unverified_write'}
+                else:
+                    state['offset'] += 1
+                if hold == 'cursor_hash':
+                    F.write_json(state_path, state)
+                else:
+                    F.RUNNER.commit_admitted_state(self.root, self.request(sid), state)
+                before = self.resume_records(sid)
+                with mock.patch.object(F.RUNNER, 'spawn_worker') as spawn:
+                    self.assertFalse(F.RUNNER.resume_pending(self.root, sid))
+                spawn.assert_not_called()
+                self.assertEqual(self.resume_records(sid), before)
+
+    def test_published_resume_still_wakes_worker_when_diagnostic_logging_fails(self):
+        sid, _, _ = self.paused_for_resume()
+        request = self.request(sid)
+        with mock.patch.object(F.RUNNER, 'event_log', side_effect=OSError('synthetic log failure')), \
+                mock.patch.object(F.RUNNER, 'spawn_worker') as spawn:
+            with self.assertRaisesRegex(OSError, 'synthetic log failure'):
+                F.RUNNER.resume_pending(self.root, sid)
+        spawn.assert_called_once_with(self.root)
+        self.assertEqual(self.request(sid), {k: v for k, v in request.items()
+                                            if k not in ('paused_request_id', 'pause_reason')})
+
+    def test_incomplete_reconciliation_gate_cannot_resume_enqueue_or_process(self):
+        for index, gate in enumerate(({}, None, False, [], ''), start=1):
+            with self.subTest(gate=gate):
+                sid, path, payload = self.paused_for_resume(index)
+                state = F.RUNNER.load_json(self.root / 'sessions' / (sid + '.json'))
+                F.RUNNER.commit_admitted_state(self.root, self.request(sid),
+                                              {**state, 'reconciliation_required': gate})
+                before = self.resume_records(sid)
+                with mock.patch.object(F.RUNNER, 'spawn_worker') as spawn, \
+                        mock.patch.object(F.RUNNER, 'run_codex', side_effect=F.forbidden):
+                    self.assertFalse(F.RUNNER.resume_pending(self.root, sid))
+                    self.append(path, 'NEW CONTENT CANNOT CLEAR A HOLD', ordinal=12)
+                    self.assertFalse(self.dispatch(payload, turn_id='later-turn'))
+                    self.assertEqual(self.process(sid), 'reconciliation_required')
+                spawn.assert_not_called()
+                self.assertEqual(self.invocations, [])
+                self.assertEqual(self.resume_records(sid), before)
+
+    def test_resume_rejects_special_state_files_before_reading(self):
+        for index, directory in enumerate(('pending', 'sessions'), start=1):
+            with self.subTest(directory=directory):
+                sid, _, _ = self.paused_for_resume(index)
+                path = self.root / directory / (sid + '.json')
+                path.unlink()
+                os.mkfifo(path, 0o600)
+                original = path.lstat()
+                with mock.patch.object(F.RUNNER, 'load_pending', side_effect=F.forbidden), \
+                        mock.patch.object(F.RUNNER, 'load_json', side_effect=F.forbidden), \
+                        mock.patch.object(F.RUNNER, 'spawn_worker') as spawn:
+                    self.assertFalse(F.RUNNER.resume_pending(self.root, sid))
+                spawn.assert_not_called()
+                self.assertEqual(path.lstat().st_ino, original.st_ino)
+                self.assertEqual(path.lstat().st_mode, original.st_mode)
+
+    def test_worker_keeps_latest_failure_after_earlier_successful_batch(self):
+        for index, outcome in enumerate(('failed', 'backoff', 'blocked', 'reconciliation_required'), start=1):
+            with self.subTest(outcome=outcome):
+                sid, _, _ = self.paused_for_resume(index)
+                pending_path = self.root / 'pending' / (sid + '.json')
+                request = {k: v for k, v in self.request(sid).items() if k not in ('paused_request_id', 'pause_reason')}
+                F.write_json(pending_path, request)
+                F.write_json(self.root / 'settings.json', {'max_runs_per_worker': 2})
+                with mock.patch.object(F.RUNNER, 'process_request', side_effect=['more', outcome]) as process, \
+                        mock.patch.object(F.RUNNER, 'spawn_worker') as spawn:
+                    F.RUNNER.worker(self.root)
+                    F.RUNNER.worker(self.root)
+                self.assertEqual(process.call_count, 2)
+                self.assertEqual(self.request(sid)['pause_reason'], outcome)
+                self.assertEqual(self.request(sid)['paused_request_id'], request['request_id'])
+                spawn.assert_not_called()
+
+    def test_worker_batch_limit_preserves_concurrent_pause_of_same_request(self):
+        sid, _, _ = self.paused_for_resume()
+        pending_path = self.root / 'pending' / (sid + '.json')
+        request = {k: v for k, v in self.request(sid).items() if k not in ('paused_request_id', 'pause_reason')}
+        F.write_json(pending_path, request)
+        F.write_json(self.root / 'settings.json', {'max_runs_per_worker': 1})
+        def process(root, current, config):
+            F.write_json(pending_path, {**current, 'paused_request_id': current['request_id'],
+                                       'pause_reason': 'reconciliation_required'})
+            return 'more'
+        with mock.patch.object(F.RUNNER, 'process_request', side_effect=process), \
+                mock.patch.object(F.RUNNER, 'spawn_worker') as spawn:
+            F.RUNNER.worker(self.root)
+        self.assertEqual(self.request(sid)['pause_reason'], 'reconciliation_required')
+        spawn.assert_not_called()
 
     def test_all_tasks_share_queue_and_preserve_current_model(self):
         tasks = [self.task(i, source='cli' if i % 2 else 'vscode') for i in range(1, 6)]
@@ -107,6 +342,7 @@ class HostTests(unittest.TestCase):
             self.append(path, 'Durable new fact for ' + sid)
             self.assertTrue(self.dispatch(payload))
             self.assertEqual(self.request(sid)['model'], 'fake-never-executed')
+        self.enable_durable()
         original = F.RUNNER.process_request
         with mock.patch.object(F.RUNNER, 'process_request', side_effect=lambda r,q,c: original(r,q,c,invoke=self.invoke)), mock.patch.object(F.RUNNER, 'spawn_worker') as spawn:
             F.RUNNER.worker(self.root)
@@ -126,6 +362,41 @@ class HostTests(unittest.TestCase):
         self.assertEqual(self.process(sid), 'succeeded')
         self.assertIn('NEW FACT', self.invocations[0][1].text)
         self.assertNotIn('OLD HISTORICAL', self.invocations[0][1].text)
+
+    def test_v1_admission_remains_inspectable_but_cannot_execute_before_migration(self):
+        sid, path, payload = self.task()
+        self.dispatch(payload, 'SessionStart')
+        self.append(path, 'NEW CONTENT REQUIRES EXPLICIT MIGRATION')
+        self.assertTrue(self.dispatch(payload))
+        request = self.request(sid)
+        before = self.resume_records(sid)
+        self.assertEqual(F.ADMISSION.check(self.root, request), request['admission'])
+        with self.assertRaisesRegex(ValueError, 'v2_required'):
+            F.RUNNER.process_request(self.root, request, F.RUNNER.settings(self.root), invoke=self.invoke)
+        self.assertEqual(self.resume_records(sid), before)
+        self.assertEqual(self.invocations, [])
+
+    def test_migrated_frontier_learns_only_new_intervals_and_resumes_exact_parser(self):
+        sid, path, payload = self.task()
+        self.append(path, 'OLD AMBER HISTORY')
+        self.dispatch(payload, 'SessionStart')
+        frontier = json.loads((self.root / 'enrollments' / (sid + '.json')).read_bytes())['frontier_offset']
+        self.append(path, 'NEW COBALT FACT', ordinal=12)
+        self.assertTrue(self.dispatch(payload))
+        self.assertEqual(self.process(sid), 'succeeded')
+        first = json.loads((self.root / 'sessions' / (sid + '.json')).read_bytes())
+        self.assertGreater(first['offset'], frontier)
+        self.assertIn('NEW COBALT', self.invocations[0][1].text)
+        self.assertNotIn('OLD AMBER', self.invocations[0][1].text)
+        self.append(path, 'NEXT JADE FACT', ordinal=13)
+        self.assertTrue(self.dispatch(payload, turn_id='next-turn'))
+        self.assertEqual(self.process(sid), 'succeeded')
+        second = json.loads((self.root / 'sessions' / (sid + '.json')).read_bytes())
+        self.assertGreater(second['offset'], first['offset'])
+        self.assertIn('NEXT JADE', self.invocations[1][1].text)
+        self.assertNotIn('NEW COBALT', self.invocations[1][1].text)
+        self.assertNotIn('OLD AMBER', self.invocations[1][1].text)
+        self.assertEqual(json.loads((self.root / 'enrollments' / (sid + '.json')).read_bytes())['frontier_offset'], frontier)
 
     def test_resume_does_not_recapture_or_skip_new_text(self):
         sid, path, payload = self.task()
@@ -163,8 +434,10 @@ class HostTests(unittest.TestCase):
         self.dispatch(payload, 'SessionStart')
         self.append(path, 'DURABLE CONTENT')
         self.assertTrue(self.dispatch(payload))
+        self.enable_durable()
         original = F.RUNNER.process_request
         def fail(*args):
+            self.durable.provider(success=False, missing_audit=True)
             return {'status': 'failed', 'write_calls': 1}
         with mock.patch.object(F.RUNNER, 'process_request', side_effect=lambda r,q,c: original(r,q,c,invoke=fail)), mock.patch.object(F.RUNNER, 'spawn_worker'):
             F.RUNNER.worker(self.root)
@@ -255,9 +528,13 @@ class HostTests(unittest.TestCase):
         self.dispatch(payload, 'SessionStart')
         self.append(path, 'DURABLE NEW TEXT')
         self.dispatch(payload)
+        self.enable_durable()
         before = self.request(sid)['admission']['frontier_offset']
+        def failed(*args):
+            self.durable.provider(success=False, missing_audit=True)
+            return {'status': 'failed', 'write_calls': 1}
         result = F.RUNNER.process_request(self.root, self.request(sid), F.RUNNER.settings(self.root),
-                                         invoke=lambda *args: {'status': 'failed', 'write_calls': 1})
+                                         invoke=failed)
         self.assertEqual(result, 'reconciliation_required')
         state = json.loads((self.root / 'sessions' / (sid + '.json')).read_text())
         self.assertEqual(state['offset'], before)
@@ -268,6 +545,8 @@ class HostTests(unittest.TestCase):
         self.dispatch(payload, 'SessionStart')
         self.append(path, 'DURABLE NEW TEXT')
         self.dispatch(payload)
+        self.enable_durable()
+        policy_raw = (self.root / 'admission.json').read_bytes()
         original = F.RUNNER.provider_slot
         @contextlib.contextmanager
         def pause_before_yield():
@@ -282,19 +561,21 @@ class HostTests(unittest.TestCase):
         self.assertIsNone(record['processing'])
         self.assertEqual(self.invocations, [])
         self.policy['enabled'] = True
-        F.write_json(self.root / 'admission.json', self.policy)
+        # Migration seals exact canonical policy bytes. Re-enabling the same
+        # activation restores those bytes, rather than changing its formatting.
+        (self.root / 'admission.json').write_bytes(policy_raw)
         self.assertEqual(self.process(sid), 'succeeded')
         self.assertEqual(len(self.invocations), 1)
 
-    def failure_with_audit(self, rows, *, provider_started=True):
+    def failure_with_audit(self, rows, *, provider_started=True, typed_success=False):
         sid, path, payload = self.task()
         self.dispatch(payload, 'SessionStart')
         self.append(path, 'DURABLE NEW TEXT')
         self.dispatch(payload)
+        self.enable_durable()
         def invoke(root, run_dir, request, excerpt, config):
-            F.RUNNER._PROVIDER_STARTED.set(provider_started)
-            if rows is not None:
-                (run_dir / 'mcp-audit.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            self.durable.provider(rows=rows, success=False, started=provider_started,
+                                  typed_success=typed_success, missing_audit=rows is None)
             return {'status': 'failed', 'write_calls': 0, 'reason': 'synthetic_failure'}
         result = F.RUNNER.process_request(self.root, self.request(sid), F.RUNNER.settings(self.root), invoke=invoke)
         state = json.loads((self.root / 'sessions' / (sid + '.json')).read_text())
@@ -306,10 +587,10 @@ class HostTests(unittest.TestCase):
             {'event': 'relay_started'},
             {'event': 'tool_call', 'id': 1, 'tool': 'remember'},
             {'event': 'tool_result', 'id': 1, 'tool': 'remember', 'ok': True, 'forwarded': True, 'memory_ids': [memory_id]},
-            {'event': 'relay_finished', 'child_reaped': True, 'cleanup_overrun': False}])
+            {'event': 'relay_finished', 'child_reaped': True, 'cleanup_overrun': False}], typed_success=True)
         self.assertEqual(result, 'reconciliation_required')
         gate = state['reconciliation_required']
-        self.assertEqual(gate['reason'], 'successful_or_unverified_write')
+        self.assertEqual(gate['reason'], 'unverified_completion')
         self.assertEqual(gate['memory_ids'], [memory_id])
         pending = self.root / 'pending' / (sid + '.json')
         before = pending.read_bytes()
@@ -323,25 +604,52 @@ class HostTests(unittest.TestCase):
         _, _, _, result, state = self.failure_with_audit([
             {'event': 'relay_started'}, {'event': 'tool_call', 'id': 1, 'tool': 'remember'}])
         self.assertEqual(result, 'reconciliation_required')
-        self.assertEqual(state['reconciliation_required']['reason'], 'successful_or_unverified_write')
+        self.assertEqual(state['reconciliation_required']['reason'], 'unverified_completion')
 
-    def test_known_no_write_conflict_failure_keeps_retry_without_reconciliation(self):
+    def test_legacy_no_write_conflict_prose_cannot_authorize_v2_retry(self):
         _, _, _, result, state = self.failure_with_audit([
             {'event': 'relay_started'}, {'event': 'tool_call', 'id': 1, 'tool': 'remember'},
             {'event': 'tool_result', 'id': 1, 'tool': 'remember', 'ok': True,
              'forwarded': True, 'memory_ids': [], 'write_outcome': 'not_stored_near_duplicate'}])
-        self.assertEqual(result, 'failed')
-        self.assertNotIn('reconciliation_required', state)
+        self.assertEqual(result, 'reconciliation_required')
+        self.assertEqual(state['reconciliation_required']['memory_ids'], [])
 
-    def test_begin_busy_keeps_cursor_and_recovers_on_later_ordinary_event(self):
+    def test_confirmed_prelaunch_failure_resumes_after_backoff_without_a_new_hook(self):
+        sid, _, payload, result, state = self.failure_with_audit(None, provider_started=False)
+        self.assertEqual(result, 'failed')
+        original = F.RUNNER.process_request
+        with mock.patch.object(F.RUNNER, 'run_codex', side_effect=F.forbidden), \
+                mock.patch.object(F.RUNNER, 'spawn_worker', side_effect=F.forbidden):
+            F.RUNNER.worker(self.root)
+        self.assertEqual(self.request(sid)['pause_reason'], 'failed')
+        before = self.resume_records(sid)
+        with mock.patch.object(F.RUNNER, 'spawn_worker') as spawn:
+            self.assertFalse(F.RUNNER.resume_pending(self.root, sid))
+            self.assertEqual(self.resume_records(sid), before)
+            with mock.patch.object(F.RUNNER.time, 'time', return_value=state['retry_after'] + 1):
+                self.assertTrue(F.RUNNER.resume_pending(self.root, sid))
+            spawn.assert_called_once_with(self.root)
+        self.assertFalse(self.dispatch(payload))
+        with mock.patch.object(F.RUNNER.time, 'time', return_value=state['retry_after'] + 1), \
+                mock.patch.object(F.RUNNER, 'process_request', side_effect=lambda r,q,c: original(r,q,c,invoke=self.invoke)), \
+                mock.patch.object(F.RUNNER, 'spawn_worker', side_effect=F.forbidden):
+            F.RUNNER.worker(self.root)
+            F.RUNNER.worker(self.root)
+        self.assertEqual(len(self.invocations), 1)
+        self.assertEqual(self.invocations[0][0]['request_id'], json.loads(before['pending'])['request_id'])
+        self.assertIn('DURABLE NEW TEXT', self.invocations[0][1].text)
+        self.assertEqual((self.root / 'enrollments' / (sid + '.json')).read_bytes(), before['enrollments'])
+        self.assertFalse((self.root / 'pending' / (sid + '.json')).exists())
+
+    def test_legacy_begin_busy_claim_keeps_cursor_held_after_later_event(self):
         sid, path, payload, result, state = self.failure_with_audit([
             {'event': 'relay_started'}, {'event': 'tool_call', 'id': 1, 'tool': 'remember'},
             {'event': 'tool_result', 'id': 1, 'tool': 'remember', 'ok': False,
              'forwarded': True, 'memory_ids': [], 'write_outcome': 'not_stored_transaction_not_started',
              'write_outcome_version': 1},
             {'event': 'relay_finished', 'child_reaped': True, 'cleanup_overrun': False}])
-        self.assertEqual(result, 'failed')
-        self.assertNotIn('reconciliation_required', state)
+        self.assertEqual(result, 'reconciliation_required')
+        self.assertEqual(state['reconciliation_required']['memory_ids'], [])
         self.assertEqual(state['offset'], self.request(sid)['admission']['frontier_offset'])
         self.assertGreater(state['retry_after'], time.time())
         original = F.RUNNER.process_request
@@ -357,15 +665,15 @@ class HostTests(unittest.TestCase):
                 F.RUNNER.worker(self.root)  # Elapsed time alone does not replay.
                 self.assertEqual(self.invocations, [])
                 self.append(path, 'NEXT NATURAL TURN')
-                self.assertTrue(self.dispatch(payload, turn_id='next-turn'))
+                self.assertFalse(self.dispatch(payload, turn_id='next-turn'))
+                with mock.patch.object(F.RUNNER, 'spawn_worker') as spawn:
+                    self.assertFalse(F.RUNNER.resume_pending(self.root, sid))
+                    spawn.assert_not_called()
                 F.RUNNER.worker(self.root)
-        self.assertEqual(len(self.invocations), 1)
-        self.assertIn('DURABLE NEW TEXT', self.invocations[0][1].text)
-        self.assertIn('NEXT NATURAL TURN', self.invocations[0][1].text)
+        self.assertEqual(self.invocations, [])
         recovered = json.loads((self.root / 'sessions' / (sid + '.json')).read_text())
-        self.assertEqual(recovered['status'], 'succeeded')
-        self.assertGreater(recovered['offset'], state['offset'])
-        self.assertFalse((self.root / 'pending' / (sid + '.json')).exists())
+        self.assertEqual(recovered, state)
+        self.assertEqual(self.request(sid)['pause_reason'], 'reconciliation_required')
 
     def test_unrecognized_forwarded_no_ids_response_stays_held(self):
         _, _, _, result, state = self.failure_with_audit([
@@ -373,7 +681,7 @@ class HostTests(unittest.TestCase):
             {'event': 'tool_result', 'id': 1, 'tool': 'remember', 'ok': True,
              'forwarded': True, 'memory_ids': []}])
         self.assertEqual(result, 'reconciliation_required')
-        self.assertEqual(state['reconciliation_required']['reason'], 'successful_or_unverified_write')
+        self.assertEqual(state['reconciliation_required']['reason'], 'unverified_completion')
 
     def test_conflict_plus_successful_write_failure_stays_held(self):
         memory_id = '11111111-2222-4333-8444-555555555555'
@@ -383,14 +691,14 @@ class HostTests(unittest.TestCase):
              'forwarded': True, 'memory_ids': [], 'write_outcome': 'not_stored_near_duplicate'},
             {'event': 'tool_call', 'id': 2, 'tool': 'remember'},
             {'event': 'tool_result', 'id': 2, 'tool': 'remember', 'ok': True,
-             'forwarded': True, 'memory_ids': [memory_id]}])
+             'forwarded': True, 'memory_ids': [memory_id]}], typed_success=True)
         self.assertEqual(result, 'reconciliation_required')
         self.assertEqual(state['reconciliation_required']['memory_ids'], [memory_id])
 
     def test_missing_audit_after_provider_start_is_unknown_write_status(self):
         _, _, _, result, state = self.failure_with_audit(None)
         self.assertEqual(result, 'reconciliation_required')
-        self.assertEqual(state['reconciliation_required']['reason'], 'write_status_unknown')
+        self.assertEqual(state['reconciliation_required']['reason'], 'unverified_completion')
 
     def test_prelaunch_failure_has_no_reconciliation_gate(self):
         _, _, _, result, state = self.failure_with_audit(None, provider_started=False)
@@ -416,9 +724,11 @@ class HostTests(unittest.TestCase):
         self.dispatch(payload, 'SessionStart')
         self.append(path, 'DURABLE TEXT')
         self.dispatch(payload)
+        self.enable_durable()
         entered = threading.Event(); completed = threading.Event(); errors = []
         def invoke(*args):
             entered.set()
+            self.durable.provider()
             return {'status': 'succeeded', 'write_calls': 0}
         def run():
             try:
@@ -430,7 +740,7 @@ class HostTests(unittest.TestCase):
         with F.RUNNER.lock_file(self.home / 'engram' / 'learner-provider.lock'):
             thread = threading.Thread(target=run); thread.start()
             self.assertFalse(entered.wait(0.1))
-        self.assertTrue(completed.wait(2)); thread.join()
+        self.assertTrue(completed.wait(15)); thread.join(timeout=1)
         self.assertEqual(errors, [])
         self.assertTrue(entered.is_set())
 

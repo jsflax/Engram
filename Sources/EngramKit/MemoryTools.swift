@@ -71,6 +71,10 @@ public actor MemoryTools {
     /// hosted service constructs one per authenticated request.
     let identity: any IdentityProviding
 
+    /// Startup opts in only after the local operation store has passed
+    /// preflight, registration and bootstrap. Existing hosts stay unchanged.
+    nonisolated let localMutationOperationsEnabled: Bool
+
     /// Structured mirror of the last recall — populated by handleRecall at
     /// its return sites, read SYNCHRONOUSLY by the MemoryService
     /// conformance right after the awaited call returns. Actor isolation
@@ -113,7 +117,8 @@ public actor MemoryTools {
                 syncedRef: LatticeThreadSafeReference?,
                 groupRefs: [GroupSpokeRef] = [],
                 embedder: any Embedder,
-                identity: any IdentityProviding = GroupDirectoryIdentityProvider()) {
+                identity: any IdentityProviding = GroupDirectoryIdentityProvider(),
+                enableLocalMutationOperations: Bool = false) {
         guard let local = localRef.resolve() else {
             fatalError("Failed to resolve local lattice reference")
         }
@@ -125,6 +130,7 @@ public actor MemoryTools {
         }
         self.embedder = embedder
         self.identity = identity
+        self.localMutationOperationsEnabled = enableLocalMutationOperations
         // Hard default, not opt-in: any MemoryTools living inside the
         // maintenance subprocess tree excludes foreign content everywhere.
         self.excludeForeignAuthored = Self.maintenanceEnvironmentDetected
@@ -155,12 +161,77 @@ public actor MemoryTools {
         groupSpokes.filter { FileManager.default.fileExists(atPath: $0.path) }
     }
 
+    /// Prepared outside the operation's writer transaction. Validation under
+    /// BEGIN only rechecks policy and selected files; it never opens/attaches a
+    /// second connection that could wait on the owning transaction itself.
+    struct OperationReadContext {
+        fileprivate let signature: String
+        fileprivate let database: Lattice
+    }
+
+    private struct ReadRoute {
+        let signature: String
+        let attachments: [Lattice]
+    }
+
+    func prepareOperationReadLattice(for project: String) throws -> OperationReadContext {
+        do {
+            let route = try resolveReadRoute(for: project, strict: true)
+            let database = try openReadRoute(route)
+            // Opening a union can block. A policy/revocation change during that
+            // interval invalidates preparation rather than degrading its scope.
+            guard try resolveReadRoute(for: project, strict: true).signature == route.signature else {
+                throw MemoryOperationError.storageUnavailable
+            }
+            return OperationReadContext(signature: route.signature, database: database)
+        } catch let error as MemoryOperationError { throw error }
+        catch { throw MemoryOperationError.storageUnavailable }
+    }
+
+    func validateOperationReadLattice(_ context: OperationReadContext, for project: String) throws -> Lattice {
+        do {
+            guard try resolveReadRoute(for: project, strict: true).signature == context.signature else {
+                throw MemoryOperationError.storageUnavailable
+            }
+            return context.database
+        } catch let error as MemoryOperationError { throw error }
+        catch { throw MemoryOperationError.storageUnavailable }
+    }
+
     package func readLattice(for project: String?) -> Lattice {
-        // Personal synced DB: still gated on the project's sync policy —
-        // a local-only project has no business reading the cloud mirror.
+        do { return try openReadRoute(resolveReadRoute(for: project, strict: false)) }
+        catch {
+            // Legacy recall remains available if an attachment fails. Durable
+            // operation preparation uses the throwing API and never falls back.
+            log("[readLattice] ATTACH FAILED (\(error)) — serving LOCAL-ONLY reads for '\(project ?? "nil")'; synced and group memories are invisible until this is resolved")
+            return localLattice
+        }
+    }
+
+    private func resolveReadRoute(for project: String?, strict: Bool) throws -> ReadRoute {
         var includeSynced = false
         if syncedLattice != nil, let project {
-            if let config = localLattice.objects(SyncConfig.self)
+            if strict {
+                let policies = localLattice.objects(SyncConfig.self)
+                    .where { $0.project == project }.snapshot(limit: 2)
+                guard localLattice.lastQueryError() == nil, policies.count <= 1 else {
+                    throw MemoryOperationError.storageUnavailable
+                }
+                if let policy = policies.first {
+                    policy.materialize()
+                    includeSynced = policy.policy == .sync
+                } else {
+                    let fallback = localLattice.objects(SyncConfig.self)
+                        .where { $0.project == "_default" }.snapshot(limit: 2)
+                    guard localLattice.lastQueryError() == nil, fallback.count <= 1 else {
+                        throw MemoryOperationError.storageUnavailable
+                    }
+                    if let policy = fallback.first {
+                        policy.materialize()
+                        includeSynced = policy.policy == .sync
+                    }
+                }
+            } else if let config = localLattice.objects(SyncConfig.self)
                 .where({ $0.project == project }).first {
                 includeSynced = config.policy == .sync
             } else if let fallback = localLattice.objects(SyncConfig.self)
@@ -169,41 +240,67 @@ public actor MemoryTools {
             }
         }
 
-        // Group spokes attach unconditionally — membership-scoped reads.
         var spokes = liveGroupSpokes()
+        // A durable writer cannot infer absence from a vanished registered
+        // spoke. Rebuild the service against the current membership/files
+        // before retrying; legacy recall still drops revoked spokes below.
+        if strict, spokes.count != groupSpokes.count {
+            throw MemoryOperationError.storageUnavailable
+        }
         let budget = Self.maxAttachments - (includeSynced ? 1 : 0)
         if spokes.count > budget {
+            if strict { throw MemoryOperationError.unsupportedTarget }
             let dropped = spokes.dropFirst(budget).map { $0.groupId.uuidString }
             log("[readLattice] ATTACH CAP: \(spokes.count) group spokes exceed the \(budget)-database budget — omitting \(dropped.joined(separator: ", ")) from this read")
             spokes = Array(spokes.prefix(budget))
         }
-
         let attachments: [Lattice] =
             (includeSynced ? [syncedLattice!] : []) + spokes.map(\.lattice)
-        guard !attachments.isEmpty else { return localLattice }
-
-        let signature = (includeSynced ? "synced|" : "|")
-            + spokes.map(\.path).sorted().joined(separator: "|")
-        if let cached = attachCache[signature] { return cached }
-
-        // `attaching` throws as of Lattice 1.x. A failed ATTACH must not take
-        // down every read path — fall back to local-only and say so LOUDLY:
-        // silent degradation here means recall quietly stops seeing synced
-        // and teammates' memories, the exact failure class this wiring exists
-        // to close.
-        do {
-            var union = try localLattice.attaching(lattice: attachments[0])
-            for extra in attachments.dropFirst() {
-                try union.attach(lattice: extra)
+        let signature: String
+        if strict {
+            // Length-delimited JSON avoids separator collisions in file names.
+            // File identities detect replacement/revocation between preparation
+            // and BEGIN; do not include mutable mtimes or database contents.
+            var components = ["operation-read-route-v1", try operationStorageBinding(localLattice)]
+            components.append(includeSynced ? try operationStorageBinding(syncedLattice!) : "no-synced")
+            for spoke in spokes.sorted(by: { $0.path < $1.path }) {
+                components.append(spoke.groupId.uuidString.lowercased())
+                components.append(spoke.path)
+                components.append(try operationStorageBinding(spoke.lattice))
             }
-            if attachCache.count >= Self.attachCacheLimit { attachCache.removeAll() }
-            attachCache[signature] = union
-            log("[readLattice] union built: local + \(attachments.count) attached (\(signature))")
-            return union
-        } catch {
-            log("[readLattice] ATTACH FAILED (\(error)) — serving LOCAL-ONLY reads for '\(project ?? "nil")'; synced and group memories are invisible until this is resolved")
-            return localLattice
+            signature = String(decoding: try JSONSerialization.data(withJSONObject: components), as: UTF8.self)
+        } else {
+            signature = (includeSynced ? "synced|" : "|")
+                + spokes.map(\.path).sorted().joined(separator: "|")
         }
+        return ReadRoute(signature: signature, attachments: attachments)
+    }
+
+    private func operationStorageBinding(_ database: Lattice) throws -> String {
+        switch database.configuration.storage {
+        case .memory(let name): return "memory:" + name
+        case .file(let url):
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard let device = attributes[.systemNumber] as? NSNumber,
+                  let inode = attributes[.systemFileNumber] as? NSNumber,
+                  attributes[.type] as? FileAttributeType == .typeRegular else {
+                throw MemoryOperationError.storageUnavailable
+            }
+            return String(decoding: try JSONSerialization.data(withJSONObject: [
+                url.standardizedFileURL.path, device.stringValue, inode.stringValue
+            ]), as: UTF8.self)
+        }
+    }
+
+    private func openReadRoute(_ route: ReadRoute) throws -> Lattice {
+        guard let first = route.attachments.first else { return localLattice }
+        if let cached = attachCache[route.signature] { return cached }
+        var union = try localLattice.attaching(lattice: first)
+        for extra in route.attachments.dropFirst() { try union.attach(lattice: extra) }
+        if attachCache.count >= Self.attachCacheLimit { attachCache.removeAll() }
+        attachCache[route.signature] = union
+        log("[readLattice] union built: local + \(route.attachments.count) attached")
+        return union
     }
 
     /// The signed-in user's id for authorUserId stamping — from the
@@ -1183,7 +1280,7 @@ public actor MemoryTools {
                     "additionalProperties": .bool(false),
                 ])
             ),
-        ]
+        ] + (localMutationOperationsEnabled ? Self.operationToolDefinitions : [])
     }
 
     // MARK: - Dispatch
@@ -1227,6 +1324,8 @@ public actor MemoryTools {
 
     private func dispatch(_ params: CallTool.Parameters) async throws -> CallTool.Result {
         switch params.name {
+        case "operation_scope", "operation_apply", "operation_status":
+            return await handleOperationTool(params)
         case "remember":
             return try await handleRemember(params.arguments)
         case "recall":

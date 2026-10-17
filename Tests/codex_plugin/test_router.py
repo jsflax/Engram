@@ -193,27 +193,42 @@ class RouterTests(unittest.TestCase):
         replacement.write_bytes(first.path.read_bytes()); replacement.replace(first.path)
         self.assert_reject(first, reason="admission_enrollment_origin_changed")
 
-    def test_existing_pilot_binding_and_cursor_continue_without_rebinding(self):
+    def test_existing_pilot_routes_without_rebinding_but_legacy_execution_is_held(self):
         first = self.fixtures[0]
         original_policy = first.policy_path.read_bytes()
         self.assertTrue(F.RUNNER.enqueue(first.root, first.payload, spawn=False))
+        original_state = first.state.read_bytes()
+        original_record = first.record.read_bytes()
+        original_pending = first.request()
         first.worker()
+        self.assertEqual(first.state.read_bytes(), original_state)
+        self.assertEqual(first.record.read_bytes(), original_record)
+        self.assertEqual(first.request(), {**original_pending,
+            "paused_request_id": original_pending["request_id"], "pause_reason": "blocked"})
         binding = json.loads(first.state.read_text())["admission"]
         cursor = json.loads(first.state.read_text())["offset"]
         first.append_turn(F.TURN2, "Only the later synthetic marker is cyan.")
         first.payload["turn_id"] = F.TURN2
         self.assertTrue(self.dispatch(first))
+        queued_record = first.record.read_bytes()
+        queued_pending = first.request()
+        self.assertNotEqual(queued_pending["request_id"], original_pending["request_id"])
+        self.assertEqual(queued_pending["turn_id"], F.TURN2)
         first.worker()
         self.assertEqual(first.policy_path.read_bytes(), original_policy)
+        self.assertEqual(first.state.read_bytes(), original_state)
+        self.assertEqual(first.record.read_bytes(), queued_record)
         self.assertEqual(json.loads(first.state.read_text())["admission"], binding)
-        self.assertGreater(json.loads(first.state.read_text())["offset"], cursor)
-        self.assertEqual(len(first.invocations), 1)
-        self.assertIn("cyan", first.invocations[0]["text"])
-        self.assertNotIn("amber", first.invocations[0]["text"])
+        self.assertEqual(json.loads(first.state.read_text())["offset"], cursor)
+        self.assertEqual(first.request(), {**queued_pending,
+            "paused_request_id": queued_pending["request_id"], "pause_reason": "blocked"})
+        self.assertEqual(first.invocations, [])
 
     def test_late_stop_at_captured_eof_never_invokes_or_reads_before_frontier(self):
         for fixture in self.fixtures:
             self.assertTrue(self.dispatch(fixture))
+            before = {path: path.read_bytes() for path in (fixture.policy_path, fixture.state, fixture.record)}
+            pending = fixture.request()
             real_read = F.RUNNER.read_excerpt
             offsets = []
 
@@ -226,10 +241,13 @@ class RouterTests(unittest.TestCase):
                 fixture.worker()
             self.assertEqual(offsets, [fixture.frontier])
             self.assertEqual(fixture.invocations, [])
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
             self.assertEqual(json.loads(fixture.state.read_text())["offset"], fixture.frontier)
-            self.assertEqual(json.loads(fixture.state.read_text())["status"], "no_visible_content")
-            self.assertFalse(fixture.pending.exists())
+            self.assertEqual(fixture.request(), {**pending,
+                "paused_request_id": pending["request_id"], "pause_reason": "blocked"})
             self.assertFalse(self.dispatch(fixture))  # Same Stop deduplicates.
+            self.assertEqual(fixture.request(), {**pending,
+                "paused_request_id": pending["request_id"], "pause_reason": "blocked"})
 
     def test_new_root_never_adopts_preexisting_cursor_or_pending(self):
         fixture = self.fixtures[1]

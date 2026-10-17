@@ -130,6 +130,52 @@ with open(os.environ['CALL_LOG'],'a') as output:
         self.assertEqual(set(cases), {'smoke', 'startup', 'recall', 'idle', 'persistence'})
         self.assertEqual(len(cases), 5)
 
+    def test_native_residual_gate_uses_release_binary_private_workdir_and_propagates_failure(self):
+        name = 'Verify actual native residual recovery and readback'
+        workflow = (ROOT / '.github/workflows/release.yml').read_text()
+        self.assertLess(workflow.index('      - name: Build CLI release binaries\n'),
+                        workflow.index('      - name: ' + name + '\n'))
+        self.assertLess(workflow.index('      - name: ' + name + '\n'),
+                        workflow.index('      - name: Import signing certificate\n'))
+        step = workflow.split('      - name: ' + name + '\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertNotIn('continue-on-error', step)
+        upload = workflow.split('      - name: Upload native residual recovery evidence\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn("always() && steps.native_residual.outcome != 'skipped'", upload)
+        self.assertIn('path: ~/localdev/engram-residual-native-${{ github.run_id }}-${{ github.run_attempt }}/', upload)
+        with tempfile.TemporaryDirectory(prefix='engram residual workflow ') as temporary:
+            root = Path(temporary).resolve()
+            bin_dir = root / 'bin'; bin_dir.mkdir()
+            log, continued = root / 'calls.jsonl', root / 'continued'
+            fake = '#!' + sys.executable + '\n' + '''import json,os,sys
+from pathlib import Path
+kind=Path(sys.argv[0]).name
+with open(os.environ['CALL_LOG'],'a') as stream:
+    stream.write(json.dumps({'tool':kind,'args':sys.argv[1:],'cwd':str(Path.cwd())})+'\\n')
+# mkdir is intercepted too: this test never writes to the actual user home.
+raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
+'''
+            for tool in ('python3', 'mkdir'):
+                command = bin_dir / tool
+                command.write_text(fake); command.chmod(0o755)
+            env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
+                       GITHUB_RUN_ID='987654321', GITHUB_RUN_ATTEMPT='2')
+            expected_work = str(Path(env['HOME']) / 'localdev/engram-residual-native-987654321-2')
+            block = run_block('release.yml', name) + "printf 'continued' > continued\n"
+            for exit_code in (0, 23):
+                with self.subTest(exit_code=exit_code):
+                    log.unlink(missing_ok=True); continued.unlink(missing_ok=True)
+                    result = subprocess.run(['/bin/bash', '-e', '-c', block], cwd=root,
+                        env=dict(env, FAKE_GATE_EXIT=str(exit_code)), capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
+                    self.assertEqual(continued.exists(), exit_code == 0)
+                    calls = [json.loads(line) for line in log.read_text().splitlines()]
+                    self.assertEqual(calls, [
+                        {'tool':'mkdir','args':['-p',str(Path(env['HOME'])/'localdev')],'cwd':str(root)},
+                        {'tool':'python3','args':['-B','scripts/native_residual_smoke.py',
+                            '--native',str(root/'.build/release/Engram'),'--repo',str(root),
+                            '--work-dir',expected_work],'cwd':str(root)},
+                    ])
+
 
     def test_slack_dispatch_announces_publication_and_checks_acknowledgment(self):
         workflow = (ROOT / '.github/workflows/release.yml').read_text()

@@ -1,0 +1,442 @@
+"""Verify frozen learner completion after exclusive writer revocation.
+
+No provider, memory mutation or replay is performed here. The optional bounded
+reconciliation probe invokes only native scope/status reads before settlement.
+The process owner records dispatch before Popen and observation after cleanup;
+recovery only reads those immutable records. Caller holds worker coordination
+and an actual revoked exclusive HeldFence throughout settlement/publication.
+"""
+from __future__ import annotations
+
+import copy
+import os
+from pathlib import Path
+
+from . import execution_manifest as journal, migration as durable
+from . import operation_gateway as gateway, operation_probe, writer_fence
+
+READ_TOOLS = {"recall", "graph", "list_topics", "stats", "timeline"}
+WRITE_TOOLS = {"remember", "update", "connect"}
+FIXED = ("provider-dispatch.json", "provider-observation.json", "mcp-audit.jsonl", "result.json")
+MAX_FILES = 4096
+MAX_TOTAL = 32 * 1024 * 1024
+
+
+def _require(ok, reason):
+    if not ok:
+        raise ValueError("settlement_" + reason)
+
+
+def _same(left, right):
+    return journal.encode(left) == journal.encode(right)
+
+
+def _manifest(run_dir, expected=None):
+    _require(isinstance(run_dir, Path) and run_dir.is_absolute(), "untrusted_run_path")
+    journal._private(run_dir)
+    manifest, digest = journal.read_manifest(run_dir)
+    if expected is not None:
+        _require(digest == expected, "manifest_changed")
+    return manifest, digest
+
+
+def _validate(manifest, fence, validate, phase):
+    _require(type(fence) is writer_fence.HeldFence and fence.mode == "exclusive", "exclusive_fence_required")
+    _require(fence.verify(manifest["fencing"]) is True, "fence_changed")
+    _require(callable(validate) and validate(copy.deepcopy(manifest), phase) is True, "input_validation_refused")
+    _require(fence.verify(manifest["fencing"]) is True, "fence_changed")
+
+
+def record_provider_dispatch(run_dir, manifest_sha256, validate_inputs):
+    """Actual process owner calls immediately BEFORE Popen; never infer launch."""
+    manifest, digest = _manifest(run_dir, manifest_sha256)
+    _require(callable(validate_inputs) and validate_inputs(copy.deepcopy(manifest), "before_provider_dispatch") is True,
+             "input_validation_refused")
+    _require(not os.path.lexists(run_dir / "provider-dispatch.json"), "provider_already_dispatched")
+    raw = journal.encode({"version": 1, "manifest_sha256": digest})
+    journal._publish(run_dir / "provider-dispatch.json", raw)
+    _require(validate_inputs(copy.deepcopy(manifest), "after_provider_dispatch") is True, "input_validation_refused")
+    _manifest(run_dir, digest)
+    return journal.sha256(raw)
+
+
+def _observation(value):
+    journal._keys(value, {"started", "terminated", "returncode", "turn_completed", "provider_error",
+                          "unexpected_tool", "tool_errors", "reason"})
+    for key in ("started", "terminated", "turn_completed", "provider_error", "unexpected_tool"):
+        _require(type(value[key]) is bool, "invalid_observation")
+    journal._integer(value["tool_errors"], 0, 100000)
+    _require(value["reason"] is None or type(value["reason"]) is str and len(value["reason"]) <= 256,
+             "invalid_observation")
+    code = value["returncode"]
+    _require(code is None or type(code) is int and -(1 << 31) <= code < (1 << 31), "invalid_observation")
+    _require((not value["started"] and code is None and not value["turn_completed"])
+             or (value["started"] and ((value["terminated"] and type(code) is int)
+                                      or (not value["terminated"] and code is None))), "invalid_observation")
+    return value
+
+
+def persist_observation(run_dir, observation):
+    """Seal observations supplied only by the actual provider process owner.
+
+    These are trusted process facts, not provider-authored JSON. Recovery must
+    never call this to invent termination or success from missing evidence.
+    """
+    _, digest = _manifest(run_dir)
+    _observation(observation)
+    raw = journal.encode({"version": 1, "manifest_sha256": digest, "observation": copy.deepcopy(observation)})
+    if observation["started"]:
+        dispatch = durable._read(run_dir / "provider-dispatch.json")[0]
+        _require(dispatch == journal.encode({"version": 1, "manifest_sha256": digest}), "provider_dispatch_missing")
+    journal._publish(run_dir / "provider-observation.json", raw)
+    return journal.sha256(raw)
+
+
+def _snapshot(run_dir):
+    """Bounded inventory, including orphan evidence directories and partial files."""
+    files, raw_fixed, total = {}, {}, 0
+    def read(path, relative, absent=False):
+        nonlocal total
+        raw, identity = durable._read(path, absent=absent, maximum=journal.MAX_RECORD)
+        if raw is not None:
+            total += len(raw)
+            _require(total <= MAX_TOTAL and len(files) < MAX_FILES, "evidence_limit")
+        files[relative] = None if raw is None else {"sha256": journal.sha256(raw), "identity": identity}
+        return raw
+    for name in FIXED:
+        raw_fixed[name] = read(run_dir / name, name, True)
+    operation_ids, evidence_ids = set(), set()
+    with os.scandir(run_dir) as entries:
+        for count, entry in enumerate(entries):
+            _require(count < MAX_FILES, "run_directory_limit")
+            if entry.name.startswith("operation-"):
+                _require(entry.name.endswith(".json"), "invalid_operation_file")
+                operation = journal._uuid(entry.name[10:-5])
+                _require(entry.name == "operation-" + operation + ".json", "invalid_operation_file")
+                operation_ids.add(operation)
+                read(run_dir / entry.name, entry.name)
+            elif entry.name.startswith("evidence-"):
+                operation = journal._uuid(entry.name[9:])
+                _require(entry.name == "evidence-" + operation, "invalid_evidence_directory")
+                evidence_ids.add(operation)
+                directory = run_dir / entry.name
+                journal._private(directory)
+                children = sorted(directory.iterdir())
+                _require(len(children) <= journal.MAX_EVENTS, "evidence_limit")
+                for index, child in enumerate(children):
+                    _require(child.name == f"{index:06d}.json", "invalid_evidence_sequence")
+                    read(child, entry.name + "/" + child.name)
+    _require(len(operation_ids) <= 64 and evidence_ids <= operation_ids, "orphan_or_excess_operations")
+    return files, raw_fixed, sorted(operation_ids)
+
+
+def reconcile_statuses(run_dir, *, manifest_sha256, recovery_fence, transport,
+                       validate_inputs, limits=None):
+    """Recover observations for unresolved dispatches; never replay a mutation.
+
+    Must precede the first immutable settlement. Only the exact sealed route is
+    launched, with no writer FD inherited; the caller retains the revoked EX
+    fence throughout. A missing/failed provider outcome remains a hold even if
+    a committed receipt is recovered. Absence grants no dispatch authority.
+    """
+    manifest, digest = _manifest(run_dir, manifest_sha256)
+    selected_transport = copy.deepcopy(transport)
+    route = journal._json(journal._unseal(manifest["inputs"]["backend_route"]))
+    _require(type(route) is dict and "transport" in route
+             and _same(selected_transport, route["transport"]), "backend_route_changed")
+    _validate(manifest, recovery_fence, validate_inputs, "before_status_reconciliation")
+    _require(not os.path.lexists(run_dir / "settlement.json"), "already_settled")
+    baseline, _, operations = _snapshot(run_dir)
+    requests, event_counts, already_committed = [], {}, 0
+    for operation in operations:
+        _, request = journal.read_intent(run_dir, operation)
+        events = journal.read_evidence(run_dir, operation)
+        kinds = [event["evidence"]["kind"] for event in events]
+        if "committed" in kinds:
+            _require(bool(kinds) and kinds[0] == "dispatch", "invalid_dispatch_evidence")
+            already_committed += 1
+        elif "dispatch" in kinds:
+            _require(kinds[0] == "dispatch", "invalid_dispatch_evidence")
+            requests.append(request)
+            event_counts[operation] = len(events)
+        else:
+            _require(not events, "undispatched_evidence")
+    _require(len(requests) <= 32, "status_probe_limit")
+
+    def validate(phase, *, check_inventory=True):
+        _validate(manifest, recovery_fence, validate_inputs, phase)
+        _manifest(run_dir, digest)
+        _require(not os.path.lexists(run_dir / "settlement.json"), "already_settled")
+        if check_inventory:
+            _require(_same(_snapshot(run_dir)[0], baseline), "evidence_changed")
+        return True
+
+    validate("before_status_probe")
+    responses = operation_probe.probe_statuses(
+        selected_transport, recovery_fence=recovery_fence, expected_binding=manifest["fencing"],
+        expected_scope=manifest["expected_scope"], requests=requests, validate_inputs=validate,
+        limits=limits) if requests else []
+    _require(len(responses) == len(requests), "status_count_changed")
+    counts = {"requested": len(requests), "committed": 0, "absent": 0,
+              "already_committed": already_committed}
+    for request, response in zip(requests, responses):
+        validate("before_status_evidence")
+        operation = request["operationID"]
+        # Revalidate the fixed response before appending; no generic error can
+        # enter this path as absence. record_response rechecks its entire chain.
+        journal._response(response, request, None)
+        _require(response["kind"] in ("committed", "absent"), "invalid_status")
+        def verify_append(binding):
+            validate("status_evidence_boundary", check_inventory=False)
+            return recovery_fence.verify(binding)
+        event = journal.record_response(run_dir, operation, response, verify_fence=verify_append)
+        current = _snapshot(run_dir)[0]
+        name = f"evidence-{operation}/{event_counts[operation]:06d}.json"
+        _require(name not in baseline and name in current
+                 and current[name]["sha256"] == journal.sha256(journal.encode(event))
+                 and _same({key: value for key, value in current.items() if key != name}, baseline),
+                 "evidence_changed")
+        baseline = current
+        counts[response["kind"]] += 1
+        validate("after_status_evidence")
+    validate("after_status_reconciliation")
+    return counts
+
+
+def _operations(run_dir, operation_ids):
+    records, applied, unchanged, uncertain = [], [], [], False
+    for operation in operation_ids:
+        mutation = None
+        try:
+            _, request = journal.read_intent(run_dir, operation)
+            mutation = request["mutation"]["kind"]
+            events = journal.read_evidence(run_dir, operation)
+            kinds = [event["evidence"]["kind"] for event in events]
+            receipts = [event["evidence"]["receipt"] for event in events if event["evidence"]["kind"] == "committed"]
+            receipt = receipts[-1] if receipts else None
+            dispatched = "dispatch" in kinds
+            settled = dispatched and kinds[0] == "dispatch" and kinds[-1] == "committed" and receipt is not None
+            uncertain |= dispatched and not settled or receipt is not None and not settled
+            # A later unavailable observation cannot erase an already validated
+            # commit. Keep its effect IDs while retaining the uncertainty hold.
+            if receipt is not None:
+                (applied if receipt["outcome"] == "applied" else unchanged).append(receipt)
+            records.append({"operation_id": operation, "mutation": mutation,
+                            "dispatched": dispatched, "settled": settled, "receipt": receipt})
+        except (ValueError, TypeError, KeyError, OSError):
+            # One malformed intent/chain must not discard validated effects of
+            # other operations. Unknown dispatch is explicit, never absence.
+            uncertain = True
+            records.append({"operation_id": operation, "mutation": mutation, "dispatched": None,
+                            "settled": False, "receipt": None, "evidence_valid": False})
+    return records, applied, unchanged, uncertain
+
+
+def _audit(raw, run_dir, observation):
+    _require(raw is not None and raw.endswith(b"\n") and len(raw) <= 4 * 1024 * 1024, "audit_missing_or_partial")
+    calls, results, started, finished, interrupted = {}, {}, False, False, False
+    for index, line in enumerate(raw.splitlines()):
+        _require(index < 1024, "audit_limit")
+        value = journal._json(line, journal.MAX_INPUT)
+        _require(type(value) is dict and not finished, "invalid_audit_order")
+        event = value.get("event")
+        if event == "relay_started":
+            _require(value == {"event": event} and not started and not calls, "invalid_audit_start")
+            started = True
+            continue
+        _require(started, "audit_not_started")
+        if event == "relay_finished":
+            journal._keys(value, {"event", "child_reaped", "cleanup_overrun"},
+                          {"peak_inflight", "peak_client_queue_bytes", "peak_server_queue_bytes"})
+            _require(value["child_reaped"] is True and value["cleanup_overrun"] is False, "audit_cleanup_failed")
+            for key in set(value) - {"event", "child_reaped", "cleanup_overrun"}:
+                journal._integer(value[key])
+            finished = True
+            continue
+        _require(not interrupted, "audit_after_interrupt")
+        if event == "relay_interrupted":
+            _require(value == {"event": event} and observation is not None and _provider_clean(observation)
+                     and bool(calls) and set(calls) == set(results)
+                     and all(v["ok"] is True for v in results.values()), "audit_unclean_interrupt")
+            interrupted = True
+            continue
+        if event == "initialize_compat":
+            _require(value == {"event": event, "omitted_capability": "codex/auth-change"}, "invalid_audit_compat")
+            continue
+        _require(event in {"tool_call", "tool_result"}, "audit_failure_or_unknown_event")
+        key = gateway.call_key(value.get("id"))
+        tool = value.get("tool")
+        _require(tool in READ_TOOLS | WRITE_TOOLS, "audit_tool_invalid")
+        if event == "tool_call":
+            journal._keys(value, {"event", "id", "tool"})
+            _require(key not in calls, "audit_duplicate_id")
+            calls[key] = value
+        else:
+            journal._keys(value, {"event", "id", "tool", "ok", "memory_ids", "forwarded"},
+                          {"operation_version", "operation_id", "operation_outcome", "operation_payload_digest"})
+            _require(key in calls and calls[key]["tool"] == tool and key not in results
+                     and type(value["ok"]) is bool and type(value["forwarded"]) is bool
+                     and type(value["memory_ids"]) is list, "invalid_audit_result")
+            results[key] = value
+    _require(started and finished and set(calls) == set(results), "audit_incomplete")
+    forwarded, errors = [], 0
+    for key, call in calls.items():
+        result = results[key]
+        if call["tool"] in WRITE_TOOLS and result["forwarded"]:
+            gateway.verify_audit_receipt(run_dir, call["id"], call["tool"], result)
+            forwarded.append(call["id"])
+        else:
+            _require(not any(name.startswith("operation_") for name in result)
+                     and not result["memory_ids"], "unexpected_audit_receipt")
+            _require(result["forwarded"] or result["ok"] is False, "invalid_local_denial")
+        errors += result["ok"] is not True
+    gateway.verify_audit_coverage(run_dir, forwarded)
+    return {"tool_calls": len(calls), "tool_errors": errors, "forwarded_writes": len(forwarded)}
+
+
+def _provider_clean(value):
+    return (value["started"] and value["terminated"] and value["returncode"] == 0
+            and value["turn_completed"] and not value["provider_error"] and not value["unexpected_tool"]
+            and value["tool_errors"] == 0 and value["reason"] is None)
+
+
+def _result(raw, memory_ids):
+    value = journal._json(raw, journal.MAX_INPUT)
+    journal._keys(value, {"outcome", "summary", "memory_ids"})
+    journal._string(value["summary"], journal.MAX_INPUT, nonempty=False)
+    _require(type(value["memory_ids"]) is list, "invalid_provider_result")
+    ids = [journal._uuid(item) for item in value["memory_ids"]]
+    _require(len(ids) == len(set(ids)) and set(ids) == set(memory_ids), "provider_ids_mismatch")
+    _require(value["outcome"] == ("stored" if ids else "no_new_memories"), "provider_outcome_mismatch")
+
+
+def _compute(run_dir, manifest, digest):
+    files, raw, operation_ids = _snapshot(run_dir)
+    issues = []
+    records, applied, unchanged, uncertain = _operations(run_dir, operation_ids)
+    if any(record.get("evidence_valid") is False for record in records):
+        issues.append("invalid_operation_evidence")
+    observation, dispatch = None, raw["provider-dispatch.json"]
+    if dispatch is not None and dispatch != journal.encode({"version": 1, "manifest_sha256": digest}):
+        issues.append("invalid_provider_dispatch")
+        uncertain = True
+    if raw["provider-observation.json"] is not None:
+        try:
+            value = journal._json(raw["provider-observation.json"])
+            journal._keys(value, {"version", "manifest_sha256", "observation"})
+            journal._version(value["version"])
+            _require(value["manifest_sha256"] == digest, "observation_manifest_changed")
+            observation = _observation(value["observation"])
+            _require(not observation["started"] or dispatch is not None, "provider_dispatch_missing")
+        except (ValueError, TypeError, KeyError):
+            observation = None
+            issues.append("invalid_provider_observation")
+            uncertain = True
+    never_dispatched = (dispatch is None and raw["provider-observation.json"] is None
+                        and raw["mcp-audit.jsonl"] is None and raw["result.json"] is None and not operation_ids)
+    positive_no_start = (observation is not None and not observation["started"] and observation["terminated"]
+                         and not operation_ids and raw["mcp-audit.jsonl"] is None and raw["result.json"] is None)
+    audit = None
+    if not (never_dispatched or positive_no_start):
+        try:
+            audit = _audit(raw["mcp-audit.jsonl"], run_dir, observation)
+        except (ValueError, TypeError, KeyError, OSError):
+            issues.append("audit_unsettled")
+            uncertain = True
+    if observation is None and not never_dispatched:
+        issues.append("provider_observation_missing")
+        uncertain = True
+    elif observation is not None and not observation["terminated"]:
+        issues.append("provider_not_terminated")
+        uncertain = True
+    memory_ids = sorted({journal._uuid(value) for receipt in applied for value in receipt["memoryIDs"]})
+    result_valid = False
+    if observation is not None and _provider_clean(observation):
+        try:
+            _result(raw["result.json"], memory_ids)
+            result_valid = True
+        except (ValueError, TypeError, KeyError):
+            issues.append("provider_result_unverified")
+    success = (not uncertain and not issues and observation is not None and _provider_clean(observation)
+               and audit is not None and audit["tool_calls"] > 0 and audit["tool_errors"] == 0 and result_valid
+               and len(records) == len(applied) + len(unchanged))
+    status = "succeeded" if success else ("reconciliation_required" if uncertain or applied else "failed")
+    reason = "verified_completion" if success else ("never_dispatched" if never_dispatched else
+             "provider_not_started" if positive_no_start else "unverified_completion")
+    return {"version": 1, "kind": "learner_settlement", "manifest_sha256": digest,
+            "session_id": manifest["session_id"], "run_id": manifest["run_id"], "fencing": manifest["fencing"],
+            "source": {key: manifest["source"][key] for key in ("start_offset", "end_offset")},
+            "status": status, "reason": reason, "issues": sorted(set(issues)), "files": files,
+            "operations": records, "attempted_write_calls": sum(record["dispatched"] is True for record in records),
+            "applied_write_calls": len(applied), "unchanged_write_calls": len(unchanged),
+            "memory_ids": memory_ids, "audit": audit}
+
+
+def _coverage(manifest, manifest_sha, settlement_sha):
+    parser = journal._json(journal._unseal(manifest["inputs"]["parser_state"]))
+    journal._keys(parser, {"version", "input", "limits", "runtime", "interval_sha256"})
+    journal._digest(parser["interval_sha256"])
+    return {"version": 1, "kind": "successful_interval_coverage", "status": "succeeded",
+            "session_id": manifest["session_id"], "run_id": manifest["run_id"],
+            "source": {**manifest["source"], "interval_sha256": parser["interval_sha256"]},
+            "parser": {"runtime": parser["runtime"], "limits": parser["limits"],
+                       "input_sha256": journal.sha256(journal.encode(parser["input"])),
+                       "next_sha256": manifest["inputs"]["next_parser_state"]["sha256"]},
+            "execution_manifest_sha256": manifest_sha, "settlement_sha256": settlement_sha}
+
+
+def settle(run_dir, *, manifest_sha256, recovery_fence, validate_inputs, provider_observation=None):
+    manifest, digest = _manifest(run_dir, manifest_sha256)
+    _validate(manifest, recovery_fence, validate_inputs, "before_settlement")
+    if provider_observation is not None:
+        persist_observation(run_dir, provider_observation)
+    settlement = _compute(run_dir, manifest, digest)
+    _validate(manifest, recovery_fence, validate_inputs, "before_settlement_publication")
+    _require(_same(settlement, _compute(run_dir, manifest, digest)), "evidence_changed")
+    raw = journal.encode(settlement)
+    journal._publish(run_dir / "settlement.json", raw)
+    _validate(manifest, recovery_fence, validate_inputs, "after_settlement_publication")
+    _require(_same(settlement, _compute(run_dir, manifest, digest)), "evidence_changed")
+    result = {**copy.deepcopy(settlement), "settlement_sha256": journal.sha256(raw), "coverage_reference": None}
+    if settlement["status"] == "succeeded":
+        coverage = _coverage(manifest, digest, result["settlement_sha256"])
+        _validate(manifest, recovery_fence, validate_inputs, "before_coverage_publication")
+        _require(_same(settlement, _compute(run_dir, manifest, digest)), "evidence_changed")
+        coverage_raw = journal.encode(coverage)
+        journal._publish(run_dir / "successful-coverage.json", coverage_raw)
+        _validate(manifest, recovery_fence, validate_inputs, "after_coverage_publication")
+        result["coverage_reference"] = {"version": 1, "run_id": manifest["run_id"],
+                                        "receipt_sha256": journal.sha256(coverage_raw)}
+    _manifest(run_dir, digest)
+    _require(_same(settlement, _compute(run_dir, manifest, digest)), "evidence_changed")
+    return result
+
+
+def verify_settlement(run_dir, *, expected_sha256, recovery_fence, validate_inputs):
+    raw, identity = durable._read(run_dir / "settlement.json", maximum=journal.MAX_RECORD)
+    _require(journal.sha256(raw) == expected_sha256, "settlement_digest_changed")
+    value = journal._json(raw)
+    manifest, digest = _manifest(run_dir, value.get("manifest_sha256"))
+    _validate(manifest, recovery_fence, validate_inputs, "verify_settlement")
+    _require(raw == journal.encode(_compute(run_dir, manifest, digest)), "settlement_evidence_changed")
+    _require(durable._read(run_dir / "settlement.json", maximum=journal.MAX_RECORD) == (raw, identity), "settlement_changed")
+    _validate(manifest, recovery_fence, validate_inputs, "after_verify_settlement")
+    _manifest(run_dir, digest)
+    _require(raw == journal.encode(_compute(run_dir, manifest, digest)), "settlement_evidence_changed")
+    return copy.deepcopy(value)
+
+
+def verify_coverage(run_dir, receipt, binding, *, recovery_fence, validate_inputs):
+    """Exact-True parser_context callback for a caller-selected trusted run path."""
+    manifest, digest = _manifest(run_dir, receipt.get("execution_manifest_sha256"))
+    value = verify_settlement(run_dir, expected_sha256=receipt.get("settlement_sha256"),
+                              recovery_fence=recovery_fence, validate_inputs=validate_inputs)
+    _require(value["status"] == "succeeded" and _same(receipt, _coverage(manifest, digest, receipt["settlement_sha256"])),
+             "coverage_not_successful")
+    request = journal._json(journal._unseal(manifest["inputs"]["request"]))
+    expected = {"session_id": manifest["session_id"], "run_id": manifest["run_id"], "source": receipt["source"],
+                "parser": receipt["parser"], "admission": request["admission"]}
+    _require(_same(binding, expected), "coverage_binding_changed")
+    raw, _ = durable._read(run_dir / "successful-coverage.json")
+    _require(raw == journal.encode(receipt), "coverage_changed")
+    return True

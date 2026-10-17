@@ -13,6 +13,19 @@ Summarize advice, tool/lifecycle events, routing, policy, and learner completion
 
 `reconciliation_required` means a failed run may already have written memory, or its write status is unknown. Report its linked run, reason, and recorded UUIDs; later events are held to prevent blind replay. The status reader does not clear this gate or establish whether an uncertain write persisted.
 
+## Typed learner health
+
+Use `learner.health` (schema version 1) as the summary. Its `headline` and `recovery.action` are exact codes for consumers, including the app UI. Policy and activity are separate: enabled policy does not establish that learning is progressing. Authoritative reconciliation, migration and processing markers take precedence over stale pending `batch_limit` pauses and old success timestamps. All concurrent holds remain in `holds`; resolving one does not resolve the others.
+
+- `processing_unverified` means an admission processing marker exists. The reader does not probe worker liveness and cannot infer whether the process is active or interrupted.
+- `progress.last_completed_interval` requires a linked successful run receipt. `last_success_timestamp_claim` is the retained session field and cannot establish the latest interval's completion. The reader checks at most one additional successful run linked in the bounded event window; absent evidence is not proof that no prior learning occurred.
+- Backlog bytes describe only a recorded pending snapshot with matching file identity. `unknown`, `stale_snapshot` and `identity_mismatch` must remain distinct from zero backlog. Current transcript size is never inspected; `idle` means no selected pending request and no processing marker, not proof that current history is caught up.
+- `outcomes` separates queue metadata, provider completion, native acknowledgements recorded by the runner, and independent readback. The reader performs no memory readback, even when a provider claims `stored` or a run receipt records acknowledged UUIDs. Recorded acknowledgement is not independent proof of current persistence.
+- `failure.diagnostic_error_count` is the run's aggregate provider/gateway/transport count, not a count of unique failed operations or writes. `unverified_completion` is a source-defined failure reason and must not be presented as success.
+- `recovery.action` describes the next supported investigation or recovery step; it does not authorize clearing gates or automatic replay. An explicit resume must preserve admission, identity, current backoff and reconciliation checks.
+
+The aggregate is a bounded, non-atomic metadata snapshot. Missing, unsafe or malformed records cannot establish healthy learning. Preserve `metadata_issues` and the underlying receipt evidence when investigating a conflicting or changing snapshot. Missing required session, admission or host enrollment records and invalid recovery fields produce an unknown summary. Invalid fields are identified only by fixed field names; their contents are never returned. Any present reconciliation field remains a hold, including malformed empty, null or false values.
+
 `migration_hold` is a separate filesystem-identity migration hold. Report it independently of a reconciliation gate and a paused pending request. `host_sessions_v2` uses persistent APFS volume UUID and inode identities; legacy v1 enrollments remain held until explicitly migrated. A migration hold or `admission_legacy_migration_required` does not authorize a retry, clearing a gate, changing the cursor, or adopting the current end of the transcript. Migration and activation are separately reviewed operations.
 
 Report a returned learner `reason` code when present. The reader exposes only an exact allowlist of source-defined admission codes; it omits other reasons rather than displaying arbitrary error text. A missing reason therefore does not mean the event had no error.

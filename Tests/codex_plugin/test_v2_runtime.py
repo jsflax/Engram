@@ -32,6 +32,10 @@ class StableRuntimeTests(unittest.TestCase):
         H.F.write_json(self.f.root / "admission.json", self.f.policy)
         H.F.write_json(self.f.routes, {"schema_version": 2, "mode": "host_sessions_v2",
                                       "enabled": True, "state_dir": str(self.f.root)})
+        # Install the durable provider fixture before individual tests replace
+        # its volume oracle. Lazy setup inside process() would mask a test's
+        # changed-volume observation with the fixture's default identity.
+        self.f.enable_durable()
 
     def capture(self, fd):
         return {"scheme": "macos_volume_uuid_inode_v1", "volume_uuid": self.volume,
@@ -57,6 +61,44 @@ class StableRuntimeTests(unittest.TestCase):
         self.assertNotIn("inode", state)
         self.assertGreater(state["offset"], request["admission"]["frontier_offset"])
 
+    def test_same_snapshot_resume_preserves_stable_identity_and_original_frontier(self):
+        sid, _, payload = self.f.paused_for_resume()
+        before = self.f.resume_records(sid)
+        request = self.f.request(sid)
+        with mock.patch.object(self.runner, "spawn_worker") as spawn:
+            self.assertTrue(self.runner.resume_pending(self.f.root, sid))
+            self.assertFalse(self.runner.resume_pending(self.f.root, sid))
+        spawn.assert_called_once_with(self.f.root)
+        self.assertEqual(self.f.request(sid)["identity"], request["identity"])
+        self.assertEqual(self.f.request(sid)["request_id"], request["request_id"])
+        self.assertEqual({k: v for k, v in self.f.resume_records(sid).items() if k != "pending"},
+                         {k: v for k, v in before.items() if k != "pending"})
+        self.assertFalse(self.f.dispatch(payload))
+        self.assertEqual(self.f.process(sid), "succeeded")
+        self.assertEqual(len(self.f.invocations), 1)
+        self.assertIn("DURABLE RESUME CONTENT", self.f.invocations[0][1].text)
+
+    def test_resume_refuses_migration_hold_and_different_volume_without_changes(self):
+        for index, hold in enumerate(("migration", "volume"), start=1):
+            with self.subTest(hold=hold):
+                sid, path, _ = self.f.paused_for_resume(index)
+                inode = path.stat().st_ino
+                if hold == "migration":
+                    H.F.write_json(self.f.root / "migration-holds" / (sid + ".json"),
+                                   {"session_id": sid, "kind": "identity_migration_hold"})
+                def capture(fd):
+                    value = self.capture(fd)
+                    if hold == "volume" and value["inode"] == inode:
+                        value["volume_uuid"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+                    return value
+                before = self.f.resume_records(sid)
+                with mock.patch.object(self.identity, "capture_fd", side_effect=capture), \
+                        mock.patch.object(self.runner, "spawn_worker") as spawn:
+                    self.assertFalse(self.runner.resume_pending(self.f.root, sid))
+                spawn.assert_not_called()
+                self.assertEqual(self.f.resume_records(sid), before)
+                self.assertEqual(self.f.invocations, [])
+
     def test_later_device_renumbering_does_not_reject_pending_request(self):
         sid, _, _ = self.queued()
         original_inspect, original_read = self.runner.inspect_rollout, self.runner.read_excerpt
@@ -79,9 +121,11 @@ class StableRuntimeTests(unittest.TestCase):
             if value["inode"] == inode:
                 value["volume_uuid"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
             return value
+        before = self.f.resume_records(sid)
         with mock.patch.object(self.identity, "capture_fd", side_effect=changed):
             with self.assertRaisesRegex(ValueError, "admission_enrollment_origin_changed"):
                 self.f.process(sid)
+        self.assertEqual(self.f.resume_records(sid), before)
         self.assertEqual(self.f.invocations, [])
 
     def test_identity_change_between_inspection_and_excerpt_rejects(self):
@@ -108,7 +152,7 @@ class StableRuntimeTests(unittest.TestCase):
                       legacy_event_identity=historical)
         H.F.write_json(record_path, record)
         pending = self.f.root / "pending" / (sid + ".json")
-        pending.unlink()
+        self.assertFalse(pending.exists())  # Durable publication acknowledged it.
         before = record_path.read_bytes()
         self.assertFalse(self.f.dispatch(payload))
         self.assertFalse(pending.exists())

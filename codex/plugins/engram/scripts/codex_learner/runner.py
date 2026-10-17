@@ -1,7 +1,8 @@
 """Native hooks enqueue work; one worker learns bounded incremental excerpts.
 
-No memory database is opened here. All learning uses the installed Codex account
-and the configured Engram MCP, with other integrations and shell access disabled.
+Learning uses the installed Codex account and configured Engram MCP, with other
+integrations and shell access disabled. Explicit retrospective recovery may read
+exact historical memory rows through the separate read-only reconciliation API.
 """
 from __future__ import annotations
 
@@ -14,9 +15,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -25,17 +28,18 @@ import uuid
 
 from .transcript import inspect_rollout, read_excerpt
 from .memory_proxy import verified_no_write_receipt
-from . import admission, memory_config, host_admission
+from . import admission, memory_config, host_admission, operation_gateway, learner_settings
+from . import runner_publication, settlement
 
 EVENTS = {"Stop", "SubagentStop", "PreCompact", "SessionEnd"}
 GUARD = "ENGRAM_CODEX_LEARNER"
 _PROVIDER_LOCK_FD = contextvars.ContextVar("engram_provider_lock_fd", default=None)
 _PROVIDER_STARTED = contextvars.ContextVar("engram_provider_started", default=None)
+_EXECUTION = contextvars.ContextVar("engram_execution", default=None)
+_HELD_LOCKS = contextvars.ContextVar("engram_held_locks", default=())
 READ_TOOLS = {"recall", "graph", "list_topics", "stats", "timeline"}
 WRITE_TOOLS = {"remember", "update", "connect"}
-DEFAULTS = {"min_chars": 400, "max_chars": 24000, "max_scan_bytes": 8 * 1024 * 1024,
-            "wall_seconds": 600, "max_tool_calls": 12, "max_writes": 5,
-            "max_runs_per_worker": 4, "retry_seconds": 300}
+DEFAULTS = learner_settings.DEFAULTS
 
 
 def utc() -> str:
@@ -102,21 +106,26 @@ def lock_file(path: Path, blocking: bool = True, *, descriptor: bool = False):
     private_dir(path.parent)
     flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
     f = os.fdopen(os.open(path, flags, 0o600), "a+")
-    import stat
     info = os.fstat(f.fileno())
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
         f.close()
         raise ValueError("lock_not_owned_regular")
     os.fchmod(f.fileno(), 0o600)
     acquired = False
+    token = None
     try:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
             acquired = True
         except BlockingIOError:
             pass
+        if acquired:
+            token = _HELD_LOCKS.set((*_HELD_LOCKS.get(), (str(path.absolute()), f.fileno(),
+                                                        info.st_dev, info.st_ino)))
         yield f.fileno() if acquired and descriptor else acquired
     finally:
+        if token is not None:
+            _HELD_LOCKS.reset(token)
         if acquired:
             fcntl.flock(f, fcntl.LOCK_UN)
         f.close()
@@ -140,19 +149,107 @@ def provider_slot():
 
 
 def settings(root: Path) -> dict:
-    result = {**DEFAULTS, **load_json(root / "settings.json")}
-    # Local configuration can lower budgets, not accidentally remove bounds.
-    for key, low, high in (("min_chars", 0, 10000), ("max_chars", 1000, 48000),
-                           ("max_scan_bytes", 4096, 32 * 1024 * 1024),
-                           ("wall_seconds", 10, 900), ("max_tool_calls", 1, 20),
-                           ("max_writes", 1, 5), ("max_runs_per_worker", 1, 8),
-                           ("retry_seconds", 10, 3600)):
-        result[key] = max(low, min(high, int(result[key])))
-    return result
+    return learner_settings.bounded(load_json(root / "settings.json"))
 
 
 def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser().resolve()
+
+
+def publications(root: Path):
+    return runner_publication.Publications(root, codex_home() / "config.toml",
+        Path(__file__).resolve().parents[2], legacy_paths=lambda: legacy_paths(root),
+        legacy_verify_locks=lambda: publication_locks_owned(root),
+        residual_paths=lambda run_id: residual_paths(root, run_id),
+        residual_verify_locks=lambda: publication_locks_owned(root))
+
+
+def publication_locks_owned(root: Path) -> bool:
+    """Verify the current caller still owns its worker -> enqueue descriptors."""
+    required = [str((root / name).absolute()) for name in ("worker.lock", "enqueue.lock")]
+    found = []
+    try:
+        for path, fd, device, inode in _HELD_LOCKS.get():
+            if path not in required:
+                continue
+            descriptor, current = os.fstat(fd), os.stat(path, follow_symlinks=False)
+            if (not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid()
+                    or current.st_nlink != 1 or (descriptor.st_dev, descriptor.st_ino) != (device, inode)
+                    or (current.st_dev, current.st_ino) != (device, inode)):
+                return False
+            found.append(path)
+    except OSError:
+        return False
+    return found == required
+
+
+def legacy_paths(root: Path):
+    """Choose a current local store lazily; never follow a retained plan path."""
+    from . import legacy_reconciliation, stdio_bridge, execution_context
+    package = Path(__file__).resolve().parents[2]
+    _, memory = memory_config.resolve(codex_home() / "config.toml", package)
+    if memory.get("enabled") is not True:
+        raise ValueError("legacy_reconciliation_memory_disabled")
+    argv, environment, _ = stdio_bridge._transport(memory_config.transport(memory))
+    # Arbitrary wrapper arguments may choose another store. Only the same
+    # no-argument route supported by durable execution is eligible here.
+    if len(argv) != 1:
+        raise ValueError("legacy_reconciliation_store_selection_unavailable")
+    try:
+        execution_context._runtime(argv[0])
+    except (OSError, ValueError):
+        raise ValueError("legacy_reconciliation_store_selection_unavailable") from None
+    if "CLAUDE_MEMORY_DB" in environment:
+        store = Path(environment["CLAUDE_MEMORY_DB"])
+        if not environment["CLAUDE_MEMORY_DB"] or not store.is_absolute():
+            raise ValueError("legacy_reconciliation_store_selection_unavailable")
+    else:
+        # Foundation's default home is the account home, whereas Path.home()
+        # can follow an overridden HOME. Require an explicit store for those
+        # environments instead of guessing which database native will open.
+        try:
+            account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        except (KeyError, OSError):
+            raise ValueError("legacy_reconciliation_store_selection_unavailable") from None
+        if ("CFFIXED_USER_HOME" in environment
+                or not account_home.is_absolute()
+                or Path.home() != account_home
+                or environment.get("HOME", str(account_home)) != str(account_home)):
+            raise ValueError("legacy_reconciliation_store_selection_unavailable")
+        store = account_home / ".claude" / "memory.sqlite"
+    # evidence_directory is unused during recovery; all review bytes are frozen
+    # in the plan beneath this current trusted root.
+    return legacy_reconciliation.LegacyPaths(root, root, package, store)
+
+
+def residual_paths(root: Path, run_id: str):
+    """Resolve recovery from the checked run ID and current native store route."""
+    from . import residual_context, residual_publication
+    residual_publication._run_id(run_id)
+    selected = legacy_paths(root)
+    return residual_context.ResidualPaths(root, root / "runs" / run_id,
+        codex_home() / "config.toml", selected.package_root, selected.candidate_store)
+
+
+def has_recoverable_transition(root: Path, session_id: str) -> bool:
+    if os.path.lexists(root / "publications" / session_id / "active.json"):
+        return True
+    try:
+        record = load_json(admission.state_paths(root, session_id)["admissions"])
+        if isinstance(record, dict) and record.get("processing_execution") is not None:
+            return True
+    except (OSError, ValueError):
+        # A damaged admission must not hide a retained legacy recovery proof
+        # when its pending request is paused. Recovery will surface the hold.
+        pass
+    try:
+        from . import legacy_reconciliation
+        if legacy_reconciliation.needs_recovery(root, session_id):
+            return True
+    except (OSError, ValueError):
+        pass
+    from . import residual_publication
+    return residual_publication.needs_recovery(root, session_id)
 
 
 def validate_request(payload: dict, root: Path) -> dict:
@@ -292,6 +389,12 @@ def commit_admitted_state(root: Path, request: dict, state: dict) -> None:
         atomic_json(root / "sessions" / (sid + ".json"), state)
 
 
+def requires_reconciliation(state: dict) -> bool:
+    # Only a supported recovery transition may remove a gate. A malformed or
+    # partially published gate cannot grant permission to replay uncertain work.
+    return "reconciliation_required" in state or state.get("status") == "reconciliation_required"
+
+
 def enqueue(root: Path, payload: dict, *, spawn: bool = True, expected_admission: dict | None = None,
             route_guard=None) -> bool:
     if os.environ.get(GUARD) or os.environ.get("CLAUDE_MEMORY_LEARNER") or os.environ.get("ENGRAM_LEARNER_ORCHESTRATED") == "1":
@@ -316,8 +419,9 @@ def enqueue(root: Path, payload: dict, *, spawn: bool = True, expected_admission
                 route_guard()
             record = admitted_record(root, request, create=True)
             state = load_json(root / "sessions" / (sid + ".json"))
-            if state.get("reconciliation_required"):
-                gate = state["reconciliation_required"]
+            if requires_reconciliation(state):
+                gate = state.get("reconciliation_required")
+                gate = gate if isinstance(gate, dict) else {}
                 event_log(root, "reconciliation_required", session_id=sid,
                           run_id=state.get("last_run"), reason=gate.get("reason"), memory_ids=gate.get("memory_ids", []))
                 return False
@@ -341,10 +445,81 @@ def enqueue(root: Path, payload: dict, *, spawn: bool = True, expected_admission
             atomic_json(pending, request)
     except (ValueError, OSError) as exc:
         event_log(root, "rejected", session_id=sid, reason=str(exc)[:160])
+        # Only the worker may recover a known interrupted pair; it owns the
+        # worker -> enqueue lock order and checks the pinned publication.
+        if spawn and os.path.lexists(root / "publications" / sid / "active.json"):
+            spawn_worker(root)
         return False
     event_log(root, "queued", session_id=sid, hook_event=request["event"], request_id=request["request_id"])
     if spawn:
         spawn_worker(root)
+    return True
+
+
+def resume_pending(root: Path, session_id: str, *, spawn: bool = True) -> bool:
+    """Resume the same paused request without treating it as a new hook event.
+
+    Reconciliation and interrupted execution need their own recovery evidence.
+    This path only releases an ordinary pause after rechecking its exact cursor,
+    admission and transcript identity. Lock order matches the worker.
+    """
+    if (os.environ.get(GUARD) or os.environ.get("CLAUDE_MEMORY_LEARNER")
+            or os.environ.get("ENGRAM_LEARNER_ORCHESTRATED") == "1"):
+        return False
+    if not isinstance(session_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,100}", session_id) is None:
+        return False
+    try:
+        admission.check_activation(root)
+        paths = admission.state_paths(root, session_id)
+        pending_path, state_path = paths["pending"], paths["sessions"]
+        expected_request = load_pending(pending_path)
+        expected_state = load_json(state_path)
+        if not expected_request or not isinstance(expected_state, dict):
+            raise ValueError("resume_missing_request_or_state")
+        with lock_file(root / "worker.lock", blocking=False) as acquired:
+            if not acquired:
+                raise ValueError("resume_worker_active")
+            with lock_file(root / "enqueue.lock"):
+                admission.state_paths(root, session_id)
+                request = load_pending(pending_path)
+                state = load_json(state_path)
+                if request != expected_request or state != expected_state:
+                    raise ValueError("resume_request_or_state_changed")
+                record = admitted_record(root, request)
+                if record["processing"] is not None:
+                    raise ValueError("admission_interrupted_processing")
+                if requires_reconciliation(state):
+                    raise ValueError("reconciliation_required")
+                if (request.get("paused_request_id") != request["request_id"]
+                        or request.get("pause_reason") not in {"failed", "backoff", "blocked", "batch_limit"}):
+                    raise ValueError("resume_request_not_safely_paused")
+                retry_after = state.get("retry_after", 0)
+                if type(retry_after) not in (int, float) or not 0 <= retry_after <= time.time():
+                    raise ValueError("resume_backoff")
+                stable = request["admission"].get("mode") == host_admission.MODE_V2
+                meta = inspect_rollout(request["transcript_path"], **({"stable_identity": True} if stable else {}))
+                identity = {"identity": meta.identity} if stable else {"device": meta.device, "inode": meta.inode}
+                if (meta.session_id != session_id
+                        or any(request.get(k) != v or state.get(k) != v for k, v in identity.items())):
+                    raise ValueError("resume_transcript_identity_changed")
+                size = request.get("size_bytes")
+                if type(size) is not int or size < 0 or meta.size_bytes < max(state["offset"], size):
+                    raise ValueError("resume_transcript_truncated")
+                resumed = dict(request)
+                resumed.pop("paused_request_id")
+                resumed.pop("pause_reason")
+                atomic_json(pending_path, resumed)
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        event_log(root, "resume_refused", session_id=session_id, reason=str(exc)[:160])
+        return False
+    # Queue publication already succeeded. A diagnostic failure must neither
+    # describe this as a refused/no-change resume nor suppress its wakeup.
+    try:
+        event_log(root, "resumed", session_id=session_id, request_id=request["request_id"],
+                  previous_pause_reason=request["pause_reason"], state_sha256=record["state_sha256"])
+    finally:
+        if spawn:
+            spawn_worker(root)
     return True
 
 
@@ -396,11 +571,21 @@ def learner_command(root: Path, run_dir: Path, request: dict, config: dict) -> l
     tool_policies = {tool: {**memory["tools"].get(tool, {}), "approval_mode": "approve"}
                      for tool in sorted(allowed)}
     memory = memory_config.transport(memory)
+    execution = _EXECUTION.get()
+    execution_config = {}
+    if execution is not None:
+        if execution.paths.root != root or execution.paths.run_dir != run_dir:
+            raise ValueError("execution_paths_changed")
+        manifest, _ = runner_publication.journal.read_manifest(run_dir)
+        execution.context.validate_inputs(manifest, "before_intent")
+        memory = execution.context.transport
+        execution_config = {"execution": execution.specification()}
     transport_path = run_dir / "transport.json"
     atomic_json(transport_path, {"transport": memory, "audit_path": str(run_dir / "mcp-audit.jsonl"),
                                "provenance": "codex-session:" + request["session_id"],
                                "allowed_tools": sorted(allowed),
-                               "max_tool_calls": config["max_tool_calls"], "max_writes": config["max_writes"]})
+                               "max_tool_calls": config["max_tool_calls"], "max_writes": config["max_writes"],
+                               **execution_config})
     memory = {"command": sys.executable, "args": [str(Path(__file__).with_name("memory_proxy.py")), str(transport_path)],
               "enabled": True, "required": True, "enabled_tools": sorted(allowed),
               "default_tools_approval_mode": "prompt",
@@ -560,10 +745,25 @@ def audit_tools(path: Path, *, allow_clean_interrupt: bool = False) -> dict:
     if interrupt_seen and not interrupt_finished:
         errors += 1
     writes = []
+    durable_run = os.path.lexists(path.parent / "execution-manifest.json")
+    durable_receipts = durable_run or any(any(key.startswith("operation_") for key in result)
+                                         for result in results.values())
+    unchanged = operation_failures = 0
     for key, tool in calls.items():
         result = results.get(key, {})
         if result.get("ok") is not True or result.get("tool") != tool:
             errors += 1
+            operation_failures += tool in WRITE_TOOLS
+        elif tool in WRITE_TOOLS and (durable_run or any(key.startswith("operation_") for key in result)):
+            try:
+                receipt = operation_gateway.verify_audit_receipt(path.parent, key[1], tool, result)
+                if receipt["outcome"] == "applied":
+                    writes.append({"tool": tool, "memory_ids": receipt["memoryIDs"]})
+                else:
+                    unchanged += 1
+            except (OSError, ValueError, KeyError, TypeError):
+                errors += 1
+                operation_failures += 1
         elif "write_outcome" in result:
             if not verified_no_write_receipt(result):
                 errors += 1
@@ -574,7 +774,18 @@ def audit_tools(path: Path, *, allow_clean_interrupt: bool = False) -> dict:
             else:
                 writes.append({"tool": tool, "memory_ids": ids})
     errors += len(set(results) - set(calls))
-    return {"tool_calls": len(calls), "write_calls": len(writes), "writes": writes, "tool_errors": errors}
+    if durable_run:
+        try:
+            operation_gateway.verify_audit_coverage(path.parent, [key[1] for key, tool in calls.items()
+                if tool in WRITE_TOOLS and results.get(key, {}).get("forwarded") is True])
+        except (OSError, ValueError, KeyError, TypeError):
+            errors += 1
+    summary = {"tool_calls": len(calls), "write_calls": len(writes), "writes": writes, "tool_errors": errors}
+    if durable_receipts:
+        summary.update(attempted_write_calls=sum(tool in WRITE_TOOLS for tool in calls.values()),
+                       applied_write_calls=len(writes), unchanged_write_calls=unchanged,
+                       operation_failures=operation_failures)
+    return summary
 
 
 def render_learner_prompt(template: str, config: dict) -> str:
@@ -618,6 +829,9 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict) -
                 "tool_errors": 0, "provider_error": False, "unexpected_tool": False, "turn_completed": False}
     initial = {"status": "running", "started_at": utc(), "session_id": request["session_id"],
                "event": request["event"], "end_offset": excerpt.next_offset}
+    execution = _EXECUTION.get()
+    if execution is not None:
+        initial["execution_manifest_sha256"] = execution.context.manifest_sha256
     atomic_json(run_dir / "run.json", initial)
     stdout_path, stderr_path = run_dir / "provider.jsonl", run_dir / "stderr.log"
     prompt_path = run_dir / "prompt.txt"
@@ -628,6 +842,9 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict) -
     with stdout_path.open("wb") as output, stderr_path.open("wb") as error, prompt_path.open("rb") as prompt_input:
         stdout_path.chmod(0o600)
         stderr_path.chmod(0o600)
+        if execution is not None:
+            settlement.record_provider_dispatch(run_dir, execution.context.manifest_sha256,
+                lambda manifest, _phase: execution.context.validate_inputs(manifest, "before_intent"))
         proc = subprocess.Popen(argv, stdin=prompt_input, stdout=output, stderr=error,
                                 cwd=run_dir / "workspace", env=env, start_new_session=True,
                                 pass_fds=(() if _PROVIDER_LOCK_FD.get() is None else (_PROVIDER_LOCK_FD.get(),)))
@@ -692,6 +909,12 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict) -
                     os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
     observed.pop("seen")
+    if execution is not None:
+        settlement.persist_observation(run_dir, {
+            "started": True, "terminated": proc.poll() is not None,
+            "returncode": proc.returncode, "turn_completed": observed["turn_completed"],
+            "provider_error": observed["provider_error"], "unexpected_tool": observed["unexpected_tool"],
+            "tool_errors": observed["tool_errors"], "reason": reason})
     # Completed MCP calls have their own receipts even when Codex wraps them in
     # code-mode events. Never accept a claimed write without an Engram response.
     provider_tool_errors = observed["tool_errors"]
@@ -832,14 +1055,18 @@ def failure_reconciliation(run_dir: Path, provider_started: bool | None) -> dict
 def process_request(root: Path, request: dict, config: dict, *, invoke=run_codex) -> str:
     sid = request["session_id"]
     state_path = root / "sessions" / (sid + ".json")
+    publisher = publications(root)
     with lock_file(root / "enqueue.lock"):
+        recovered = publisher.recover(sid, config)
+        if recovered is not None:
+            return recovered
         record = admitted_record(root, request)
         if record["processing"] is not None:
             raise ValueError("admission_interrupted_processing")
         state = load_json(state_path)
         if state and state.get("admission") != request["admission"]:
             raise ValueError("admission_cursor_binding_changed")
-    if state.get("reconciliation_required"):
+    if requires_reconciliation(state):
         return "reconciliation_required"
     if state.get("retry_after", 0) > time.time():
         return "backoff"
@@ -872,67 +1099,60 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=run_codex
         event_log(root, "blocked", session_id=sid, reason=excerpt.blocked_reason, offset=offset)
         return "blocked"
     if not excerpt.text:
-        commit_admitted_state(root, request, {**state, **next_state, "status": "no_visible_content"})
-        return "more" if excerpt.has_more else "no_change"
+        with lock_file(root / "enqueue.lock"):
+            return publisher.parser(request, state, excerpt, next_state, config, reason="no_visible_content")
     if len(excerpt.text) < config["min_chars"] and request["event"] in {"Stop", "SubagentStop"} and not excerpt.has_more:
         event_log(root, "deferred_short", session_id=sid, chars=len(excerpt.text))
         return "deferred"
-    digest = hashlib.sha256(excerpt.text.encode()).hexdigest()
-    if digest == state.get("last_excerpt_sha256"):
-        commit_admitted_state(root, request, {**state, **next_state, "status": "duplicate", "last_excerpt_sha256": digest})
-        return "more" if excerpt.has_more else "no_change"
+    # Equal visible text at a different byte interval is not prior successful
+    # coverage. The parser already deduplicates mirrored transcript records;
+    # any remaining visible interval must receive its own verified completion.
     # Do not seal a processing marker while waiting for a provider. Pausing a
     # policy during that wait must be reversible without implying a write began.
     with provider_slot():
         admission.check(root, request)
-        run_dir = private_dir(root / "runs" / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex))
         with lock_file(root / "enqueue.lock"):
             record = admitted_record(root, request)
             if record["processing"] is not None:
                 raise ValueError("admission_interrupted_processing")
             current = load_json(state_path)
-            if current.get("reconciliation_required"):
+            if requires_reconciliation(current):
                 return "reconciliation_required"
             if admission_digest(current) != admission_digest(state):
                 raise ValueError("admission_cursor_changed_while_waiting")
-            atomic_json(root / "admissions" / (sid + ".json"), {**record, "processing": request["request_id"]})
+            execution = publisher.begin(request, state, excerpt, config)
+            run_dir = execution.paths.run_dir
         token = _PROVIDER_STARTED.set(None)
+        execution_token = _EXECUTION.set(execution)
         try:
             result = invoke(root, run_dir, request, excerpt, config)
         except Exception as exc:
             result = {"status": "failed", "reason": type(exc).__name__, "ended_at": utc()}
             atomic_json(run_dir / "run.json", result)
         finally:
-            provider_started = _PROVIDER_STARTED.get()
+            _EXECUTION.reset(execution_token)
             _PROVIDER_STARTED.reset(token)
             (run_dir / "prompt.txt").unlink(missing_ok=True)
+            execution.close()
     event_log(root, "learner_finished", session_id=sid, run_id=run_dir.name,
               status=result["status"], writes=result.get("write_calls", 0))
-    if result["status"] != "succeeded":
-        reconciliation = failure_reconciliation(run_dir, provider_started)
-        failure_state = {**state, "session_id": sid, **observed_identity,
-                         "status": "failed", "last_run": run_dir.name,
-                         "retry_after": time.time() + config["retry_seconds"]}
-        if reconciliation is not None:
-            reconciliation = {"run_id": run_dir.name, **reconciliation}
-            failure_state.update(status="reconciliation_required", reconciliation_required=reconciliation)
-            atomic_json(run_dir / "run.json", {**result, "reconciliation_required": reconciliation})
-            event_log(root, "reconciliation_required", session_id=sid, **reconciliation)
-        commit_admitted_state(root, request, failure_state)
-        return failure_state["status"]
-    commit_admitted_state(root, request, {**next_state, "status": "succeeded", "last_run": run_dir.name,
-                            "last_excerpt_sha256": digest, "last_success_at": utc()})
-    return "more" if excerpt.has_more else "succeeded"
+    with lock_file(root / "enqueue.lock"):
+        outcome = publisher.finish(execution, config)
+    event_log(root, "learner_settled", session_id=sid, run_id=run_dir.name, status=str(outcome))
+    return outcome
 
 
 def worker(root: Path) -> int:
     # A missing/inactive policy must not even inspect or pause an old queue.
     active_policy = admission.check_activation(root)
     invalid_pending = set()
+    recovery_failures = set()
 
     def ready_pending():
         values = []
         for sid in admission.enrollment_ids(root, active_policy):
+            if sid in recovery_failures:
+                continue
             p = admission.state_paths(root, sid)["pending"]
             if not p.exists():
                 continue
@@ -946,6 +1166,15 @@ def worker(root: Path) -> int:
                 continue
         return sorted(values, key=lambda v: v[0])
 
+    def recovery_session():
+        # A missing or paused queue slot cannot hide an active publication.
+        for sid in admission.enrollment_ids(root, active_policy):
+            if sid in recovery_failures:
+                continue
+            if has_recoverable_transition(root, sid):
+                return sid
+        return None
+
     more = {}
     with lock_file(root / "worker.lock", blocking=False) as acquired:
         if not acquired:
@@ -954,6 +1183,22 @@ def worker(root: Path) -> int:
         handled = 0
         pending_dir = private_dir(root / "pending")
         while handled < config["max_runs_per_worker"]:
+            with lock_file(root / "enqueue.lock"):
+                sid = recovery_session()
+                if sid is not None:
+                    try:
+                        recovered = publications(root).recover(sid, config)
+                        if recovered == "more":
+                            path = admission.state_paths(root, sid)["pending"]
+                            if load_pending(path).get("request_id") == recovered.request_id:
+                                more[path] = recovered.request_id
+                    except Exception as exc:
+                        # Preserve an unfinished transition's pending preimage.
+                        recovery_failures.add(sid)
+                        event_log(root, "publication_recovery_held", session_id=sid, reason=type(exc).__name__)
+                    handled += 1
+            if sid is not None:
+                continue
             candidates = ready_pending()
             if not candidates:
                 break
@@ -963,9 +1208,23 @@ def worker(root: Path) -> int:
             except Exception as exc:
                 event_log(root, "worker_error", session_id=request.get("session_id"), reason=type(exc).__name__)
                 outcome = "blocked"
+                if has_recoverable_transition(root, request["session_id"]):
+                    recovery_failures.add(request["session_id"])
             handled += 1
+            # Only the latest outcome for this queue slot may pause it for the
+            # batch limit. An earlier successful batch must not mask a hold.
+            more.pop(pending, None)
             with lock_file(root / "enqueue.lock"):
                 current = load_pending(pending)
+                if request["session_id"] in recovery_failures:
+                    continue
+                if isinstance(outcome, runner_publication.Outcome):
+                    # The coordinator already sealed the old request's queue
+                    # decision. A recovered older run may have preserved this
+                    # newer pending request, which must be processed next.
+                    if outcome == "more" and current.get("request_id") == outcome.request_id:
+                        more[pending] = outcome.request_id
+                    continue
                 if current.get("request_id") == request.get("request_id"):
                     if outcome in {"failed", "backoff", "blocked", "reconciliation_required"}:
                         atomic_json(pending, {**current, "paused_request_id": request["request_id"], "pause_reason": outcome})
@@ -977,8 +1236,11 @@ def worker(root: Path) -> int:
         # the next event for this source resumes it without replaying successes.
         with lock_file(root / "enqueue.lock"):
             for pending, request_id in more.items():
+                if pending.stem in recovery_failures:
+                    continue
                 current = load_pending(pending)
-                if current.get("request_id") == request_id:
+                if (current.get("request_id") == request_id
+                        and current.get("paused_request_id") != request_id):
                     atomic_json(pending, {**current, "paused_request_id": request_id, "pause_reason": "batch_limit"})
         event_log(root, "worker_idle", handled=handled, pending=len(list(pending_dir.glob("*.json"))),
                   invalid_pending=len(invalid_pending))
@@ -1018,12 +1280,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "retry":
         if not args.session_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", args.session_id):
             parser.error("retry requires a valid --session-id")
-        request = load_json(root / "pending" / (args.session_id + ".json"))
-        if not request:
-            parser.error("no pending request for this session")
-        # Explicit retry respects the same backoff and transcript identity checks.
-        payload = {**request, "hook_event_name": request["event"]}
-        return 0 if enqueue(root, payload) else 1
+        return 0 if resume_pending(root, args.session_id) else 1
     states = [load_json(p) for p in sorted((root / "sessions").glob("*.json"))] if (root / "sessions").exists() else []
     pending = [load_json(p) for p in (root / "pending").glob("*.json")]
     print(json.dumps({"state_dir": str(root), "pending": len(pending),
