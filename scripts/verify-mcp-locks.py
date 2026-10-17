@@ -2,7 +2,7 @@
 """Exercise the real MCP executable against disposable databases only."""
 
 import argparse
-from contextlib import closing
+from contextlib import closing, ExitStack
 import ctypes
 import fcntl
 import json
@@ -88,9 +88,9 @@ class Client:
         assert "error" not in message, message
         return message["result"]
 
-    def initialize(self):
+    def initialize(self, protocol_version="2025-03-26"):
         response = self.response(self.send("initialize", {
-            "protocolVersion": "2025-03-26", "capabilities": {
+            "protocolVersion": protocol_version, "capabilities": {
                 "experimental": {"codex": {"structured": True},
                                  "optional": None, "versions": [1, "v1"]}},
             "clientInfo": {"name": "engram-lock-regression", "version": "1"}}))
@@ -179,6 +179,318 @@ def persisted_memories(db):
     with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=1)) as reader:
         rows = reader.execute("SELECT globalId, content FROM Memory").fetchall()
     return {str(uuid.UUID(row[0])).upper(): row[1] for row in rows}
+
+
+def operation_scope(client):
+    result = client.call("operation_scope", {})
+    envelope = json.loads(tool_text(result))
+    assert result.get("structuredContent") == envelope, "Operation scope envelopes differ"
+    assert set(envelope) == {"engram_operation"}, envelope
+    payload = envelope["engram_operation"]
+    assert set(payload) == {"version", "kind", "capability", "scope"}, payload
+    assert payload["version"] == 1 and payload["kind"] == "scope", payload
+    assert payload["capability"] == "localMutationOperationsV1", payload
+    scope = payload["scope"]
+    assert set(scope) == {"version", "storeID", "principal"} and scope["version"] == 1, scope
+    uuid.UUID(scope["storeID"])
+    return scope
+
+
+def initialized_store_snapshot(db):
+    # Only the native executable creates/registers this disposable fixture.
+    # A smaller registry changes Lattice's schema fingerprint and would test
+    # real schema work instead of reopening the existing runtime's store.
+    expected_tables = {"Memory", "Edge", "Checkpoint", "HookState", "SessionState",
+                       "SyncConfig", "EngramOperationStoreV1", "EngramOperationReceiptV1"}
+    with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=1)) as reader:
+        tables = {row[0] for row in reader.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert expected_tables <= tables, expected_tables - tables
+        cookie = reader.execute("PRAGMA schema_version").fetchone()[0]
+        fingerprints = reader.execute(
+            "SELECT key, value FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%' ORDER BY key").fetchall()
+        assert fingerprints and all(value == str(cookie) for _, value in fingerprints), {
+            "schema_cookie": cookie, "fingerprints": fingerprints}
+        stores = reader.execute(
+            "SELECT singletonKey, storeID, formatVersion FROM EngramOperationStoreV1").fetchall()
+        assert len(stores) == 1 and stores[0][0] == "local-operation-store" and stores[0][2] == 1, stores
+        receipts = reader.execute("SELECT COUNT(*) FROM EngramOperationReceiptV1").fetchone()[0]
+        assert receipts == 0, "Fixture must contain no operation receipts"
+    return {"schema_cookie": cookie, "fingerprints": fingerprints, "stores": stores,
+            "operation_receipts": receipts}
+
+
+def assert_retained_writer(writer, db):
+    assert writer.in_transaction, "Independent writer transaction was released"
+    # A second connection confirms real SQLite writer exclusion, not just the
+    # Python connection's transaction flag. Neither connection changes rows.
+    with closing(sqlite3.connect(db, timeout=0)) as contender:
+        try:
+            contender.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as error:
+            assert "locked" in str(error).lower(), error
+        else:
+            contender.rollback()
+            raise AssertionError("Independent writer no longer excludes another writer")
+
+
+def reopen_registered_fixture(binary, db, expected_scope, *, environment, cwd, deadline,
+                              require_open_logs=None):
+    # The first vector insert can create vec0 tables/triggers AFTER startup
+    # stamped its schema fingerprints. One unlocked native reopen lets Core
+    # validate/register that real schema before the warm contention baseline.
+    # Never stamp markers ourselves or accept stale fingerprints under lock.
+    client = Client(binary, db, environment=environment, cwd=cwd, deadline=deadline)
+    closed = False
+    try:
+        client.initialize(protocol_version="2025-11-25")
+        assert operation_scope(client) == expected_scope, "Fixture reopen changed store/principal scope"
+        if require_open_logs is not None:
+            require_open_logs(client)
+        client.close(require_clean=True)
+        closed = True
+        return client.process.pid
+    finally:
+        if not closed:
+            client.close()
+
+
+def run_warm_startup(binary):
+    configured_tmp = os.environ.get("TMPDIR")
+    assert configured_tmp and Path(configured_tmp).is_dir(), "warm-startup requires an existing owned TMPDIR"
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="engram-mcp-warm-startup-", dir=configured_tmp) as directory:
+        root = Path(directory).resolve()
+        db = root / "memory.sqlite"
+        for path in (root / "home", root / "home/.codex", root / "tmp"):
+            path.mkdir(parents=True, exist_ok=True)
+        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C",
+               "HOME": str(root / "home"), "CFFIXED_USER_HOME": str(root / "home"),
+               "CODEX_HOME": str(root / "home/.codex"), "TMPDIR": str(root / "tmp") + "/"}
+        client = None
+        cases = []
+        token = uuid.uuid4().hex
+        content = f"Warm startup keeper {token}: retain this exact identity and content under an independent writer."
+        try:
+            # A real initial process registers the complete production schema
+            # and initializes the store. The remember also exercises normal
+            # model readiness before any lock is acquired.
+            client = Client(binary, db, environment=env, cwd=root, deadline=started + 60)
+            client.initialize(protocol_version="2025-11-25")
+            identity = remembered_id(client.call("remember", {
+                "content": content, "project": "WarmStartupRegression", "force": True}, timeout=60))
+            expected_scope = operation_scope(client)
+            client.close(require_clean=True)
+            warm_pid = client.process.pid
+            client = None
+            assert persisted_memories(db) == {identity: content}
+            reopen_pid = reopen_registered_fixture(binary, db, expected_scope,
+                environment=env, cwd=root, deadline=started + 60)
+            expected_store = initialized_store_snapshot(db)
+            assert expected_store["stores"][0][1] == expected_scope["storeID"].lower()
+            assert persisted_memories(db) == {identity: content}
+
+            for slot_count in (0, 1):
+                # The synthetic slot triggers Core's non-fatal sync-state
+                # healing admission on reopen. No schema change is made, and
+                # no pending sync work or production configuration is used.
+                with closing(sqlite3.connect(db, timeout=1)) as setup:
+                    assert setup.execute("SELECT COUNT(*) FROM _lattice_replication_slots").fetchone()[0] == 0
+                    if slot_count:
+                        setup.execute("INSERT INTO _lattice_replication_slots(sync_id) VALUES (?)",
+                                      ("warm-startup-regression-" + token,))
+                        setup.commit()
+                assert initialized_store_snapshot(db) == expected_store
+
+                with closing(sqlite3.connect(db, timeout=1)) as writer:
+                    writer.execute("BEGIN IMMEDIATE")
+                    try:
+                        assert_retained_writer(writer, db)
+                        attempt_started = time.monotonic()
+                        # Match the production operation probe: a single 10s
+                        # budget covers launch, initialize and scope. Cleanup
+                        # retains the independent lock and has its own bound.
+                        client = Client(binary, db, environment=env, cwd=root,
+                                        deadline=attempt_started + 10)
+                        initialize_seconds = client.initialize(protocol_version="2025-11-25")
+                        assert operation_scope(client) == expected_scope, "Store/principal scope changed"
+                        protocol_seconds = time.monotonic() - attempt_started
+                        assert protocol_seconds < 10, "Warm startup exceeded production probe budget"
+                        assert_retained_writer(writer, db)
+                        assert initialized_store_snapshot(db) == expected_store
+                        assert persisted_memories(db) == {identity: content}
+                        client.close(require_clean=True)
+                        assert_retained_writer(writer, db)
+                        cases.append({"replication_slots": slot_count,
+                                      "initialize_seconds": initialize_seconds,
+                                      "protocol_seconds": round(protocol_seconds, 3),
+                                      "pid": client.process.pid, "clean_exit": client.process.returncode,
+                                      "writer_retained_through_scope_and_shutdown": True})
+                        client = None
+                    finally:
+                        # Reap an owned child before releasing the lock even
+                        # when an assertion/deadline fails.
+                        if client is not None:
+                            client.close()
+                            client = None
+                        writer.rollback()
+                assert initialized_store_snapshot(db) == expected_store
+                assert persisted_memories(db) == {identity: content}
+            assert len({warm_pid, reopen_pid, *(case["pid"] for case in cases)}) == 4
+            print(json.dumps({"case": "warm-startup", "passed": True,
+                              "seconds": round(time.monotonic() - started, 3),
+                              "full_model_registry": True, "scope_unchanged": True,
+                              "store_and_fingerprints_unchanged": True,
+                              "warmup_pid": warm_pid, "schema_reopen_pid": reopen_pid,
+                              "cases": cases}), flush=True)
+        finally:
+            if client is not None:
+                client.close()
+
+
+def optional_store_snapshot(db, expected_tables):
+    # Schema was established by the actual CLI's optional-store branch. Never
+    # open an optional store through a local-ledger model registration fixture.
+    with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=1)) as reader:
+        tables = {row[0] for row in reader.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert expected_tables <= tables, expected_tables - tables
+        assert not {"EngramOperationStoreV1", "EngramOperationReceiptV1"} & tables, tables
+        cookie = reader.execute("PRAGMA schema_version").fetchone()[0]
+        fingerprints = reader.execute(
+            "SELECT key, value FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%' ORDER BY key").fetchall()
+        assert fingerprints and all(value == str(cookie) for _, value in fingerprints), {
+            "schema_cookie": cookie, "fingerprints": fingerprints}
+    return {"tables": sorted(tables), "schema_cookie": cookie, "fingerprints": fingerprints}
+
+
+def require_optional_open_logs(client, synced, groups):
+    # Startup logs prove that the CLI entered each optional store successfully;
+    # local operation_scope cannot prove optional-store read visibility.
+    messages = [f"Synced database at {synced}"]
+    messages += [f"Group spoke {identity} at {path}" for identity, path in groups]
+    client.pump(0)
+    for message in messages:
+        assert any(line.endswith(message) for line in client.stderr), f"Missing optional-open receipt: {message}"
+
+
+def run_warm_multistore_startup(binary):
+    configured_tmp = os.environ.get("TMPDIR")
+    assert configured_tmp and Path(configured_tmp).is_dir(), "warm-multistore-startup requires an existing owned TMPDIR"
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="engram-mcp-warm-multistore-", dir=configured_tmp) as directory:
+        root = Path(directory).resolve()
+        db = root / "memory.sqlite"
+        for path in (root / "home", root / "home/.codex", root / "tmp", root / "sync"):
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        synced = root / "sync/memory-synced.sqlite"
+        groups = [(str(uuid.uuid4()).upper(), None) for _ in range(2)]
+        groups = [(identity, root / "sync" / f"group-{identity}.sqlite") for identity, _ in groups]
+        optional = [(synced, {"Memory", "Edge", "SyncConfig"})]
+        optional += [(path, {"Memory", "Edge", "GroupProjectMap"}) for _, path in groups]
+        for path, _ in optional:
+            # Existence activates CLI discovery. Only the real executable may
+            # establish schema; these new exclusive regular files are empty.
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            os.close(descriptor)
+            assert path.stat().st_size == 0
+        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C",
+               "HOME": str(root / "home"), "CFFIXED_USER_HOME": str(root / "home"),
+               "CODEX_HOME": str(root / "home/.codex"), "TMPDIR": str(root / "tmp") + "/"}
+        token = uuid.uuid4().hex
+        content = f"Multi-store startup keeper {token}: retain this local identity under independent writers on every store."
+        stores = [db, synced, *(path for _, path in groups)]
+        client = None
+        try:
+            client = Client(binary, db, environment=env, cwd=root, deadline=started + 60)
+            client.initialize(protocol_version="2025-11-25")
+            identity = remembered_id(client.call("remember", {
+                "content": content, "project": "WarmMultistoreStartupRegression", "force": True}, timeout=60))
+            expected_scope = operation_scope(client)
+            require_optional_open_logs(client, synced, groups)
+            client.close(require_clean=True)
+            warm_pid = client.process.pid
+            client = None
+            assert persisted_memories(db) == {identity: content}
+            reopen_pid = reopen_registered_fixture(binary, db, expected_scope,
+                environment=env, cwd=root, deadline=started + 60,
+                require_open_logs=lambda opened: require_optional_open_logs(opened, synced, groups))
+            expected_local = initialized_store_snapshot(db)
+            assert expected_local["stores"][0][1] == expected_scope["storeID"].lower()
+            expected_optional = {path: optional_store_snapshot(path, tables) for path, tables in optional}
+            expected_memories = {path: persisted_memories(path) for path in stores}
+            assert expected_memories[db] == {identity: content}
+            assert all(expected_memories[path] == {} for path, _ in optional)
+
+            expected_slots = {}
+            for index, path in enumerate(stores):
+                with closing(sqlite3.connect(path, timeout=1)) as setup:
+                    assert setup.execute("SELECT COUNT(*) FROM _lattice_replication_slots").fetchone()[0] == 0
+                    slot = f"warm-multistore-regression-{token}-{index}"
+                    setup.execute("INSERT INTO _lattice_replication_slots(sync_id) VALUES (?)", (slot,))
+                    setup.commit()
+                    expected_slots[path] = setup.execute(
+                        "SELECT sync_id, confirmed_audit_id, last_active_at, upload_floor FROM _lattice_replication_slots").fetchall()
+
+            def assert_stores_unchanged():
+                assert initialized_store_snapshot(db) == expected_local
+                for path, tables in optional:
+                    assert optional_store_snapshot(path, tables) == expected_optional[path]
+                for path in stores:
+                    assert persisted_memories(path) == expected_memories[path]
+                    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)) as reader:
+                        assert reader.execute(
+                            "SELECT sync_id, confirmed_audit_id, last_active_at, upload_floor FROM _lattice_replication_slots").fetchall() == expected_slots[path]
+
+            assert_stores_unchanged()
+            # The stack owns all four writer connections. Cleanup/child join
+            # finishes before stack callbacks roll back any independent lock.
+            with ExitStack() as stack:
+                writers = []
+                for path in stores:
+                    writer = stack.enter_context(closing(sqlite3.connect(path, timeout=1)))
+                    writer.execute("BEGIN IMMEDIATE")
+                    stack.callback(writer.rollback)
+                    writers.append((writer, path))
+                    assert_retained_writer(writer, path)
+                try:
+                    attempt_started = time.monotonic()
+                    client = Client(binary, db, environment=env, cwd=root,
+                                    deadline=attempt_started + 10)
+                    initialize_seconds = client.initialize(protocol_version="2025-11-25")
+                    assert operation_scope(client) == expected_scope, "Local store/principal scope changed"
+                    protocol_seconds = time.monotonic() - attempt_started
+                    assert protocol_seconds < 10, "Multi-store startup exceeded production probe budget"
+                    require_optional_open_logs(client, synced, groups)
+                    for writer, path in writers:
+                        assert_retained_writer(writer, path)
+                    assert_stores_unchanged()
+                    client.close(require_clean=True)
+                    locked_pid = client.process.pid
+                    clean_exit = client.process.returncode
+                    client = None
+                    for writer, path in writers:
+                        assert_retained_writer(writer, path)
+                finally:
+                    if client is not None:
+                        client.close()
+                        client = None
+            assert_stores_unchanged()
+            assert len({warm_pid, reopen_pid, locked_pid}) == 3
+            print(json.dumps({"case": "warm-multistore-startup", "passed": True,
+                              "seconds": round(time.monotonic() - started, 3),
+                              "stores": 4, "group_stores": 2, "synthetic_replication_slots_per_store": 1,
+                              "initial_and_locked_optional_open_receipts": True,
+                              "optional_schema_fingerprints_unchanged": True,
+                              "optional_ledger_tables_absent": True,
+                              "local_scope_unchanged": True, "optional_read_visibility_verified": False,
+                              "writers_retained_through_scope_and_shutdown": True,
+                              "initialize_seconds": initialize_seconds,
+                              "protocol_seconds": round(protocol_seconds, 3),
+                              "warmup_pid": warm_pid, "schema_reopen_pid": reopen_pid,
+                              "locked_pid": locked_pid,
+                              "clean_exit": clean_exit}), flush=True)
+        finally:
+            if client is not None:
+                client.close()
 
 
 def run_persistence(binary):
@@ -299,6 +611,10 @@ def read_lock_holders(db):
 def run(binary, case):
     if case == "persistence":
         return run_persistence(binary)
+    if case == "warm-startup":
+        return run_warm_startup(binary)
+    if case == "warm-multistore-startup":
+        return run_warm_multistore_startup(binary)
     with tempfile.TemporaryDirectory(prefix="engram-mcp-locks-") as directory:
         db = Path(directory) / "memory.sqlite"
         client = Client(binary, db)
@@ -331,6 +647,17 @@ def run(binary, case):
             client.close(require_clean=True)
             client = None
             if case == "startup":
+                # Preserve the write-required startup refusal case. A fully
+                # bootstrapped store now correctly reopens without writer
+                # admission (covered separately by warm-startup). Only this
+                # disposable zero-receipt fixture loses its initial identity;
+                # all eight registered models/fingerprints remain intact.
+                with closing(sqlite3.connect(db, timeout=2)) as setup:
+                    assert setup.execute("SELECT COUNT(*) FROM EngramOperationReceiptV1").fetchone()[0] == 0
+                    assert setup.execute("SELECT COUNT(*) FROM EngramOperationStoreV1").fetchone()[0] == 1
+                    setup.execute("DELETE FROM EngramOperationStoreV1 WHERE singletonKey = 'local-operation-store'")
+                    setup.commit()
+                    assert setup.execute("SELECT COUNT(*) FROM EngramOperationStoreV1").fetchone()[0] == 0
                 with sqlite3.connect(db, timeout=2) as writer:
                     writer.execute("BEGIN IMMEDIATE")
                     client = Client(binary, db)
@@ -357,6 +684,6 @@ def run(binary, case):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--case", choices=["smoke", "idle", "recall", "startup", "persistence"], default="smoke")
+    parser.add_argument("--case", choices=["smoke", "idle", "recall", "startup", "warm-startup", "warm-multistore-startup", "persistence"], default="smoke")
     args = parser.parse_args()
     run(args.binary.resolve(), args.case)

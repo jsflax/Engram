@@ -1,0 +1,250 @@
+name: Native validation
+run-name: Native validation at ${{ github.event.pull_request.head.sha || github.sha }}
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    # Private dependency credentials must never enter a fork's workflow.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: macos-26
+    timeout-minutes: 240
+    env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out exact source under localdev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          task_root="$HOME/localdev/engram-native-validation-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$HOME/localdev"
+          mkdir -m 700 "$task_root"
+          mkdir -m 700 -p "$task_root"/{bin,scratch,cache,config,security,module-cache,tmp,evidence,fixtures,private,mirror,test-home}
+          {
+            echo "VALIDATION_ROOT=$task_root"
+            echo "TMPDIR=$task_root/tmp"
+            echo "CLANG_MODULE_CACHE_PATH=$task_root/module-cache"
+            echo "SWIFTPM_MODULECACHE_OVERRIDE=$task_root/module-cache"
+            echo "CFFIXED_USER_HOME=$task_root/test-home"
+            echo "ENGRAM_TEST_ROOT=$task_root/fixtures"
+            echo "ENGRAM_ADOPTION_TEST_ROOT=$task_root/fixtures"
+            echo "ENGRAM_MCP_TEST_TMPDIR=$task_root/fixtures"
+          } >> "$GITHUB_ENV"
+          gh auth setup-git
+          git init "$task_root/repo"
+          git -C "$task_root/repo" remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git -C "$task_root/repo" fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git -C "$task_root/repo" checkout --detach "$SOURCE_SHA"
+          test "$(git -C "$task_root/repo" rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C "$task_root/repo" diff --exit-code
+          cp "$task_root/repo/Package.resolved" "$task_root/private/Package.resolved"
+          cp "$task_root/repo/.swiftpm/configuration/mirrors.json" "$task_root/private/mirrors.json"
+          cat > "$task_root/bin/swift-validation" <<'SH'
+          #!/bin/bash
+          set -euo pipefail
+          command_name=$1
+          shift
+          exec swift "$command_name" --package-path "$VALIDATION_ROOT/repo" \
+            --scratch-path "$VALIDATION_ROOT/scratch" --cache-path "$VALIDATION_ROOT/cache" \
+            --config-path "$VALIDATION_ROOT/config" --security-path "$VALIDATION_ROOT/security" "$@"
+          SH
+          chmod 700 "$task_root/bin/swift-validation"
+          SOURCE_ROOT="$task_root" python3 -B - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['SOURCE_ROOT'])
+          repo = root / 'repo'
+          files = subprocess.check_output(['git', 'ls-files', '-z', 'Sources', 'Tests', 'scripts',
+              'Package.swift', 'Package.resolved', '.swiftpm/configuration/mirrors.json',
+              '.github/workflows/native-validation.yml'], cwd=repo).decode().split('\0')
+          hashes = {name: hashlib.sha256((repo / name).read_bytes()).hexdigest() for name in files if name}
+          (root / 'evidence/source-identity.json').write_text(json.dumps({
+              'source_sha': os.environ['SOURCE_SHA'], 'files_sha256': hashes,
+              'workflow': 'native-validation', 'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT']}, indent=2) + '\n')
+          PY
+
+      - name: Mirror identical Sparkle artifact from localhost
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VALIDATION_ROOT/repo"
+          artifact_url=https://github.com/sparkle-project/Sparkle/releases/download/2.8.1/Sparkle-for-Swift-Package-Manager.zip
+          curl -sSfL --connect-timeout 20 --max-time 180 \
+            -o "$VALIDATION_ROOT/mirror/Sparkle-for-Swift-Package-Manager.zip" "$artifact_url"
+          nohup python3 -B -m http.server 8765 --bind 127.0.0.1 --directory "$VALIDATION_ROOT/mirror" \
+            > "$VALIDATION_ROOT/private/mirror.log" 2>&1 &
+          echo "$!" > "$VALIDATION_ROOT/private/mirror.pid"
+          for attempt in 1 2 3 4 5; do
+            if curl -sSf --max-time 2 -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip; then break; fi
+            sleep 1
+          done
+          curl -sSf --max-time 5 -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip
+          "$VALIDATION_ROOT/bin/swift-validation" package config set-mirror \
+            --original "$artifact_url" \
+            --mirror http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip
+          python3 -B - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ['VALIDATION_ROOT'])
+          original = json.loads((root / 'private/mirrors.json').read_text())['object']
+          current = json.loads((root / 'repo/.swiftpm/configuration/mirrors.json').read_text())['object']
+          assert all(item in current for item in original), 'Checked-in SDK mirrors changed'
+          PY
+
+      - name: Resolve pinned dependencies (private read-only clone credential)
+        timeout-minutes: 30
+        env:
+          SWIFTLM_CLONE_TOKEN: ${{ secrets.SWIFTLM_CLONE_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SWIFTLM_CLONE_TOKEN" || { echo '::error::Read-only SwiftLM clone credential is unavailable'; exit 1; }
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${SWIFTLM_CLONE_TOKEN}@github.com/jsflax/SwiftLM.insteadOf"
+          export GIT_CONFIG_VALUE_0=https://github.com/jsflax/SwiftLM
+          # This log can contain a rewritten private URL. Never print or upload it.
+          for attempt in 1 2 3; do
+            if perl -e 'alarm(8*60); exec @ARGV' -- "$VALIDATION_ROOT/bin/swift-validation" \
+              package resolve --force-resolved-versions > "$VALIDATION_ROOT/private/resolve-${attempt}.log" 2>&1; then
+              cmp "$VALIDATION_ROOT/private/Package.resolved" "$VALIDATION_ROOT/repo/Package.resolved"
+              exit 0
+            fi
+            echo "::warning::Dependency resolution attempt $attempt failed; raw credential-bearing diagnostics retained privately"
+          done
+          exit 1
+
+      - name: Build native tests
+        timeout-minutes: 75
+        run: '"$VALIDATION_ROOT/bin/swift-validation" build --force-resolved-versions --disable-index-store --build-tests'
+
+      - name: Run full native release filter
+        timeout-minutes: 32
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VALIDATION_ROOT/repo"
+          python3 -B scripts/run_native_tests.py --diagnostics-dir "$VALIDATION_ROOT/evidence/native-tests" \
+            --timeout-seconds 1800 --silence-seconds 300 -- \
+            "$VALIDATION_ROOT/bin/swift-validation" test --force-resolved-versions --disable-index-store --skip-build \
+            --filter 'EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests|LockedSnapshotTests' \
+            --skip PerfTests --skip keyBERTKeywordExtraction --skip recall_semanticRelevanceOrdering \
+            --skip recall_connectedMemory_showsEdgeRelation \
+            --skip recall_graphTraversal_relatesToDoesNotLeakViaUnrelatedStructuralEdge \
+            --skip recall_statementBudget --skip clusters_statementBudget
+
+      - name: Run both statement budgets in separate serial processes
+        timeout-minutes: 13
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VALIDATION_ROOT/repo"
+          for budget in recall_statementBudget clusters_statementBudget; do
+            python3 -B scripts/run_native_tests.py --diagnostics-dir "$VALIDATION_ROOT/evidence/$budget" \
+              --timeout-seconds 300 --silence-seconds 180 -- \
+              "$VALIDATION_ROOT/bin/swift-validation" test --force-resolved-versions --disable-index-store --skip-build --filter "$budget"
+          done
+
+      - name: Validate Python MCP harness fixtures
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VALIDATION_ROOT/repo"
+          python3 -B scripts/run_native_tests.py --diagnostics-dir "$VALIDATION_ROOT/evidence/mcp-harness-fixtures" \
+            --timeout-seconds 180 --silence-seconds 60 -- \
+            python3 -B -m unittest discover -s scripts -p test_mcp_locks.py
+
+      - name: Build release Engram native product
+        timeout-minutes: 75
+        run: '"$VALIDATION_ROOT/bin/swift-validation" build --force-resolved-versions --disable-index-store -c release --product Engram'
+
+      - name: Verify actual native MCP lifecycle and contention cases
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VALIDATION_ROOT/repo"
+          native_binary="$VALIDATION_ROOT/scratch/release/Engram"
+          test -x "$native_binary"
+          status=0
+          for regression in smoke startup warm-startup warm-multistore-startup recall idle persistence; do
+            python3 -B scripts/run_native_tests.py --diagnostics-dir "$VALIDATION_ROOT/evidence/mcp-$regression" \
+              --timeout-seconds 180 --silence-seconds 90 -- \
+              python3 -B scripts/verify-mcp-locks.py --binary "$native_binary" --case "$regression" || status=1
+          done
+          exit "$status"
+
+      - name: Record source and dependency integrity
+        if: ${{ always() && env.VALIDATION_ROOT != '' }}
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['VALIDATION_ROOT'])
+          repo = root / 'repo'
+          def sha(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+          def git(path, *args):
+              result = subprocess.run(['git', '-C', str(path), *args], capture_output=True, text=True)
+              return result.stdout.strip() if result.returncode == 0 else None
+          lock = repo / 'Package.resolved'
+          original = root / 'private/Package.resolved'
+          unchanged = lock.is_file() and original.is_file() and lock.read_bytes() == original.read_bytes()
+          pins = {pin['identity'].lower(): pin['state']['revision']
+                  for pin in json.loads(original.read_text())['pins']} if original.is_file() else {}
+          checks = []
+          checkouts = root / 'scratch/checkouts'
+          if checkouts.is_dir():
+              for path in sorted(checkouts.iterdir()):
+                  if path.is_dir():
+                      head = git(path, 'rev-parse', 'HEAD')
+                      expected = pins.get(path.name.lower())
+                      checks.append({'name': path.name, 'head': head, 'expected_revision': expected,
+                          'matches_pin': expected is not None and head == expected,
+                          'tree': git(path, 'rev-parse', 'HEAD^{tree}')})
+          dependencies_match = bool(pins) and {item['name'].lower() for item in checks} == set(pins) and all(
+              item['matches_pin'] for item in checks)
+          original_mirror = root / 'private/mirrors.json'
+          current_mirror = repo / '.swiftpm/configuration/mirrors.json'
+          mirrors_preserved = original_mirror.is_file() and current_mirror.is_file() and all(
+              item in json.loads(current_mirror.read_text())['object']
+              for item in json.loads(original_mirror.read_text())['object'])
+          source_receipt = root / 'evidence/source-identity.json'
+          source_unchanged = source_receipt.is_file() and all(
+              name == '.swiftpm/configuration/mirrors.json' or sha(repo / name) == digest
+              for name, digest in json.loads(source_receipt.read_text())['files_sha256'].items())
+          receipt = {'source_sha': os.environ['SOURCE_SHA'], 'checked_out_head': git(repo, 'rev-parse', 'HEAD'),
+              'package_resolved_sha256': sha(lock), 'package_resolved_unchanged': unchanged,
+              'source_files_unchanged': source_unchanged, 'dependency_pins_match': dependencies_match,
+              'checked_in_sdk_mirrors_preserved': mirrors_preserved, 'dependency_checkouts': checks,
+              'release_native_sha256': sha(root / 'scratch/release/Engram')}
+          (root / 'evidence/dependency-integrity.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          assert receipt['checked_out_head'] == os.environ['SOURCE_SHA'], 'Source checkout identity changed'
+          assert source_unchanged and unchanged and mirrors_preserved, 'Source or pinned dependency configuration changed'
+          assert dependencies_match, 'Resolved checkout revisions do not match every dependency pin'
+          PY
+
+      - name: Upload explicit validation evidence
+        if: ${{ always() && env.VALIDATION_ROOT != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.VALIDATION_ROOT }}/evidence/
+            ${{ env.VALIDATION_ROOT }}/fixtures/
+          if-no-files-found: warn
+          retention-days: 7

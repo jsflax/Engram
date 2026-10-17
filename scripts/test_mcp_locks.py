@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -56,7 +57,7 @@ class PersistenceHarnessTests(unittest.TestCase):
             with self.subTest(result=result), self.assertRaises(AssertionError):
                 HARNESS.assert_failed_write({"jsonrpc": "2.0", "id": 1, "result": result})
 
-    def fake_binary(self, directory, dishonest=False):
+    def fake_binary(self, directory, dishonest=False, scope=None):
         # A small Python JSON-RPC fixture backed by its disposable SQLite DB.
         # This verifies the harness's process/reopen/lock logic, not Engram.
         program = textwrap.dedent('''\
@@ -88,16 +89,80 @@ class PersistenceHarnessTests(unittest.TestCase):
                                 result = {"content": [{"type": "text", "text": "Stored memory (id: " + identity + ", project: Test): " + args["content"]}]}
                             else:
                                 result = {"isError": True, "content": [{"type": "text", "text": str(exc)}]}
+                    elif params["name"] == "operation_scope":
+                        payload = {"engram_operation": {"version": 1, "kind": "scope",
+                            "capability": "localMutationOperationsV1", "scope": SCOPE}}
+                        result = {"content": [{"type": "text", "text": json.dumps(payload)}],
+                                  "structuredContent": payload}
                     else:
                         rows = db.execute("SELECT globalId, content FROM Memory").fetchall()
                         result = {"content": [{"type": "text", "text": "\\n\\n".join("[id:" + identity + "] [Test/general] (distance: 0.100) " + content for identity, content in rows)}]}
                 print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
             db.close()
-        ''').replace("DISHONEST", repr(dishonest))
+        ''').replace("DISHONEST", repr(dishonest)).replace("SCOPE", repr(scope))
         binary = Path(directory) / "fake-mcp"
         binary.write_text("#!" + sys.executable + "\n" + program)
         binary.chmod(0o700)
         return binary
+
+    def test_unlocked_reopen_preserves_scope_deadline_and_reaps_process(self):
+        scope = {"version": 1, "storeID": ID, "principal": {"kind": "anonymous", "groupIds": [], "scopes": []}}
+        with self.temporary_directory() as directory:
+            binary = self.fake_binary(directory, scope=scope)
+            clients, receipts = [], []
+            original_client = HARNESS.Client
+            deadline = time.monotonic() + 5
+            def capture(*args, **kwargs):
+                client = original_client(*args, **kwargs)
+                clients.append(client)
+                return client
+            with patch.object(HARNESS, "Client", side_effect=capture):
+                pid = HARNESS.reopen_registered_fixture(binary, Path(directory) / "fixture.sqlite", scope,
+                    environment={}, cwd=directory, deadline=deadline,
+                    require_open_logs=lambda client: receipts.append(client.process.poll()))
+            self.assertEqual(clients[0].deadline, deadline)
+            self.assertEqual(clients[0].process.returncode, 0)
+            self.assertEqual(receipts, [None])
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_unlocked_reopen_rejects_changed_scope_and_still_reaps(self):
+        scope = {"version": 1, "storeID": ID, "principal": {"kind": "anonymous", "groupIds": [], "scopes": []}}
+        changed = dict(scope, storeID="00000000-0000-0000-0000-000000000001")
+        with self.temporary_directory() as directory:
+            binary = self.fake_binary(directory, scope=changed)
+            clients = []
+            original_client = HARNESS.Client
+            def capture(*args, **kwargs):
+                client = original_client(*args, **kwargs)
+                clients.append(client)
+                return client
+            with patch.object(HARNESS, "Client", side_effect=capture):
+                with self.assertRaisesRegex(AssertionError, "changed store/principal scope"):
+                    HARNESS.reopen_registered_fixture(binary, Path(directory) / "fixture.sqlite", scope,
+                        environment={}, cwd=directory, deadline=time.monotonic() + 5)
+            self.assertEqual(clients[0].process.returncode, 0)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(clients[0].process.pid, 0)
+
+    def test_schema_snapshot_still_refuses_fingerprints_staled_by_post_open_ddl(self):
+        with self.temporary_directory() as directory:
+            path = (Path(directory) / "fixture.sqlite").resolve()
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                for name in ("Memory", "Edge", "Checkpoint", "HookState", "SessionState", "SyncConfig", "EngramOperationReceiptV1"):
+                    db.execute(f"CREATE TABLE {name}(id INTEGER)")
+                db.execute("CREATE TABLE EngramOperationStoreV1(singletonKey TEXT, storeID TEXT, formatVersion INTEGER)")
+                db.execute("INSERT INTO EngramOperationStoreV1 VALUES ('local-operation-store', ?, 1)", (ID.lower(),))
+                db.execute("CREATE TABLE _lattice_meta(key TEXT, value TEXT)")
+                original_cookie = db.execute("PRAGMA schema_version").fetchone()[0]
+                db.execute("INSERT INTO _lattice_meta VALUES ('schema_fingerprint:fixture', ?)", (str(original_cookie),))
+                db.commit()
+                self.assertEqual(HARNESS.initialized_store_snapshot(path)["schema_cookie"], original_cookie)
+                db.execute("CREATE TABLE post_open_vector_fixture(id INTEGER)")
+                db.commit()
+                with self.assertRaisesRegex(AssertionError, "schema_cookie"):
+                    HARNESS.initialized_store_snapshot(path)
+                self.assertEqual(db.execute("SELECT value FROM _lattice_meta").fetchone()[0], str(original_cookie))
 
     def fixture_run(self, dishonest=False):
         with self.temporary_directory() as directory:

@@ -23,11 +23,17 @@ public struct MemoryOperationLedger {
 
     public init(lattice: Lattice) { self.lattice = lattice }
 
-    /// Bootstrap only after safe registration. Concurrent first writers are
-    /// serialized by checked BEGIN IMMEDIATE. The identity is never replaced.
+    /// Bootstrap only after safe registration. An existing identity needs only
+    /// a checked read; concurrent first writers are serialized by checked
+    /// BEGIN IMMEDIATE and re-read before creation. The identity is never replaced.
     @discardableResult public func bootstrapStoreID() throws -> UUID {
         try storageErrors {
-            try withBeginRetry {
+            // Preserve the writer-budget contract even when bootstrap can read
+            // the immutable identity without competing for SQLite's write lock.
+            let timeout = lattice.configuration.busyTimeoutMs
+            guard timeout > 0, timeout <= 2_000 else { throw MemoryOperationError.storageUnavailable }
+            if let id = try readStoreID() { return id }
+            return try withBeginRetry {
                 if let id = try readStoreID() { return id }
                 let query = lattice.objects(EngramOperationReceiptV1.self)
                 query.refresh()
@@ -120,16 +126,15 @@ public struct MemoryOperationLedger {
     }
 
     private func readStoreID() throws -> UUID? {
-        let query = lattice.objects(EngramOperationStoreV1.self)
-        // Typed Results may retain an older MVCC generation across calls.
-        // Ledger status/lookup must consult the current committed head even
-        // before cross-process invalidation arrives. Within our transaction,
-        // snapshot still uses Lattice's explicit writer-connection path.
-        query.refresh()
-        let rows = query.snapshot(limit: 2)
+        // The eager query seals this read's error independently of an earlier
+        // failed BEGIN. A generation-backed empty snapshot can retain that
+        // earlier thread-local error. The owning Lattice routes this eager
+        // read through its writer when the current thread is in a transaction.
+        let rows = lattice.dynamicObjects(EngramOperationStoreV1.entityName).snapshot(limit: 2)
         try checkQuery()
         guard rows.count <= 1 else { throw MemoryOperationError.storageUnavailable }
-        guard let row = rows.first else { return nil }
+        guard let image = rows.first else { return nil }
+        let row = EngramOperationStoreV1(image.backend)
         // snapshot() hydrates every scalar but live model accessors otherwise
         // re-query per field. Read the one checked row image consistently.
         row.materialize()
