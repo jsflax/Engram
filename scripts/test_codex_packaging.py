@@ -21,7 +21,9 @@ class CodexPackagingTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="engram install test ")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        # macOS temporary roots may traverse /var -> /private/var. The health
+        # reader rejects symlink ancestors, so give it the real fixture path.
+        self.root = Path(self.temporary.name).resolve(strict=True)
         self.home = self.root / "home"
         self.home.mkdir()
         self.codex_home = self.home / "custom codex"
@@ -171,7 +173,10 @@ for binary in Engram EngramHooks EngramDaemon; do echo local-build > ".build/rel
                                  "--session-id", "11111111-2222-4333-8444-555555555555"],
                                 cwd=self.root, env=self.env, text=True, capture_output=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["learner"]["health"]["schema_version"], 1)
+        status = json.loads(result.stdout)
+        self.assertEqual(status.get("status"), "ok", status)
+        self.assertIn("learner", status)
+        self.assertEqual(status["learner"]["health"]["schema_version"], 1, status)
         self.assertFalse(any("test_" in p or "__pycache__" in p for p in files), files)
 
     def test_packaged_install_registers_memory_and_preserves_user_settings(self):
