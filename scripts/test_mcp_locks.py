@@ -230,6 +230,51 @@ class PersistenceHarnessTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "")
         client.close.assert_called_once()
 
+    def test_failure_diagnostics_collect_logs_through_fixture_path_alias(self):
+        with self.temporary_directory() as directory:
+            actual = Path(directory) / "actual"
+            log_dir = actual / "home/.claude/memory-logs"
+            log_dir.mkdir(parents=True)
+            (actual / "memory.sqlite").write_bytes(b"synthetic fixture")
+            (log_dir / "lattice-mcp-fixture.log").write_text("owned native detail")
+            alias = Path(directory) / "alias"
+            alias.symlink_to(actual, target_is_directory=True)
+            with contextlib.redirect_stderr(io.StringIO()) as output:
+                with self.assertRaisesRegex(ValueError, "original failure"):
+                    try:
+                        raise ValueError("original failure")
+                    finally:
+                        HARNESS.close_warm_fixture(None, alias, "warm-startup", "seed_remember")
+            record = json.loads(output.getvalue())
+            self.assertEqual(record["error"], "original failure")
+            self.assertEqual(record["fixture_files"], [{"name": "memory.sqlite", "bytes": 17}])
+            self.assertEqual(record["native_log_tails"], [{"name": "lattice-mcp-fixture.log",
+                             "bytes": 19, "tail": "owned native detail"}])
+            self.assertNotIn("diagnostic_error", record)
+
+    def test_failure_diagnostics_reject_log_directory_outside_aliased_fixture(self):
+        with self.temporary_directory() as directory:
+            actual = Path(directory) / "actual"
+            log_dir = actual / "home/.claude/memory-logs"
+            log_dir.parent.mkdir(parents=True)
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            (outside / "lattice-mcp-unrelated.log").write_text("must not collect this unrelated log")
+            log_dir.symlink_to(outside, target_is_directory=True)
+            alias = Path(directory) / "alias"
+            alias.symlink_to(actual, target_is_directory=True)
+            with contextlib.redirect_stderr(io.StringIO()) as output:
+                with self.assertRaisesRegex(ValueError, "original failure"):
+                    try:
+                        raise ValueError("original failure")
+                    finally:
+                        HARNESS.close_warm_fixture(None, alias, "warm-startup", "seed_remember")
+            record = json.loads(output.getvalue())
+            self.assertEqual(record["error"], "original failure")
+            self.assertEqual(record["native_log_tails"], [])
+            self.assertNotIn("must not collect", output.getvalue())
+            self.assertNotIn("diagnostic_error", record)
+
     def test_failure_diagnostics_skip_fifo_without_waiting_for_a_writer(self):
         with self.temporary_directory() as directory:
             root = Path(directory)

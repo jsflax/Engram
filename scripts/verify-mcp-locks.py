@@ -188,7 +188,9 @@ def close_warm_fixture(client, root, case, phase):
                     if path.exists() and not path.is_symlink():
                         record["fixture_files"].append({"name": path.name, "bytes": path.stat().st_size})
                 log_dir = root / "home/.claude/memory-logs"
-                if log_dir.resolve().is_relative_to(root) and log_dir.is_dir():
+                # Both sides must use the same path identity (e.g. macOS
+                # /var and /private/var temporary-directory aliases).
+                if log_dir.resolve().is_relative_to(root.resolve()) and log_dir.is_dir():
                     for index, path in enumerate(log_dir.glob("lattice-mcp-*.log")):
                         if index == 4:
                             break
