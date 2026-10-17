@@ -9,6 +9,9 @@ All notable changes to Engram are documented in this file.
 ## [0.15.1] - 2026-10-17
 
 ### Fixed
+- Resume reviewed V1-to-V2 learner migrations of up to 192 sessions in bounded,
+  verified steps. Preserve holds and exact plans across migration and release,
+  with explicit progress receipts and unchanged admission checks.
 - Support explicitly reviewed recovery of an expired replacement update followed
   by a verified pre-transaction no-write remember. Preserve the original row and
   lifetime, require complete transcript coverage, and perform no memory writes.

@@ -911,7 +911,7 @@ class Bound64Tests(unittest.TestCase):
         return sorted(selected)
 
     def test_exact_64_healthy_tasks_prepare_without_mutation_or_changed_other_bounds(self):
-        self.assertEqual(M.MAX_SELECTED, 64)
+        self.assertEqual(M.MAX_SELECTED, 192)
         self.assertEqual(M.MAX_IMPACT_TASKS, 500)
         self.assertEqual(M.MAX_PLAN_BYTES, 32 * 1024 * 1024)
         selected = self.cohort()
@@ -954,20 +954,19 @@ class Bound64Tests(unittest.TestCase):
                 found_unpaused |= after.get("paused_request_id") != after["request_id"]
         self.assertTrue(found_gate and found_paused and found_unpaused and found_event_bridge)
 
-    def test_65_explicit_selected_tasks_refuse_before_mutation(self):
-        selected = self.cohort()
-        selected.append(self.fixture.task(65, cursor=False, pending=False))
+    def test_193_explicit_selected_tasks_refuse_before_mutation(self):
+        selected = [F.uuid7(F.ORIGIN, suffix=n) for n in range(1, 194)]
         before = self.snapshot()
         with self.assertRaisesRegex(ValueError, "invalid_selection"):
             self.prepare(selected)
         self.assertEqual(before, self.snapshot())
         self.assertFalse((self.root / "migrations").exists())
 
-    def test_65_healthy_tasks_cannot_fit_by_omitting_one_from_64_selection(self):
+    def test_65_healthy_tasks_still_cannot_omit_one_from_64_selection(self):
         selected = self.cohort()
         self.fixture.task(65, cursor=False, pending=False)
         before = self.snapshot()
-        with self.assertRaisesRegex(ValueError, "impact_healthy_cohort_limit_exceeded"):
+        with self.assertRaisesRegex(ValueError, "impact_healthy_cohort_not_selected"):
             self.prepare(selected)
         self.assertEqual(before, self.snapshot())
 
@@ -975,7 +974,7 @@ class Bound64Tests(unittest.TestCase):
         selected = self.cohort()
         plan = self.prepare(selected)
         self.fixture.task(65, cursor=False, pending=False)
-        self.unchanged_refusal(plan, "impact_healthy_cohort_limit_exceeded")
+        self.unchanged_refusal(plan, "impact_healthy_cohort_changed")
         self.assertEqual(plan["session_ids"], selected)
 
     def test_new_membership_within_health_bound_still_refuses_exact_64_selection(self):
@@ -1278,6 +1277,382 @@ class PublicationPlanIntegrityTests(unittest.TestCase):
         self.assertEqual(publication.call_count, 5)  # Four task records, then the route.
         self.assertEqual([call.kwargs["candidate_task_ids"] for call in publication.call_args_list],
                          [(self.sid,)] * 4 + [()])
+
+
+class PinnedCLIPlanTests(unittest.TestCase):
+    setUp = MigrationTests.setUp
+    prepare = MigrationTests.prepare
+
+    def pinned(self, plan):
+        raw = M.encode(plan)
+        return M._PinnedPlan(raw, M.digest(raw))
+
+    def test_cli_owned_inputs_have_no_mutable_nested_aliases(self):
+        plan = self.prepare()
+        pinned = self.pinned(plan)
+        raw = M.encode(pinned)
+        plan["records"][0]["candidate"] = "changed original caller"
+        self.assertEqual(M.encode(pinned), raw)
+        with self.assertRaises(TypeError):
+            pinned["records"][0]["candidate"] = "changed"
+        with self.assertRaises(AttributeError):
+            pinned["session_ids"].append("changed")
+        with self.assertRaises(TypeError):
+            pinned["records"][0]["preimage_identity"]["inode"] = 0
+        with self.assertRaises(TypeError):
+            pinned["records"][0]["candidate"].decoded = b"changed"
+        with self.assertRaises(TypeError):
+            pinned.canonical_bytes = b"changed"
+        with self.assertRaises(TypeError):
+            pinned.__init__(raw, M.digest(raw))
+        self.assertFalse(hasattr(pinned, "__dict__"))
+
+    def test_expected_images_and_nested_canonical_bytes_match_original(self):
+        plan = self.prepare()
+        pinned = self.pinned(plan)
+        self.assertEqual(pinned, plan)
+        self.assertEqual(M.encode(pinned), M.encode(plan))
+        for key in ("records", "activation_impact", "runtime_sha256", "legacy_policy"):
+            self.assertEqual(M.encode(pinned[key]), M.encode(plan[key]))
+        for before, after in zip(plan["records"], pinned["records"]):
+            self.assertEqual(M._unb64(before["candidate"]), M._unb64(after["candidate"]))
+            self.assertEqual(M._unb64(before["preimage"]), M._unb64(after["preimage"]))
+
+    def test_pinned_cli_completes_and_releases_using_existing_contract(self):
+        plan = self.prepare()
+        plan_path = self.base / "plan.json"
+        F.write_json(plan_path, plan)
+        plan_path.write_bytes(M.encode(plan))
+        sha = M.digest(plan_path.read_bytes())
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(M.main(["apply", "--state-dir", str(self.root),
+                                     "--plan", str(plan_path), "--plan-sha256", sha]), 0, output.call_args)
+        pinned = M._load_plan(plan_path, sha)
+        release = M.prepare_release(self.root, pinned, sha, [self.sid])
+        release_raw = M.encode(release)
+        release_path = self.base / "release.json"
+        release_path.write_bytes(release_raw); release_path.chmod(0o600)
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(M.main(["release", "--state-dir", str(self.root),
+                                     "--plan", str(plan_path), "--plan-sha256", sha,
+                                     "--release-plan", str(release_path),
+                                     "--release-sha256", M.digest(release_raw)]), 0, output.call_args)
+        self.assertFalse((self.root / "migration-holds" / (self.sid + ".json")).exists())
+
+    def test_pinned_input_still_rejects_runtime_and_prior_record_drift(self):
+        plan = self.pinned(self.prepare())
+        sha = M.digest(M.encode(plan))
+        with mock.patch.object(M, "_runtime", return_value={"changed": "0" * 64}):
+            with self.assertRaisesRegex(ValueError, "runtime_changed"):
+                M.apply(self.root, plan, sha)
+        self.assertFalse((self.root / "migrations").exists())
+        original = M._event
+        def change(work, event, **fields):
+            original(work, event, **fields)
+            if event == "published" and fields["index"] == 0:
+                path = Path(plan["records"][0]["path"])
+                value = json.loads(path.read_bytes())
+                F.write_json(path, {**value, "changed": True})
+        with mock.patch.object(M, "_event", side_effect=change):
+            with self.assertRaisesRegex(ValueError, "cas_mismatch"):
+                M.apply(self.root, plan, sha)
+        self.assertFalse(json.loads((self.root / "admission.json").read_bytes())["enabled"])
+
+    def test_pinned_digest_validation_avoids_rehashing_owned_bytes(self):
+        plan = self.pinned(self.prepare())
+        with mock.patch.object(M, "digest", side_effect=AssertionError("unnecessary full-plan rehash")):
+            M._validate_plan_digest(plan, plan.sha256)
+        with self.assertRaisesRegex(ValueError, "plan_sha_mismatch"):
+            M._validate_plan_digest(plan, "0" * 64)
+
+
+class CooperativeProgressTests(unittest.TestCase):
+    """Real fixture publications stop only at verified durable boundaries."""
+    setUp = MigrationTests.setUp
+    prepare = MigrationTests.prepare
+    apply = MigrationTests.apply
+    snapshot = MigrationTests.snapshot
+    _advance_released_task = MigrationTests._advance_released_task
+
+    def budget(self, **caps):
+        budget = M._ProgressBudget(M.time.monotonic(), 10000)
+        budget.CAPS = {"hold": 1000, "record": 1000, "release": 1000, **caps}
+        return budget
+
+    def progress_run(self, plan, *, recovery=False, **caps):
+        return M._run(self.root, plan, M.digest(M.encode(plan)), recovery=recovery,
+                      progress=self.budget(**caps))
+
+    def test_all_holds_precede_every_record_across_multiple_commands(self):
+        ids = [self.sid, self.fixture.task(2), self.fixture.task(3)]
+        plan = self.prepare(ids)
+        sha = M.digest(M.encode(plan))
+        first = self.progress_run(plan, hold=1)
+        self.assertEqual((first["status"], first["phase"], first["verified_hold_count"]),
+                         ("migration_in_progress_held", "holds", 1))
+        self.assertEqual(first["verified_published_record_count"], 0)
+        self.assertEqual(first["new_publications"], 1)
+        for record in plan["records"][:-1]:
+            self.assertEqual(Path(record["path"]).read_bytes(), M._unb64(record["preimage"]))
+        second = self.progress_run(plan, recovery=True, hold=1)
+        self.assertEqual((second["phase"], second["verified_hold_count"]), ("holds", 2))
+        seen = []
+        publish = M._publish
+        def checked(record, work, index):
+            if isinstance(index, int):
+                self.assertTrue(all(Path(p).read_bytes() == M._hold(sid, sha)
+                                    for sid, p in zip(plan["session_ids"], plan["hold_paths"])))
+                seen.append(index)
+            return publish(record, work, index)
+        with mock.patch.object(M, "_publish", side_effect=checked):
+            third = self.progress_run(plan, recovery=True, hold=1, record=2)
+        self.assertEqual((third["phase"], third["verified_hold_count"], third["verified_published_record_count"]),
+                         ("records", 3, 2))
+        self.assertEqual(seen, [0, 1])
+        self.assertEqual(M.recover(self.root, plan, sha)["status"], "migration_complete_held")
+        self.assertEqual(M.digest(M.encode(plan)), sha)
+        self.assertTrue(all(Path(p).exists() for p in plan["hold_paths"]))
+
+    def test_record_progress_resumes_only_exact_plan_and_keeps_published_bytes(self):
+        plan = self.prepare()
+        sha = M.digest(M.encode(plan))
+        result = self.progress_run(plan, record=2)
+        self.assertEqual((result["phase"], result["verified_published_record_count"], result["remaining_record_count"]),
+                         ("records", 2, 3))
+        before = self.snapshot()
+        changed = json.loads(M.encode(plan)); changed["learner_started"] = True
+        with self.assertRaisesRegex(ValueError, "plan_sha_mismatch"):
+            M.recover(self.root, changed, sha)
+        self.assertEqual(self.snapshot(), before)
+        retained = {r["path"]: Path(r["path"]).read_bytes() for r in plan["records"][:2]}
+        self.assertEqual(M.recover(self.root, plan, sha)["status"], "migration_complete_held")
+        self.assertEqual(retained, {path: Path(path).read_bytes() for path in retained})
+
+    def test_finalization_stop_keeps_policy_suspended_then_runs_three_full_checks(self):
+        plan = self.prepare()
+        budget = self.budget()
+        with mock.patch.object(budget, "can_finalize", return_value=False):
+            result = M._run(self.root, plan, M.digest(M.encode(plan)), recovery=False, progress=budget)
+        self.assertEqual((result["phase"], result["remaining_record_count"]), ("final_validation", 0))
+        self.assertEqual((self.root / "admission.json").read_bytes(), M._unb64(plan["transitional_policy"]["candidate"]))
+        with mock.patch.object(M, "_validate_candidates", wraps=M._validate_candidates) as validate:
+            done = self.progress_run(plan, recovery=True)
+        self.assertEqual(done["status"], "migration_complete_held")
+        self.assertEqual([c.kwargs.get("candidate_task_ids") for c in validate.call_args_list], [None, None, None])
+        self.assertEqual((self.root / "admission.json").read_bytes(), M._unb64(plan["records"][-1]["candidate"]))
+
+    def test_resume_refuses_origin_or_runtime_drift_without_new_mutations(self):
+        plan = self.prepare()
+        self.progress_run(plan, record=1)
+        before = self.snapshot()
+        runtime = M._runtime()
+        with mock.patch.object(M, "_runtime", return_value={**runtime, "drift.py": "0" * 64}):
+            with self.assertRaisesRegex(ValueError, "runtime_changed"):
+                self.progress_run(plan, recovery=True)
+        self.assertEqual(self.snapshot(), before)
+        path = self.fixture.tasks[self.sid]["path"]
+        path.write_bytes(path.read_bytes().replace(b'"cli_version": "fixture"', b'"cli_version": "changed"'))
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "legacy_origin_changed"):
+            self.progress_run(plan, recovery=True)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_release_progress_keeps_same_intent_and_newer_sibling_state(self):
+        second, third = self.fixture.task(2), self.fixture.task(3)
+        plan = self.prepare([self.sid, second, third]); self.apply(plan)
+        sha = M.digest(M.encode(plan))
+        release = M.prepare_release(self.root, plan, sha, plan["session_ids"])
+        rsha = M.digest(M.encode(release))
+        first = M.release(self.root, plan, sha, release, rsha, _progress=self.budget(release=1))
+        self.assertEqual((first["status"], first["released_count"], first["new_publications"]),
+                         ("migration_release_in_progress", 1, 1))
+        newer = self._advance_released_task(self.sid, processing="newer-run", new_gate=True)
+        before = self.snapshot()
+        altered = json.loads(M.encode(release)); altered["session_ids"] = [third]
+        with self.assertRaisesRegex(ValueError, "release_sha_mismatch"):
+            M.release(self.root, plan, sha, altered, rsha, _progress=self.budget(release=1))
+        self.assertEqual(before, self.snapshot())
+        second_result = M.release(self.root, plan, sha, release, rsha, _progress=self.budget(release=1))
+        self.assertEqual((second_result["released_count"], second_result["new_publications"]), (2, 1))
+        last = M.release(self.root, plan, sha, release, rsha, _progress=self.budget(release=1))
+        self.assertEqual(last["status"], "selected_migration_holds_released")
+        self.assertEqual(newer, {n: p.read_bytes() if p.exists() else None for n, p in M._paths(self.root, self.sid).items()})
+        self.assertEqual(list((self.root / "migrations" / sha).glob("release-*.json")),
+                         [self.root / "migrations" / sha / ("release-" + rsha + ".json")])
+
+    def test_release_progress_refuses_newer_sibling_corruption(self):
+        second = self.fixture.task(2)
+        plan = self.prepare([self.sid, second]); self.apply(plan); sha = M.digest(M.encode(plan))
+        release = M.prepare_release(self.root, plan, sha, plan["session_ids"]); rsha = M.digest(M.encode(release))
+        M.release(self.root, plan, sha, release, rsha, _progress=self.budget(release=1))
+        self._advance_released_task(self.sid)
+        path = M._paths(self.root, self.sid)["sessions"]
+        state = json.loads(path.read_bytes()); state["offset"] = 1; F.write_json(path, state)
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "released_cursor_chain_invalid"):
+            M.release(self.root, plan, sha, release, rsha, _progress=self.budget(release=1))
+        self.assertEqual(before, self.snapshot())
+        self.assertTrue((self.root / "migration-holds" / (second + ".json")).exists())
+
+    def test_cli_exit_three_reports_verified_progress_and_exact_resume(self):
+        plan = self.prepare(); raw = M.encode(plan); sha = M.digest(raw)
+        path = self.base / "reviewed.json"; M._new(path, raw)
+        common = ["--state-dir", str(self.root), "--plan", str(path), "--plan-sha256", sha]
+        with mock.patch.object(M._ProgressBudget, "CAPS", {"hold": 64, "record": 1, "release": 8}), \
+                mock.patch("builtins.print") as output:
+            rc = M.main(["apply"] + common)
+        summary = json.loads(output.call_args.args[0])
+        self.assertEqual(rc, 3)
+        self.assertEqual(summary["status"], "migration_in_progress_held")
+        self.assertEqual(summary["plan_sha256"], sha)
+        self.assertEqual(summary["next_command"], "recover")
+        self.assertEqual(summary["verified_published_record_count"], 1)
+        self.assertEqual(summary["verified_hold_count"], 1)
+        self.assertFalse(summary["complete"])
+        self.assertFalse(summary["learner_started"])
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(M.main(["recover"] + common), 0)
+        self.assertEqual(json.loads(output.call_args.args[0])["status"], "migration_complete_held")
+        self.assertEqual(path.read_bytes(), raw)
+
+    def test_cli_release_exit_three_keeps_reviewed_release_sha(self):
+        second = self.fixture.task(2)
+        plan = self.prepare([self.sid, second]); self.apply(plan); raw = M.encode(plan); sha = M.digest(raw)
+        path = self.base / "reviewed.json"; M._new(path, raw)
+        release = M.prepare_release(self.root, plan, sha, plan["session_ids"]); release_raw = M.encode(release)
+        release_path = self.base / "release.json"; M._new(release_path, release_raw); rsha = M.digest(release_raw)
+        argv = ["release", "--state-dir", str(self.root), "--plan", str(path), "--plan-sha256", sha,
+                "--release-plan", str(release_path), "--release-sha256", rsha]
+        with mock.patch.object(M._ProgressBudget, "CAPS", {"hold": 64, "record": 32, "release": 1}), \
+                mock.patch("builtins.print") as output:
+            self.assertEqual(M.main(argv), 3)
+        summary = json.loads(output.call_args.args[0])
+        self.assertEqual((summary["status"], summary["released_count"], summary["release_sha256"]),
+                         ("migration_release_in_progress", 1, rsha))
+        with mock.patch("builtins.print"):
+            self.assertEqual(M.main(argv), 0)
+
+
+class CountScaledDeadlineTests(unittest.TestCase):
+    setUp = MigrationTests.setUp
+    prepare = MigrationTests.prepare
+    snapshot = MigrationTests.snapshot
+
+    def ids(self, count):
+        return [F.uuid7(F.ORIGIN, suffix=n) for n in range(1, count + 1)]
+
+    def test_exact_tiers_and_selection_validation(self):
+        for n, seconds in [(1, 30), (64, 30), (65, 60), (128, 60), (129, 90), (192, 90)]:
+            self.assertEqual(M._command_seconds(self.ids(n), require_sorted=True), seconds)
+        for ids in [[], self.ids(193), [self.sid] * 65, self.ids(64) + ["not-a-uuid"], [1] * 65]:
+            with self.assertRaises(ValueError): M._command_seconds(ids)
+        with self.assertRaisesRegex(ValueError, "invalid_selection"):
+            M._command_seconds(list(reversed(self.ids(65))), require_sorted=True)
+        self.assertEqual(M.MAX_IMPACT_TASKS, 500)
+        self.assertEqual(M.MAX_PLAN_BYTES, 32 * 1024 * 1024)
+
+    def test_rearming_uses_original_start_and_rejects_exhausted_allowance(self):
+        with mock.patch.object(M.time, "monotonic", return_value=120), mock.patch.object(M.signal, "setitimer") as timer:
+            M._arm_command_deadline(100, 30)
+            self.assertEqual(timer.call_args.args, (M.signal.ITIMER_REAL, 10))
+            M._arm_command_deadline(100, 90)
+            self.assertEqual(timer.call_args.args, (M.signal.ITIMER_REAL, 70))
+        with mock.patch.object(M.time, "monotonic", return_value=191), mock.patch.object(M.signal, "setitimer") as timer:
+            with self.assertRaisesRegex(ValueError, "deadline_or_interruption"):
+                M._arm_command_deadline(100, 90)
+            timer.assert_not_called()
+
+    def test_cli_loading_time_is_charged_before_large_plan_extension(self):
+        clock = [100.0]
+        plan = {"kind": M.PLAN_KIND, "session_ids": self.ids(192)}
+        def load(*_):
+            clock[0] = 120.0
+            return plan
+        with mock.patch.object(M.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(M.signal, "setitimer") as timer, \
+                mock.patch.object(M, "_load_plan", side_effect=load), \
+                mock.patch.object(M, "_run", return_value={"status": "test_no_publication"}) as run, \
+                mock.patch("builtins.print"):
+            self.assertEqual(M.main(["recover", "--state-dir", str(self.root), "--plan", "unused", "--plan-sha256", "0" * 64]), 0)
+        self.assertEqual([c.args[1] for c in timer.call_args_list], [30, 70, 0])
+        self.assertEqual(run.call_args.kwargs["progress"].deadline, 190)
+
+    def test_release_budget_counts_whole_migration_not_only_released_subset(self):
+        plan = {"kind": M.PLAN_KIND, "session_ids": self.ids(192)}
+        release = {"session_ids": [self.sid]}
+        with mock.patch.object(M.time, "monotonic", return_value=100), \
+                mock.patch.object(M.signal, "setitimer") as timer, \
+                mock.patch.object(M, "_load_plan", side_effect=[plan, release]), \
+                mock.patch.object(M, "release", return_value={"status": "test_no_publication"}) as publish, \
+                mock.patch("builtins.print"):
+            self.assertEqual(M.main(["release", "--state-dir", str(self.root), "--plan", "unused",
+                "--plan-sha256", "0" * 64, "--release-plan", "unused-release", "--release-sha256", "1" * 64]), 0)
+        self.assertEqual([c.args[1] for c in timer.call_args_list], [30, 90, 0])
+        self.assertEqual(publish.call_args.kwargs["_progress"].deadline, 190)
+
+    def test_invalid_large_selection_never_extends_timer_or_calls_publication(self):
+        plan = {"kind": M.PLAN_KIND, "session_ids": [self.sid] * 192}
+        with mock.patch.object(M.time, "monotonic", return_value=100), \
+                mock.patch.object(M.signal, "setitimer") as timer, \
+                mock.patch.object(M, "_load_plan", return_value=plan), mock.patch.object(M, "_run") as run, \
+                mock.patch("builtins.print") as output:
+            self.assertEqual(M.main(["apply", "--state-dir", str(self.root), "--plan", "unused", "--plan-sha256", "0" * 64]), 1)
+        self.assertEqual([c.args[1] for c in timer.call_args_list], [30, 0])
+        self.assertIn("invalid_selection", output.call_args.args[0]); run.assert_not_called()
+
+
+class ExpandedSelectionTests(unittest.TestCase):
+    """Selection-bound fixtures use mocked identity; no native cohort qualification."""
+    setUp = MigrationTests.setUp
+    prepare = MigrationTests.prepare
+    snapshot = MigrationTests.snapshot
+    healthy = ImpactTests.healthy
+
+    def cohort(self, count):
+        self.healthy(self.sid)
+        return [self.sid] + [self.fixture.task(n, cursor=n % 4 != 0, pending=n % 4 != 0,
+                                              paused=n % 3 != 0, gated=False)
+                             for n in range(2, count + 1)]
+
+    def test_192_selected_healthy_tasks_plan_exactly_without_mutating_inputs(self):
+        ids = sorted(self.cohort(192)); before = self.snapshot()
+        plan = self.prepare(ids)
+        self.assertEqual(plan["session_ids"], ids)
+        self.assertEqual(plan["activation_impact"]["healthy_session_ids"], ids)
+        self.assertEqual(len(plan["records"]), 770)
+        self.assertEqual(len(plan["hold_paths"]), 192)
+        self.assertLess(len(M.encode(plan)), M.MAX_PLAN_BYTES)
+        M._validate_plan(self.root, plan, M.digest(M.encode(plan)))
+        self.assertEqual(before, self.snapshot())
+
+    def test_193_healthy_tasks_refuse_a_192_selection_without_silent_omission(self):
+        ids = sorted(self.cohort(193)); before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "impact_healthy_cohort_limit_exceeded"):
+            self.prepare(ids[:-1])
+        self.assertEqual(before, self.snapshot())
+        self.assertFalse((self.root / "migrations").exists())
+        self.assertFalse((self.root / "migration-holds").exists())
+
+
+class ElapsedProgressTests(unittest.TestCase):
+    setUp = MigrationTests.setUp
+    prepare = MigrationTests.prepare
+
+    def test_elapsed_time_yields_verified_prefix_without_publishing_next_record(self):
+        plan = self.prepare(); sha = M.digest(M.encode(plan)); clock = [100.0]
+        original = M._publish
+        def publish(record, work, index):
+            original(record, work, index)
+            if index == 0:
+                clock[0] = 121.0
+        with mock.patch.object(M.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(M, "_publish", side_effect=publish):
+            budget = M._ProgressBudget(100, 30)
+            result = M._run(self.root, plan, sha, recovery=False, progress=budget)
+        self.assertEqual((result["phase"], result["verified_published_record_count"]), ("records", 1))
+        self.assertEqual(Path(plan["records"][1]["path"]).read_bytes(), M._unb64(plan["records"][1]["preimage"]))
+        self.assertEqual((self.root / "admission.json").read_bytes(), M._unb64(plan["transitional_policy"]["candidate"]))
+        self.assertEqual(M.recover(self.root, plan, sha)["status"], "migration_complete_held")
 
 
 if __name__ == "__main__":

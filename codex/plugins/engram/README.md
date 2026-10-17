@@ -102,8 +102,8 @@ The first host policy conversion must include the explicitly reviewed healthy
 v1 tasks, including tasks waiting for their next event. The tool rechecks that
 cohort under its locks before changing state. A newly eligible task causes a
 refusal and a new review; it is never silently added. A plan can explicitly select
-at most 64 tasks; the impact scan remains bounded to 500 enrollment entries.
-If the required cohort exceeds 64, keep v1 until a coordinated rollout is
+at most 192 tasks; the impact scan remains bounded to 500 enrollment entries.
+If the required cohort exceeds 192, keep v1 until a coordinated rollout is
 prepared. Installing the new runtime preserves an existing v1 policy. A larger
 selection still requires a fresh reviewed list of IDs and an exact plan; raising
 the bound does not expand any existing selection or authorize activation.
@@ -113,16 +113,36 @@ records and route, then restores the policy's original enabled setting in v2.
 The journal supports `recover` after an interrupted publication. Other tasks'
 records remain untouched; unmigrated v1 enrollments under v2 require their own
 migration. Later plans use the retained original v1 policy as their legacy anchor.
-The 32 MiB plan limit and 30-second command deadline remain unchanged. An oversized
-plan is refused before migration begins. A deadline after publication has started
-can leave admission suspended or tasks held; use the exact journal's `recover`
-path after review. Planning speed alone does not qualify application or recovery
-time for a larger cohort.
+The plan limit remains 32 MiB. Commands have an absolute time bound from their
+original start: 30 seconds for up to 64 selected tasks, 60 seconds for 65–128,
+and 90 seconds for 129–192. The full reviewed migration cohort determines the
+bound, including release commands. Loading a plan and validating its selection
+consume that same allowance; the clock is never restarted.
+
+`apply` and `recover` may return exit code **3** with
+`status: migration_in_progress_held`. This is a verified durable stopping point,
+not completion: admission remains suspended until the final checks finish, and
+all selected holds must exist before any task record changes. The summary gives
+the exact plan SHA256, phase, verified hold and record counts, and
+`next_command: recover`. After checking that summary, continue with **the same
+reviewed plan file and SHA256**. Each command has bounded publication work;
+never replace the plan, reset a cursor, or retry a failed command until green.
+
+Exit code **0** reports the command's completed result. Exit code **1** reports
+refusal or interruption requiring diagnosis; a hard deadline can leave a valid
+partial journal but is not an exit-3 progress receipt. Preserve its evidence and
+review the exact journal before recovery. Oversized plans refuse before
+publication. Planning speed alone does not qualify application or recovery time
+for a larger cohort.
 
 Each migrated task receives a separate migration hold. `release-plan` and
 `release` remove only explicitly selected holds after validating their records.
-They do not clear a reconciliation gate, change a cursor or paused request, retry
-work, or launch a learner. Previously released tasks may advance normally while
+A bounded `release` may return exit code **3** with
+`status: migration_release_in_progress`, the released count, and the exact
+migration and release SHA256 values. Continue only that same release plan and
+SHA256; its durable intent accounts for holds already removed. Release does not
+clear a reconciliation gate, change a cursor or paused request, retry work, or
+launch a learner. Previously released tasks may advance normally while
 their siblings remain held. Use the CLI's `--help` and `hook-status` to inspect
 the required arguments and current state.
 

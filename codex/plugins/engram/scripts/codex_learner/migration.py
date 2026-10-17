@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+from collections.abc import Mapping
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -20,10 +21,12 @@ from pathlib import Path
 import re
 import signal
 import stat
+import time
+from types import MappingProxyType
 
 from . import admission, file_identity, host_admission
 
-MAX_SELECTED = 64
+MAX_SELECTED = 192
 MAX_IMPACT_TASKS = 500
 MAX_PLAN_BYTES = 32 * 1024 * 1024
 MODE_V1 = "host_sessions_v1"
@@ -39,8 +42,15 @@ def require(ok, reason):
 
 
 def encode(value):
+    if type(value) is _PinnedPlan:
+        return value.canonical_bytes
     return (json.dumps(value, sort_keys=True, separators=(",", ":"),
-                       ensure_ascii=False, allow_nan=False) + "\n").encode()
+                       ensure_ascii=False, allow_nan=False,
+                       default=lambda obj: dict(obj) if isinstance(obj, _FrozenObject) else _json_type_error(obj)) + "\n").encode()
+
+
+def _json_type_error(value):
+    raise TypeError("not a JSON value")
 
 
 def digest(raw):
@@ -57,6 +67,8 @@ def _b64(raw):
 
 
 def _unb64(value):
+    if type(value) is _EncodedImage:
+        return value.decoded
     if value is None:
         return None
     require(isinstance(value, str), "invalid_encoded_bytes")
@@ -66,6 +78,152 @@ def _unb64(value):
         raise ValueError("migration_invalid_encoded_bytes") from error
     require(_b64(raw) == value and len(raw) <= admission.MAX_BYTES, "invalid_encoded_bytes")
     return raw
+
+
+def _immutable(*args, **kwargs):
+    raise TypeError("migration_pinned_input_is_immutable")
+
+
+class _EncodedImage(str):
+    """An owned expected image, never a cache of current filesystem state."""
+    __slots__ = ("decoded",)
+    def __new__(cls, value):
+        instance = str.__new__(cls, value)
+        object.__setattr__(instance, "decoded", _unb64(value))
+        return instance
+
+    __setattr__ = __delattr__ = _immutable
+
+
+class _ImmutableArray(tuple):
+    __slots__ = ()
+
+    def __eq__(self, other):
+        return isinstance(other, (list, tuple)) and tuple.__eq__(self, tuple(other))
+
+    def __ne__(self, other):
+        return not self == other
+
+    __hash__ = None
+
+
+class _FrozenObject(Mapping):
+    __slots__ = ("_values",)
+
+    def __init__(self, values):
+        if hasattr(self, "_values"):
+            _immutable()
+        object.__setattr__(self, "_values", MappingProxyType(dict(values)))
+
+    def __getitem__(self, key):
+        return self._values[key]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    __setattr__ = __delattr__ = _immutable
+
+
+def _freeze(value, key=None):
+    if isinstance(value, dict):
+        return _FrozenObject((k, _freeze(v, k)) for k, v in value.items())
+    if isinstance(value, list):
+        return _ImmutableArray(_freeze(v) for v in value)
+    if isinstance(value, str) and key in ("preimage", "candidate", "bytes"):
+        return _EncodedImage(value)
+    return value
+
+
+class _PinnedPlan(_FrozenObject):
+    """Private CLI input decoded from owned, hash-checked canonical bytes.
+
+    No caller-owned dictionary is retained. Public apply/recover/release callers
+    still pass ordinary dictionaries and retain every existing digest check.
+    Only expected immutable images are decoded once; live identity, prefix,
+    runtime, hold and CAS checks continue to read the current filesystem.
+    """
+    __slots__ = ("canonical_bytes", "sha256")
+
+    def __init__(self, raw, expected):
+        require(type(raw) is bytes and len(raw) <= MAX_PLAN_BYTES
+                and digest(raw) == expected, "plan_file_sha_mismatch")
+        value = admission._json(raw)
+        require(isinstance(value, dict) and raw == encode(value), "noncanonical_plan_encoding")
+        super().__init__((k, _freeze(v, k)) for k, v in value.items())
+        object.__setattr__(self, "canonical_bytes", raw)
+        object.__setattr__(self, "sha256", expected)
+
+
+def _command_seconds(selected, *, require_sorted=False):
+    """Only valid reviewed/explicit selections choose a larger hard bound."""
+    require(isinstance(selected, (list, tuple)) and 1 <= len(selected) <= MAX_SELECTED
+            and all(isinstance(sid, str) for sid in selected)
+            and len(set(selected)) == len(selected), "invalid_selection")
+    for sid in selected:
+        admission._uuid(sid, 7)
+    require(not require_sorted or selected == sorted(selected), "invalid_selection")
+    return 30 if len(selected) <= 64 else 60 if len(selected) <= 128 else 90
+
+
+def _arm_command_deadline(started, seconds):
+    # Loading/validating a plan is part of this command's allowance. Re-arming
+    # after selection validation never grants a fresh interval from now.
+    remaining = started + seconds - time.monotonic()
+    require(remaining > 0, "deadline_or_interruption")
+    signal.setitimer(signal.ITIMER_REAL, remaining)
+
+
+class _ProgressBudget:
+    """Cooperative stops at durable boundaries; the signal remains the hard cap."""
+    CAPS = {"hold": 64, "record": 32, "release": 8}
+
+    def __init__(self, started, seconds):
+        self.deadline = started + seconds
+        self.reserve = max(10.0, seconds / 5)
+        self.counts = {kind: 0 for kind in self.CAPS}
+        self.costs = {kind: 0.0 for kind in self.CAPS}
+        self.entry_validation_seconds = 0.0
+
+    def stop(self, kind):
+        return (self.counts[kind] >= self.CAPS[kind]
+                or time.monotonic() + self.reserve + self.costs[kind] >= self.deadline)
+
+    def completed(self, kind, started):
+        self.counts[kind] += 1
+        self.costs[kind] = max(self.costs[kind], (time.monotonic() - started) * 1.25)
+
+    def can_finalize(self):
+        # Entry, pre-activation and completed-chain validation are retained.
+        # Use the observed entry cost conservatively, never a new deadline.
+        return time.monotonic() + max(self.reserve, 3 * self.entry_validation_seconds * 1.25) < self.deadline
+
+
+def _progress_result(root, plan, plan_sha, locks, budget, phase):
+    """Report current held state without making this report new authority."""
+    locks.verify()
+    _validate_publication(root, plan, plan_sha, candidate_task_ids=())
+    states = _verify_prefix(plan, recover=True)
+    require(_policy_phase(plan, recover=True) != "original", "progress_policy_not_suspended")
+    holds = 0
+    for sid, path in zip(plan["session_ids"], plan["hold_paths"]):
+        raw, _ = _read(Path(path), absent=True)
+        if raw is not None:
+            require(raw == _hold(sid, plan_sha), "hold_changed")
+            holds += 1
+    published = sum(state == "after" and record["preimage"] != record["candidate"]
+                    for state, record in zip(states[:-1], plan["records"][:-1]))
+    require(not published or holds == len(plan["session_ids"]), "hold_missing_after_publication")
+    remaining = sum(state == "before" and record["preimage"] != record["candidate"]
+                    for state, record in zip(states[:-1], plan["records"][:-1]))
+    locks.verify()
+    return {"version": 1, "status": "migration_in_progress_held", "complete": False,
+            "plan_sha256": plan_sha, "phase": phase, "selected_count": len(plan["session_ids"]),
+            "verified_hold_count": holds, "verified_published_record_count": published,
+            "remaining_record_count": remaining, "new_publications": sum(budget.counts.values()),
+            "next_command": "recover", "learner_started": False}
 
 
 def _canonical(path):
@@ -454,7 +612,7 @@ def _validate_impact(plan):
     if policy["mode"] == MODE_V2:
         require(impact is None, "unexpected_v2_impact_assertion")
         return
-    require(isinstance(impact, dict) and set(impact) == {"schema_version", "predicate", "policy_sha256", "policy_enabled",
+    require(isinstance(impact, (dict, _FrozenObject)) and set(impact) == {"schema_version", "predicate", "policy_sha256", "policy_enabled",
             "legacy_sessions_directory_valid", "healthy_session_ids", "max_tasks"}
             and type(impact["schema_version"]) is int and impact["schema_version"] == 1
             and impact["predicate"] == "host_v1_future_event_admission_v1"
@@ -463,7 +621,7 @@ def _validate_impact(plan):
             and type(impact["legacy_sessions_directory_valid"]) is bool
             and type(impact["max_tasks"]) is int and impact["max_tasks"] == MAX_IMPACT_TASKS, "invalid_impact_assertion")
     ids = impact["healthy_session_ids"]
-    require(isinstance(ids, list) and ids == sorted(set(ids)) and len(ids) <= MAX_SELECTED
+    require(isinstance(ids, (list, _ImmutableArray)) and ids == sorted(set(ids)) and len(ids) <= MAX_SELECTED
             and set(ids) <= set(plan["session_ids"]), "impact_healthy_cohort_not_selected")
 
 
@@ -549,6 +707,9 @@ def prepare(root, route_path, session_ids, *, legacy_policy_path=None, authorize
 
 
 def _validate_plan_digest(plan, expected_sha):
+    if type(plan) is _PinnedPlan:
+        require(plan.sha256 == expected_sha, "plan_sha_mismatch")
+        return
     require(isinstance(plan, dict), "plan_sha_mismatch")
     raw = encode(plan)
     require(len(raw) <= MAX_PLAN_BYTES and digest(raw) == expected_sha, "plan_sha_mismatch")
@@ -583,7 +744,7 @@ def _validate_plan(root, plan, expected_sha, *, candidate_task_ids=None):
             and plan.get("historical_volume_continuity_proven") is False and plan.get("learner_started") is False,
             "invalid_plan")
     selected = plan.get("session_ids")
-    require(isinstance(selected, list) and 1 <= len(selected) <= MAX_SELECTED
+    require(isinstance(selected, (list, _ImmutableArray)) and 1 <= len(selected) <= MAX_SELECTED
             and selected == sorted(set(selected)), "invalid_selection")
     expected_paths = [str(path) for sid in selected for path in _paths(root, sid).values()]
     route_path = Path(plan["route_path"])
@@ -758,11 +919,14 @@ def _publish_policy(plan, work, *, final):
     _publish(record, work, "final-policy" if final else "transitional-policy")
 
 
-def _run(root, plan, plan_sha, *, recovery):
+def _run(root, plan, plan_sha, *, recovery, progress=None):
     root = _root(root)
     with Locks(root) as locks:
+        validation_started = time.monotonic()
         _validate_plan(root, plan, plan_sha)
         states = _verify_prefix(plan, recover=recovery)
+        if progress is not None:
+            progress.entry_validation_seconds = time.monotonic() - validation_started
         if not recovery:
             # This must precede even journal creation: changed eligibility causes
             # zero application mutations, not merely zero task-record writes.
@@ -806,14 +970,22 @@ def _run(root, plan, plan_sha, *, recovery):
             else:
                 require(all(s == "before" or r["preimage"] == r["candidate"]
                             for s, r in zip(states[:-1], plan["records"][:-1])), "hold_missing_after_publication")
+                if progress is not None and progress.stop("hold"):
+                    return _progress_result(root, plan, plan_sha, locks, progress, "holds")
+                unit_started = time.monotonic()
                 _new(path, expected)
                 _event(work, "hold_published", session_id=sid)
+                if progress is not None:
+                    progress.completed("hold", unit_started)
         for index, record in enumerate(plan["records"][:-1]):
             # Entry validation already proved the complete plan and exact prefix.
             # Recovery must reach its first remaining record without rechecking
             # every task's native identity once per already-published record.
             if record["preimage"] == record["candidate"] or states[index] == "after":
                 continue
+            if progress is not None and progress.stop("record"):
+                return _progress_result(root, plan, plan_sha, locks, progress, "records")
+            unit_started = time.monotonic()
             locks.verify()
             affected = (plan["session_ids"][index // 4],) if index < len(plan["session_ids"]) * 4 else ()
             _validate_publication(root, plan, plan_sha, candidate_task_ids=affected)
@@ -823,6 +995,10 @@ def _run(root, plan, plan_sha, *, recovery):
             _event(work, "before_publish", index=index, path=record["path"], candidate_sha256=record["candidate_sha256"])
             _publish(record, work, index)
             _event(work, "published", index=index, path=record["path"], candidate_sha256=record["candidate_sha256"])
+            if progress is not None:
+                progress.completed("record", unit_started)
+        if progress is not None and not progress.can_finalize():
+            return _progress_result(root, plan, plan_sha, locks, progress, "final_validation")
         locks.verify()
         _validate_plan(root, plan, plan_sha)
         _verify_prefix(plan, recover=True)
@@ -967,7 +1143,7 @@ def _validate_release(root, plan, plan_sha, release_plan):
             and release_plan["runtime_sha256"] == plan["runtime_sha256"]
             and release_plan["learner_started"] is False, "invalid_release_plan")
     selected = release_plan["session_ids"]
-    require(isinstance(selected, list) and selected == sorted(set(selected)) and 1 <= len(selected) <= MAX_SELECTED
+    require(isinstance(selected, (list, _ImmutableArray)) and selected == sorted(set(selected)) and 1 <= len(selected) <= MAX_SELECTED
             and set(selected) <= set(plan["session_ids"]), "invalid_release_selection")
     require([r["path"] for r in release_plan["holds"]]
             == [str(root / "migration-holds" / (sid + ".json")) for sid in selected], "release_paths_changed")
@@ -976,7 +1152,7 @@ def _validate_release(root, plan, plan_sha, release_plan):
                 and _unb64(record["bytes"]) == _hold(sid, plan_sha), "release_hold_changed")
 
 
-def release(root, plan, plan_sha256, release_plan, release_sha256):
+def release(root, plan, plan_sha256, release_plan, release_sha256, *, _progress=None):
     root = _root(root)
     require(digest(encode(release_plan)) == release_sha256, "release_sha_mismatch")
     with Locks(root) as locks:
@@ -987,20 +1163,35 @@ def release(root, plan, plan_sha256, release_plan, release_sha256):
         work = _journal(root, plan, plan_sha256, create=False)
         intent = work / ("release-" + release_sha256 + ".json")
         absent = [sid for sid in selected if not os.path.lexists(root / "migration-holds" / (sid + ".json"))]
+        verification_started = time.monotonic()
+        _verify_complete(root, plan, plan_sha256)
+        if _progress is not None:
+            cost = (time.monotonic() - verification_started) * 1.25
+            _progress.costs["release"] = cost
+            _progress.reserve = max(_progress.reserve, cost)
         if os.path.lexists(intent):
             require(_read(intent)[0] == encode(release_plan), "release_intent_changed")
         else:
             require(not absent, "hold_missing_without_release_intent")
-            _verify_complete(root, plan, plan_sha256)
             for record in release_plan["holds"]:
                 raw, info = _read(Path(record["path"]))
                 require(raw == _unb64(record["bytes"]) and info == record["identity"], "release_hold_cas_mismatch")
             _new(intent, encode(release_plan))
         for sid, record in zip(selected, release_plan["holds"]):
-            _verify_complete(root, plan, plan_sha256, released=absent)
-            locks.verify()
             if sid in absent:
                 continue
+            if _progress is not None and _progress.stop("release"):
+                _verify_complete(root, plan, plan_sha256, released=absent)
+                locks.verify()
+                return {"version": 1, "status": "migration_release_in_progress", "complete": False,
+                        "plan_sha256": plan_sha256, "release_sha256": release_sha256,
+                        "phase": "release", "selected_count": len(plan["session_ids"]),
+                        "requested_release_count": len(selected), "released_count": len(absent),
+                        "new_publications": _progress.counts["release"], "next_command": "release",
+                        "learner_started": False}
+            unit_started = time.monotonic()
+            _verify_complete(root, plan, plan_sha256, released=absent)
+            locks.verify()
             path = Path(record["path"])
             raw, info = _read(path)
             require(raw == _unb64(record["bytes"]) == _hold(sid, plan_sha256)
@@ -1009,19 +1200,19 @@ def release(root, plan, plan_sha256, release_plan, release_sha256):
             _fsync(path.parent)
             absent.append(sid)
             _event(work, "hold_released", session_id=sid, release_sha256=release_sha256)
+            if _progress is not None:
+                _progress.completed("release", unit_started)
         locks.verify()
         return {"status": "selected_migration_holds_released", "session_ids": selected, "learner_started": False}
 
 
 def _load_plan(path, expected):
     raw, _ = _read(_canonical(path), maximum=MAX_PLAN_BYTES)
-    require(digest(raw) == expected, "plan_file_sha_mismatch")
-    plan = admission._json(raw)
-    require(raw == encode(plan), "noncanonical_plan_encoding")
-    return plan
+    return _PinnedPlan(raw, expected)
 
 
 def main(argv=None):
+    started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("plan", "apply", "recover", "release-plan", "release"))
     parser.add_argument("--state-dir", required=True, type=Path)
@@ -1038,31 +1229,41 @@ def main(argv=None):
     def deadline(*_):
         raise ValueError("migration_deadline_or_interruption")
     handlers = {number: signal.signal(number, deadline) for number in (signal.SIGALRM, signal.SIGTERM, signal.SIGINT)}
-    signal.setitimer(signal.ITIMER_REAL, 30)
     try:
+        _arm_command_deadline(started, 30)
         if args.command == "plan":
             require(args.routes is not None and args.output is not None, "plan_requires_routes_and_output")
+            seconds = _command_seconds(args.session_id)
+            _arm_command_deadline(started, seconds)
             result = prepare(args.state_dir, args.routes, args.session_id, legacy_policy_path=args.legacy_policy,
                              authorize_current_volume_adoption=args.authorize_current_volume_adoption)
         else:
             require(args.plan is not None and args.plan_sha256 is not None, "reviewed_plan_required")
             plan = _load_plan(args.plan, args.plan_sha256)
+            require(plan.get("kind") == PLAN_KIND, "invalid_plan")
+            seconds = _command_seconds(plan.get("session_ids"), require_sorted=True)
+            _arm_command_deadline(started, seconds)
+            progress = _ProgressBudget(started, seconds)
             if args.command == "release-plan":
                 require(args.output is not None, "release_plan_output_required")
                 result = prepare_release(args.state_dir, plan, args.plan_sha256, args.session_id)
             elif args.command == "release":
                 require(args.release_plan is not None and args.release_sha256 is not None, "reviewed_release_required")
                 result = release(args.state_dir, plan, args.plan_sha256,
-                                 _load_plan(args.release_plan, args.release_sha256), args.release_sha256)
+                                 _load_plan(args.release_plan, args.release_sha256), args.release_sha256,
+                                 _progress=progress)
             else:
-                result = (apply if args.command == "apply" else recover)(args.state_dir, plan, args.plan_sha256)
+                result = _run(args.state_dir, plan, args.plan_sha256,
+                              recovery=args.command == "recover", progress=progress)
         if args.output is not None:
             _new(args.output, encode(result))
         summary = {"status": result.get("status", "review_required"), "sha256": digest(encode(result)), "learner_started": False}
+        if result.get("complete") is False:
+            summary.update(result)
         if result.get("activation_impact") is not None:
             summary["reviewed_healthy_session_ids"] = result["activation_impact"]["healthy_session_ids"]
         print(json.dumps(summary))
-        return 0
+        return 3 if result.get("complete") is False else 0
     except (OSError, ValueError, TypeError, KeyError) as error:
         reason = str(error) if isinstance(error, ValueError) and re.fullmatch(r"(?:admission|migration)_[a-z_]+", str(error)) else "migration_failed"
         print(json.dumps({"status": "refused_or_partial_recovery_required", "reason": reason, "learner_started": False}))
