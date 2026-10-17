@@ -2,6 +2,7 @@ import EngramMemoryCore
 import EngramModels
 import Foundation
 import Lattice
+import SQLite3
 import Testing
 @testable import EngramKit
 
@@ -48,13 +49,62 @@ struct OperationLedgerSyncIsolationTests {
         return (stores, receipts)
     }
 
-    private func waitForAcknowledgements(_ source: Lattice, _ target: Lattice) async -> Bool {
+    /// Incoming IPC rows keep their global isSynchronized flag at zero even
+    /// after this channel's durable acknowledgement is recorded. A startup
+    /// reconcile may also put those rows in the sync set, so the whole-store
+    /// pendingSyncEntryCount can stay nonzero after both peers have finished.
+    /// Check the exact barrier and preceding shared rows for this channel.
+    private func acknowledgedBarrier(_ barrier: UUID, at url: URL, channel: String) throws -> Bool {
+        var database: OpaquePointer?
+        let opened = sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil)
+        defer { if let database { sqlite3_close(database) } }
+        try #require(opened == SQLITE_OK, "Could not open acknowledgement readback")
+        let db = try #require(database)
+        try #require(sqlite3_busy_timeout(db, 100) == SQLITE_OK)
+        let sql = """
+            WITH barrier AS (
+                SELECT MAX(id) AS last_id, COUNT(*) AS rows
+                FROM AuditLog
+                WHERE tableName = 'Memory' AND globalRowId = ?1 COLLATE NOCASE
+            ), eligible AS (
+                SELECT a.id, a.isSynchronized
+                FROM AuditLog a
+                WHERE a.id <= (SELECT last_id FROM barrier)
+                  AND ((a.tableName = 'Memory' AND a.globalRowId = ?1 COLLATE NOCASE)
+                       OR EXISTS (SELECT 1 FROM _lattice_sync_set ss
+                                  WHERE ss.sync_id = ?2 AND ss.table_name = a.tableName
+                                    AND ss.global_row_id = a.globalRowId))
+            )
+            SELECT (SELECT rows FROM barrier) > 0
+              AND EXISTS (SELECT 1 FROM _lattice_replication_slots WHERE sync_id = ?2)
+              AND NOT EXISTS (
+                  SELECT 1 FROM eligible a
+                  WHERE COALESCE((SELECT st.is_synchronized FROM _lattice_sync_state st
+                                  WHERE st.audit_entry_id = a.id AND st.sync_id = ?2),
+                                 a.isSynchronized) != 1
+              )
+            """
+        var statement: OpaquePointer?
+        try #require(sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK,
+                     "Could not prepare acknowledgement readback")
+        defer { sqlite3_finalize(statement) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        try #require(sqlite3_bind_text(statement, 1, barrier.uuidString, -1, transient) == SQLITE_OK)
+        try #require(sqlite3_bind_text(statement, 2, "ipc:\(channel)", -1, transient) == SQLITE_OK)
+        try #require(sqlite3_step(statement) == SQLITE_ROW, "Acknowledgement readback failed")
+        return sqlite3_column_int(statement, 0) == 1
+    }
+
+    private func waitForAcknowledgements(_ barrier: UUID, source: URL, target: URL,
+                                         channel: String) async throws -> Bool {
         let deadline = Date().addingTimeInterval(15)
         while Date() < deadline {
-            if source.pendingSyncEntryCount == 0 && target.pendingSyncEntryCount == 0 { return true }
+            if try acknowledgedBarrier(barrier, at: source, channel: channel)
+                && acknowledgedBarrier(barrier, at: target, channel: channel) { return true }
             try? await Task.sleep(for: .milliseconds(50))
         }
-        return source.pendingSyncEntryCount == 0 && target.pendingSyncEntryCount == 0
+        return try acknowledgedBarrier(barrier, at: source, channel: channel)
+            && acknowledgedBarrier(barrier, at: target, channel: channel)
     }
 
     /// The memory and real receipt commit together, followed by a later audit
@@ -110,6 +160,8 @@ struct OperationLedgerSyncIsolationTests {
                                   exposedTeams: [groupID.uuidString]))
         let firstBarrier = try seedOperation(in: source, authorID: authorID)
         let channel = "ledger-\(UUID().uuidString.prefix(8))"
+        #expect(try !acknowledgedBarrier(firstBarrier, at: sourceURL, channel: channel),
+                "A local barrier without a registered channel must not count as acknowledged")
         var sourceConfig = Lattice.Configuration(fileURL: sourceURL, busyTimeoutMs: 100)
         sourceConfig.ipcTargets = [.init(
             channel: channel,
@@ -124,7 +176,8 @@ struct OperationLedgerSyncIsolationTests {
         let target = try Lattice(for: fixtureModels, configuration: targetConfig)
 
         try #require(await waitForMemory(firstBarrier, in: target), "Startup relay positive control failed")
-        try #require(await waitForAcknowledgements(sourceRelay, target), "Startup relay did not drain")
+        try #require(await waitForAcknowledgements(firstBarrier, source: sourceURL, target: targetURL,
+                                                    channel: channel), "Startup relay did not acknowledge the barrier")
         // The unfiltered control must actually export the evidence; otherwise
         // zero rows on the filtered routes could merely mean that this fixture
         // never exercised export of the ledger's tables.
@@ -138,7 +191,8 @@ struct OperationLedgerSyncIsolationTests {
             route.filter(from: source, groupID: groupID, authorID: authorID), forChannel: channel)
         let secondBarrier = try seedOperation(in: source, authorID: authorID)
         try #require(await waitForMemory(secondBarrier, in: target), "Refreshed relay positive control failed")
-        try #require(await waitForAcknowledgements(sourceRelay, target), "Refreshed relay did not drain")
+        try #require(await waitForAcknowledgements(secondBarrier, source: sourceURL, target: targetURL,
+                                                    channel: channel), "Refreshed relay did not acknowledge the barrier")
         let secondTargetCounts = try ledgerCounts(in: target)
         #expect(secondTargetCounts.stores == expectedStoreCount)
         #expect(secondTargetCounts.receipts == expectedStoreCount * 2)

@@ -169,18 +169,21 @@ struct MemoryOperationLedgerTests {
         let operation = try prepared(f)
         let blocker = try SQL(f.path)
         try blocker.execute("BEGIN IMMEDIATE")
-        let released = DispatchSemaphore(value: 0)
-        DispatchQueue.global().async {
-            Thread.sleep(forTimeInterval: 0.17)
+        let release = BeginContentionRelease(blocker: blocker)
+        f.lattice.onQueryError { release.observe($0) }
+        defer {
+            f.lattice.onQueryError { _ in }
             try? blocker.execute("ROLLBACK")
-            released.signal()
         }
         var bodyCalls = 0
-        let commit = try f.ledger.withOperation(operation, principal: { .anonymous }) {
-            bodyCalls += 1
-            return .init(outcome: .unchanged)
+        let result = Result {
+            try f.ledger.withOperation(operation, principal: { .anonymous }) {
+                bodyCalls += 1
+                return .init(outcome: .unchanged)
+            }
         }
-        #expect(released.wait(timeout: .now() + 1) == .success)
+        try release.verify()
+        let commit = try result.get()
         #expect(!commit.isReplay)
         #expect(bodyCalls == 1)
         #expect(try SQL(f.path).integer("SELECT COUNT(*) FROM EngramOperationReceiptV1") == 1)
@@ -212,12 +215,13 @@ struct MemoryOperationLedgerTests {
         let principal = PrincipalBox()
         let blocker = try SQL(f.path)
         try blocker.execute("BEGIN IMMEDIATE")
-        let released = DispatchSemaphore(value: 0)
-        DispatchQueue.global().async {
-            Thread.sleep(forTimeInterval: 0.17)
+        let release = BeginContentionRelease(blocker: blocker) {
             principal.set(Principal(id: UUID(), kind: .user))
+        }
+        f.lattice.onQueryError { release.observe($0) }
+        defer {
+            f.lattice.onQueryError { _ in }
             try? blocker.execute("ROLLBACK")
-            released.signal()
         }
         #expect(throws: MemoryOperationError.scopeMismatch) {
             try f.ledger.withOperation(operation, principal: { principal.get() }) {
@@ -225,7 +229,7 @@ struct MemoryOperationLedgerTests {
                 return .init(outcome: .unchanged)
             }
         }
-        #expect(released.wait(timeout: .now() + 1) == .success)
+        try release.verify()
         #expect(try SQL(f.path).integer("SELECT COUNT(*) FROM Memory") == (alreadyCommitted ? 1 : 0))
         #expect(try SQL(f.path).integer("SELECT COUNT(*) FROM EngramOperationReceiptV1") == (alreadyCommitted ? 1 : 0))
     }
@@ -329,6 +333,41 @@ struct MemoryOperationLedgerTests {
         }
         #expect(try sql.integer("SELECT COUNT(*) FROM EngramOperationReceiptV1") == count)
         #expect(try sql.strings("SELECT receiptJSON FROM EngramOperationReceiptV1 ORDER BY id") == content)
+    }
+
+    /// Lattice reports a failed checked BEGIN synchronously, before throwing.
+    /// Release the independent SQLite writer only after that real contention
+    /// has occurred, so the next ledger retry can acquire it. No queue or sleep
+    /// races the production BEGIN budget; the callback never touches Lattice.
+    private final class BeginContentionRelease: @unchecked Sendable {
+        private static let expectedError = "Failed to begin transaction: database is locked"
+        private let lock = NSLock()
+        private let blocker: SQL
+        private let beforeRelease: @Sendable () -> Void
+        private var messages: [String] = []
+        private var result: Result<Void, any Error>?
+
+        init(blocker: SQL, beforeRelease: @escaping @Sendable () -> Void = {}) {
+            self.blocker = blocker
+            self.beforeRelease = beforeRelease
+        }
+
+        func observe(_ message: String) {
+            lock.withLock {
+                messages.append(message)
+                guard message == Self.expectedError, result == nil else { return }
+                result = Result {
+                    beforeRelease()
+                    try blocker.execute("ROLLBACK")
+                }
+            }
+        }
+
+        func verify() throws {
+            let (observedMessages, releaseResult) = lock.withLock { (messages, result) }
+            #expect(observedMessages == [Self.expectedError])
+            try #require(releaseResult).get()
+        }
     }
 
     private final class SQL: @unchecked Sendable {
