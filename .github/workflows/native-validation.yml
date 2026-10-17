@@ -23,6 +23,7 @@ jobs:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Check out exact source under localdev
+        id: checkout_source
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -106,6 +107,7 @@ jobs:
           PY
 
       - name: Resolve pinned dependencies (private read-only clone credential)
+        id: dependencies
         timeout-minutes: 30
         env:
           SWIFTLM_CLONE_TOKEN: ${{ secrets.SWIFTLM_CLONE_TOKEN }}
@@ -128,10 +130,12 @@ jobs:
           exit 1
 
       - name: Build native tests
+        id: native_build
         timeout-minutes: 75
         run: '"$VALIDATION_ROOT/bin/swift-validation" build --force-resolved-versions --disable-index-store --build-tests'
 
       - name: Run full native release filter
+        if: ${{ !cancelled() && steps.native_build.outcome == 'success' }}
         timeout-minutes: 32
         shell: bash
         run: |
@@ -145,11 +149,13 @@ jobs:
             --skip recall_connectedMemory_showsEdgeRelation \
             --skip recall_graphTraversal_relatesToDoesNotLeakViaUnrelatedStructuralEdge \
             --skip recall_statementBudget --skip clusters_statementBudget \
-            --skip busyBeginDoesNotInvokeBodyOrPublishReceipt
+            --skip busyBeginDoesNotInvokeBodyOrPublishReceipt \
+            --skip beginContentionTimingDiagnostics
 
       # Keep the existing <2s held-writer assertion, but isolate its scheduling
       # window from the parallel suite. The matching skip above is not a waiver.
       - name: Run ledger BEGIN timing regression (serial)
+        if: ${{ !cancelled() && steps.native_build.outcome == 'success' }}
         timeout-minutes: 3
         shell: bash
         run: |
@@ -160,19 +166,35 @@ jobs:
             "$VALIDATION_ROOT/bin/swift-validation" test --force-resolved-versions --disable-index-store --skip-build \
             --filter busyBeginDoesNotInvokeBodyOrPublishReceipt
 
+      - name: Collect ledger BEGIN contention diagnostics (serial)
+        if: ${{ !cancelled() && steps.native_build.outcome == 'success' }}
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VALIDATION_ROOT/repo"
+          ENGRAM_BEGIN_DIAGNOSTICS=1 python3 -B scripts/run_native_tests.py --diagnostics-dir "$VALIDATION_ROOT/evidence/ledger-begin-diagnostics" \
+            --timeout-seconds 120 --silence-seconds 60 -- \
+            "$VALIDATION_ROOT/bin/swift-validation" test --force-resolved-versions --disable-index-store --skip-build \
+            --filter beginContentionTimingDiagnostics
+
       - name: Run both statement budgets in separate serial processes
+        if: ${{ !cancelled() && steps.native_build.outcome == 'success' }}
         timeout-minutes: 13
         shell: bash
         run: |
           set -euo pipefail
           cd "$VALIDATION_ROOT/repo"
+          status=0
           for budget in recall_statementBudget clusters_statementBudget; do
             python3 -B scripts/run_native_tests.py --diagnostics-dir "$VALIDATION_ROOT/evidence/$budget" \
               --timeout-seconds 300 --silence-seconds 180 -- \
-              "$VALIDATION_ROOT/bin/swift-validation" test --force-resolved-versions --disable-index-store --skip-build --filter "$budget"
+              "$VALIDATION_ROOT/bin/swift-validation" test --force-resolved-versions --disable-index-store --skip-build --filter "$budget" || status=1
           done
+          exit "$status"
 
       - name: Validate Python MCP harness fixtures
+        if: ${{ !cancelled() && steps.checkout_source.outcome == 'success' }}
         timeout-minutes: 5
         shell: bash
         run: |
@@ -183,10 +205,13 @@ jobs:
             python3 -B -m unittest discover -s scripts -p test_mcp_locks.py
 
       - name: Build release Engram native product
+        id: release_build
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         timeout-minutes: 75
         run: '"$VALIDATION_ROOT/bin/swift-validation" build --force-resolved-versions --disable-index-store -c release --product Engram'
 
       - name: Verify actual native MCP lifecycle and contention cases
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         timeout-minutes: 30
         shell: bash
         run: |

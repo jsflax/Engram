@@ -12,15 +12,23 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run_block(workflow, name):
+def step_section(workflow, name):
     text = (ROOT / '.github/workflows' / workflow).read_text()
     marker = '      - name: ' + name + '\n'
-    section = text.split(marker, 1)[1].split('\n      - ', 1)[0]
+    return text.split(marker, 1)[1].split('\n      - ', 1)[0]
+
+
+def run_block(workflow, name):
+    section = step_section(workflow, name)
     match = re.search(r'^        run: (.*)$', section, re.M)
     if not match:
         raise AssertionError('step has no run command: ' + name)
     value = match[1]
     if value not in ('|', '>'):
+        # Decode the YAML single-quoted scalar used by native build commands;
+        # its outer quotes are not part of the script GitHub executes.
+        if value.startswith("'") and value.endswith("'"):
+            value = value[1:-1].replace("''", "'")
         return value + '\n'
     body = []
     for line in section[match.end():].splitlines()[1:]:
@@ -147,7 +155,9 @@ with open(os.environ['CALL_LOG'],'a') as output:
                 self.assertEqual(text.count('      - name: ' + name + '\n'), 1)
                 section = text.split('      - name: ' + name + '\n', 1)[1].split('\n      - ', 1)[0]
                 self.assertNotIn('continue-on-error', section)
-                self.assertNotRegex(section, re.compile(r'^        if:', re.M))
+                conditions = re.findall(r'^        if: (.*)$', section, re.M)
+                self.assertEqual(conditions, [] if workflow == 'release.yml' else [
+                    "${{ !cancelled() && steps.native_build.outcome == 'success' }}"])
                 self.assertNotIn('|| true', section)
                 self.assertLess(text.index('      - name: ' + parallel_name + '\n'),
                                 text.index('      - name: ' + name + '\n'))
@@ -203,6 +213,180 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
                         self.assertEqual(call['cwd'], str(expected_cwd))
                         self.assertEqual(call['fixture'], str(expected_fixture))
                         self.assertEqual(call['tmp'], str(expected_fixture / 'tmp') if release else str(validation / 'tmp'))
+
+    def test_native_validation_uses_only_explicit_independent_prerequisites(self):
+        workflow = 'native-validation.yml'
+        text = (ROOT / '.github/workflows' / workflow).read_text()
+        ids = {
+            'Check out exact source under localdev': 'checkout_source',
+            'Resolve pinned dependencies (private read-only clone credential)': 'dependencies',
+            'Build native tests': 'native_build',
+            'Build release Engram native product': 'release_build',
+        }
+        self.assertEqual(re.findall(r'^        id: (.*)$', text, re.M), list(ids.values()))
+        for name, step_id in ids.items():
+            self.assertEqual(re.findall(r'^        id: (.*)$', step_section(workflow, name), re.M), [step_id])
+        prerequisites = {
+            'Run full native release filter': 'native_build',
+            'Run ledger BEGIN timing regression (serial)': 'native_build',
+            'Collect ledger BEGIN contention diagnostics (serial)': 'native_build',
+            'Run both statement budgets in separate serial processes': 'native_build',
+            'Validate Python MCP harness fixtures': 'checkout_source',
+            'Build release Engram native product': 'dependencies',
+            'Verify actual native MCP lifecycle and contention cases': 'release_build',
+        }
+        evidence_steps = {'Record source and dependency integrity', 'Upload explicit validation evidence'}
+        for name in re.findall(r'^      - name: (.*)$', text, re.M):
+            conditions = re.findall(r'^        if: (.*)$', step_section(workflow, name), re.M)
+            expected = []
+            if name in prerequisites:
+                expected = ["${{ !cancelled() && steps." + prerequisites[name] + ".outcome == 'success' }}"]
+            elif name in evidence_steps:
+                expected = ["${{ always() && env.VALIDATION_ROOT != '' }}"]
+            self.assertEqual(conditions, expected, name)
+        self.assertNotIn('continue-on-error', text)
+        self.assertNotIn('|| true', text)
+        diagnostic = 'Collect ledger BEGIN contention diagnostics (serial)'
+        self.assertLess(text.index('      - name: Run ledger BEGIN timing regression (serial)\n'),
+                        text.index('      - name: ' + diagnostic + '\n'))
+        self.assertLess(text.index('      - name: ' + diagnostic + '\n'),
+                        text.index('      - name: Run both statement budgets in separate serial processes\n'))
+        self.assertIn('--skip beginContentionTimingDiagnostics',
+                      run_block(workflow, 'Run full native release filter'))
+        self.assertIn('timeout-minutes: 3', step_section(workflow, diagnostic))
+
+    def test_native_validation_shell_commands_collect_independent_failures(self):
+        workflow = 'native-validation.yml'
+        full_filter = 'EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests|LockedSnapshotTests'
+        with tempfile.TemporaryDirectory(prefix='engram independent workflow ') as temporary:
+            root = Path(temporary).resolve()
+            validation = root / 'validation'
+            (validation / 'repo').mkdir(parents=True)
+            bin_dir = root / 'bin'; bin_dir.mkdir()
+            (validation / 'bin').mkdir()
+            (validation / 'scratch/release').mkdir(parents=True)
+            native = validation / 'scratch/release/Engram'
+            native.write_text('#!/bin/sh\nexit 99\n'); native.chmod(0o700)
+            log = root / 'calls.jsonl'
+            fake = '#!' + sys.executable + '\n' + """import json,os,sys
+from pathlib import Path
+args=sys.argv[1:]
+with open(os.environ['CALL_LOG'],'a') as stream:
+    stream.write(json.dumps({'tool':Path(sys.argv[0]).name,'args':args,'cwd':str(Path.cwd())})+'\\n')
+key = (args[args.index('--filter')+1] if '--filter' in args else
+       args[args.index('--case')+1] if '--case' in args else
+       'release' if Path(sys.argv[0]).name=='swift-validation' else 'fixtures')
+raise SystemExit(29 if key in json.loads(os.environ['FAIL_KEYS']) else 0)
+"""
+            for command in (bin_dir / 'python3', validation / 'bin/swift-validation'):
+                command.write_text(fake); command.chmod(0o700)
+            env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
+                       VALIDATION_ROOT=str(validation))
+            swift_test = [str(validation / 'bin/swift-validation'), 'test',
+                          '--force-resolved-versions', '--disable-index-store', '--skip-build']
+            def supervised(directory, timeout, silence, command):
+                return ['-B', 'scripts/run_native_tests.py', '--diagnostics-dir',
+                        str(validation / 'evidence' / directory), '--timeout-seconds', str(timeout),
+                        '--silence-seconds', str(silence), '--', *command]
+            cases = ['smoke', 'startup', 'warm-startup', 'warm-multistore-startup',
+                     'recall', 'idle', 'persistence']
+            budgets = ['recall_statementBudget', 'clusters_statementBudget']
+            checks = [
+                ('Run full native release filter', [full_filter], [supervised('native-tests', 1800, 300,
+                    swift_test + ['--filter', full_filter] + [argument for name in (
+                        'PerfTests', 'keyBERTKeywordExtraction', 'recall_semanticRelevanceOrdering',
+                        'recall_connectedMemory_showsEdgeRelation',
+                        'recall_graphTraversal_relatesToDoesNotLeakViaUnrelatedStructuralEdge',
+                        *budgets, 'busyBeginDoesNotInvokeBodyOrPublishReceipt',
+                        'beginContentionTimingDiagnostics') for argument in ('--skip', name)])], False),
+                ('Collect ledger BEGIN contention diagnostics (serial)', ['beginContentionTimingDiagnostics'],
+                    [supervised('ledger-begin-diagnostics', 120, 60,
+                                swift_test + ['--filter', 'beginContentionTimingDiagnostics'])], False),
+                ('Run both statement budgets in separate serial processes', budgets,
+                    [supervised(budget, 300, 180, swift_test + ['--filter', budget]) for budget in budgets], True),
+                ('Validate Python MCP harness fixtures', ['fixtures'],
+                    [supervised('mcp-harness-fixtures', 180, 60,
+                                ['python3', '-B', '-m', 'unittest', 'discover', '-s', 'scripts', '-p', 'test_mcp_locks.py'])], False),
+                ('Build release Engram native product', ['release'],
+                    [['build', '--force-resolved-versions', '--disable-index-store', '-c', 'release', '--product', 'Engram']], False),
+                ('Verify actual native MCP lifecycle and contention cases', cases,
+                    [supervised('mcp-' + case, 180, 90,
+                                ['python3', '-B', 'scripts/verify-mcp-locks.py', '--binary', str(native), '--case', case])
+                     for case in cases], True),
+            ]
+            for name, keys, expected_args, aggregated in checks:
+                # First and second budget failures each preserve the other run;
+                # every MCP position is also exercised without running Swift.
+                scenarios = [[], *[[key] for key in keys]] + ([keys] if aggregated else [])
+                for failures in scenarios:
+                    with self.subTest(step=name, failures=failures):
+                        log.unlink(missing_ok=True)
+                        continued = root / 'continued'; continued.unlink(missing_ok=True)
+                        result = subprocess.run(['/bin/bash', '-e', '-c', run_block(workflow, name)
+                            + 'printf continued > "$1"\n', 'gate', str(continued)], cwd=validation / 'repo',
+                            env=dict(env, FAIL_KEYS=json.dumps(failures)), capture_output=True, text=True, timeout=20)
+                        self.assertEqual(result.returncode, (1 if aggregated else 29) if failures else 0,
+                                         result.stdout + result.stderr)
+                        self.assertEqual(continued.exists(), not failures and not aggregated)
+                        calls = [json.loads(line) for line in log.read_text().splitlines()]
+                        self.assertEqual(calls, [{'tool': 'swift-validation' if keys == ['release'] else 'python3',
+                            'args': arguments, 'cwd': str(validation / 'repo')} for arguments in expected_args])
+
+    def test_begin_diagnostics_requires_explicit_native_opt_in(self):
+        flag = 'ENGRAM_BEGIN_DIAGNOSTICS'
+        workflow = 'native-validation.yml'
+        name = 'Collect ledger BEGIN contention diagnostics (serial)'
+        block = run_block(workflow, name)
+        source = (ROOT / 'Tests/EngramTests/BeginContentionDiagnosticsTests.swift').read_text()
+        self.assertRegex(source, r'@Test\(\.enabled\(if:\s*ProcessInfo\.processInfo\.environment\["'
+                         + flag + r'"\]\s*==\s*"1"\)\)\s*func beginContentionTimingDiagnostics\(')
+        self.assertIn(flag + '=1 python3 -B scripts/run_native_tests.py', block)
+        text = (ROOT / '.github/workflows' / workflow).read_text()
+        self.assertEqual(text.count(flag), 1)
+        self.assertNotIn(flag, (ROOT / '.github/workflows/release.yml').read_text())
+        with tempfile.TemporaryDirectory(prefix='engram diagnostic opt in ') as temporary:
+            root = Path(temporary).resolve()
+            validation = root / 'validation'
+            scripts = validation / 'repo/scripts'; scripts.mkdir(parents=True)
+            bin_dir = root / 'bin'; bin_dir.mkdir()
+            (validation / 'bin').mkdir()
+            (bin_dir / 'python3').symlink_to(sys.executable)
+            log = root / 'calls.jsonl'
+            (scripts / 'run_native_tests.py').write_text("""import argparse,json,os,subprocess
+parser=argparse.ArgumentParser()
+parser.add_argument('--diagnostics-dir',required=True)
+parser.add_argument('--timeout-seconds',type=int,required=True)
+parser.add_argument('--silence-seconds',type=int,required=True)
+parser.add_argument('command',nargs=argparse.REMAINDER)
+args=parser.parse_args()
+assert args.timeout_seconds==120 and args.silence_seconds==60,args
+assert args.command[0]=='--',args
+with open(os.environ['CALL_LOG'],'a') as stream:
+    stream.write(json.dumps({'phase':'supervisor','opt_in':os.environ.get('ENGRAM_BEGIN_DIAGNOSTICS')})+'\\n')
+raise SystemExit(subprocess.run(args.command[1:],check=False).returncode)
+""")
+            native = validation / 'bin/swift-validation'
+            native.write_text('#!' + sys.executable + '\n' + """import json,os,sys
+assert sys.argv[1:]==['test','--force-resolved-versions','--disable-index-store','--skip-build',
+                      '--filter','beginContentionTimingDiagnostics'],sys.argv
+with open(os.environ['CALL_LOG'],'a') as stream:
+    stream.write(json.dumps({'phase':'child','opt_in':os.environ.get('ENGRAM_BEGIN_DIAGNOSTICS')})+'\\n')
+raise SystemExit(int(os.environ['FAKE_GATE_EXIT']))
+""")
+            native.chmod(0o700)
+            env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', VALIDATION_ROOT=str(validation),
+                       CALL_LOG=str(log), ENGRAM_BEGIN_DIAGNOSTICS='0')
+            for exit_code in (0, 29):
+                with self.subTest(exit_code=exit_code):
+                    log.unlink(missing_ok=True)
+                    continued = root / 'continued'; continued.unlink(missing_ok=True)
+                    result = subprocess.run(['/bin/bash', '-e', '-c', block + 'printf continued > "$1"\n',
+                                             'gate', str(continued)], cwd=validation / 'repo',
+                        env=dict(env, FAKE_GATE_EXIT=str(exit_code)), capture_output=True, text=True, timeout=20)
+                    self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
+                    self.assertEqual(continued.exists(), exit_code == 0)
+                    self.assertEqual([json.loads(line) for line in log.read_text().splitlines()], [
+                        {'phase': 'supervisor', 'opt_in': '1'}, {'phase': 'child', 'opt_in': '1'}])
 
     def test_native_mcp_gate_includes_persistence_and_existing_cases(self):
         name = 'Verify real MCP lifecycle and database lock regressions'
