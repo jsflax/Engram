@@ -1,6 +1,7 @@
 #if canImport(FoundationModels)
 import Testing
 import EngramKit
+import struct EngramMemoryCore.StaticIdentityProvider
 import Lattice
 import Foundation
 import FoundationModels
@@ -24,7 +25,8 @@ private func makeMemoryTools() async throws -> MemoryTools {
     if await !embedder.isLoaded {
         await embedder.load()
     }
-    return MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
+    return MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder,
+        identity: StaticIdentityProvider(.anonymous))
 }
 
 /// Extract a UUID string from text like "id:550E8400-..." or "id: 550E8400-..."

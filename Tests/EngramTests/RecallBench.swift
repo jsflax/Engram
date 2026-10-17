@@ -1,5 +1,6 @@
 import Testing
 import EngramKit
+import struct EngramMemoryCore.StaticIdentityProvider
 import EngramModels
 import Lattice
 import MCP
@@ -107,7 +108,8 @@ struct RecallBench {
         let embedder = sharedEmbedder
         if await !embedder.isLoaded { await embedder.load() }
         let tools = MemoryTools(localRef: lattice.sendableReference,
-                                syncedRef: nil, embedder: embedder)
+                                syncedRef: nil, embedder: embedder,
+                                identity: StaticIdentityProvider(.anonymous))
 
         let topics = ["hook startup cost", "sqlite recall latency",
                       "embedding model load", "regression triage notes"]
@@ -186,8 +188,10 @@ struct RecallBench {
 
         let embedder = sharedEmbedder
         if await !embedder.isLoaded { await embedder.load() }
+        // Preserve the same live attribution as the cold advise benchmark.
         return MemoryTools(localRef: lattice.sendableReference, syncedRef: syncedRef,
-                           groupRefs: groupRefs, embedder: embedder)
+                           groupRefs: groupRefs, embedder: embedder,
+                           identity: GroupDirectoryIdentityProvider())
     }
 
     // MARK: Measurement helpers

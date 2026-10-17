@@ -1,5 +1,6 @@
 import Testing
 import EngramKit
+import struct EngramMemoryCore.StaticIdentityProvider
 import Lattice
 import MCP
 import Foundation
@@ -541,7 +542,8 @@ import Foundation
         .appending(path: "claude-memory-test-\(UUID().uuidString).sqlite")
     let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, configuration: .init(fileURL: path))
     let embedder = EmbeddingService(modelPath: "/nonexistent/path")
-    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
+    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder,
+        identity: StaticIdentityProvider(.anonymous))
 
     await #expect(throws: MCPError.self) {
         _ = try await tools.handle(CallTool.Parameters(
@@ -1220,7 +1222,8 @@ import Foundation
         .appending(path: "claude-memory-test-\(UUID().uuidString).sqlite")
     let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, configuration: .init(fileURL: path))
     let embedder = EmbeddingService()
-    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
+    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder,
+        identity: StaticIdentityProvider(.anonymous))
 
     // Without embedding model, remember should fail rather than store empty vectors
     await #expect(throws: MCPError.self) {

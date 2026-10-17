@@ -1,5 +1,6 @@
 import Testing
 import EngramKit
+import struct EngramMemoryCore.StaticIdentityProvider
 import EngramModels
 import Lattice
 import MCP
@@ -8,8 +9,8 @@ import Foundation
 // ============================================================================
 // Groups increment 7 — hooks hardening: the escape-hardened indentation
 // fence for foreign-authored content, the per-device opt-out exclusion, and
-// the maintenance-guard filter in clustering. No groups.json in tests →
-// currentUserId is nil, so any non-nil authorUserId is foreign.
+// the maintenance-guard filter in clustering. Pin an anonymous identity
+// so directory fixtures in parallel suites cannot change which rows are foreign.
 // ============================================================================
 
 private struct ToolsContext {
@@ -24,7 +25,8 @@ private func makeHardeningTools() async throws -> ToolsContext {
     let embedder = sharedEmbedder
     if await !embedder.isLoaded { await embedder.load() }
     return ToolsContext(
-        tools: MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder),
+        tools: MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder,
+            identity: StaticIdentityProvider(.anonymous)),
         lattice: lattice)
 }
 
