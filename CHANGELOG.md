@@ -6,6 +6,23 @@ All notable changes to Engram are documented in this file.
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-17
+
+### Fixed
+- Load an established operation-ledger identity without unnecessarily requesting
+  the SQLite writer lock. Genuine read errors still fail closed, and first-time
+  creation retains its checked transaction and bounded admission policy.
+- Adopt Lattice 2.0.1 and Core 2.0.8 so startup skips unnecessary sync-repair
+  transactions. Required repairs recheck acknowledgements from current live
+  channels under writer ownership and preserve caller-owned transactions.
+- Release the memory service's own completed read snapshots before typed vacuum
+  maintenance. Independent readers still constrain checkpointing and prevent
+  a false claim that the WAL was truncated.
+
+### Compatibility
+- Existing learner holds, operation receipts, memory IDs, enrollment frontiers,
+  cursors, and original memory lifetimes remain intact across upgrade.
+
 ## [0.15.0] - 2026-10-16
 
 ### Added
