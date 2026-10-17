@@ -244,7 +244,7 @@ jobs:
         timeout-minutes: 10
         run: |
           mkdir -p build/mcp-test-home build/mcp-test-tmp
-          for regression in smoke startup warm-startup recall idle persistence; do
+          for regression in smoke startup warm-startup warm-multistore-startup recall idle persistence; do
             env HOME="$PWD/build/mcp-test-home" \
               CFFIXED_USER_HOME="$PWD/build/mcp-test-home" \
               TMPDIR="$PWD/build/mcp-test-tmp" \

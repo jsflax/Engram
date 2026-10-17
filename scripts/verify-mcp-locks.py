@@ -68,9 +68,11 @@ class Client:
                     self.messages.append(json.loads(line))
 
     def response_message(self, request_id, timeout=15):
-        deadline = time.monotonic() + timeout
+        response_started = time.monotonic()
+        deadline = response_started + timeout
         if self.deadline is not None:
             deadline = min(deadline, self.deadline)
+        effective_timeout = max(0, deadline - response_started)
         while time.monotonic() < deadline:
             for i, message in enumerate(self.messages):
                 if message.get("id") == request_id:
@@ -80,7 +82,7 @@ class Client:
             if self.process.poll() is not None:
                 raise AssertionError(f"MCP exited {self.process.returncode}: "
                                      + "\n".join(self.stderr[-12:]))
-        raise AssertionError(f"MCP response exceeded {timeout}s: "
+        raise AssertionError(f"MCP response exceeded {effective_timeout:.3f}s effective budget (requested {timeout}s): "
                              + "\n".join(self.stderr[-12:]))
 
     def response(self, request_id, timeout=15):
@@ -217,6 +219,42 @@ def initialized_store_snapshot(db):
         assert receipts == 0, "Fixture must contain no operation receipts"
     return {"schema_cookie": cookie, "fingerprints": fingerprints, "stores": stores,
             "operation_receipts": receipts}
+
+
+def remove_fixture_store_identity(db):
+    # Only the disposable, native-created startup fixture calls this helper,
+    # after its native child has exited. Keep the generated audit triggers:
+    # sync_disabled() is connection state, and 1 disables this setup DELETE's
+    # audit insertion without changing the persistent _SyncControl flag.
+    expected_tables = {"Memory", "Edge", "Checkpoint", "HookState", "SessionState",
+                       "SyncConfig", "EngramOperationStoreV1", "EngramOperationReceiptV1"}
+    with closing(sqlite3.connect(db, timeout=2)) as setup:
+        setup.execute("BEGIN IMMEDIATE")
+        schema = setup.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").fetchall()
+        assert expected_tables <= {row[1] for row in schema if row[0] == "table"}, "Incomplete native fixture registry"
+        guard = next((row[3] for row in schema if row[0] == "trigger" and
+                      row[1] == "AuditEngramOperationStoreV1Delete"), None)
+        assert guard and "WHEN (sync_disabled() = 0)" in guard, "Missing native DELETE audit guard"
+        stores = setup.execute("SELECT singletonKey, storeID, formatVersion FROM EngramOperationStoreV1").fetchall()
+        assert len(stores) == 1 and stores[0][0] == "local-operation-store" and stores[0][2] == 1, stores
+        uuid.UUID(stores[0][1])
+        assert setup.execute("SELECT COUNT(*) FROM EngramOperationReceiptV1").fetchone()[0] == 0, "Fixture has operation receipts"
+        def preserved():
+            return (setup.execute("PRAGMA schema_version").fetchone(),
+                    setup.execute("SELECT key, value FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%' ORDER BY key").fetchall(),
+                    setup.execute("SELECT id, disabled FROM _SyncControl ORDER BY id").fetchall(),
+                    setup.execute("SELECT * FROM AuditLog ORDER BY id").fetchall(),
+                    setup.execute("SELECT globalId, content FROM Memory ORDER BY globalId").fetchall(),
+                    setup.execute("SELECT name, seq FROM sqlite_sequence ORDER BY name").fetchall())
+        before = preserved()
+        assert before[1] and before[2] == [(1, 0)] and len(before[4]) == 1, "Unexpected startup fixture state"
+        setup.create_function("sync_disabled", 0, lambda: 1)
+        deleted = setup.execute("DELETE FROM EngramOperationStoreV1 WHERE singletonKey = 'local-operation-store'")
+        assert deleted.rowcount == 1, "Fixture identity removal was not exact"
+        assert setup.execute("SELECT COUNT(*) FROM EngramOperationStoreV1").fetchone()[0] == 0
+        assert preserved() == before, "Fixture setup changed protected state"
+        assert setup.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").fetchall() == schema
+        setup.commit()
 
 
 def assert_retained_writer(writer, db):
@@ -652,12 +690,7 @@ def run(binary, case):
                 # admission (covered separately by warm-startup). Only this
                 # disposable zero-receipt fixture loses its initial identity;
                 # all eight registered models/fingerprints remain intact.
-                with closing(sqlite3.connect(db, timeout=2)) as setup:
-                    assert setup.execute("SELECT COUNT(*) FROM EngramOperationReceiptV1").fetchone()[0] == 0
-                    assert setup.execute("SELECT COUNT(*) FROM EngramOperationStoreV1").fetchone()[0] == 1
-                    setup.execute("DELETE FROM EngramOperationStoreV1 WHERE singletonKey = 'local-operation-store'")
-                    setup.commit()
-                    assert setup.execute("SELECT COUNT(*) FROM EngramOperationStoreV1").fetchone()[0] == 0
+                remove_fixture_store_identity(db)
                 with sqlite3.connect(db, timeout=2) as writer:
                     writer.execute("BEGIN IMMEDIATE")
                     client = Client(binary, db)

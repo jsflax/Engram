@@ -205,12 +205,52 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
                         self.assertEqual(call['tmp'], str(expected_fixture / 'tmp') if release else str(validation / 'tmp'))
 
     def test_native_mcp_gate_includes_persistence_and_existing_cases(self):
-        body = run_block('release.yml', 'Verify real MCP lifecycle and database lock regressions')
+        name = 'Verify real MCP lifecycle and database lock regressions'
+        body = run_block('release.yml', name)
         match = re.search(r'for regression in ([^;]+); do', body)
         self.assertIsNotNone(match)
         cases = match[1].split()
-        self.assertEqual(set(cases), {'smoke', 'startup', 'warm-startup', 'recall', 'idle', 'persistence'})
-        self.assertEqual(len(cases), 6)
+        expected = ['smoke', 'startup', 'warm-startup', 'warm-multistore-startup',
+                    'recall', 'idle', 'persistence']
+        self.assertEqual(cases, expected)
+        validation = run_block('native-validation.yml', 'Verify actual native MCP lifecycle and contention cases')
+        self.assertEqual(re.search(r'for regression in ([^;]+); do', validation)[1].split(), expected)
+        section = (ROOT / '.github/workflows/release.yml').read_text().split(
+            '      - name: ' + name + '\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('timeout-minutes: 10', section)
+        self.assertNotIn('continue-on-error', section)
+        self.assertNotRegex(section, re.compile(r'^        if:', re.M))
+        with tempfile.TemporaryDirectory(prefix='engram mcp workflow ') as temporary:
+            root = Path(temporary).resolve()
+            bin_dir = root / 'bin'; bin_dir.mkdir()
+            log, continued = root / 'calls.jsonl', root / 'continued'
+            fake = '#!' + sys.executable + '\n' + """import json,os,sys
+from pathlib import Path
+with open(os.environ['CALL_LOG'],'a') as stream:
+    stream.write(json.dumps({'args':sys.argv[1:],'cwd':str(Path.cwd()),
+        'home':os.environ['HOME'],'foundation_home':os.environ['CFFIXED_USER_HOME'],
+        'tmp':os.environ['TMPDIR']})+'\\n')
+case=sys.argv[sys.argv.index('--case')+1]
+raise SystemExit(37 if case==os.environ['FAILING_CASE'] else 0)
+"""
+            command = bin_dir / 'python3'
+            command.write_text(fake); command.chmod(0o755)
+            env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log))
+            for failing in ('', 'warm-multistore-startup'):
+                with self.subTest(failing=failing):
+                    log.unlink(missing_ok=True); continued.unlink(missing_ok=True)
+                    result = subprocess.run(['/bin/bash', '-e', '-c', body + 'printf continued > continued\n'],
+                        cwd=root, env=dict(env, FAILING_CASE=failing), capture_output=True, text=True, timeout=20)
+                    self.assertEqual(result.returncode, 37 if failing else 0, result.stdout + result.stderr)
+                    self.assertEqual(continued.exists(), not failing)
+                    observed = [json.loads(line) for line in log.read_text().splitlines()]
+                    selected = expected[:4] if failing else expected
+                    self.assertEqual(observed, [{
+                        'args': ['-B', 'scripts/verify-mcp-locks.py', '--binary', '.build/release/Engram', '--case', case],
+                        'cwd': str(root), 'home': str(root / 'build/mcp-test-home'),
+                        'foundation_home': str(root / 'build/mcp-test-home'),
+                        'tmp': str(root / 'build/mcp-test-tmp'),
+                    } for case in selected])
 
     def test_native_residual_gate_uses_release_binary_private_workdir_and_propagates_failure(self):
         name = 'Verify actual native residual recovery and readback'

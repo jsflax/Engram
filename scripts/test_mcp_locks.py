@@ -13,7 +13,7 @@ import tempfile
 import textwrap
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("verify_mcp_locks", ROOT / "verify-mcp-locks.py")
@@ -163,6 +163,92 @@ class PersistenceHarnessTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "schema_cookie"):
                     HARNESS.initialized_store_snapshot(path)
                 self.assertEqual(db.execute("SELECT value FROM _lattice_meta").fetchone()[0], str(original_cookie))
+
+    def guarded_startup_fixture(self, directory):
+        path = (Path(directory) / "startup.sqlite").resolve()
+        with contextlib.closing(sqlite3.connect(path)) as db:
+            db.execute("CREATE TABLE Memory(globalId TEXT, content TEXT)")
+            db.execute("INSERT INTO Memory VALUES (?, 'synthetic preserved memory')", (ID,))
+            for name in ("Edge", "Checkpoint", "HookState", "SessionState", "SyncConfig", "EngramOperationReceiptV1"):
+                db.execute(f"CREATE TABLE {name}(id INTEGER)")
+            db.execute("CREATE TABLE EngramOperationStoreV1(id INTEGER PRIMARY KEY, globalId TEXT, singletonKey TEXT, storeID TEXT, formatVersion INTEGER)")
+            db.execute("INSERT INTO EngramOperationStoreV1 VALUES (1, ?, 'local-operation-store', ?, 1)", (ID, ID))
+            db.execute("CREATE TABLE _SyncControl(id INTEGER PRIMARY KEY, disabled INTEGER)")
+            db.execute("INSERT INTO _SyncControl VALUES (1, 0)")
+            db.execute("CREATE TABLE _lattice_meta(key TEXT, value TEXT)")
+            db.execute("CREATE TABLE AuditLog(id INTEGER PRIMARY KEY AUTOINCREMENT, tableName TEXT, operation TEXT, rowId INTEGER, globalRowId TEXT, changedFields TEXT, changedFieldsNames TEXT, timestamp REAL)")
+            db.execute("INSERT INTO AuditLog(tableName, operation, rowId, globalRowId) VALUES ('Memory', 'INSERT', 1, ?)", (ID,))
+            # Match Core's generated DELETE guard and audit fields. No UDF is
+            # installed until the test explicitly selects its connection state.
+            db.execute("""CREATE TRIGGER AuditEngramOperationStoreV1Delete
+                AFTER DELETE ON EngramOperationStoreV1 WHEN (sync_disabled() = 0)
+                BEGIN INSERT INTO AuditLog(tableName, operation, rowId, globalRowId,
+                                          changedFields, changedFieldsNames, timestamp)
+                    VALUES ('EngramOperationStoreV1', 'DELETE', OLD.id, OLD.globalId,
+                            json_object('singletonKey', OLD.singletonKey, 'storeID', OLD.storeID,
+                                        'formatVersion', OLD.formatVersion),
+                            json_array('singletonKey', 'storeID', 'formatVersion'), unixepoch('subsec'));
+                END""")
+            cookie = db.execute("PRAGMA schema_version").fetchone()[0]
+            db.execute("INSERT INTO _lattice_meta VALUES ('schema_fingerprint:fixture', ?)", (str(cookie),))
+            db.commit()
+        return path
+
+    def test_startup_identity_removal_retains_generated_guard_schema_and_audit(self):
+        with self.temporary_directory() as directory:
+            path = self.guarded_startup_fixture(directory)
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                before = list(db.iterdump())
+                with self.assertRaisesRegex(sqlite3.OperationalError, "no such function: sync_disabled"):
+                    db.execute("DELETE FROM EngramOperationStoreV1")
+                db.rollback()
+                self.assertEqual(list(db.iterdump()), before)
+                # The existing trigger still audits ordinary, non-disabled
+                # deletes. Roll back this probe before exercising setup.
+                db.create_function("sync_disabled", 0, lambda: 0)
+                db.execute("DELETE FROM EngramOperationStoreV1")
+                self.assertEqual(db.execute("SELECT operation FROM AuditLog ORDER BY id").fetchall(), [("INSERT",), ("DELETE",)])
+                db.rollback()
+                self.assertEqual(list(db.iterdump()), before)
+            HARNESS.remove_fixture_store_identity(path)
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                after = list(db.iterdump())
+                self.assertEqual(after, [line for line in before if not line.startswith('INSERT INTO "EngramOperationStoreV1"')])
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM EngramOperationStoreV1").fetchone()[0], 0)
+                with self.assertRaisesRegex(sqlite3.OperationalError, "no such function: sync_disabled"):
+                    db.execute("SELECT sync_disabled()")
+
+    def test_startup_identity_removal_refuses_unsafe_fixture_preconditions(self):
+        for mutation in ("INSERT INTO EngramOperationReceiptV1 VALUES (1)",
+                         "UPDATE EngramOperationStoreV1 SET singletonKey='other'",
+                         "DROP TRIGGER AuditEngramOperationStoreV1Delete"):
+            with self.subTest(mutation=mutation), self.temporary_directory() as directory:
+                path = self.guarded_startup_fixture(directory)
+                with contextlib.closing(sqlite3.connect(path)) as db:
+                    db.execute(mutation)
+                    db.commit()
+                    before = list(db.iterdump())
+                with self.assertRaises(AssertionError):
+                    HARNESS.remove_fixture_store_identity(path)
+                with contextlib.closing(sqlite3.connect(path)) as db:
+                    self.assertEqual(list(db.iterdump()), before)
+
+    def test_response_timeout_reports_effective_clamped_budget(self):
+        for absolute, effective in ((102.0, 2.0), (None, 15.0), (99.0, 0.0)):
+            with self.subTest(absolute=absolute):
+                now = [100.0]
+                client = HARNESS.Client.__new__(HARNESS.Client)
+                client.deadline, client.messages, client.stderr = absolute, [], []
+                client.process = Mock()
+                client.process.poll.return_value = None
+                def pump(timeout):
+                    self.assertGreater(timeout, 0)
+                    now[0] += timeout
+                client.pump = pump
+                with patch.object(HARNESS.time, "monotonic", side_effect=lambda: now[0]):
+                    with self.assertRaisesRegex(AssertionError, rf"exceeded {effective:.3f}s effective budget \(requested 15s\)"):
+                        client.response_message(1)
+                self.assertAlmostEqual(now[0], 100 + effective)
 
     def fixture_run(self, dishonest=False):
         with self.temporary_directory() as directory:
