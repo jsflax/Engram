@@ -55,7 +55,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
             (root / 'scripts').mkdir()
             # This test checks workflow command contracts. Supervision has its
             # own tests; a real process inventory can stall on a busy host.
-            (root / 'scripts/run_native_tests.py').write_text('''import argparse, subprocess
+            (root / 'scripts/run_native_tests.py').write_text('''import argparse, os, subprocess
+from pathlib import Path
 parser = argparse.ArgumentParser()
 parser.add_argument('--diagnostics-dir', required=True)
 parser.add_argument('--timeout-seconds', type=int, required=True)
@@ -66,6 +67,10 @@ assert args.diagnostics_dir == 'build/native-test-diagnostics', args
 assert args.timeout_seconds == 1800, args
 assert args.silence_seconds == 300, args
 assert args.command and args.command[0] == '--', args
+assert os.environ['ENGRAM_ADOPTION_TEST_ROOT'] == str(
+    Path(os.environ['HOME']) / 'localdev/engram-native-tests-987654321-2')
+assert os.environ['ENGRAM_TEST_ROOT'] == os.environ['ENGRAM_ADOPTION_TEST_ROOT']
+assert os.environ['TMPDIR'] == str(Path(os.environ['ENGRAM_ADOPTION_TEST_ROOT']) / 'tmp')
 raise SystemExit(subprocess.run(args.command[1:], check=False).returncode)
 ''')
             bin_dir = root / 'bin'
@@ -75,7 +80,11 @@ raise SystemExit(subprocess.run(args.command[1:], check=False).returncode)
 from pathlib import Path
 kind=Path(sys.argv[0]).name
 args=sys.argv[1:]
-if kind=='swift':
+if kind=='mkdir':
+    # Intercept the workflow's fixture allocation: never write to the real home.
+    fixture = Path(os.environ['HOME'])/'localdev/engram-native-tests-987654321-2'
+    assert args == ['-m','700','-p',str(fixture),str(fixture/'tmp')],args
+elif kind=='swift':
     assert '--force-resolved-versions' in args,args
 else:
     assert '-disableAutomaticPackageResolution' in args,args
@@ -86,13 +95,14 @@ else:
 with open(os.environ['CALL_LOG'],'a') as output:
     output.write(json.dumps([kind,*args])+'\\n')
 '''
-            for name in ('swift', 'xcodebuild'):
+            for name in ('swift', 'xcodebuild', 'mkdir'):
                 command = bin_dir / name
                 command.write_text(fake)
                 command.chmod(0o755)
             (root / 'appcast.xml').write_text('<sparkle:version>14</sparkle:version>\n')
             env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
-                       RELEASE_TAG='v0.14.8', APPLE_TEAM_ID='ABCDEFGHIJ', RUNNER_TEMP=str(root))
+                       RELEASE_TAG='v0.14.8', APPLE_TEAM_ID='ABCDEFGHIJ', RUNNER_TEMP=str(root),
+                       GITHUB_RUN_ID='987654321', GITHUB_RUN_ATTEMPT='2')
             steps = {
                 'release.yml': ['Resolve dependencies', 'Build tests', 'Run tests',
                                 'Run statement-budget regressions (serial)',
@@ -108,6 +118,7 @@ with open(os.environ['CALL_LOG'],'a') as output:
             calls = [json.loads(line) for line in log.read_text().splitlines()]
             self.assertEqual(sum(call[0] == 'swift' for call in calls), 8)
             self.assertEqual(sum(call[0] == 'xcodebuild' for call in calls), 1)
+            self.assertEqual(sum(call[0] == 'mkdir' for call in calls), 1)
             tests = [call for call in calls if call[:2] == ['swift', 'test']]
             self.assertEqual(len(tests), 3)
             self.assertTrue(any('recall_statementBudget' in call for call in tests))

@@ -132,25 +132,31 @@ jobs:
         id: native_tests
         # Keep the full 30-minute test budget, plus bounded diagnostics/cleanup.
         timeout-minutes: 32
-        run: >
-          python3 -B scripts/run_native_tests.py
-          --diagnostics-dir build/native-test-diagnostics
-          --timeout-seconds 1800 --silence-seconds 300 --
-          swift test --force-resolved-versions --skip-build --filter "EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests|LockedSnapshotTests"
-          --skip "PerfTests"
-          --skip "keyBERTKeywordExtraction"
-          --skip "recall_semanticRelevanceOrdering"
-          --skip "recall_connectedMemory_showsEdgeRelation"
-          --skip "recall_graphTraversal_relatesToDoesNotLeakViaUnrelatedStructuralEdge"
-          --skip "recall_statementBudget"
-          --skip "clusters_statementBudget"
+        run: |
+          export ENGRAM_ADOPTION_TEST_ROOT="$HOME/localdev/engram-native-tests-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export ENGRAM_TEST_ROOT="$ENGRAM_ADOPTION_TEST_ROOT"
+          export TMPDIR="$ENGRAM_ADOPTION_TEST_ROOT/tmp"
+          mkdir -m 700 -p "$ENGRAM_ADOPTION_TEST_ROOT" "$TMPDIR"
+          python3 -B scripts/run_native_tests.py \
+            --diagnostics-dir build/native-test-diagnostics \
+            --timeout-seconds 1800 --silence-seconds 300 -- \
+            swift test --force-resolved-versions --skip-build --filter "EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests|LockedSnapshotTests" \
+            --skip "PerfTests" \
+            --skip "keyBERTKeywordExtraction" \
+            --skip "recall_semanticRelevanceOrdering" \
+            --skip "recall_connectedMemory_showsEdgeRelation" \
+            --skip "recall_graphTraversal_relatesToDoesNotLeakViaUnrelatedStructuralEdge" \
+            --skip "recall_statementBudget" \
+            --skip "clusters_statementBudget"
 
       - name: Upload native test diagnostics
         if: ${{ (failure() || cancelled()) && steps.native_tests.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: native-test-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
-          path: build/native-test-diagnostics/
+          path: |
+            build/native-test-diagnostics/
+            ~/localdev/engram-native-tests-${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: ignore
           retention-days: 7
 
