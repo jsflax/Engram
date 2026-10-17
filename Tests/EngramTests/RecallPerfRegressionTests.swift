@@ -1,5 +1,6 @@
 import Testing
 import EngramKit
+import EngramMemoryCore
 import EngramModels
 import Lattice
 import MCP
@@ -28,7 +29,8 @@ struct RecallPerfRegressionTests {
             configuration: .init(fileURL: path))
         let embedder = sharedEmbedder
         if await !embedder.isLoaded { await embedder.load() }
-        return (MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder), lattice)
+        return (MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder,
+            identity: StaticIdentityProvider(.anonymous)), lattice)
     }
 
     @discardableResult

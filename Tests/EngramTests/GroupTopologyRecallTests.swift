@@ -85,7 +85,8 @@ private func makeTopologyTools(
     let embedder = sharedEmbedder
     if await !embedder.isLoaded { await embedder.load() }
     let tools = MemoryTools(localRef: local.sendableReference, syncedRef: nil,
-                            groupRefs: refs, embedder: embedder)
+                            groupRefs: refs, embedder: embedder,
+                            identity: GroupDirectoryIdentityProvider())
     return TopologyContext(tools: tools, local: local,
                            selfUserId: selfUserId, spokes: spokes)
 }
@@ -361,7 +362,8 @@ struct GroupTopologyRecallTests {
         let tools = MemoryTools(
             localRef: local.sendableReference, syncedRef: nil,
             groupRefs: [.init(groupId: gid, path: spokePath, ref: spoke.sendableReference)],
-            embedder: embedder)
+            embedder: embedder,
+            identity: GroupDirectoryIdentityProvider())
 
         // The vacuum surface must report spoke coverage…
         let healed = text(from: try await tools.handle(CallTool.Parameters(name: "vacuum")))

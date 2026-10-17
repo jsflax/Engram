@@ -236,7 +236,8 @@ func attachRace_productionDB_repeatedRecall() async throws {
     let tools = MemoryTools(
         localRef: localLattice.sendableReference,
         syncedRef: syncedLattice.sendableReference,
-        embedder: embedder
+        embedder: embedder,
+        identity: GroupDirectoryIdentityProvider()
     )
 
     // Rapid-fire recall — each creates a temporary attached Lattice

@@ -263,6 +263,7 @@ let package = Package(
             dependencies: [
                 "EngramFoundationModels",
                 "EngramKit",
+                "EngramMemoryCore",
                 .product(name: "Lattice", package: "lattice"),
             ],
             resources: [
