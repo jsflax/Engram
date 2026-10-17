@@ -182,6 +182,10 @@ let tools = MemoryTools(
     enableLocalMutationOperations: true
 )
 
+// Open independent handles before accepting requests; failures propagate out
+// of startup without leaving a partially prepared MemoryTools instance live.
+try await tools.prepareStorage()
+
 // v2 embedding-space backstop: the daemon owns the migration for
 // subscribed/grouped users, but signed-out and daemon-less machines would
 // otherwise embed QUERIES in the new space against rows stored in the old
