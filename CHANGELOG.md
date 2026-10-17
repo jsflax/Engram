@@ -9,6 +9,9 @@ All notable changes to Engram are documented in this file.
 ## [0.15.1] - 2026-10-17
 
 ### Fixed
+- Support explicitly reviewed recovery of an expired replacement update followed
+  by a verified pre-transaction no-write remember. Preserve the original row and
+  lifetime, require complete transcript coverage, and perform no memory writes.
 - Load an established operation-ledger identity without unnecessarily requesting
   the SQLite writer lock. Genuine read errors still fail closed, and first-time
   creation retains its checked transaction and bounded admission policy.

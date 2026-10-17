@@ -150,6 +150,15 @@ exact historical evidence, independent memory-row checks and a hash-pinned revie
 bundle. It refuses other cases, including fresh unexpired intents and uncertain
 writes. Use `--help` for the explicit `prepare`, `apply` and `recover` arguments.
 
+A separate expired replacement-update profile supports one acknowledged update
+followed by one affirmative pre-transaction no-write remember, with both original
+fourteen-day lifetimes elapsed. It requires the exact update arguments and
+acknowledgement, an independent readback of the preserved row, and a pinned
+review covering all thirteen assistant messages in the historical interval.
+Every sentence and clause must have a reviewed disposition and attribution;
+assistant proposals cannot become asserted facts. The same publication and
+recovery checks apply, with no memory writes or renewed lifetimes.
+
 Preparation produces an immutable plan for inspection. Application requires that
 plan's exact SHA256, preserves the original failed run and memory IDs, advances
 only its reviewed interval, and records `legacy_reconciled_no_new_mutation`.
