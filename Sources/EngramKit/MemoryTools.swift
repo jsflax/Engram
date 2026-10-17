@@ -1311,7 +1311,7 @@ public actor MemoryTools {
     /// Every lattice this instance can hold a read generation on: the hub,
     /// the personal synced mirror, the group spokes, and the attach-cache
     /// union handles built over them.
-    private func retireAllReadMarks() {
+    func retireAllReadMarks() {
         localLattice.retireAllGenerations()
         syncedLattice?.retireAllGenerations()
         for spoke in groupSpokes {

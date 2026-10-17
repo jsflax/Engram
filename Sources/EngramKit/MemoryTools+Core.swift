@@ -1460,6 +1460,12 @@ extension MemoryTools {
     }
 
     func handleVacuum() throws -> CallTool.Result {
+        // Typed service calls bypass the MCP wrapper's per-call cleanup.
+        // Release this instance's completed reads, including cached attachment
+        // unions, before TRUNCATE can wait on our own keeper transactions.
+        // Independent readers remain untouched and still report a busy result.
+        retireAllReadMarks()
+
         // Checkpoint AFTER the VACUUM as well as before. SQLite's VACUUM
         // rewrites the entire database through the WAL, so a vacuum on an
         // 800MB database appends ~800MB of WAL — and without a trailing

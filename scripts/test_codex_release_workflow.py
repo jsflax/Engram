@@ -131,15 +131,86 @@ with open(os.environ['CALL_LOG'],'a') as output:
                 '--skip', 'recall_connectedMemory_showsEdgeRelation',
                 '--skip', 'recall_graphTraversal_relatesToDoesNotLeakViaUnrelatedStructuralEdge',
                 '--skip', 'recall_statementBudget', '--skip', 'clusters_statementBudget',
+                '--skip', 'busyBeginDoesNotInvokeBodyOrPublishReceipt',
             ])
+
+    def test_begin_timing_skip_has_mandatory_isolated_gate_and_propagates_failure(self):
+        selected = 'busyBeginDoesNotInvokeBodyOrPublishReceipt'
+        name = 'Run ledger BEGIN timing regression (serial)'
+        source = (ROOT / 'Tests/EngramTests/MemoryOperationLedgerTests.swift').read_text()
+        self.assertIn('@Test func ' + selected + '()', source)
+        self.assertIn('#expect(elapsed < 2.0)', source)
+        for workflow, parallel_name in (('release.yml', 'Run tests'),
+                                         ('native-validation.yml', 'Run full native release filter')):
+            with self.subTest(workflow=workflow):
+                text = (ROOT / '.github/workflows' / workflow).read_text()
+                self.assertEqual(text.count('      - name: ' + name + '\n'), 1)
+                section = text.split('      - name: ' + name + '\n', 1)[1].split('\n      - ', 1)[0]
+                self.assertNotIn('continue-on-error', section)
+                self.assertNotRegex(section, re.compile(r'^        if:', re.M))
+                self.assertNotIn('|| true', section)
+                self.assertLess(text.index('      - name: ' + parallel_name + '\n'),
+                                text.index('      - name: ' + name + '\n'))
+                parallel = run_block(workflow, parallel_name)
+                self.assertRegex(parallel, r'--skip ["\']?' + selected + r'["\']?(?:\s|$)')
+                block = run_block(workflow, name)
+                with tempfile.TemporaryDirectory(prefix='engram ledger workflow ') as temporary:
+                    root = Path(temporary).resolve()
+                    validation = root / 'validation'
+                    (validation / 'repo').mkdir(parents=True)
+                    bin_dir = root / 'bin'; bin_dir.mkdir()
+                    log, continued = root / 'calls.jsonl', root / 'continued'
+                    fake = '#!' + sys.executable + '\n' + """import json,os,sys
+from pathlib import Path
+kind=Path(sys.argv[0]).name
+with open(os.environ['CALL_LOG'],'a') as stream:
+    stream.write(json.dumps({'tool':kind,'args':sys.argv[1:],'cwd':str(Path.cwd()),
+        'fixture':os.environ['ENGRAM_ADOPTION_TEST_ROOT'],'tmp':os.environ['TMPDIR']})+'\\n')
+raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
+"""
+                    for tool in ('python3', 'mkdir'):
+                        command = bin_dir / tool
+                        command.write_text(fake); command.chmod(0o755)
+                    fixture = validation / 'fixtures'
+                    env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
+                        VALIDATION_ROOT=str(validation), GITHUB_RUN_ID='987654321', GITHUB_RUN_ATTEMPT='2',
+                        ENGRAM_ADOPTION_TEST_ROOT=str(fixture), ENGRAM_TEST_ROOT=str(fixture),
+                        TMPDIR=str(validation / 'tmp'))
+                    release = workflow == 'release.yml'
+                    expected_fixture = (Path(env['HOME']) / 'localdev/engram-native-ledger-begin-987654321-2'
+                                        if release else fixture)
+                    expected_cwd = root if release else validation / 'repo'
+                    command = ['swift' if release else str(validation / 'bin/swift-validation'),
+                               'test', '--force-resolved-versions']
+                    if not release:
+                        command += ['--disable-index-store']
+                    command += ['--skip-build', '--filter', selected]
+                    expected_args = ['-B', 'scripts/run_native_tests.py', '--diagnostics-dir',
+                        str(expected_fixture / 'diagnostics') if release else str(validation / 'evidence/ledger-begin-timing'),
+                        '--timeout-seconds', '120', '--silence-seconds', '60', '--', *command]
+                    for code in (0, 29):
+                        log.unlink(missing_ok=True); continued.unlink(missing_ok=True)
+                        # The path may contain spaces; pass it as a separate shell argument.
+                        result = subprocess.run(['/bin/bash', '-e', '-c', block + "printf continued > \"$1\"\n", 'gate', str(continued)],
+                            cwd=root, env=dict(env, FAKE_GATE_EXIT=str(code)),
+                            capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                        self.assertEqual(continued.exists(), code == 0)
+                        calls = [json.loads(line) for line in log.read_text().splitlines()]
+                        self.assertEqual([call['tool'] for call in calls], ['mkdir', 'python3'] if release else ['python3'])
+                        call = calls[-1]
+                        self.assertEqual(call['args'], expected_args)
+                        self.assertEqual(call['cwd'], str(expected_cwd))
+                        self.assertEqual(call['fixture'], str(expected_fixture))
+                        self.assertEqual(call['tmp'], str(expected_fixture / 'tmp') if release else str(validation / 'tmp'))
 
     def test_native_mcp_gate_includes_persistence_and_existing_cases(self):
         body = run_block('release.yml', 'Verify real MCP lifecycle and database lock regressions')
         match = re.search(r'for regression in ([^;]+); do', body)
         self.assertIsNotNone(match)
         cases = match[1].split()
-        self.assertEqual(set(cases), {'smoke', 'startup', 'recall', 'idle', 'persistence'})
-        self.assertEqual(len(cases), 5)
+        self.assertEqual(set(cases), {'smoke', 'startup', 'warm-startup', 'recall', 'idle', 'persistence'})
+        self.assertEqual(len(cases), 6)
 
     def test_native_residual_gate_uses_release_binary_private_workdir_and_propagates_failure(self):
         name = 'Verify actual native residual recovery and readback'

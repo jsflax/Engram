@@ -234,6 +234,9 @@ struct MemoryOperationLedgerTests {
         let blocker = try SQL(f.path)
         try blocker.execute("BEGIN IMMEDIATE")
         defer { try? blocker.execute("ROLLBACK") }
+        let failures = BeginFailureTrace()
+        f.lattice.onQueryError { failures.observe($0) }
+        defer { f.lattice.onQueryError { _ in } }
         let started = ProcessInfo.processInfo.systemUptime
         #expect(throws: MemoryOperationError.storageUnavailable) {
             try f.ledger.withOperation(operation, principal: { .anonymous }) {
@@ -242,8 +245,17 @@ struct MemoryOperationLedgerTests {
             }
         }
         let elapsed = ProcessInfo.processInfo.systemUptime - started
+        let observed = failures.snapshot(since: started)
+        // Bounded, content-free diagnostics distinguish actual retries from
+        // time spent descheduled. Exactly three is not a contract: deadline admission
+        // can legitimately refuse a later attempt after an earlier delay.
+        print("[ledger BEGIN timing] failures=\(observed.count), offsets=\(observed.offsets), elapsed=\(elapsed)")
+        #expect(observed.onlyExpectedContention)
+        #expect(observed.count > 1 && observed.count <= 3)
         #expect(elapsed >= 0.2) // More than one configured 100ms BEGIN attempt.
         #expect(elapsed < 2.0) // Finite small-fixture budget, including scheduling allowance.
+        #expect(blocker.isInTransaction)
+        #expect(try blocker.integer("SELECT COUNT(*) FROM Memory") == 0)
         #expect(try blocker.integer("SELECT COUNT(*) FROM EngramOperationReceiptV1") == 0)
     }
 
@@ -451,6 +463,34 @@ struct MemoryOperationLedgerTests {
             let (observedMessages, releaseResult) = lock.withLock { (messages, result) }
             #expect(observedMessages == [Self.expectedError])
             try #require(releaseResult).get()
+        }
+    }
+
+    private final class BeginFailureTrace: @unchecked Sendable {
+        struct Snapshot {
+            let count: Int
+            let offsets: [Double]
+            let onlyExpectedContention: Bool
+        }
+        private let lock = NSLock()
+        private var count = 0
+        private var timestamps: [Double] = []
+        private var onlyExpectedContention = true
+
+        func observe(_ message: String) {
+            lock.withLock {
+                count += 1
+                if timestamps.count < 8 { timestamps.append(ProcessInfo.processInfo.systemUptime) }
+                onlyExpectedContention = onlyExpectedContention
+                    && message == "Failed to begin transaction: database is locked"
+            }
+        }
+
+        func snapshot(since started: Double) -> Snapshot {
+            lock.withLock {
+                Snapshot(count: count, offsets: timestamps.map { $0 - started },
+                         onlyExpectedContention: onlyExpectedContention)
+            }
         }
     }
 
