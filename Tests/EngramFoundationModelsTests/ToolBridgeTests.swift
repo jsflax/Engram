@@ -1,7 +1,7 @@
 #if canImport(FoundationModels)
 import Testing
 import EngramKit
-import EngramMemoryCore
+import struct EngramMemoryCore.StaticIdentityProvider
 import Lattice
 import Foundation
 import FoundationModels

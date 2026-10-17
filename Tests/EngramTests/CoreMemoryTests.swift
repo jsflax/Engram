@@ -1,6 +1,6 @@
 import Testing
 import EngramKit
-import EngramMemoryCore
+import struct EngramMemoryCore.StaticIdentityProvider
 import Lattice
 import MCP
 import Foundation
