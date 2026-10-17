@@ -30,3 +30,24 @@ without it, those checks report skips and require separate native qualification.
 These tests do not replace signed-artifact validation or natural hook/MCP/learner
 acceptance in Codex. They preserve the prior rollout regressions while testing
 the assembled release source, including manifest-based marketplace policy.
+
+## Actual native residual gate
+
+After building the CLI release binary, the release workflow separately runs
+`scripts/native_residual_smoke.py` against that exact binary and the assembled
+plugin. It initializes a fresh disposable database, applies five synthetic
+reviewed residual operations, completes retrospective publication, and checks
+exact cursor/history/pending preservation plus independent SQLite readback.
+Production execution deadlines remain unchanged. Its initial bootstrap alone
+uses a separate bounded setup budget.
+
+```sh
+python3 -B scripts/native_residual_smoke.py \
+  --native "$PWD/.build/release/Engram" --repo "$PWD" \
+  --work-dir "$HOME/localdev/engram-residual-native-unique-run"
+```
+
+The work directory must not exist; its parent must already be an owned canonical
+directory. All evidence is retained there, including on failure. The harness
+never selects an installed binary, live learner state, a provider or a previous
+store. Its small setup-guard tests do not replace a successful actual-native run.

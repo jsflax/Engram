@@ -159,7 +159,9 @@ def codex_home() -> Path:
 def publications(root: Path):
     return runner_publication.Publications(root, codex_home() / "config.toml",
         Path(__file__).resolve().parents[2], legacy_paths=lambda: legacy_paths(root),
-        legacy_verify_locks=lambda: publication_locks_owned(root))
+        legacy_verify_locks=lambda: publication_locks_owned(root),
+        residual_paths=lambda run_id: residual_paths(root, run_id),
+        residual_verify_locks=lambda: publication_locks_owned(root))
 
 
 def publication_locks_owned(root: Path) -> bool:
@@ -220,6 +222,15 @@ def legacy_paths(root: Path):
     return legacy_reconciliation.LegacyPaths(root, root, package, store)
 
 
+def residual_paths(root: Path, run_id: str):
+    """Resolve recovery from the checked run ID and current native store route."""
+    from . import residual_context, residual_publication
+    residual_publication._run_id(run_id)
+    selected = legacy_paths(root)
+    return residual_context.ResidualPaths(root, root / "runs" / run_id,
+        codex_home() / "config.toml", selected.package_root, selected.candidate_store)
+
+
 def has_recoverable_transition(root: Path, session_id: str) -> bool:
     if os.path.lexists(root / "publications" / session_id / "active.json"):
         return True
@@ -233,9 +244,12 @@ def has_recoverable_transition(root: Path, session_id: str) -> bool:
         pass
     try:
         from . import legacy_reconciliation
-        return legacy_reconciliation.needs_recovery(root, session_id)
+        if legacy_reconciliation.needs_recovery(root, session_id):
+            return True
     except (OSError, ValueError):
-        return False
+        pass
+    from . import residual_publication
+    return residual_publication.needs_recovery(root, session_id)
 
 
 def validate_request(payload: dict, root: Path) -> dict:

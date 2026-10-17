@@ -39,10 +39,12 @@ identities fail closed, including when one candidate is disabled.
 | PreCompact / auto | Queue learning before automatic compaction |
 | SessionEnd | Clean ephemeral tool counters; preserve learning progress |
 
-**Tool-failure limitation:** the inspected Codex 0.154 source omits usable exit
-metadata from some shell hook payloads and does not dispatch some failed tool
-calls. The adapter never guesses failure from arbitrary stdout. This is partial
-failure-event coverage, not full Claude `PostToolUseFailure` parity.
+**Tool-failure limitation:** Engram classifies only explicit structured failure
+metadata, such as an integer shell exit code or an MCP error flag. Current
+[Codex hook documentation](https://learn.chatgpt.com/docs/hooks) includes nonzero
+Bash exits, but tool output remains host-specific. Plain-text output is left
+unclassified; the adapter never guesses failure from arbitrary stdout. Verify
+actual receipts on each host before claiming Claude `PostToolUseFailure` parity.
 
 Advice uses the prompt and inferred project, with no fixed memory UUID pins.
 When the project is inferred, semantically relevant memories from this user's
@@ -155,6 +157,27 @@ It performs no native mutation and does not renew a lifetime, claim historical
 provider success, or manufacture modern successful-coverage evidence. The
 pending request retains its original pause and provenance; resuming it is a
 separate operation with normal admission checks.
+
+For a separately reviewed legacy update followed by an affirmative no-write
+remember, `scripts/learner_residual.py` supports the reviewed five-intent recovery
+profile. `prepare` seals the review, current source, preserved update and native
+store route; it does not dispatch mutations. `execute` requires the prepared run,
+manifest and context hashes. It preserves the old update and sends only the
+retained residual intents through native durable operations.
+
+`recover` only checks recorded operation status and completes qualified
+publication. An absent operation remains held until the explicit
+`continue-absent` command receives the same execution pins. Continuation first
+revokes every older writer and reuses the original operation IDs and payloads.
+Unknown writes, changed evidence, manual-review pauses and semantic duplicates
+remain held. This narrow profile does not prepare a second residual recovery for
+a task that already has a recorded residual reconciliation.
+
+The resulting `legacy_reconciled_with_residuals` receipt records retrospective
+reviewed writes separately from the failed historical provider run. It advances
+only the reviewed interval, preserves original or newer pending work, and leaves
+explicit resume as a separate action. Inspect the completed recovery receipt and
+perform independent memory readback before treating the recovery as verified.
 
 Interrupted application can finish only its pinned publication. The worker can
 recover selected unfinished legacy metadata when its current local store route

@@ -144,9 +144,9 @@ def _immutable(path, value, label):
 def _outcome(value):
     _require(type(value) is dict and set(value) == {"result", "queue_action", "pause_reason"}, "invalid_outcome")
     _require(value["result"] in {"processing", "succeeded", "no_change", "more", "failed",
-                                 "reconciliation_required", "backoff", "blocked", "deferred", "legacy_reconciled_no_new_mutation"}, "invalid_outcome")
+                                 "reconciliation_required", "backoff", "blocked", "deferred", "legacy_reconciled_no_new_mutation", "legacy_reconciled_with_residuals"}, "invalid_outcome")
     _require(value["queue_action"] in {"none", "delete", "pause", "keep"}, "invalid_outcome")
-    expected_action = {"legacy_reconciled_no_new_mutation": "keep", "processing": "none", "more": "keep", "succeeded": "delete", "no_change": "delete",
+    expected_action = {"legacy_reconciled_no_new_mutation": "keep", "legacy_reconciled_with_residuals": "keep", "processing": "none", "more": "keep", "succeeded": "delete", "no_change": "delete",
                        "deferred": "delete", "failed": "pause", "reconciliation_required": "pause",
                        "backoff": "pause", "blocked": "pause"}
     _require(value["queue_action"] == expected_action[value["result"]], "outcome_action_mismatch")

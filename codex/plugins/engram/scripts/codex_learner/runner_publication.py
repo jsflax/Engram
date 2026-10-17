@@ -77,7 +77,8 @@ class Execution:
 
 
 class Publications:
-    def __init__(self, root, config_path, plugin_root, *, legacy_paths=None, legacy_verify_locks=None):
+    def __init__(self, root, config_path, plugin_root, *, legacy_paths=None, legacy_verify_locks=None,
+                 residual_paths=None, residual_verify_locks=None):
         for path in (root, plugin_root):
             _require(isinstance(path, Path) and path.is_absolute()
                      and path.resolve(strict=True) == path, "untrusted_paths")
@@ -87,6 +88,7 @@ class Publications:
         _require(not durable._directory(root).st_mode & 0o077, "untrusted_root")
         self.root, self.config_path, self.plugin_root = root, config_path, plugin_root
         self._legacy_paths, self._legacy_verify_locks = legacy_paths, legacy_verify_locks
+        self._residual_paths, self._residual_verify_locks = residual_paths, residual_verify_locks
 
     def paths(self, session_id):
         selected = admission.state_paths(self.root, session_id)
@@ -376,6 +378,31 @@ class Publications:
         """
         selected = self.paths(session_id)
         active = coordinator._active(selected, session_id)
+        from . import residual_context, residual_publication
+        residual_selected = (active is not None
+                             and active[0]["input_evidence"].get("kind") == residual_publication.KIND)
+        if active is None:
+            residual_selected = residual_publication.needs_recovery(self.root, session_id)
+        if residual_selected:
+            _require(callable(self._residual_paths) and callable(self._residual_verify_locks),
+                     "residual_trusted_paths_and_locks_required")
+            reference = residual_publication.recovery_reference(self.root, session_id)
+            _require(reference is not None, "residual_reference_missing")
+            paths = self._residual_paths(reference["run_id"])
+            _require(type(paths) is residual_context.ResidualPaths and paths.root == self.root
+                     and paths.run_dir == self.root / "runs" / reference["run_id"]
+                     and paths.plugin_root == self.plugin_root and paths.config_path == self.config_path,
+                     "residual_paths_changed")
+            _require(self._residual_verify_locks() is True, "residual_caller_locks_changed")
+            resolved = residual_publication.recover_locked(paths, session_id=session_id,
+                verify_locks=self._residual_verify_locks, allow_continuation=False)
+            if resolved is not None:
+                completed = coordinator.read_completed(selected, session_id=session_id, **resolved["publication"])
+                _require(resolved["request_id"] == completed["ticket"]["request_id"], "residual_request_changed")
+                return Outcome(residual_publication.RESULT, completed["ticket"]["request_id"])
+            # Selected residual recovery must never fall through to ordinary
+            # execution or use an earlier active ticket after it was retired.
+            return None
         legacy_selected = active is not None and active[0]["input_evidence"].get("kind") == legacy_reconciliation.KIND
         if active is None:
             legacy_selected = legacy_reconciliation.needs_recovery(self.root, session_id)

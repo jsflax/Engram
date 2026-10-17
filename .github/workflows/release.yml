@@ -190,6 +190,30 @@ jobs:
       - name: Build CLI release binaries
         run: swift build --force-resolved-versions -c release
 
+      - name: Validate native residual harness guards
+        run: |
+          mkdir -p "$HOME/localdev"
+          ENGRAM_NATIVE_RESIDUAL_TEST_ROOT="$HOME/localdev/engram-residual-harness-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            python3 -B -m unittest discover -s scripts -p 'test_native_residual_smoke.py'
+
+      - name: Verify actual native residual recovery and readback
+        id: native_residual
+        timeout-minutes: 10
+        run: |
+          mkdir -p "$HOME/localdev"
+          python3 -B scripts/native_residual_smoke.py \
+            --native "$PWD/.build/release/Engram" --repo "$PWD" \
+            --work-dir "$HOME/localdev/engram-residual-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+      - name: Upload native residual recovery evidence
+        if: ${{ always() && steps.native_residual.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-residual-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ~/localdev/engram-residual-native-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Verify real MCP lifecycle and database lock regressions
         timeout-minutes: 10
         run: |

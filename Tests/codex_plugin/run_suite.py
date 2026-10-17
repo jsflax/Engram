@@ -25,10 +25,22 @@ MODULES = (
     "test_publication_coordinator", "test_settlement", "test_proxy_execution",
     "test_runner_publication", "test_runner_durable", "test_runner_legacy_entry", "test_runner_legacy_dispatch",
     "test_legacy_acceptance", "test_legacy_report_dates", "test_legacy_cli",
+    'test_runner_residual_dispatch',
+    'test_residual_driver',
+    'test_residual_cache',
+    'test_residual_cleanup',
+    'test_residual_crashes',
+    'test_residual_status_retention',
+    'test_residual_independent',
+    'test_residual_context_acceptance',
+    'test_residual_policy',
+    'test_residual_publication_contract',
+    'test_learner_residual',
 )
 FSYNC_MODULES = {"test_host", "test_migration", "test_execution_context", "test_parser_context",
                  "test_publication_coordinator", "test_settlement", "test_runner_publication",
-                 "test_legacy_acceptance"}
+                 "test_legacy_acceptance", "test_residual_context_acceptance", "test_learner_residual",
+                 "test_residual_driver", "test_residual_independent", "test_residual_crashes"}
 
 def run_module(name):
     module = importlib.import_module(name)

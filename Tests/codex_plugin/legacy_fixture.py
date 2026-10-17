@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import sys
 import tempfile
 import uuid
@@ -56,13 +57,21 @@ def load_runtime():
 class LegacyFixture:
     """One V2 origin, a failed legacy run, six messages, and two expired rows."""
 
-    def __init__(self, module=None):
+    def __init__(self, module=None, *, fixture_parent=None):
         self.L = module or load_runtime()
         L, A, H, C = self.L, self.L.admission, self.L.host_admission, self.L.context
-        parent = TEST_ROOT / ".tmp"
-        if parent.is_symlink():
-            raise RuntimeError("The fixture directory must not be a symlink")
-        parent.mkdir(mode=0o700, exist_ok=True)
+        if fixture_parent is None:
+            parent = TEST_ROOT / ".tmp"
+            if parent.is_symlink():
+                raise RuntimeError("The fixture directory must not be a symlink")
+            parent.mkdir(mode=0o700, exist_ok=True)
+        else:
+            parent = Path(fixture_parent)
+            if not parent.is_absolute() or parent.resolve(strict=True) != parent:
+                raise ValueError("fixture_parent must be an existing canonical absolute directory")
+            info = parent.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise ValueError("fixture_parent must be an owned private directory")
         self.temp = tempfile.TemporaryDirectory(prefix="legacy-acceptance-", dir=parent)
         self.base = Path(self.temp.name).resolve()
         self.base.chmod(0o700)
