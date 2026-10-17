@@ -1,5 +1,6 @@
 import Testing
 import EngramKit
+import EngramMemoryCore
 import Lattice
 import MCP
 import Foundation
@@ -455,7 +456,8 @@ func makeSamplerContext() async throws -> SamplerTestContext {
     if await !embedder.isLoaded {
         await embedder.load()
     }
-    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
+    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder,
+        identity: StaticIdentityProvider(.anonymous))
     return SamplerTestContext(tools: tools, lattice: lattice, embedder: embedder)
 }
 

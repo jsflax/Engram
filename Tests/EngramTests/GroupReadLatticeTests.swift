@@ -1,5 +1,6 @@
 import Testing
 import EngramKit
+import EngramMemoryCore
 import EngramModels
 import Lattice
 import MCP
@@ -13,8 +14,8 @@ import Foundation
 // inspection — a teammate's memory that doesn't surface looks exactly like a
 // teammate who wrote nothing.
 //
-// No groups.json is written (a global mutation would race parallel suites),
-// so currentUserId is nil throughout: any non-nil author is foreign, and the
+// Pin an anonymous identity without writing groups.json: parallel directory
+// fixtures cannot change currentUserId. Any non-nil author is foreign, and
 // nil-author rows exercise the residency arm directly.
 // ============================================================================
 
@@ -47,7 +48,8 @@ private func makeGroupTools(spokeCount: Int = 1) async throws -> GroupToolsConte
     let embedder = sharedEmbedder
     if await !embedder.isLoaded { await embedder.load() }
     let tools = MemoryTools(localRef: local.sendableReference, syncedRef: nil,
-                            groupRefs: refs, embedder: embedder)
+                            groupRefs: refs, embedder: embedder,
+                            identity: StaticIdentityProvider(.anonymous))
     return GroupToolsContext(tools: tools, local: local, spokes: spokes)
 }
 

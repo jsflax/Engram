@@ -24,7 +24,8 @@ private func makeToolsWithLattice() async throws -> ToolsContext {
     let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, SyncConfig.self, configuration: .init(fileURL: path))
     let embedder = try await loadedFixtureEmbedder()
     return ToolsContext(
-        tools: MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder),
+        tools: MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder,
+            identity: StaticIdentityProvider(.anonymous)),
         lattice: lattice, embedder: embedder)
 }
 
@@ -153,7 +154,7 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
 
     let out = text(from: try await ctx.tools.handle(CallTool.Parameters(
         name: "recall", arguments: ["query": .string("flaky test timezone"), "project": .string("badge-proj")])))
-    // Foreign row is badged (no groups.json in tests → fallback name).
+    // The synthetic foreign author uses the fallback badge name.
     #expect(out.contains("[by:teammate]"))
     // Exactly ONE badge — own/legacy rows stay clean.
     #expect(out.components(separatedBy: "[by:").count == 2)

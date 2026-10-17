@@ -201,7 +201,8 @@ private func milliseconds(_ elapsed: Duration) -> Int64 {
         Memory.self, Edge.self, Checkpoint.self, HookState.self,
         configuration: .init(fileURL: URL(fileURLWithPath: dbPath), migration: engramMigrations)
     )
-    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
+    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder,
+        identity: GroupDirectoryIdentityProvider())
     let memoryCount = lattice.objects(Memory.self).count
     print("\nDatabase: \(memoryCount) memories")
 
@@ -406,7 +407,8 @@ private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
     }
 
     // Step 5: Compare with current approach (FTS5 + cosine, slow)
-    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
+    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder,
+        identity: GroupDirectoryIdentityProvider())
     let startOld = ContinuousClock.now
     let resultOld = try await tools.directRecall(query: prompt, project: "Engram", depth: 0, limit: 5)
     let oldMs = milliseconds(ContinuousClock.now - startOld)
@@ -440,7 +442,8 @@ private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
     )
     let embedder = EmbeddingService()
     await embedder.load()
-    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
+    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder,
+        identity: GroupDirectoryIdentityProvider())
 
     let memoryCount = lattice.objects(Memory.self).count
     let edgeCount = lattice.objects(Edge.self).count

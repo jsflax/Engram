@@ -1,5 +1,6 @@
 import Testing
 import EngramKit
+import EngramMemoryCore
 import EngramModels
 import Lattice
 import MCP
@@ -73,7 +74,8 @@ private let allowProdDBTests = ProcessInfo.processInfo.environment["ENGRAM_ALLOW
     let tools = MemoryTools(
         localRef: localLattice.sendableReference,
         syncedRef: syncedLattice?.sendableReference,
-        embedder: embedder
+        embedder: embedder,
+        identity: GroupDirectoryIdentityProvider()
     )
     let toolsElapsed = ContinuousClock.now - toolsStart
     print("MemoryTools init: \(Double(toolsElapsed.components.seconds)*1000 + Double(toolsElapsed.components.attoseconds)/1e15) ms")
@@ -245,7 +247,8 @@ private let allowProdDBTests = ProcessInfo.processInfo.environment["ENGRAM_ALLOW
     let tools = MemoryTools(
         localRef: localLattice.sendableReference,
         syncedRef: syncedLattice.sendableReference,
-        embedder: embedder
+        embedder: embedder,
+        identity: StaticIdentityProvider(.anonymous)
     )
 
     // Recall through the MCP tool (uses attaching internally)
