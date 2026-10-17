@@ -105,6 +105,15 @@ class PluginPackageTests(unittest.TestCase):
             provenance = json.load(packaged.extractfile("engram/RELEASE-PROVENANCE.json"))
             self.assertEqual(provenance["source"]["pluginPath"], "codex/plugins/engram")
 
+    def test_repository_plugin_packages_expired_update_recovery(self):
+        source = Path(__file__).resolve().parents[1] / "codex/plugins/engram"
+        version = json.loads((source / ".codex-plugin/plugin.json").read_text())["version"]
+        manifest = self.build(source=source, version=version)
+        relative = "scripts/codex_learner/legacy_expired_update.py"
+        with tarfile.open(self.root / "first" / manifest["archive"]["name"]) as archive:
+            self.assertEqual(archive.extractfile("engram/" + relative).read(),
+                             (source / relative).read_bytes())
+
     def test_archive_deterministic_across_locations_mtimes_and_modes(self):
         first = self.build()
         second_source = self.root / "second-source"

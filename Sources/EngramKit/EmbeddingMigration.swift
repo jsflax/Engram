@@ -144,7 +144,10 @@ public enum EmbeddingMigration {
 
         // The vector index was built over the old distribution — rebuild it.
         lattice._vacuumVec0(Memory(), for: \.embedding)
-        lattice.checkpoint()
+        // Startup migration runs alongside foreground writes and retained read
+        // generations. Bound the final checkpoint so readers cannot make it
+        // hold the writer gate for the connection's full busy timeout.
+        lattice.checkpointBounded()
         log("Embedding migration: complete — \(report.reembedded) re-embedded, vec index rebuilt")
         return report
     }

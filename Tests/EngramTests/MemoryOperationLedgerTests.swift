@@ -17,7 +17,7 @@ struct MemoryOperationLedgerTests {
         var ledger: MemoryOperationLedger { .init(lattice: lattice) }
     }
 
-    private func fixture() throws -> Fixture {
+    private func fixture(bootstrap: Bool = true, busyTimeoutMs: Int = 100) throws -> Fixture {
         let base = ProcessInfo.processInfo.environment["ENGRAM_ADOPTION_TEST_ROOT"]
             .map { URL(fileURLWithPath: $0, isDirectory: true) }
             ?? FileManager.default.temporaryDirectory
@@ -26,8 +26,8 @@ struct MemoryOperationLedgerTests {
         let path = directory.appendingPathComponent("memory.sqlite")
         try MemoryOperationLedger.preflightLocalStore(at: path)
         let lattice = try Lattice(for: [Memory.self] + MemoryOperationLedger.localModels,
-                                  configuration: .init(fileURL: path, busyTimeoutMs: 100))
-        try MemoryOperationLedger(lattice: lattice).bootstrapStoreID()
+                                  configuration: .init(fileURL: path, busyTimeoutMs: busyTimeoutMs))
+        if bootstrap { try MemoryOperationLedger(lattice: lattice).bootstrapStoreID() }
         return Fixture(directory: directory, path: path, lattice: lattice)
     }
 
@@ -55,6 +55,90 @@ struct MemoryOperationLedgerTests {
             .appendingPathComponent("absent-ledger-\(UUID().uuidString).sqlite")
         try MemoryOperationLedger.preflightLocalStore(at: path)
         #expect(!FileManager.default.fileExists(atPath: path.path))
+    }
+
+    @Test func establishedBootstrapReadsIdentityWhileAnotherWriterRemainsHeld() throws {
+        let f = try fixture()
+        defer { f.lattice.close() }
+        let knownID = try f.ledger.scope(principal: .anonymous).storeID
+        let blocker = try SQL(f.path)
+        let rowIDs = try blocker.strings("SELECT globalId FROM EngramOperationStoreV1")
+        try #require(rowIDs.count == 1)
+        try blocker.execute("BEGIN IMMEDIATE")
+        defer { try? blocker.execute("ROLLBACK") }
+        #expect(blocker.isInTransaction)
+        f.lattice.onQueryError { _ in
+            Issue.record("Reading an established identity must not attempt writer admission or fail a query")
+        }
+        defer { f.lattice.onQueryError { _ in } }
+
+        #expect(try f.ledger.bootstrapStoreID() == knownID)
+
+        #expect(blocker.isInTransaction)
+        #expect(try blocker.strings("SELECT globalId FROM EngramOperationStoreV1") == rowIDs)
+        #expect(try blocker.text("SELECT storeID FROM EngramOperationStoreV1") == knownID.uuidString.lowercased())
+    }
+
+    @Test func firstBootstrapRequiresWriterAdmissionBeforeCreatingIdentity() throws {
+        let f = try fixture(bootstrap: false)
+        defer { f.lattice.close() }
+        let blocker = try SQL(f.path)
+        #expect(try blocker.integer("SELECT COUNT(*) FROM EngramOperationStoreV1") == 0)
+        try blocker.execute("BEGIN IMMEDIATE")
+        defer { try? blocker.execute("ROLLBACK") }
+
+        #expect(throws: MemoryOperationError.storageUnavailable) { try f.ledger.bootstrapStoreID() }
+
+        #expect(blocker.isInTransaction)
+        #expect(try blocker.integer("SELECT COUNT(*) FROM EngramOperationStoreV1") == 0)
+        try blocker.execute("ROLLBACK")
+        let createdID = try f.ledger.bootstrapStoreID()
+        #expect(try blocker.integer("SELECT COUNT(*) FROM EngramOperationStoreV1") == 1)
+        #expect(try blocker.text("SELECT storeID FROM EngramOperationStoreV1") == createdID.uuidString.lowercased())
+        #expect(try f.ledger.bootstrapStoreID() == createdID)
+    }
+
+    @Test func bootstrapStoreQueryFailureDoesNotAttemptWriterAdmission() throws {
+        let f = try fixture()
+        defer { f.lattice.close() }
+        let blocker = try SQL(f.path)
+        let knownID = try blocker.text("SELECT storeID FROM EngramOperationStoreV1")
+        try blocker.execute("ALTER TABLE EngramOperationStoreV1 RENAME TO HeldStoreIdentityEvidence")
+        try blocker.execute("BEGIN IMMEDIATE")
+        defer { try? blocker.execute("ROLLBACK") }
+        let errors = QueryErrorRecorder()
+        f.lattice.onQueryError { errors.observe($0) }
+        defer { f.lattice.onQueryError { _ in } }
+
+        #expect(throws: MemoryOperationError.storageUnavailable) { try f.ledger.bootstrapStoreID() }
+
+        let messages = errors.snapshot()
+        #expect(!messages.isEmpty)
+        #expect(messages.allSatisfy { $0.contains("no such table: EngramOperationStoreV1") })
+        #expect(!messages.contains { $0.contains("Failed to begin transaction") })
+        #expect(blocker.isInTransaction)
+        #expect(try blocker.integer("SELECT COUNT(*) FROM HeldStoreIdentityEvidence") == 1)
+        #expect(try blocker.text("SELECT storeID FROM HeldStoreIdentityEvidence") == knownID)
+        #expect(try blocker.integer("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='EngramOperationStoreV1'") == 0)
+    }
+
+    @Test func storeScopeReadsOwnUncommittedIdentityAndRollbackRemovesIt() throws {
+        let f = try fixture(bootstrap: false)
+        defer { f.lattice.close() }
+        let observer = try SQL(f.path)
+        let storeID = UUID()
+        let rollback = MemoryOperationError.invalidRequest("synthetic identity rollback")
+
+        #expect(throws: rollback) {
+            try f.lattice.withTransaction {
+                try f.lattice.add(EngramOperationStoreV1(storeID: storeID))
+                #expect(try f.ledger.scope(principal: .anonymous).storeID == storeID)
+                #expect(try observer.integer("SELECT COUNT(*) FROM EngramOperationStoreV1") == 0)
+                throw rollback
+            }
+        }
+
+        #expect(try observer.integer("SELECT COUNT(*) FROM EngramOperationStoreV1") == 0)
     }
 
     @Test func commitsMutationAndImmutableReceiptThenReplaysAfterReopen() throws {
@@ -144,12 +228,18 @@ struct MemoryOperationLedgerTests {
     }
 
     @Test func busyBeginDoesNotInvokeBodyOrPublishReceipt() throws {
-        let f = try fixture()
+        // One SQLite busy-sleep quantum avoids amplifying hosted timer delays
+        // across a 100ms sleep schedule; the strict two-second gate stays intact.
+        let f = try fixture(busyTimeoutMs: 1)
         defer { f.lattice.close() }
+        try #require(f.lattice.configuration.busyTimeoutMs == 1)
         let operation = try prepared(f)
         let blocker = try SQL(f.path)
         try blocker.execute("BEGIN IMMEDIATE")
         defer { try? blocker.execute("ROLLBACK") }
+        let failures = BeginFailureTrace()
+        f.lattice.onQueryError { failures.observe($0) }
+        defer { f.lattice.onQueryError { _ in } }
         let started = ProcessInfo.processInfo.systemUptime
         #expect(throws: MemoryOperationError.storageUnavailable) {
             try f.ledger.withOperation(operation, principal: { .anonymous }) {
@@ -158,8 +248,17 @@ struct MemoryOperationLedgerTests {
             }
         }
         let elapsed = ProcessInfo.processInfo.systemUptime - started
-        #expect(elapsed >= 0.2) // More than one configured 100ms BEGIN attempt.
+        let observed = failures.snapshot(since: started)
+        // Bounded, content-free diagnostics distinguish actual retries from
+        // time spent descheduled. Exactly three is not a contract: deadline admission
+        // can legitimately refuse a later attempt after an earlier delay.
+        print("[ledger BEGIN timing] failures=\(observed.count), offsets=\(observed.offsets), elapsed=\(elapsed)")
+        #expect(observed.onlyExpectedContention)
+        #expect(observed.count > 1 && observed.count <= 3)
+        #expect(elapsed >= 0.025) // The first admitted retry includes a 25ms backoff.
         #expect(elapsed < 2.0) // Finite small-fixture budget, including scheduling allowance.
+        #expect(blocker.isInTransaction)
+        #expect(try blocker.integer("SELECT COUNT(*) FROM Memory") == 0)
         #expect(try blocker.integer("SELECT COUNT(*) FROM EngramOperationReceiptV1") == 0)
     }
 
@@ -370,6 +469,41 @@ struct MemoryOperationLedgerTests {
         }
     }
 
+    private final class BeginFailureTrace: @unchecked Sendable {
+        struct Snapshot {
+            let count: Int
+            let offsets: [Double]
+            let onlyExpectedContention: Bool
+        }
+        private let lock = NSLock()
+        private var count = 0
+        private var timestamps: [Double] = []
+        private var onlyExpectedContention = true
+
+        func observe(_ message: String) {
+            lock.withLock {
+                count += 1
+                if timestamps.count < 8 { timestamps.append(ProcessInfo.processInfo.systemUptime) }
+                onlyExpectedContention = onlyExpectedContention
+                    && message == "Failed to begin transaction: database is locked"
+            }
+        }
+
+        func snapshot(since started: Double) -> Snapshot {
+            lock.withLock {
+                Snapshot(count: count, offsets: timestamps.map { $0 - started },
+                         onlyExpectedContention: onlyExpectedContention)
+            }
+        }
+    }
+
+    private final class QueryErrorRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var messages: [String] = []
+        func observe(_ message: String) { lock.withLock { messages.append(message) } }
+        func snapshot() -> [String] { lock.withLock { messages } }
+    }
+
     private final class SQL: @unchecked Sendable {
         private let db: OpaquePointer
         init(_ path: URL) throws {
@@ -383,6 +517,7 @@ struct MemoryOperationLedgerTests {
             sqlite3_busy_timeout(db, 100)
         }
         deinit { sqlite3_close(db) }
+        var isInTransaction: Bool { sqlite3_get_autocommit(db) == 0 }
         func execute(_ sql: String) throws {
             guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
                 throw MemoryOperationError.invalidRequest(String(cString: sqlite3_errmsg(db)))

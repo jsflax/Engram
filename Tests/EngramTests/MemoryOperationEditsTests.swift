@@ -388,12 +388,18 @@ struct MemoryOperationEditsTests {
     func failedTargetQueryNeverBecomesAbsenceOrCreatesAnEdge(_ table: String) async throws {
         let f = try fixture()
         defer { f.close() }
+        // Open before injecting the query failure; schema registration on a
+        // fresh connection would recreate the renamed table.
+        try await f.tools.prepareStorage()
         let sql = try SQL(f.path)
+        let tableName = table == "memory" ? "Memory" : "Edge"
         try sql.execute(table == "memory" ? "ALTER TABLE Memory RENAME TO HeldMemory" : "ALTER TABLE Edge RENAME TO HeldEdge")
+        #expect(try sql.integer("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='\(tableName)'") == 0)
         await #expect(throws: MemoryOperationError.storageUnavailable) {
             _ = try await f.tools.applyOperation(f.request(.connect(ConnectRequest(
                 sourceId: f.sourceID, targetId: f.targetID, relation: "relates_to"))))
         }
+        #expect(try sql.integer("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='\(tableName)'") == 0)
         #expect(try sql.integer("SELECT COUNT(*) FROM EngramOperationReceiptV1") == 0)
         #expect(try sql.integer("SELECT COUNT(*) FROM \(table == "edge" ? "HeldEdge" : "Edge")") == 0)
     }

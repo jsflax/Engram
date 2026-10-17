@@ -147,7 +147,26 @@ jobs:
             --skip "recall_connectedMemory_showsEdgeRelation" \
             --skip "recall_graphTraversal_relatesToDoesNotLeakViaUnrelatedStructuralEdge" \
             --skip "recall_statementBudget" \
-            --skip "clusters_statementBudget"
+            --skip "clusters_statementBudget" \
+            --skip "busyBeginDoesNotInvokeBodyOrPublishReceipt"
+
+      # Keep the existing <2s held-writer assertion, but isolate its scheduling
+      # window from the parallel suite. The matching skip above is not a waiver.
+      - name: Run ledger BEGIN timing regression (serial)
+        id: ledger_begin_timing
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ENGRAM_ADOPTION_TEST_ROOT="$HOME/localdev/engram-native-ledger-begin-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export ENGRAM_TEST_ROOT="$ENGRAM_ADOPTION_TEST_ROOT"
+          export TMPDIR="$ENGRAM_ADOPTION_TEST_ROOT/tmp"
+          mkdir -m 700 -p "$ENGRAM_ADOPTION_TEST_ROOT" "$TMPDIR"
+          python3 -B scripts/run_native_tests.py \
+            --diagnostics-dir "$ENGRAM_ADOPTION_TEST_ROOT/diagnostics" \
+            --timeout-seconds 120 --silence-seconds 60 -- \
+            swift test --force-resolved-versions --skip-build \
+            --filter busyBeginDoesNotInvokeBodyOrPublishReceipt
 
       - name: Upload native test diagnostics
         if: ${{ (failure() || cancelled()) && steps.native_tests.outcome != 'skipped' }}
@@ -157,6 +176,7 @@ jobs:
           path: |
             build/native-test-diagnostics/
             ~/localdev/engram-native-tests-${{ github.run_id }}-${{ github.run_attempt }}/
+            ~/localdev/engram-native-ledger-begin-${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: ignore
           retention-days: 7
 
@@ -224,7 +244,7 @@ jobs:
         timeout-minutes: 10
         run: |
           mkdir -p build/mcp-test-home build/mcp-test-tmp
-          for regression in smoke startup recall idle persistence; do
+          for regression in smoke startup warm-startup warm-multistore-startup recall idle persistence; do
             env HOME="$PWD/build/mcp-test-home" \
               CFFIXED_USER_HOME="$PWD/build/mcp-test-home" \
               TMPDIR="$PWD/build/mcp-test-tmp" \

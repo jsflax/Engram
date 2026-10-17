@@ -18,10 +18,10 @@ import Foundation
 /// - **graph**: View a memory's neighborhood in the knowledge graph.
 public actor MemoryTools {
     /// Local database — all writes go here. Reads go here for local-only projects.
-    package let localLattice: Lattice
+    package var localLattice: Lattice { requireDatabases().local }
     /// Synced database (memory-synced.sqlite) — reads go here for synced projects.
     /// Contains cross-device data relayed by the sync daemon. Nil if no synced DB exists.
-    package let syncedLattice: Lattice?
+    package var syncedLattice: Lattice? { requireDatabases().synced }
     /// `any Embedder` (not the concrete CoreML actor): the contract suite
     /// injects a deterministic embedder; production passes EmbeddingService.
     package let embedder: any Embedder
@@ -64,7 +64,9 @@ public actor MemoryTools {
     /// Group spokes attached on reads. Reads are MEMBERSHIP-scoped (decision
     /// 3) — exposure gates only what LEAVES this machine — so every spoke
     /// participates in every recall, including project-less ones.
-    package let groupSpokes: [(groupId: UUID, path: String, lattice: Lattice)]
+    package var groupSpokes: [(groupId: UUID, path: String, lattice: Lattice)] {
+        requireDatabases().groups
+    }
 
     /// The authenticated identity this instance operates as. Injected, not
     /// ambient (increment 1b): the CLI/hook default reads groups.json; a
@@ -112,28 +114,67 @@ public actor MemoryTools {
             deletedBy: m.deletedBy)
     }
 
-    /// Resolves sendable references inside the actor's isolation domain.
+    private let localReference: LatticeThreadSafeReference
+    private let syncedReference: LatticeThreadSafeReference?
+    private let groupReferences: [GroupSpokeRef]
+
+    private struct ResolvedDatabases {
+        let local: Lattice
+        let synced: Lattice?
+        let groups: [(groupId: UUID, path: String, lattice: Lattice)]
+    }
+    private var resolvedDatabases: ResolvedDatabases?
+
+    /// A synchronous actor initializer is nonisolated. Keep references here;
+    /// opening a handle in init would cache it in the nil-isolation domain and
+    /// let a detached migration share this actor's SQLite transaction.
     public init(localRef: LatticeThreadSafeReference,
                 syncedRef: LatticeThreadSafeReference?,
                 groupRefs: [GroupSpokeRef] = [],
                 embedder: any Embedder,
                 identity: any IdentityProviding = GroupDirectoryIdentityProvider(),
                 enableLocalMutationOperations: Bool = false) {
-        guard let local = localRef.resolve() else {
-            fatalError("Failed to resolve local lattice reference")
-        }
-        self.localLattice = local
-        self.syncedLattice = syncedRef?.resolve()
-        self.groupSpokes = groupRefs.compactMap { spoke in
-            guard let lattice = spoke.ref.resolve() else { return nil }
-            return (groupId: spoke.groupId, path: spoke.path, lattice: lattice)
-        }
+        self.localReference = localRef
+        self.syncedReference = syncedRef
+        self.groupReferences = groupRefs
         self.embedder = embedder
         self.identity = identity
         self.localMutationOperationsEnabled = enableLocalMutationOperations
         // Hard default, not opt-in: any MemoryTools living inside the
         // maintenance subprocess tree excludes foreign content everywhere.
         self.excludeForeignAuthored = Self.maintenanceEnvironmentDetected
+    }
+
+    /// Open the complete handle set before accepting requests. This does not
+    /// load embeddings or wait for the independent embedding migration.
+    public func prepareStorage() throws {
+        _ = try resolveDatabases()
+    }
+
+    // Public throwing entrypoints prepare storage before using these legacy
+    // nonthrowing internal accessors, so open errors remain catchable.
+    private func requireDatabases() -> ResolvedDatabases {
+        do { return try resolveDatabases() }
+        catch { fatalError("Failed to prepare MemoryTools storage: \(error)") }
+    }
+
+    /// Open the whole bundle before any caller can enter a writer transaction.
+    /// Independent nil-scheduler handles cannot share detached workers' SQLite
+    /// transactions or retain this actor through a scheduler/cache reference.
+    /// Publish only the complete bundle; a failed open releases partial work.
+    private func resolveDatabases() throws -> ResolvedDatabases {
+        if let resolvedDatabases { return resolvedDatabases }
+        guard let local = try localReference.resolveIndependent() else {
+            throw LatticeError.missingLatticeContext
+        }
+        let synced = try syncedReference?.resolveIndependent()
+        let groups: [(groupId: UUID, path: String, lattice: Lattice)] = try groupReferences.compactMap { spoke in
+            guard let lattice = try spoke.ref.resolveIndependent() else { return nil }
+            return (groupId: spoke.groupId, path: spoke.path, lattice: lattice)
+        }
+        let result = ResolvedDatabases(local: local, synced: synced, groups: groups)
+        resolvedDatabases = result
+        return result
     }
 
     /// Returns the right Lattice for reading based on the project's sync policy.
@@ -209,6 +250,7 @@ public actor MemoryTools {
     }
 
     private func resolveReadRoute(for project: String?, strict: Bool) throws -> ReadRoute {
+        try prepareStorage()
         var includeSynced = false
         if syncedLattice != nil, let project {
             if strict {
@@ -244,7 +286,7 @@ public actor MemoryTools {
         // A durable writer cannot infer absence from a vanished registered
         // spoke. Rebuild the service against the current membership/files
         // before retrying; legacy recall still drops revoked spokes below.
-        if strict, spokes.count != groupSpokes.count {
+        if strict, spokes.count != groupReferences.count {
             throw MemoryOperationError.storageUnavailable
         }
         let budget = Self.maxAttachments - (includeSynced ? 1 : 0)
@@ -1311,10 +1353,13 @@ public actor MemoryTools {
     /// Every lattice this instance can hold a read generation on: the hub,
     /// the personal synced mirror, the group spokes, and the attach-cache
     /// union handles built over them.
-    private func retireAllReadMarks() {
-        localLattice.retireAllGenerations()
-        syncedLattice?.retireAllGenerations()
-        for spoke in groupSpokes {
+    func retireAllReadMarks() {
+        // A failed first open has no published handles to retire. Cleanup
+        // must never retry that open through the nonthrowing accessors.
+        guard let databases = resolvedDatabases else { return }
+        databases.local.retireAllGenerations()
+        databases.synced?.retireAllGenerations()
+        for spoke in databases.groups {
             spoke.lattice.retireAllGenerations()
         }
         for union in attachCache.values {
@@ -1326,6 +1371,10 @@ public actor MemoryTools {
         switch params.name {
         case "operation_scope", "operation_apply", "operation_status":
             return await handleOperationTool(params)
+        default:
+            try prepareStorage()
+        }
+        switch params.name {
         case "remember":
             return try await handleRemember(params.arguments)
         case "recall":

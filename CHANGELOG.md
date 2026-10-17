@@ -6,6 +6,40 @@ All notable changes to Engram are documented in this file.
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-17
+
+### Fixed
+- Give the memory service independent database connections before it accepts
+  requests, so background workers cannot share its SQLite transactions. Failed
+  startup releases partial connections, and storage does not retain the service.
+- Return storage-open failures through typed and MCP calls without terminating
+  the process. Durable operations reject missing group stores even when those
+  stores disappear before the service first opens its connections.
+- Bound the final embedding-migration checkpoint so retained read snapshots do
+  not block foreground vector-index creation for the full database busy timeout.
+- Resume reviewed V1-to-V2 learner migrations of up to 192 sessions in bounded,
+  verified steps. Preserve holds and exact plans across migration and release,
+  with explicit progress receipts and unchanged admission checks.
+- Support explicitly reviewed recovery of an expired replacement update followed
+  by a verified pre-transaction no-write remember. Preserve the original row and
+  lifetime, require complete transcript coverage, and perform no memory writes.
+- Load an established operation-ledger identity without unnecessarily requesting
+  the SQLite writer lock. Genuine read errors still fail closed, and first-time
+  creation retains its checked transaction and bounded admission policy.
+- Adopt Lattice 2.1.0 and Core 2.1.0 so startup skips unnecessary sync-repair
+  transactions. Required repairs recheck acknowledgements from current live
+  channels under writer ownership and preserve caller-owned transactions.
+- Finalize SQL statements before releasing connection ownership. Preserve every
+  committed notification across later query failures and rollbacks, and deliver
+  observer callbacks after releasing the SQLite connection lock.
+- Release the memory service's own completed read snapshots before typed vacuum
+  maintenance. Independent readers still constrain checkpointing and prevent
+  a false claim that the WAL was truncated.
+
+### Compatibility
+- Existing learner holds, operation receipts, memory IDs, enrollment frontiers,
+  cursors, and original memory lifetimes remain intact across upgrade.
+
 ## [0.15.0] - 2026-10-16
 
 ### Added

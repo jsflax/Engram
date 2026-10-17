@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import SQLite3
 import Testing
 
@@ -35,6 +36,86 @@ private struct HookRun {
     let seconds: Double
 }
 
+/// Drain while the child runs: waiting for exit before reading a pipe can
+/// deadlock a healthy hook inside its final stdout write. A nonblocking reader
+/// keeps the original kill deadline authoritative without a reader thread to
+/// strand during cleanup.
+private func runHookProcess(_ process: Process, input: Data,
+                            killAfter: TimeInterval) throws -> HookRun {
+    let stdinPipe = Pipe()
+    let stdoutPipe = Pipe()
+    process.standardInput = stdinPipe
+    process.standardOutput = stdoutPipe
+    process.standardError = FileHandle.nullDevice
+    let outputFD = stdoutPipe.fileHandleForReading.fileDescriptor
+    let flags = fcntl(outputFD, F_GETFL)
+    guard flags >= 0, fcntl(outputFD, F_SETFL, flags | O_NONBLOCK) == 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    defer {
+        if process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+            process.waitUntilExit()
+        }
+        try? stdinPipe.fileHandleForReading.close()
+        try? stdinPipe.fileHandleForWriting.close()
+        try? stdoutPipe.fileHandleForReading.close()
+        try? stdoutPipe.fileHandleForWriting.close()
+    }
+
+    var data = Data()
+    var reachedEOF = false
+    var buffer = [UInt8](repeating: 0, count: 16_384)
+    func drainOutput() throws -> Int {
+        var drained = 0
+        // Bound each pass so even an unexpectedly noisy child cannot prevent
+        // the process/deadline check. The fixtures never need 4 MiB of output.
+        while drained < 262_144 {
+            let count = buffer.withUnsafeMutableBytes { Darwin.read(outputFD, $0.baseAddress, $0.count) }
+            if count > 0 {
+                guard data.count + count <= 4 * 1024 * 1024 else { throw POSIXError(.EFBIG) }
+                data.append(contentsOf: buffer.prefix(count))
+                drained += count
+            } else if count == 0 {
+                reachedEOF = true
+                break
+            } else if errno == EINTR {
+                continue
+            } else if errno == EAGAIN || errno == EWOULDBLOCK {
+                break
+            } else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        }
+        return drained
+    }
+
+    let start = Date()
+    try process.run()
+    try? stdinPipe.fileHandleForReading.close()
+    try? stdoutPipe.fileHandleForWriting.close()
+    stdinPipe.fileHandleForWriting.write(input)
+    stdinPipe.fileHandleForWriting.closeFile()
+
+    while process.isRunning, Date().timeIntervalSince(start) < killAfter {
+        _ = try drainOutput()
+        var descriptor = pollfd(fd: outputFD, events: Int16(POLLIN | POLLHUP), revents: 0)
+        if poll(&descriptor, 1, 50) < 0, errno != EINTR {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
+    let terminated = !process.isRunning
+    if !terminated { kill(process.processIdentifier, SIGKILL) }
+    process.waitUntilExit()
+    let seconds = Date().timeIntervalSince(start)
+    while !reachedEOF {
+        let drained = try drainOutput()
+        guard drained > 0 || reachedEOF else { throw POSIXError(.EIO) }
+    }
+    return HookRun(terminated: terminated, exitCode: process.terminationStatus,
+                   stdout: String(data: data, encoding: .utf8) ?? "", seconds: seconds)
+}
+
 /// Spawn `EngramHooks advise` against an isolated HOME with the given env,
 /// feed it a UserPromptSubmit payload, and SIGKILL it past `killAfter` —
 /// the test's stand-in for the harness's kill timeout.
@@ -54,37 +135,14 @@ private func runAdvise(env extraEnv: [String: String], home: URL,
     for (key, value) in extraEnv { env[key] = value }
     process.environment = env
 
-    let stdinPipe = Pipe()
-    let stdoutPipe = Pipe()
-    process.standardInput = stdinPipe
-    process.standardOutput = stdoutPipe
-    process.standardError = FileHandle.nullDevice
-
     let payload: [String: Any] = [
         "session_id": "watchdog-test-\(UUID().uuidString.prefix(8))",
         "cwd": "/tmp/engram-watchdog-project",
         "prompt": prompt,
     ]
 
-    let start = Date()
-    try process.run()
-    stdinPipe.fileHandleForWriting.write(try JSONSerialization.data(withJSONObject: payload))
-    stdinPipe.fileHandleForWriting.closeFile()
-
-    while process.isRunning, Date().timeIntervalSince(start) < killAfter {
-        usleep(50_000)
-    }
-    let terminated = !process.isRunning
-    if !terminated {
-        kill(process.processIdentifier, SIGKILL)
-    }
-    process.waitUntilExit()
-    let seconds = Date().timeIntervalSince(start)
-    let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-    return HookRun(terminated: terminated,
-                   exitCode: process.terminationStatus,
-                   stdout: String(data: data, encoding: .utf8) ?? "",
-                   seconds: seconds)
+    return try runHookProcess(process, input: JSONSerialization.data(withJSONObject: payload),
+                              killAfter: killAfter)
 }
 
 private func makeTempHome() throws -> URL {
@@ -107,6 +165,17 @@ private func additionalContext(of stdout: String) -> String? {
 
 @Suite("Advise watchdog (child process)", .serialized)
 struct AdviseWatchdogTests {
+
+    @Test func largeHookOutputIsDrainedWhileChildIsRunning() throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/dd")
+        process.arguments = ["if=/dev/zero", "bs=16384", "count=64"]
+        let run = try runHookProcess(process, input: Data(), killAfter: 12)
+        #expect(run.terminated, "A full stdout pipe must not hold the child until its kill deadline")
+        #expect(run.exitCode == 0)
+        #expect(run.stdout.utf8.count == 1_048_576)
+        #expect(run.stdout.utf8.allSatisfy { $0 == 0 })
+    }
 
     /// The core H1.6 guarantee: a main path wedged in an uninterruptible
     /// blocking wait (the seam models the incident's stuck C++ lock frame)

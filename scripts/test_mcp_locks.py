@@ -6,19 +6,35 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("verify_mcp_locks", ROOT / "verify-mcp-locks.py")
 HARNESS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(HARNESS)
 ID = "7603516A-65A2-450B-8A55-86D74EEC7946"
+
+
+def wait_for_group_exit(group, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(group, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            # Darwin can report EPERM while an exiting group's last member is
+            # a zombie. This is unknown, not absence; still require ESRCH.
+            pass
+        time.sleep(0.02)
+    raise TimeoutError("Outer group cleanup did not remove the orphaned native")
 
 
 class PersistenceHarnessTests(unittest.TestCase):
@@ -56,11 +72,12 @@ class PersistenceHarnessTests(unittest.TestCase):
             with self.subTest(result=result), self.assertRaises(AssertionError):
                 HARNESS.assert_failed_write({"jsonrpc": "2.0", "id": 1, "result": result})
 
-    def fake_binary(self, directory, dishonest=False):
+    def fake_binary(self, directory, dishonest=False, scope=None, seed_failure=False):
         # A small Python JSON-RPC fixture backed by its disposable SQLite DB.
         # This verifies the harness's process/reopen/lock logic, not Engram.
         program = textwrap.dedent('''\
             import json, os, sqlite3, sys, uuid
+            from pathlib import Path
             assert "ENGRAM_URL" not in os.environ
             db = sqlite3.connect(os.environ["CLAUDE_MEMORY_DB"], timeout=0.05)
             db.execute("PRAGMA journal_mode=WAL")
@@ -88,16 +105,291 @@ class PersistenceHarnessTests(unittest.TestCase):
                                 result = {"content": [{"type": "text", "text": "Stored memory (id: " + identity + ", project: Test): " + args["content"]}]}
                             else:
                                 result = {"isError": True, "content": [{"type": "text", "text": str(exc)}]}
+                        if SEED_FAILURE:
+                            # A returned error does not prove that no write occurred.
+                            log_dir = Path(os.environ["HOME"]) / ".claude/memory-logs"
+                            log_dir.mkdir(parents=True)
+                            (log_dir / "lattice-mcp-fixture.log").write_text("old" * 10000 + "\\nfixture backend transaction detail\\n")
+                            sys.stderr.write("old" * 10000 + "\\nfixture stderr transaction detail\\npartial final detail")
+                            sys.stderr.flush()
+                            result = {"isError": True, "content": [{"type": "text", "text": "Memory storage transaction failed."}]}
+                    elif params["name"] == "operation_scope":
+                        payload = {"engram_operation": {"version": 1, "kind": "scope",
+                            "capability": "localMutationOperationsV1", "scope": SCOPE}}
+                        result = {"content": [{"type": "text", "text": json.dumps(payload)}],
+                                  "structuredContent": payload}
                     else:
                         rows = db.execute("SELECT globalId, content FROM Memory").fetchall()
                         result = {"content": [{"type": "text", "text": "\\n\\n".join("[id:" + identity + "] [Test/general] (distance: 0.100) " + content for identity, content in rows)}]}
                 print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
             db.close()
-        ''').replace("DISHONEST", repr(dishonest))
+        ''').replace("DISHONEST", repr(dishonest)).replace("SCOPE", repr(scope)).replace("SEED_FAILURE", repr(seed_failure))
         binary = Path(directory) / "fake-mcp"
         binary.write_text("#!" + sys.executable + "\n" + program)
         binary.chmod(0o700)
         return binary
+
+    def test_tool_error_retains_bounded_stderr_without_wait_or_retry(self):
+        client = HARNESS.Client.__new__(HARNESS.Client)
+        client.stderr = ["old diagnostic" * 5000, "transaction detail"]
+        client.buffers = {"stderr": b"partial final detail"}
+        client.send = Mock(return_value=7)
+        client.response = Mock(return_value=self.result("storage failed", isError=True))
+        client.pump = Mock()
+        with self.assertRaisesRegex(AssertionError, "transaction detail") as error:
+            client.call("remember", {"force": True}, timeout=60)
+        self.assertIn("partial final detail", str(error.exception))
+        self.assertLessEqual(len(client.stderr_tail().encode()), 16 * 1024)
+        client.send.assert_called_once()
+        client.response.assert_called_once_with(7, 60)
+        client.pump.assert_called_once_with(0)
+
+    def test_tool_error_survives_diagnostic_read_failure(self):
+        client = HARNESS.Client.__new__(HARNESS.Client)
+        client.stderr, client.buffers = ["retained native detail"], {"stderr": b""}
+        client.send = Mock(return_value=7)
+        client.response = Mock(return_value=self.result("original tool failure", isError=True))
+        client.pump = Mock(side_effect=OSError("diagnostic pipe failed"))
+        with self.assertRaisesRegex(AssertionError, "original tool failure") as error:
+            client.call("remember", {})
+        self.assertIn("retained native detail", str(error.exception))
+        self.assertIn("Diagnostic read error: diagnostic pipe failed", str(error.exception))
+        client.send.assert_called_once()
+
+    def test_diagnostic_tails_bound_utf8_replacement_and_split_characters(self):
+        for value in (b"\xff" * 20000, ("\U0001f600" * 5000).encode() + b"end",
+                      b"\x80\xc3" * 10000 + b"tail", "\U0001f600" * 5000):
+            with self.subTest(kind=type(value).__name__):
+                result = HARNESS.bounded_text_tail(value)
+                self.assertLessEqual(len(result.encode()), 16 * 1024)
+                self.assertEqual(result.encode().decode(), result)
+        self.assertEqual(HARNESS.bounded_text_tail("\U0001f600end", 5), "end")
+        client = HARNESS.Client.__new__(HARNESS.Client)
+        client.stderr, client.buffers = ["older"], {"stderr": b"\xff" * 20000}
+        self.assertLessEqual(len(client.stderr_tail().encode()), 16 * 1024)
+
+    def test_warm_seed_failure_retains_diagnostics_after_reaping_before_temp_removal(self):
+        with self.temporary_directory() as directory:
+            binary = self.fake_binary(directory, seed_failure=True)
+            clients, roots = [], []
+            original_client = HARNESS.Client
+            def capture(*args, **kwargs):
+                client = original_client(*args, **kwargs)
+                clients.append(client)
+                roots.append(Path(kwargs["cwd"]))
+                return client
+            with patch.dict(os.environ, {"TMPDIR": directory}), \
+                    patch.object(HARNESS, "Client", side_effect=capture), \
+                    contextlib.redirect_stderr(io.StringIO()) as output:
+                with self.assertRaisesRegex(AssertionError, "fixture stderr transaction detail"):
+                    HARNESS.run_warm_startup(binary)
+            record = json.loads(output.getvalue())
+            self.assertEqual(record["phase"], "seed_remember")
+            self.assertEqual(record["native_exit_code"], 0)
+            self.assertIsNone(record["cleanup_error"])
+            self.assertIn("partial final detail", record["native_stderr_tail"])
+            self.assertLessEqual(len(record["native_stderr_tail"].encode()), 16 * 1024)
+            self.assertIn("fixture backend transaction detail", record["native_log_tails"][0]["tail"])
+            self.assertLessEqual(len(record["native_log_tails"][0]["tail"].encode()), 16 * 1024)
+            self.assertTrue(any(item["name"] == "memory.sqlite" for item in record["fixture_files"]))
+            self.assertEqual(len(clients), 1)  # No contention client or retry starts.
+            self.assertFalse(roots[0].exists())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(clients[0].process.pid, 0)
+
+    def test_failure_diagnostics_do_not_mask_original_error_or_follow_log_symlink(self):
+        with self.temporary_directory() as directory:
+            root = Path(directory) / "fixture"
+            log_dir = root / "home/.claude/memory-logs"
+            log_dir.mkdir(parents=True)
+            outside = Path(directory) / "outside.log"
+            outside.write_text("must not collect this unrelated log")
+            (log_dir / "lattice-mcp-link.log").symlink_to(outside)
+            client = Mock()
+            client.process.pid = 123
+            client.process.poll.return_value = None
+            client.stderr_tail.return_value = "native failure detail"
+            client.close.side_effect = RuntimeError("cleanup failed")
+            with contextlib.redirect_stderr(io.StringIO()) as output:
+                with self.assertRaisesRegex(ValueError, "original failure"):
+                    try:
+                        raise ValueError("original failure")
+                    finally:
+                        HARNESS.close_warm_fixture(client, root, "warm-startup", "seed_remember")
+            record = json.loads(output.getvalue())
+            self.assertEqual(record["cleanup_error"], "cleanup failed")
+            self.assertIsNone(record["native_exit_code"])
+            self.assertIn("diagnostic_error", record)
+            self.assertNotIn("must not collect", output.getvalue())
+            client.close.assert_called_once()
+
+    def test_successful_fixture_close_does_not_emit_diagnostics(self):
+        client = Mock()
+        with contextlib.redirect_stderr(io.StringIO()) as output:
+            HARNESS.close_warm_fixture(client, Path("unused"), "warm-startup", "complete")
+        self.assertEqual(output.getvalue(), "")
+        client.close.assert_called_once()
+
+    def test_failure_diagnostics_skip_fifo_without_waiting_for_a_writer(self):
+        with self.temporary_directory() as directory:
+            root = Path(directory)
+            log_dir = root / "home/.claude/memory-logs"
+            log_dir.mkdir(parents=True)
+            os.mkfifo(log_dir / "lattice-mcp-pipe.log")
+            with contextlib.redirect_stderr(io.StringIO()) as output:
+                with self.assertRaisesRegex(ValueError, "original failure"):
+                    try:
+                        raise ValueError("original failure")
+                    finally:
+                        HARNESS.close_warm_fixture(None, root, "warm-startup", "seed_remember")
+            record = json.loads(output.getvalue())
+            self.assertEqual(record["native_log_tails"], [])
+            self.assertNotIn("diagnostic_error", record)
+
+    def test_unlocked_reopen_preserves_scope_deadline_and_reaps_process(self):
+        scope = {"version": 1, "storeID": ID, "principal": {"kind": "anonymous", "groupIds": [], "scopes": []}}
+        with self.temporary_directory() as directory:
+            binary = self.fake_binary(directory, scope=scope)
+            clients, receipts = [], []
+            original_client = HARNESS.Client
+            deadline = time.monotonic() + 5
+            def capture(*args, **kwargs):
+                client = original_client(*args, **kwargs)
+                clients.append(client)
+                return client
+            with patch.object(HARNESS, "Client", side_effect=capture):
+                pid = HARNESS.reopen_registered_fixture(binary, Path(directory) / "fixture.sqlite", scope,
+                    environment={}, cwd=directory, deadline=deadline,
+                    require_open_logs=lambda client: receipts.append(client.process.poll()))
+            self.assertEqual(clients[0].deadline, deadline)
+            self.assertEqual(clients[0].process.returncode, 0)
+            self.assertEqual(receipts, [None])
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_unlocked_reopen_rejects_changed_scope_and_still_reaps(self):
+        scope = {"version": 1, "storeID": ID, "principal": {"kind": "anonymous", "groupIds": [], "scopes": []}}
+        changed = dict(scope, storeID="00000000-0000-0000-0000-000000000001")
+        with self.temporary_directory() as directory:
+            binary = self.fake_binary(directory, scope=changed)
+            clients = []
+            original_client = HARNESS.Client
+            def capture(*args, **kwargs):
+                client = original_client(*args, **kwargs)
+                clients.append(client)
+                return client
+            with patch.object(HARNESS, "Client", side_effect=capture):
+                with self.assertRaisesRegex(AssertionError, "changed store/principal scope"):
+                    HARNESS.reopen_registered_fixture(binary, Path(directory) / "fixture.sqlite", scope,
+                        environment={}, cwd=directory, deadline=time.monotonic() + 5)
+            self.assertEqual(clients[0].process.returncode, 0)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(clients[0].process.pid, 0)
+
+    def test_schema_snapshot_still_refuses_fingerprints_staled_by_post_open_ddl(self):
+        with self.temporary_directory() as directory:
+            path = (Path(directory) / "fixture.sqlite").resolve()
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                for name in ("Memory", "Edge", "Checkpoint", "HookState", "SessionState", "SyncConfig", "EngramOperationReceiptV1"):
+                    db.execute(f"CREATE TABLE {name}(id INTEGER)")
+                db.execute("CREATE TABLE EngramOperationStoreV1(singletonKey TEXT, storeID TEXT, formatVersion INTEGER)")
+                db.execute("INSERT INTO EngramOperationStoreV1 VALUES ('local-operation-store', ?, 1)", (ID.lower(),))
+                db.execute("CREATE TABLE _lattice_meta(key TEXT, value TEXT)")
+                original_cookie = db.execute("PRAGMA schema_version").fetchone()[0]
+                db.execute("INSERT INTO _lattice_meta VALUES ('schema_fingerprint:fixture', ?)", (str(original_cookie),))
+                db.commit()
+                self.assertEqual(HARNESS.initialized_store_snapshot(path)["schema_cookie"], original_cookie)
+                db.execute("CREATE TABLE post_open_vector_fixture(id INTEGER)")
+                db.commit()
+                with self.assertRaisesRegex(AssertionError, "schema_cookie"):
+                    HARNESS.initialized_store_snapshot(path)
+                self.assertEqual(db.execute("SELECT value FROM _lattice_meta").fetchone()[0], str(original_cookie))
+
+    def guarded_startup_fixture(self, directory):
+        path = (Path(directory) / "startup.sqlite").resolve()
+        with contextlib.closing(sqlite3.connect(path)) as db:
+            db.execute("CREATE TABLE Memory(globalId TEXT, content TEXT)")
+            db.execute("INSERT INTO Memory VALUES (?, 'synthetic preserved memory')", (ID,))
+            for name in ("Edge", "Checkpoint", "HookState", "SessionState", "SyncConfig", "EngramOperationReceiptV1"):
+                db.execute(f"CREATE TABLE {name}(id INTEGER)")
+            db.execute("CREATE TABLE EngramOperationStoreV1(id INTEGER PRIMARY KEY, globalId TEXT, singletonKey TEXT, storeID TEXT, formatVersion INTEGER)")
+            db.execute("INSERT INTO EngramOperationStoreV1 VALUES (1, ?, 'local-operation-store', ?, 1)", (ID, ID))
+            db.execute("CREATE TABLE _SyncControl(id INTEGER PRIMARY KEY, disabled INTEGER)")
+            db.execute("INSERT INTO _SyncControl VALUES (1, 0)")
+            db.execute("CREATE TABLE _lattice_meta(key TEXT, value TEXT)")
+            db.execute("CREATE TABLE AuditLog(id INTEGER PRIMARY KEY AUTOINCREMENT, tableName TEXT, operation TEXT, rowId INTEGER, globalRowId TEXT, changedFields TEXT, changedFieldsNames TEXT, timestamp REAL)")
+            db.execute("INSERT INTO AuditLog(tableName, operation, rowId, globalRowId) VALUES ('Memory', 'INSERT', 1, ?)", (ID,))
+            # Match Core's generated DELETE guard and audit fields. No UDF is
+            # installed until the test explicitly selects its connection state.
+            db.execute("""CREATE TRIGGER AuditEngramOperationStoreV1Delete
+                AFTER DELETE ON EngramOperationStoreV1 WHEN (sync_disabled() = 0)
+                BEGIN INSERT INTO AuditLog(tableName, operation, rowId, globalRowId,
+                                          changedFields, changedFieldsNames, timestamp)
+                    VALUES ('EngramOperationStoreV1', 'DELETE', OLD.id, OLD.globalId,
+                            json_object('singletonKey', OLD.singletonKey, 'storeID', OLD.storeID,
+                                        'formatVersion', OLD.formatVersion),
+                            json_array('singletonKey', 'storeID', 'formatVersion'), unixepoch('subsec'));
+                END""")
+            cookie = db.execute("PRAGMA schema_version").fetchone()[0]
+            db.execute("INSERT INTO _lattice_meta VALUES ('schema_fingerprint:fixture', ?)", (str(cookie),))
+            db.commit()
+        return path
+
+    def test_startup_identity_removal_retains_generated_guard_schema_and_audit(self):
+        with self.temporary_directory() as directory:
+            path = self.guarded_startup_fixture(directory)
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                before = list(db.iterdump())
+                with self.assertRaisesRegex(sqlite3.OperationalError, "no such function: sync_disabled"):
+                    db.execute("DELETE FROM EngramOperationStoreV1")
+                db.rollback()
+                self.assertEqual(list(db.iterdump()), before)
+                # The existing trigger still audits ordinary, non-disabled
+                # deletes. Roll back this probe before exercising setup.
+                db.create_function("sync_disabled", 0, lambda: 0)
+                db.execute("DELETE FROM EngramOperationStoreV1")
+                self.assertEqual(db.execute("SELECT operation FROM AuditLog ORDER BY id").fetchall(), [("INSERT",), ("DELETE",)])
+                db.rollback()
+                self.assertEqual(list(db.iterdump()), before)
+            HARNESS.remove_fixture_store_identity(path)
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                after = list(db.iterdump())
+                self.assertEqual(after, [line for line in before if not line.startswith('INSERT INTO "EngramOperationStoreV1"')])
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM EngramOperationStoreV1").fetchone()[0], 0)
+                with self.assertRaisesRegex(sqlite3.OperationalError, "no such function: sync_disabled"):
+                    db.execute("SELECT sync_disabled()")
+
+    def test_startup_identity_removal_refuses_unsafe_fixture_preconditions(self):
+        for mutation in ("INSERT INTO EngramOperationReceiptV1 VALUES (1)",
+                         "UPDATE EngramOperationStoreV1 SET singletonKey='other'",
+                         "DROP TRIGGER AuditEngramOperationStoreV1Delete"):
+            with self.subTest(mutation=mutation), self.temporary_directory() as directory:
+                path = self.guarded_startup_fixture(directory)
+                with contextlib.closing(sqlite3.connect(path)) as db:
+                    db.execute(mutation)
+                    db.commit()
+                    before = list(db.iterdump())
+                with self.assertRaises(AssertionError):
+                    HARNESS.remove_fixture_store_identity(path)
+                with contextlib.closing(sqlite3.connect(path)) as db:
+                    self.assertEqual(list(db.iterdump()), before)
+
+    def test_response_timeout_reports_effective_clamped_budget(self):
+        for absolute, effective in ((102.0, 2.0), (None, 15.0), (99.0, 0.0)):
+            with self.subTest(absolute=absolute):
+                now = [100.0]
+                client = HARNESS.Client.__new__(HARNESS.Client)
+                client.deadline, client.messages, client.stderr = absolute, [], []
+                client.process = Mock()
+                client.process.poll.return_value = None
+                def pump(timeout):
+                    self.assertGreater(timeout, 0)
+                    now[0] += timeout
+                client.pump = pump
+                with patch.object(HARNESS.time, "monotonic", side_effect=lambda: now[0]):
+                    with self.assertRaisesRegex(AssertionError, rf"exceeded {effective:.3f}s effective budget \(requested 15s\)"):
+                        client.response_message(1)
+                self.assertAlmostEqual(now[0], 100 + effective)
 
     def fixture_run(self, dishonest=False):
         with self.temporary_directory() as directory:
@@ -190,21 +482,14 @@ class PersistenceHarnessTests(unittest.TestCase):
                 os.kill(state["pid"], 0)  # fake native deliberately ignores stdin EOF
                 self.assertEqual(os.getpgid(state["pid"]), group)
                 os.killpg(group, signal.SIGKILL)
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline:
-                    try:
-                        os.killpg(group, 0)
-                    except ProcessLookupError:
-                        native_gone = True
-                        break
-                    time.sleep(0.02)
-                else:
-                    self.fail("Outer group cleanup did not remove the orphaned native")
+                wait_for_group_exit(group)
+                native_gone = True
             finally:
-                try:
-                    os.killpg(group, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                if not native_gone:
+                    # Preserve the initiating failure if the exiting group is
+                    # temporarily unsignalable; this is not a successful join.
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.killpg(group, signal.SIGKILL)
                 verifier.wait(timeout=2)
                 # Defensive cleanup also makes this regression safe when run
                 # against the old escaping implementation: only its known PID.
@@ -213,6 +498,24 @@ class PersistenceHarnessTests(unittest.TestCase):
                         os.kill(state["pid"], signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+
+    def test_group_exit_requires_absence_after_transient_permission_error(self):
+        with patch.object(os, "killpg", side_effect=[PermissionError(), None, ProcessLookupError()]) as probe, \
+                patch.object(time, "monotonic", side_effect=[0, 0, 0.02, 0.04]), \
+                patch.object(time, "sleep"):
+            wait_for_group_exit(123)
+        self.assertEqual(probe.call_count, 3)
+        self.assertTrue(all(call.args == (123, 0) for call in probe.call_args_list))
+
+    def test_group_exit_refuses_persistent_permission_error_or_live_group(self):
+        for result in (PermissionError(), None):
+            with self.subTest(result=result), \
+                    patch.object(os, "killpg", side_effect=[result]) as probe, \
+                    patch.object(time, "monotonic", side_effect=[0, 0, 5]), \
+                    patch.object(time, "sleep"):
+                with self.assertRaises(TimeoutError):
+                    wait_for_group_exit(123)
+            probe.assert_called_once_with(123, 0)
 
 
 if __name__ == "__main__":

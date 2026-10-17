@@ -1,8 +1,26 @@
 import Testing
 import EngramKit
 import EngramModels
-import Lattice
+@testable import Lattice
 import Foundation
+
+private final class MigrationSweepClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var started: ContinuousClock.Instant?
+
+    func record(_ message: String) {
+        guard message.hasPrefix("Embedding migration: 0 rows ") else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        started = ContinuousClock.now
+    }
+
+    func elapsed() -> Duration? {
+        lock.lock()
+        defer { lock.unlock() }
+        return started?.duration(to: .now)
+    }
+}
 
 // ============================================================================
 // EmbeddingMigration — the v2 space sweep every 0.14.0 machine runs.
@@ -20,7 +38,7 @@ import Foundation
 struct EmbeddingMigrationTests {
 
     private func makeLattice(withHookState: Bool = true) throws -> (Lattice, URL) {
-        let dir = FileManager.default.temporaryDirectory
+        let dir = try testFixtureDirectory()
             .appending(path: "embed-migration-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appending(path: "db.sqlite")
@@ -38,6 +56,56 @@ struct EmbeddingMigrationTests {
         var v = [Float](repeating: 0, count: 384)
         v[0] = 1.0
         return Vector<Float>(v)
+    }
+
+    @Test func emptySweepBoundsFinalCheckpointWithAnIndependentReadSnapshot() async throws {
+        await sharedEmbedder.load()
+        #expect(await sharedEmbedder.isLoaded)
+
+        let directory = try testFixtureDirectory()
+            .appending(path: "embed-migration-empty-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var configuration = Lattice.Configuration(fileURL: directory.appending(path: "db.sqlite"))
+        configuration.busyTimeoutMs = 2_000
+        let migration = try Lattice(Memory.self, Edge.self, Checkpoint.self,
+                                    HookState.self, SyncConfig.self, configuration: configuration)
+        defer { migration.close() }
+        let snapshotReference = try migration.sendableReference.resolveIndependent()
+        let reader = try #require(snapshotReference)
+        defer { reader.close() }
+        let queryReference = try migration.sendableReference.resolveIndependent()
+        let request = try #require(queryReference)
+        defer { request.close() }
+        #expect(Set([migration.backend.identityHash, reader.backend.identityHash,
+                     request.backend.identityHash]).count == 3)
+
+        // Even an empty snapshot pins a real WAL generation. Keep this
+        // independent handle alive across the marker write and checkpoint.
+        #expect(reader.objects(Memory.self).snapshot().isEmpty)
+        #expect(reader.lastQueryError() == nil)
+        #expect(reader.backend.localReadGenerationsOutstanding() > 0)
+        let clock = MigrationSweepClock()
+        let report = try await EmbeddingMigration.runIfNeeded(
+            on: migration, embedder: sharedEmbedder, log: clock.record)
+        // runIfNeeded calls load() again. Its first sweep log is emitted after
+        // that await, so model loading cannot consume this storage budget.
+        let elapsed = try #require(clock.elapsed())
+        #expect(elapsed < .seconds(2), "Empty migration held the writer gate for \(elapsed)")
+        #expect(reader.backend.localReadGenerationsOutstanding() > 0)
+        #expect(!report.skipped)
+        #expect(report.reembedded == 0)
+        #expect(report.failed == 0)
+        #expect(EmbeddingMigration.storedVersion(in: migration) == EmbeddingSpace.currentVersion)
+        #expect(migration.objects(Memory.self).snapshot().isEmpty)
+
+        // The first foreground vector query must still be able to lazily
+        // create its index on a separate connection after the empty sweep.
+        let neighbors = request.objects(Memory.self)
+            .nearest(to: staleVector(), on: \.embedding, limit: 8, distance: .l2)
+            .snapshot()
+        #expect(request.lastQueryError() == nil)
+        #expect(neighbors.isEmpty)
     }
 
     @Test func sweepReembedsStaleRowsAndAdvancesMarker() async throws {

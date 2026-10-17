@@ -10,6 +10,7 @@ extension MemoryTools {
     /// Perform a recall and return the text result directly, without MCP framing.
     /// Used by the hooks binary to inject recalled memories as context.
     public func directRecall(query: String, project: String?, depth: Int = 1, limit: Int = 5) async throws -> String? {
+        try prepareStorage()
         var args: [String: Value] = ["query": .string(query)]
         if let project {
             args["project"] = .string(project)
@@ -1460,6 +1461,12 @@ extension MemoryTools {
     }
 
     func handleVacuum() throws -> CallTool.Result {
+        // Typed service calls bypass the MCP wrapper's per-call cleanup.
+        // Release this instance's completed reads, including cached attachment
+        // unions, before TRUNCATE can wait on our own keeper transactions.
+        // Independent readers remain untouched and still report a busy result.
+        retireAllReadMarks()
+
         // Checkpoint AFTER the VACUUM as well as before. SQLite's VACUUM
         // rewrites the entire database through the WAL, so a vacuum on an
         // 800MB database appends ~800MB of WAL — and without a trailing

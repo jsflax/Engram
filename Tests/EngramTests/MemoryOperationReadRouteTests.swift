@@ -78,9 +78,11 @@ struct MemoryOperationReadRouteTests {
         }
     }
 
-    @Test func vanishedRegisteredSpokeRefusesDurableRouteWhileLegacyRecallCanContinue() async throws {
+    @Test(arguments: [false, true])
+    func vanishedRegisteredSpokeRefusesDurableRouteWhileLegacyRecallCanContinue(_ prepareBeforeRevocation: Bool) async throws {
         let f = try fixture()
         defer { f.close() }
+        if prepareBeforeRevocation { try await f.tools.prepareStorage() }
         let path = try #require(f.groups.first).configuration.fileURL
         try FileManager.default.moveItem(at: path, to: path.appendingPathExtension("revoked"))
         await #expect(throws: MemoryOperationError.storageUnavailable) {
