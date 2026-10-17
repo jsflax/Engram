@@ -11,10 +11,20 @@ from pathlib import Path
 import re
 import selectors
 import sqlite3
+import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
+
+
+def bounded_text_tail(value, limit=16 * 1024):
+    assert 0 < limit <= 16 * 1024
+    raw = value if isinstance(value, bytes) else value.encode(errors="replace")
+    # Replacement of invalid bytes can expand the decoded UTF-8 representation.
+    text = raw[-limit:].decode(errors="replace")
+    return text.encode()[-limit:].decode(errors="ignore")
 
 
 class Client:
@@ -103,8 +113,19 @@ class Client:
     def call(self, name, arguments, timeout=15):
         result = self.response(self.send("tools/call", {"name": name,
                                   "arguments": arguments}), timeout)
-        assert not result.get("isError"), result
+        if result.get("isError"):
+            diagnostic_error = None
+            try:
+                self.pump(0)  # Observe ready diagnostics without extending the deadline.
+            except Exception as error:
+                diagnostic_error = bounded_text_tail(str(error), 4096)
+            raise AssertionError(f"MCP tool {name} failed: {result}\nNative stderr tail:\n{self.stderr_tail()}"
+                                 f"\nDiagnostic read error: {diagnostic_error}")
         return result
+
+    def stderr_tail(self):
+        raw = ("\n".join(self.stderr[-64:]) + "\n").encode(errors="replace") + self.buffers["stderr"]
+        return bounded_text_tail(raw)
 
     def close(self, require_clean=False):
         if self.process.stdin and not self.process.stdin.closed:
@@ -137,6 +158,52 @@ class Client:
         if require_clean:
             assert not forced, "MCP did not exit cleanly after stdin closed"
             assert self.process.returncode == 0, self.process.returncode
+
+
+def close_warm_fixture(client, root, case, phase):
+    """Retain bounded synthetic diagnostics in the supervisor log before temp cleanup."""
+    failure = sys.exc_info()[1]
+    cleanup_error = None
+    try:
+        if client is not None:
+            client.close()
+    except BaseException as error:
+        cleanup_error = error
+        if failure is None:
+            raise
+    finally:
+        if failure is not None or cleanup_error is not None:
+            # This runs only for the newly created, isolated warm fixtures.
+            # Never copy a database, environment, or arbitrary home directory.
+            record = {"case": case, "phase": phase, "synthetic_fixture_failure": True,
+                      "error": bounded_text_tail(str(failure or cleanup_error), 4096),
+                      "cleanup_error": None if cleanup_error is None else bounded_text_tail(str(cleanup_error), 4096),
+                      "native_pid": None if client is None else client.process.pid,
+                      "native_exit_code": None if client is None else client.process.poll(),
+                      "native_stderr_tail": "" if client is None else client.stderr_tail(),
+                      "fixture_files": [], "native_log_tails": []}
+            try:
+                for suffix in ("", "-wal", "-shm"):
+                    path = root / ("memory.sqlite" + suffix)
+                    if path.exists() and not path.is_symlink():
+                        record["fixture_files"].append({"name": path.name, "bytes": path.stat().st_size})
+                log_dir = root / "home/.claude/memory-logs"
+                if log_dir.resolve().is_relative_to(root) and log_dir.is_dir():
+                    for index, path in enumerate(log_dir.glob("lattice-mcp-*.log")):
+                        if index == 4:
+                            break
+                        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                        try:
+                            metadata = os.fstat(descriptor)
+                            if stat.S_ISREG(metadata.st_mode):
+                                os.lseek(descriptor, max(0, metadata.st_size - 16 * 1024), os.SEEK_SET)
+                                record["native_log_tails"].append({"name": path.name, "bytes": metadata.st_size,
+                                    "tail": bounded_text_tail(os.read(descriptor, 16 * 1024))})
+                        finally:
+                            os.close(descriptor)
+            except Exception as error:
+                record["diagnostic_error"] = bounded_text_tail(str(error), 4096)
+            print(json.dumps(record), file=sys.stderr, flush=True)
 
 def tool_text(result):
     assert isinstance(result, dict) and not result.get("isError"), result
@@ -308,14 +375,17 @@ def run_warm_startup(binary):
         cases = []
         token = uuid.uuid4().hex
         content = f"Warm startup keeper {token}: retain this exact identity and content under an independent writer."
+        phase = "seed_initialize"
         try:
             # A real initial process registers the complete production schema
             # and initializes the store. The remember also exercises normal
             # model readiness before any lock is acquired.
             client = Client(binary, db, environment=env, cwd=root, deadline=started + 60)
             client.initialize(protocol_version="2025-11-25")
+            phase = "seed_remember"
             identity = remembered_id(client.call("remember", {
                 "content": content, "project": "WarmStartupRegression", "force": True}, timeout=60))
+            phase = "seed_scope_and_reopen"
             expected_scope = operation_scope(client)
             client.close(require_clean=True)
             warm_pid = client.process.pid
@@ -328,6 +398,7 @@ def run_warm_startup(binary):
             assert persisted_memories(db) == {identity: content}
 
             for slot_count in (0, 1):
+                phase = f"slot_setup_{slot_count}"
                 # The synthetic slot triggers Core's non-fatal sync-state
                 # healing admission on reopen. No schema change is made, and
                 # no pending sync work or production configuration is used.
@@ -343,6 +414,7 @@ def run_warm_startup(binary):
                     writer.execute("BEGIN IMMEDIATE")
                     try:
                         assert_retained_writer(writer, db)
+                        phase = f"held_writer_{slot_count}_slots"
                         attempt_started = time.monotonic()
                         # Match the production operation probe: a single 10s
                         # budget covers launch, initialize and scope. Cleanup
@@ -381,8 +453,7 @@ def run_warm_startup(binary):
                               "warmup_pid": warm_pid, "schema_reopen_pid": reopen_pid,
                               "cases": cases}), flush=True)
         finally:
-            if client is not None:
-                client.close()
+            close_warm_fixture(client, root, "warm-startup", phase)
 
 
 def optional_store_snapshot(db, expected_tables):
@@ -437,11 +508,14 @@ def run_warm_multistore_startup(binary):
         content = f"Multi-store startup keeper {token}: retain this local identity under independent writers on every store."
         stores = [db, synced, *(path for _, path in groups)]
         client = None
+        phase = "seed_initialize"
         try:
             client = Client(binary, db, environment=env, cwd=root, deadline=started + 60)
             client.initialize(protocol_version="2025-11-25")
+            phase = "seed_remember"
             identity = remembered_id(client.call("remember", {
                 "content": content, "project": "WarmMultistoreStartupRegression", "force": True}, timeout=60))
+            phase = "seed_scope_and_reopen"
             expected_scope = operation_scope(client)
             require_optional_open_logs(client, synced, groups)
             client.close(require_clean=True)
@@ -459,6 +533,7 @@ def run_warm_multistore_startup(binary):
             assert all(expected_memories[path] == {} for path, _ in optional)
 
             expected_slots = {}
+            phase = "slot_setup"
             for index, path in enumerate(stores):
                 with closing(sqlite3.connect(path, timeout=1)) as setup:
                     assert setup.execute("SELECT COUNT(*) FROM _lattice_replication_slots").fetchone()[0] == 0
@@ -490,6 +565,7 @@ def run_warm_multistore_startup(binary):
                     writers.append((writer, path))
                     assert_retained_writer(writer, path)
                 try:
+                    phase = "held_writers_four_stores"
                     attempt_started = time.monotonic()
                     client = Client(binary, db, environment=env, cwd=root,
                                     deadline=attempt_started + 10)
@@ -527,8 +603,7 @@ def run_warm_multistore_startup(binary):
                               "locked_pid": locked_pid,
                               "clean_exit": clean_exit}), flush=True)
         finally:
-            if client is not None:
-                client.close()
+            close_warm_fixture(client, root, "warm-multistore-startup", phase)
 
 
 def run_persistence(binary):

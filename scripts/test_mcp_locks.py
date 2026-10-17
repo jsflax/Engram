@@ -57,11 +57,12 @@ class PersistenceHarnessTests(unittest.TestCase):
             with self.subTest(result=result), self.assertRaises(AssertionError):
                 HARNESS.assert_failed_write({"jsonrpc": "2.0", "id": 1, "result": result})
 
-    def fake_binary(self, directory, dishonest=False, scope=None):
+    def fake_binary(self, directory, dishonest=False, scope=None, seed_failure=False):
         # A small Python JSON-RPC fixture backed by its disposable SQLite DB.
         # This verifies the harness's process/reopen/lock logic, not Engram.
         program = textwrap.dedent('''\
             import json, os, sqlite3, sys, uuid
+            from pathlib import Path
             assert "ENGRAM_URL" not in os.environ
             db = sqlite3.connect(os.environ["CLAUDE_MEMORY_DB"], timeout=0.05)
             db.execute("PRAGMA journal_mode=WAL")
@@ -89,6 +90,14 @@ class PersistenceHarnessTests(unittest.TestCase):
                                 result = {"content": [{"type": "text", "text": "Stored memory (id: " + identity + ", project: Test): " + args["content"]}]}
                             else:
                                 result = {"isError": True, "content": [{"type": "text", "text": str(exc)}]}
+                        if SEED_FAILURE:
+                            # A returned error does not prove that no write occurred.
+                            log_dir = Path(os.environ["HOME"]) / ".claude/memory-logs"
+                            log_dir.mkdir(parents=True)
+                            (log_dir / "lattice-mcp-fixture.log").write_text("old" * 10000 + "\\nfixture backend transaction detail\\n")
+                            sys.stderr.write("old" * 10000 + "\\nfixture stderr transaction detail\\npartial final detail")
+                            sys.stderr.flush()
+                            result = {"isError": True, "content": [{"type": "text", "text": "Memory storage transaction failed."}]}
                     elif params["name"] == "operation_scope":
                         payload = {"engram_operation": {"version": 1, "kind": "scope",
                             "capability": "localMutationOperationsV1", "scope": SCOPE}}
@@ -99,11 +108,128 @@ class PersistenceHarnessTests(unittest.TestCase):
                         result = {"content": [{"type": "text", "text": "\\n\\n".join("[id:" + identity + "] [Test/general] (distance: 0.100) " + content for identity, content in rows)}]}
                 print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
             db.close()
-        ''').replace("DISHONEST", repr(dishonest)).replace("SCOPE", repr(scope))
+        ''').replace("DISHONEST", repr(dishonest)).replace("SCOPE", repr(scope)).replace("SEED_FAILURE", repr(seed_failure))
         binary = Path(directory) / "fake-mcp"
         binary.write_text("#!" + sys.executable + "\n" + program)
         binary.chmod(0o700)
         return binary
+
+    def test_tool_error_retains_bounded_stderr_without_wait_or_retry(self):
+        client = HARNESS.Client.__new__(HARNESS.Client)
+        client.stderr = ["old diagnostic" * 5000, "transaction detail"]
+        client.buffers = {"stderr": b"partial final detail"}
+        client.send = Mock(return_value=7)
+        client.response = Mock(return_value=self.result("storage failed", isError=True))
+        client.pump = Mock()
+        with self.assertRaisesRegex(AssertionError, "transaction detail") as error:
+            client.call("remember", {"force": True}, timeout=60)
+        self.assertIn("partial final detail", str(error.exception))
+        self.assertLessEqual(len(client.stderr_tail().encode()), 16 * 1024)
+        client.send.assert_called_once()
+        client.response.assert_called_once_with(7, 60)
+        client.pump.assert_called_once_with(0)
+
+    def test_tool_error_survives_diagnostic_read_failure(self):
+        client = HARNESS.Client.__new__(HARNESS.Client)
+        client.stderr, client.buffers = ["retained native detail"], {"stderr": b""}
+        client.send = Mock(return_value=7)
+        client.response = Mock(return_value=self.result("original tool failure", isError=True))
+        client.pump = Mock(side_effect=OSError("diagnostic pipe failed"))
+        with self.assertRaisesRegex(AssertionError, "original tool failure") as error:
+            client.call("remember", {})
+        self.assertIn("retained native detail", str(error.exception))
+        self.assertIn("Diagnostic read error: diagnostic pipe failed", str(error.exception))
+        client.send.assert_called_once()
+
+    def test_diagnostic_tails_bound_utf8_replacement_and_split_characters(self):
+        for value in (b"\xff" * 20000, ("\U0001f600" * 5000).encode() + b"end",
+                      b"\x80\xc3" * 10000 + b"tail", "\U0001f600" * 5000):
+            with self.subTest(kind=type(value).__name__):
+                result = HARNESS.bounded_text_tail(value)
+                self.assertLessEqual(len(result.encode()), 16 * 1024)
+                self.assertEqual(result.encode().decode(), result)
+        self.assertEqual(HARNESS.bounded_text_tail("\U0001f600end", 5), "end")
+        client = HARNESS.Client.__new__(HARNESS.Client)
+        client.stderr, client.buffers = ["older"], {"stderr": b"\xff" * 20000}
+        self.assertLessEqual(len(client.stderr_tail().encode()), 16 * 1024)
+
+    def test_warm_seed_failure_retains_diagnostics_after_reaping_before_temp_removal(self):
+        with self.temporary_directory() as directory:
+            binary = self.fake_binary(directory, seed_failure=True)
+            clients, roots = [], []
+            original_client = HARNESS.Client
+            def capture(*args, **kwargs):
+                client = original_client(*args, **kwargs)
+                clients.append(client)
+                roots.append(Path(kwargs["cwd"]))
+                return client
+            with patch.dict(os.environ, {"TMPDIR": directory}), \
+                    patch.object(HARNESS, "Client", side_effect=capture), \
+                    contextlib.redirect_stderr(io.StringIO()) as output:
+                with self.assertRaisesRegex(AssertionError, "fixture stderr transaction detail"):
+                    HARNESS.run_warm_startup(binary)
+            record = json.loads(output.getvalue())
+            self.assertEqual(record["phase"], "seed_remember")
+            self.assertEqual(record["native_exit_code"], 0)
+            self.assertIsNone(record["cleanup_error"])
+            self.assertIn("partial final detail", record["native_stderr_tail"])
+            self.assertLessEqual(len(record["native_stderr_tail"].encode()), 16 * 1024)
+            self.assertIn("fixture backend transaction detail", record["native_log_tails"][0]["tail"])
+            self.assertLessEqual(len(record["native_log_tails"][0]["tail"].encode()), 16 * 1024)
+            self.assertTrue(any(item["name"] == "memory.sqlite" for item in record["fixture_files"]))
+            self.assertEqual(len(clients), 1)  # No contention client or retry starts.
+            self.assertFalse(roots[0].exists())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(clients[0].process.pid, 0)
+
+    def test_failure_diagnostics_do_not_mask_original_error_or_follow_log_symlink(self):
+        with self.temporary_directory() as directory:
+            root = Path(directory) / "fixture"
+            log_dir = root / "home/.claude/memory-logs"
+            log_dir.mkdir(parents=True)
+            outside = Path(directory) / "outside.log"
+            outside.write_text("must not collect this unrelated log")
+            (log_dir / "lattice-mcp-link.log").symlink_to(outside)
+            client = Mock()
+            client.process.pid = 123
+            client.process.poll.return_value = None
+            client.stderr_tail.return_value = "native failure detail"
+            client.close.side_effect = RuntimeError("cleanup failed")
+            with contextlib.redirect_stderr(io.StringIO()) as output:
+                with self.assertRaisesRegex(ValueError, "original failure"):
+                    try:
+                        raise ValueError("original failure")
+                    finally:
+                        HARNESS.close_warm_fixture(client, root, "warm-startup", "seed_remember")
+            record = json.loads(output.getvalue())
+            self.assertEqual(record["cleanup_error"], "cleanup failed")
+            self.assertIsNone(record["native_exit_code"])
+            self.assertIn("diagnostic_error", record)
+            self.assertNotIn("must not collect", output.getvalue())
+            client.close.assert_called_once()
+
+    def test_successful_fixture_close_does_not_emit_diagnostics(self):
+        client = Mock()
+        with contextlib.redirect_stderr(io.StringIO()) as output:
+            HARNESS.close_warm_fixture(client, Path("unused"), "warm-startup", "complete")
+        self.assertEqual(output.getvalue(), "")
+        client.close.assert_called_once()
+
+    def test_failure_diagnostics_skip_fifo_without_waiting_for_a_writer(self):
+        with self.temporary_directory() as directory:
+            root = Path(directory)
+            log_dir = root / "home/.claude/memory-logs"
+            log_dir.mkdir(parents=True)
+            os.mkfifo(log_dir / "lattice-mcp-pipe.log")
+            with contextlib.redirect_stderr(io.StringIO()) as output:
+                with self.assertRaisesRegex(ValueError, "original failure"):
+                    try:
+                        raise ValueError("original failure")
+                    finally:
+                        HARNESS.close_warm_fixture(None, root, "warm-startup", "seed_remember")
+            record = json.loads(output.getvalue())
+            self.assertEqual(record["native_log_tails"], [])
+            self.assertNotIn("diagnostic_error", record)
 
     def test_unlocked_reopen_preserves_scope_deadline_and_reaps_process(self):
         scope = {"version": 1, "storeID": ID, "principal": {"kind": "anonymous", "groupIds": [], "scopes": []}}
