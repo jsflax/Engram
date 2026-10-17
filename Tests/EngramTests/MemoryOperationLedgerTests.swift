@@ -17,7 +17,7 @@ struct MemoryOperationLedgerTests {
         var ledger: MemoryOperationLedger { .init(lattice: lattice) }
     }
 
-    private func fixture(bootstrap: Bool = true) throws -> Fixture {
+    private func fixture(bootstrap: Bool = true, busyTimeoutMs: Int = 100) throws -> Fixture {
         let base = ProcessInfo.processInfo.environment["ENGRAM_ADOPTION_TEST_ROOT"]
             .map { URL(fileURLWithPath: $0, isDirectory: true) }
             ?? FileManager.default.temporaryDirectory
@@ -26,7 +26,7 @@ struct MemoryOperationLedgerTests {
         let path = directory.appendingPathComponent("memory.sqlite")
         try MemoryOperationLedger.preflightLocalStore(at: path)
         let lattice = try Lattice(for: [Memory.self] + MemoryOperationLedger.localModels,
-                                  configuration: .init(fileURL: path, busyTimeoutMs: 100))
+                                  configuration: .init(fileURL: path, busyTimeoutMs: busyTimeoutMs))
         if bootstrap { try MemoryOperationLedger(lattice: lattice).bootstrapStoreID() }
         return Fixture(directory: directory, path: path, lattice: lattice)
     }
@@ -228,8 +228,11 @@ struct MemoryOperationLedgerTests {
     }
 
     @Test func busyBeginDoesNotInvokeBodyOrPublishReceipt() throws {
-        let f = try fixture()
+        // One SQLite busy-sleep quantum avoids amplifying hosted timer delays
+        // across a 100ms sleep schedule; the strict two-second gate stays intact.
+        let f = try fixture(busyTimeoutMs: 1)
         defer { f.lattice.close() }
+        try #require(f.lattice.configuration.busyTimeoutMs == 1)
         let operation = try prepared(f)
         let blocker = try SQL(f.path)
         try blocker.execute("BEGIN IMMEDIATE")
@@ -252,7 +255,7 @@ struct MemoryOperationLedgerTests {
         print("[ledger BEGIN timing] failures=\(observed.count), offsets=\(observed.offsets), elapsed=\(elapsed)")
         #expect(observed.onlyExpectedContention)
         #expect(observed.count > 1 && observed.count <= 3)
-        #expect(elapsed >= 0.2) // More than one configured 100ms BEGIN attempt.
+        #expect(elapsed >= 0.025) // The first admitted retry includes a 25ms backoff.
         #expect(elapsed < 2.0) // Finite small-fixture budget, including scheduling allowance.
         #expect(blocker.isInTransaction)
         #expect(try blocker.integer("SELECT COUNT(*) FROM Memory") == 0)

@@ -22,6 +22,21 @@ SPEC.loader.exec_module(HARNESS)
 ID = "7603516A-65A2-450B-8A55-86D74EEC7946"
 
 
+def wait_for_group_exit(group, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(group, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            # Darwin can report EPERM while an exiting group's last member is
+            # a zombie. This is unknown, not absence; still require ESRCH.
+            pass
+        time.sleep(0.02)
+    raise TimeoutError("Outer group cleanup did not remove the orphaned native")
+
+
 class PersistenceHarnessTests(unittest.TestCase):
     def temporary_directory(self):
         # CI may use its normal temporary root. Agent runs explicitly set
@@ -467,21 +482,14 @@ class PersistenceHarnessTests(unittest.TestCase):
                 os.kill(state["pid"], 0)  # fake native deliberately ignores stdin EOF
                 self.assertEqual(os.getpgid(state["pid"]), group)
                 os.killpg(group, signal.SIGKILL)
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline:
-                    try:
-                        os.killpg(group, 0)
-                    except ProcessLookupError:
-                        native_gone = True
-                        break
-                    time.sleep(0.02)
-                else:
-                    self.fail("Outer group cleanup did not remove the orphaned native")
+                wait_for_group_exit(group)
+                native_gone = True
             finally:
-                try:
-                    os.killpg(group, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                if not native_gone:
+                    # Preserve the initiating failure if the exiting group is
+                    # temporarily unsignalable; this is not a successful join.
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.killpg(group, signal.SIGKILL)
                 verifier.wait(timeout=2)
                 # Defensive cleanup also makes this regression safe when run
                 # against the old escaping implementation: only its known PID.
@@ -490,6 +498,24 @@ class PersistenceHarnessTests(unittest.TestCase):
                         os.kill(state["pid"], signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+
+    def test_group_exit_requires_absence_after_transient_permission_error(self):
+        with patch.object(os, "killpg", side_effect=[PermissionError(), None, ProcessLookupError()]) as probe, \
+                patch.object(time, "monotonic", side_effect=[0, 0, 0.02, 0.04]), \
+                patch.object(time, "sleep"):
+            wait_for_group_exit(123)
+        self.assertEqual(probe.call_count, 3)
+        self.assertTrue(all(call.args == (123, 0) for call in probe.call_args_list))
+
+    def test_group_exit_refuses_persistent_permission_error_or_live_group(self):
+        for result in (PermissionError(), None):
+            with self.subTest(result=result), \
+                    patch.object(os, "killpg", side_effect=[result]) as probe, \
+                    patch.object(time, "monotonic", side_effect=[0, 0, 5]), \
+                    patch.object(time, "sleep"):
+                with self.assertRaises(TimeoutError):
+                    wait_for_group_exit(123)
+            probe.assert_called_once_with(123, 0)
 
 
 if __name__ == "__main__":
