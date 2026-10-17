@@ -268,6 +268,9 @@ struct LatticeAdoptionRecallTests {
     @Test(arguments: ["failed-update", "busy-writer"])
     func recall_bookkeepingFailureIsNonfatalAndRecovers(_ failure: String) async throws {
         let fixture = try fixture()
+        // This case exercises bookkeeping after startup. Cold-open contention
+        // has a separate throwing-entrypoint regression below.
+        try await fixture.tools.prepareStorage()
         let blocker = try SQL(fixture.path)
         if failure == "failed-update" {
             // lastAccessedAt is written first. Failing the later increment
@@ -310,6 +313,7 @@ struct LatticeAdoptionRecallTests {
     @Test(arguments: ["failed-insert", "busy-writer"])
     func remember_failedWriteDoesNotReportSuccessOrPersistAndRecovers(_ failure: String) async throws {
         let fixture = try fixture(seed: false)
+        try await fixture.tools.prepareStorage()
         let blocker = try SQL(fixture.path)
         if failure == "failed-insert" {
             try blocker.execute("CREATE TRIGGER adoption_insert_fault BEFORE INSERT ON Memory BEGIN SELECT RAISE(ABORT, 'adoption-insert-fault'); END")
@@ -337,6 +341,64 @@ struct LatticeAdoptionRecallTests {
         let saved = try SQL(fixture.path, readOnly: true).memories()
         #expect(saved[recovered.id]?.content == "recovered durable write")
         #expect(!saved.values.contains { $0.content == "write must fail" })
+    }
+
+    @Test(arguments: ["recall", "remember", "direct-recall", "mcp-recall", "mcp-remember", "stats"])
+    func coldStorageContentionThrowsWithoutTrappingAndRecovers(_ entrypoint: String) async throws {
+        let fixture = try fixture()
+        let blocker = try SQL(fixture.path)
+        // Committed external DDL invalidates the schema fingerprint, so a
+        // fresh handle must take the schema write lock before serving work.
+        try blocker.execute("CREATE TABLE adoption_cold_open_marker (value INTEGER)")
+        try blocker.execute("BEGIN IMMEDIATE")
+        defer { try? blocker.execute("ROLLBACK") }
+
+        func invoke() async throws {
+            switch entrypoint {
+            case "recall":
+                let result = try await recall(fixture)
+                assertRecallContract(result, fixture)
+            case "remember":
+                let result = try await fixture.tools.remember(RememberRequest(
+                    content: "cold storage recovery write", project: "Persistence"))
+                #expect(try SQL(fixture.path, readOnly: true).memories()[result.id]?.content
+                        == "cold storage recovery write")
+            case "direct-recall":
+                let result = try await fixture.tools.directRecall(
+                    query: "fixed unit query", project: Self.project, depth: 0, limit: 6)
+                #expect(result?.contains("important row") == true)
+            case "mcp-recall":
+                let result = try await fixture.tools.handle(CallTool.Parameters(name: "recall", arguments: [
+                    "query": .string("fixed unit query"), "project": .string(Self.project),
+                    "depth": .int(0), "limit": .int(6),
+                ]))
+                #expect(result.isError != true)
+                #expect(MemoryTools.text(from: result).contains("important row"))
+            case "mcp-remember":
+                let result = try await fixture.tools.handle(CallTool.Parameters(name: "remember", arguments: [
+                    "content": .string("cold storage recovery write"), "project": .string("Persistence"),
+                ]))
+                #expect(result.isError != true)
+                #expect(try SQL(fixture.path, readOnly: true).memories().values.contains {
+                    $0.content == "cold storage recovery write"
+                })
+            default:
+                let result = try await fixture.tools.stats(project: Self.project)
+                #expect(!result.isError)
+            }
+        }
+
+        let started = Date()
+        var openFailure: String?
+        do { try await invoke() }
+        catch { openFailure = String(describing: error) }
+        #expect(openFailure?.contains("database is locked") == true)
+        #expect(Date().timeIntervalSince(started) < 5, "100 ms busy timeout must bound cold-open failure")
+        try assertPersistedStats(fixture, bumped: false)
+        #expect(try SQL(fixture.path, readOnly: true).memories().count == fixture.ids.count)
+
+        try blocker.execute("ROLLBACK")
+        try await invoke()
     }
 
     @Test

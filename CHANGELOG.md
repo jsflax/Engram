@@ -12,6 +12,11 @@ All notable changes to Engram are documented in this file.
 - Give the memory service independent database connections before it accepts
   requests, so background workers cannot share its SQLite transactions. Failed
   startup releases partial connections, and storage does not retain the service.
+- Return storage-open failures through typed and MCP calls without terminating
+  the process. Durable operations reject missing group stores even when those
+  stores disappear before the service first opens its connections.
+- Bound the final embedding-migration checkpoint so retained read snapshots do
+  not block foreground vector-index creation for the full database busy timeout.
 - Resume reviewed V1-to-V2 learner migrations of up to 192 sessions in bounded,
   verified steps. Preserve holds and exact plans across migration and release,
   with explicit progress receipts and unchanged admission checks.

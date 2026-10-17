@@ -151,8 +151,8 @@ public actor MemoryTools {
         _ = try resolveDatabases()
     }
 
-    // Preserve the existing nonthrowing internal accessors for legacy direct
-    // callers. Hosts use prepareStorage() to handle open failures before work.
+    // Public throwing entrypoints prepare storage before using these legacy
+    // nonthrowing internal accessors, so open errors remain catchable.
     private func requireDatabases() -> ResolvedDatabases {
         do { return try resolveDatabases() }
         catch { fatalError("Failed to prepare MemoryTools storage: \(error)") }
@@ -250,6 +250,7 @@ public actor MemoryTools {
     }
 
     private func resolveReadRoute(for project: String?, strict: Bool) throws -> ReadRoute {
+        try prepareStorage()
         var includeSynced = false
         if syncedLattice != nil, let project {
             if strict {
@@ -285,7 +286,7 @@ public actor MemoryTools {
         // A durable writer cannot infer absence from a vanished registered
         // spoke. Rebuild the service against the current membership/files
         // before retrying; legacy recall still drops revoked spokes below.
-        if strict, spokes.count != groupSpokes.count {
+        if strict, spokes.count != groupReferences.count {
             throw MemoryOperationError.storageUnavailable
         }
         let budget = Self.maxAttachments - (includeSynced ? 1 : 0)
@@ -1353,9 +1354,12 @@ public actor MemoryTools {
     /// the personal synced mirror, the group spokes, and the attach-cache
     /// union handles built over them.
     func retireAllReadMarks() {
-        localLattice.retireAllGenerations()
-        syncedLattice?.retireAllGenerations()
-        for spoke in groupSpokes {
+        // A failed first open has no published handles to retire. Cleanup
+        // must never retry that open through the nonthrowing accessors.
+        guard let databases = resolvedDatabases else { return }
+        databases.local.retireAllGenerations()
+        databases.synced?.retireAllGenerations()
+        for spoke in databases.groups {
             spoke.lattice.retireAllGenerations()
         }
         for union in attachCache.values {
@@ -1367,6 +1371,10 @@ public actor MemoryTools {
         switch params.name {
         case "operation_scope", "operation_apply", "operation_status":
             return await handleOperationTool(params)
+        default:
+            try prepareStorage()
+        }
+        switch params.name {
         case "remember":
             return try await handleRemember(params.arguments)
         case "recall":

@@ -10,6 +10,7 @@ extension MemoryTools {
     /// Perform a recall and return the text result directly, without MCP framing.
     /// Used by the hooks binary to inject recalled memories as context.
     public func directRecall(query: String, project: String?, depth: Int = 1, limit: Int = 5) async throws -> String? {
+        try prepareStorage()
         var args: [String: Value] = ["query": .string(query)]
         if let project {
             args["project"] = .string(project)

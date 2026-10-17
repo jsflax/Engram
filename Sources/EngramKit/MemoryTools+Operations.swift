@@ -7,11 +7,13 @@ extension MemoryTools {
     /// store. This read never initializes a ledger or falls back to legacy CRUD.
     public func operationScope() async throws -> MemoryOperationScope {
         guard localMutationOperationsEnabled else { throw MemoryOperationError.unsupported }
+        try prepareOperationStorage()
         return try MemoryOperationLedger(lattice: localLattice).scope(principal: identity.currentPrincipal())
     }
 
     public func operationStatus(operationID: UUID, scope: MemoryOperationScope) async throws -> MemoryOperationStatus {
         guard localMutationOperationsEnabled else { throw MemoryOperationError.unsupported }
+        try prepareOperationStorage()
         return try MemoryOperationLedger(lattice: localLattice).status(
             operationID: operationID, scope: scope, principal: identity.currentPrincipal())
     }
@@ -19,6 +21,7 @@ extension MemoryTools {
     public func applyOperation(_ request: MemoryOperationRequest) async throws -> MemoryOperationReceipt {
         guard localMutationOperationsEnabled else { throw MemoryOperationError.unsupported }
         let prepared = try MemoryOperationCanonicalPayload.prepare(request)
+        try prepareOperationStorage()
         let ledger = MemoryOperationLedger(lattice: localLattice)
         // Exact replay must succeed without embedding, re-running duplicate
         // detection, refreshing TTL or publishing episode/save effects again.
@@ -31,6 +34,11 @@ extension MemoryTools {
         case .connect(let value):
             return try applyPreparedConnect(prepared, value, ledger: ledger)
         }
+    }
+
+    private func prepareOperationStorage() throws {
+        do { try prepareStorage() }
+        catch { throw MemoryOperationError.storageUnavailable }
     }
 
     private func applyPreparedRemember(_ prepared: MemoryOperationCanonicalPayload,

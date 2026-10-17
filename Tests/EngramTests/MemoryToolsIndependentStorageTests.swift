@@ -3,6 +3,7 @@
 import EngramMemoryCore
 import EngramModels
 import Foundation
+import MCP
 import Testing
 
 private struct ActorStorageSnapshot: Equatable, Sendable {
@@ -239,6 +240,17 @@ struct MemoryToolsIndependentStorageTests {
         try FileManager.default.createDirectory(at: blocked.path, withIntermediateDirectories: true)
         // Local and synced opens precede this group's failure.
         await #expect(throws: (any Error).self) { try await tools.prepareStorage() }
+        await #expect(throws: MemoryOperationError.storageUnavailable) { try await tools.operationScope() }
+        let failedOperation = try await tools.handle(CallTool.Parameters(name: "operation_scope", arguments: [:]))
+        #expect(failedOperation.isError == true)
+        #expect(MemoryTools.text(from: failedOperation).contains("storage_unavailable"))
+        // The operation transport still validates requests before touching
+        // storage and emits its structured error rather than throwing.
+        let invalidOperation = try await tools.handle(CallTool.Parameters(name: "operation_scope", arguments: [
+            "unexpected": .bool(true),
+        ]))
+        #expect(invalidOperation.isError == true)
+        #expect(MemoryTools.text(from: invalidOperation).contains("invalid_request"))
         try FileManager.default.removeItem(at: blocked.path)
         try FileManager.default.moveItem(at: backup, to: blocked.path)
 
