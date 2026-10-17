@@ -2,7 +2,9 @@
 
 The caller explicitly pins a reviewed bundle. That pin is semantic review
 authority, not a historical execution seal. Only one preserved successful
-remember and one expired, authoritative failed-BEGIN remember are supported.
+remember and one expired, authoritative failed-BEGIN remember are supported by
+the original profile. A separately typed profile supports an expired replacement
+update followed by an authoritative failed-BEGIN remember.
 Current V2 admission, exact source/parser, current row readback and historical
 records are checked separately. All publication uses the normal coordinator.
 """
@@ -23,6 +25,7 @@ import time
 from . import admission, execution_context as context, execution_manifest as codec
 from . import file_identity, host_admission, migration as durable, transcript
 from . import publication_coordinator as coordinator, publication_journal as publication
+from . import legacy_expired_update as expired_update
 
 KIND = "legacy_no_new_mutation"
 RESULT = "legacy_reconciled_no_new_mutation"
@@ -123,9 +126,10 @@ class LegacyPaths:
 
 def _runtime(paths):
     # Pin only the bounded implementation paths actually used by this command.
-    modules = (Path(__file__), Path(context.__file__), Path(transcript.__file__),
+    modules = (Path(__file__), Path(context.__file__), Path(transcript.__file__), Path(codec.__file__),
                Path(admission.__file__), Path(host_admission.__file__), Path(file_identity.__file__),
-               Path(durable.__file__), Path(publication.__file__), Path(coordinator.__file__))
+               Path(durable.__file__), Path(publication.__file__), Path(coordinator.__file__),
+               Path(expired_update.__file__))
     result = {}
     for path in modules:
         raw, identity = durable._read(path, private=False, maximum=1024 * 1024)
@@ -142,9 +146,9 @@ def _read_historical(root, run_id, role):
     return raw
 
 
-def _rows(paths, expected):
+def _rows(paths, expected, *, count=2):
     """Exact UUID read-only snapshot; no recall, SQL from evidence, or counters."""
-    _require(type(expected) is list and len(expected) == 2, "invalid_row_count")
+    _require(type(expected) is list and len(expected) == count, "invalid_row_count")
     ids = [codec._uuid(row["globalId"]) for row in expected]
     _require(len(set(ids)) == len(ids), "duplicate_row_id")
     before = paths.candidate_store.lstat()
@@ -187,8 +191,8 @@ def _lines(raw):
     return [_json(line) for line in lines]
 
 
-def _history(review, history):
-    """Validate exact serial native attempts, not provider prose."""
+def _serial_history(review, history, write_tools, *, strict_projection=False):
+    """Correlate the complete serial trace under an explicit profile allowlist."""
     run = _json(_raw(history["run"]))
     _require(run.get("session_id") == review["session_id"] and run.get("status") == "failed"
              and run.get("reason") == "unverified_completion" and type(run.get("returncode")) is int
@@ -212,7 +216,9 @@ def _history(review, history):
     for event in audit[1:-1]:
         kind = event.get("event")
         if kind == "tool_call":
-            _require(active is None and event.get("tool") in READ_TOOLS | {"remember"}, "unaccounted_call")
+            _require(active is None and event.get("tool") in READ_TOOLS | write_tools, "unaccounted_call")
+            if strict_projection:
+                codec._keys(event, {"event", "id", "tool"})
             codec._integer(event.get("id"), 0, (1 << 31) - 1)
             active = event
             calls.append(event)
@@ -239,16 +245,26 @@ def _history(review, history):
                      and type(item["text"]) is str and pending is None,
                      "unexpected_provider_item")
             continue
-        _require(item.get("server") == "memory" and item.get("tool") in READ_TOOLS | {"remember"},
+        _require(item.get("server") == "memory" and item.get("tool") in READ_TOOLS | write_tools,
                  "unaccounted_provider_tool")
+        if strict_projection:
+            codec._keys(item, {"id", "type", "server", "tool", "arguments", "result", "error", "status"})
+            _identifier(item["id"])
+            _require(item["error"] is None, "provider_error_changed")
         if event.get("type") == "item.started":
             _require(pending is None, "provider_overlap")
+            if strict_projection:
+                _require(item["status"] == "in_progress" and item["result"] is None, "provider_start_changed")
             pending = item
             started.append(item)
         elif event.get("type") == "item.completed":
             _require(pending is not None and item.get("id") == pending.get("id")
                      and item.get("tool") == pending.get("tool")
                      and _same(item.get("arguments"), pending.get("arguments")), "provider_result_changed")
+            if strict_projection:
+                _require(item["status"] in {"completed", "failed"}
+                         and (item["tool"] not in READ_TOOLS or item["status"] == "completed"),
+                         "provider_status_changed")
             completed.append(item)
             pending = None
         else:
@@ -256,7 +272,17 @@ def _history(review, history):
     _require(pending is None and len(started) == len(calls)
              and [item["tool"] for item in started] == [item["tool"] for item in calls],
              "call_correlation_changed")
-    mutations = [(a, b, c) for a, b, c in zip(started, completed, results) if a["tool"] == "remember"]
+    if strict_projection:
+        _require(len({item["id"] for item in started}) == len(started), "duplicate_provider_id")
+    mutations = [(a, b, c) for a, b, c in zip(started, completed, results) if a["tool"] in write_tools]
+    return began, ended, mutations
+
+
+def _history(review, history):
+    """Validate exact serial native attempts, not provider prose."""
+    if review["kind"] == expired_update.KIND:
+        return expired_update.validate_history(review, history)
+    began, ended, mutations = _serial_history(review, history, {"remember"})
     _require(len(mutations) == len(review["attempts"]) == 2, "mutation_count_changed")
     retained = []
     for (start, finish, result), expected in zip(mutations, review["attempts"]):
@@ -314,13 +340,15 @@ def _review(value):
         "historical_request_id", "source", "parser", "messages", "attempts", "rows", "store_identity",
         "preserved_memory_ids", "artifacts", "history", "qualifications"})
     codec._version(value["version"])
-    _require(value["kind"] == "reviewed_legacy_no_new_mutation", "invalid_review")
+    is_update = value["kind"] == expired_update.KIND
+    _require(is_update or value["kind"] == "reviewed_legacy_no_new_mutation", "invalid_review")
     admission._uuid(value["session_id"], 7)
     for key in ("legacy_run_id", "previous_run_id", "historical_request_id"):
         _identifier(value[key])
     _require(value["legacy_run_id"] != value["previous_run_id"], "invalid_previous_run")
     codec._keys(value["history"], set(ROLES) | {"previous_run"})
-    _require(type(value["artifacts"]) is dict and set(value["artifacts"]) == ARTIFACTS, "invalid_artifacts")
+    _require(type(value["artifacts"]) is dict
+             and set(value["artifacts"]) == (expired_update.ARTIFACTS if is_update else ARTIFACTS), "invalid_artifacts")
     for name, digest in value["artifacts"].items():
         _require(re.fullmatch(r"[a-z][a-z0-9.-]{0,100}\.json", name), "invalid_artifact_name")
         codec._digest(digest)
@@ -343,7 +371,7 @@ def _review(value):
     codec._keys(value["store_identity"], {"device", "inode", "uid"})
     for field in value["store_identity"].values():
         codec._integer(field)
-    _require(type(value["rows"]) is list and len(value["rows"]) == 2, "invalid_rows")
+    _require(type(value["rows"]) is list and len(value["rows"]) == (1 if is_update else 2), "invalid_rows")
     for row in value["rows"]:
         codec._keys(row, (set(ROW_FIELDS) - {"content"}) | {"content_sha256"})
         _require(codec._uuid(row["globalId"]) == row["globalId"], "noncanonical_row_id")
@@ -357,6 +385,9 @@ def _review(value):
     _require(type(value["preserved_memory_ids"]) is list and len(value["preserved_memory_ids"]) == 1,
              "invalid_preserved_ids")
     codec._uuid(value["preserved_memory_ids"][0])
+    if is_update:
+        expired_update.validate_review(value)
+        return value
     _require(type(value["messages"]) is list and 1 <= len(value["messages"]) <= 128, "invalid_messages")
     for index, message in enumerate(value["messages"], 1):
         codec._keys(message, {"index", "role", "sha256", "disposition", "memory_ids"})
@@ -373,6 +404,8 @@ def _review(value):
 
 def _assessment_links(review, images):
     """Bind the reviewed decision to the actual independent retained reports."""
+    if review["kind"] == expired_update.KIND:
+        return expired_update.validate_assessments(review, images)
     reports = {name: _json(_raw(image)) for name, image in images.items()}
     for name, report in reports.items():
         _require(type(report.get("schema_version")) is int and report["schema_version"] == 1,
@@ -483,8 +516,12 @@ def _source(request, review):
     _require(len(chunks) == excerpt.message_count == len(review["messages"])
              and all(durable.digest(chunk.encode()) == item["sha256"] for chunk, item in zip(chunks, review["messages"])),
              "message_coverage_changed")
+    projection = None
+    if review["kind"] == expired_update.KIND:
+        projection = expired_update.validate_source(request, review, excerpt, chunks)
     _require(context._interval(path, source["identity"], start, end) == source["interval_sha256"]
              and context._parser_runtime()["sha256"] == parser["runtime_sha256"], "source_changed")
+    return projection
 
 
 def _selected(paths, session_id):
@@ -566,7 +603,8 @@ def _validate(paths, plan):
                    else _read_historical(paths.root, review["legacy_run_id"], role))
         _require(raw == current and durable.digest(raw) == digest, "history_changed")
     _history(review, plan["history"])
-    _require(_rows(paths, review["rows"]) == review["store_identity"], "store_changed")
+    _require(_rows(paths, review["rows"], count=1 if review["kind"] == expired_update.KIND else 2)
+             == review["store_identity"], "store_changed")
     row_ids = {row["globalId"] for row in review["rows"]}
     for message in review["messages"]:
         _require(set(message["memory_ids"]) <= row_ids, "message_row_unbound")
@@ -575,7 +613,11 @@ def _validate(paths, plan):
             row = next(r for r in review["rows"] if r["globalId"] == message["memory_ids"][0])
             _require(type(row["expiresAt"]) in (int, float) and row["expiresAt"] < time.time()
                      and row["deletedAt"] is None, "duplicate_not_retained_expired")
-    _source(request, review)
+    projection = _source(request, review)
+    if review["kind"] == expired_update.KIND:
+        coverage = _json(_raw(plan["artifacts"]["expired-update-coverage.json"]))
+        _require(_same(projection, {key: coverage[key] for key in ("record_count", "parser_diagnostics")}),
+                 "structural_coverage_changed")
     expected_state, expected_record = _proposal(state, record, review, plan["id"], plan["review_sha256"])
     _require(_same(plan["next_state"], expected_state) and _same(plan["next_admission"], expected_record),
              "proposal_changed")
