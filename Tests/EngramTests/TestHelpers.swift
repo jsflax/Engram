@@ -97,13 +97,16 @@ func testFixtureDirectory() throws -> URL {
     return directory
 }
 
-/// Create a MemoryTools with an isolated temp database and the real embedding model.
+/// Isolate both storage and identity from concurrent group-directory fixtures.
+/// Production identity resolution is covered by the topology-specific fixtures.
+/// Uses the real embedding model.
 func makeTools() async throws -> MemoryTools {
     let path = try testFixtureDirectory()
         .appending(path: "claude-memory-test-\(UUID().uuidString).sqlite")
     let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, SyncConfig.self, configuration: .init(fileURL: path))
     let embedder = try await loadedFixtureEmbedder()
-    return MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
+    return MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder,
+                       identity: StaticIdentityProvider(.anonymous))
 }
 
 /// Context returned by makeDualDBTools for test inspection.
@@ -129,7 +132,8 @@ func makeDualDBTools() async throws -> DualDBContext {
     let tools = MemoryTools(
         localRef: localLattice.sendableReference,
         syncedRef: syncedLattice.sendableReference,
-        embedder: embedder
+        embedder: embedder,
+        identity: StaticIdentityProvider(.anonymous)
     )
     return DualDBContext(tools: tools, localLattice: localLattice, syncedLattice: syncedLattice)
 }

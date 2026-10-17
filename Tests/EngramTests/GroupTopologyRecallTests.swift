@@ -1,5 +1,6 @@
 import Testing
 import EngramKit
+import EngramMemoryCore
 import EngramModels
 import Lattice
 import MCP
@@ -14,7 +15,8 @@ import Foundation
 // Unlike GroupReadLatticeTests (deliberately directory-less), this suite
 // writes a groups.json fixture: names for [via:], members for [by:], and a
 // selfUserId so own rows render clean. GroupDirectory.fileURL is
-// process-global, hence `.serialized` + save/restore around every test.
+// process-global: serialize its writers here and save/restore every test.
+// Other suites still run concurrently, so ordinary helpers pin their identity.
 // ============================================================================
 
 private struct TopologySpoke {
@@ -101,6 +103,73 @@ private func addMemory(_ content: String, project: String, author: UUID?,
 
 @Suite(.serialized)
 struct GroupTopologyRecallTests {
+
+    /// Directory writers share this serialized suite. Ordinary helpers must
+    /// remain anonymous even when the ambient production identity changes.
+    @Test(arguments: [false, true])
+    func isolatedHelpersKeepAuthorshipAcrossDirectoryChanges(dualDatabase: Bool) async throws {
+        let savedURL = GroupDirectory.fileURL
+        defer { GroupDirectory.fileURL = savedURL }
+        let directory = try testFixtureDirectory()
+            .appending(path: "engram-helper-identity-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        func useAmbientIdentity(_ id: UUID, revision: Int) throws {
+            let file = GroupDirectory.GroupsFile(selfUserId: id, updatedAt: Date(),
+                                                  groups: [], members: [:])
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            let url = directory.appending(path: "groups-\(revision).json")
+            try encoder.encode(file).write(to: url)
+            // The production cache currently keys by mtime, so establish
+            // distinct versions without relying on sleeps or clock granularity.
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: 1_000_000_000 + Double(revision))],
+                ofItemAtPath: url.path)
+            GroupDirectory.fileURL = url
+            try #require(GroupDirectoryIdentityProvider().currentPrincipal().id == id)
+        }
+
+        let ambientA = UUID(), ambientB = UUID()
+        try useAmbientIdentity(ambientA, revision: 1)
+        let tools: MemoryTools
+        if dualDatabase { tools = try await makeDualDBTools().tools }
+        else { tools = try await makeTools() }
+        #expect(tools.principal == .anonymous)
+
+        func remember(_ content: String) async throws -> UUID {
+            let result = try await tools.handle(CallTool.Parameters(name: "remember", arguments: [
+                "content": .string(content), "force": .bool(true)
+            ]))
+            try #require(result.isError != true)
+            let id = try #require(extractId(from: text(from: result)).flatMap(UUID.init(uuidString:)))
+            let stored = try await tools.graph(GraphRequest(id: id)).root
+            #expect(stored.id == id && stored.authorUserId == nil)
+            return id
+        }
+
+        let first = try await remember("Memory A for isolated helper identity")
+        try useAmbientIdentity(ambientB, revision: 2)
+        #expect(tools.principal == .anonymous)
+        let second = try await remember("Memory B for isolated helper identity")
+        let firstAfterChange = try await tools.graph(GraphRequest(id: first)).root
+        #expect(firstAfterChange.authorUserId == nil)
+
+        // This is an ordinary consolidation: no foreign-author override.
+        let result = try await tools.handle(CallTool.Parameters(name: "consolidate", arguments: [
+            "ids": .array([.string(first.uuidString), .string(second.uuidString)]),
+            "content": .string("Combined isolated helper identity summary"), "importance": .int(5)
+        ]))
+        try #require(result.isError != true)
+        #expect(text(from: result).contains("importance: 5"))
+        let summaryID = try #require(extractId(from: text(from: result)).flatMap(UUID.init(uuidString:)))
+        let summary = try await tools.graph(GraphRequest(id: summaryID)).root
+        #expect(summary.importance == 5 && summary.authorUserId == nil)
+        for id in [first, second] {
+            let source = try await tools.graph(GraphRequest(id: id)).root
+            #expect(source.importance == 0 && source.authorUserId == nil)
+        }
+    }
 
     /// One recall unions the org's teams AND the concept graph, with every
     /// graph attributed and provenanced — the founder's canary/mobile shape,
