@@ -53,6 +53,13 @@ public final class ForceSimulation3D {
     public var nodeCount: Int { ids.count }
     /// Identity/order of flat GPU slots, independent of count and simulation ticks.
     public private(set) var nodeOrderVersion: UInt64 = 0
+    /// Changes whenever existing node indices may move. Appending nodes leaves
+    /// old indices valid; GPU results must still use `nodeOrderVersion`.
+    public private(set) var nodeIndexGeneration: UInt64 = 0
+
+    /// Index into the flat position arrays, valid until `nodeIndexGeneration`
+    /// changes. A missing node may acquire an index on a later append.
+    public func index(for id: UUID) -> Int? { idToIndex[id] }
 
     /// Position dictionary — lazily materialized from the flat x/y/z arrays
     /// on first read per generation. The render path consumes the flat
@@ -232,6 +239,7 @@ public final class ForceSimulation3D {
 
         ids = newIds
         nodeOrderVersion &+= 1
+        nodeIndexGeneration &+= 1
         x = newX; y = newY; z = newZ
         vx = newVx; vy = newVy; vz = newVz
         pinned = newPinned
@@ -319,6 +327,7 @@ public final class ForceSimulation3D {
 
         ids = newIds; x = newX; y = newY; z = newZ
         nodeOrderVersion &+= 1
+        nodeIndexGeneration &+= 1
         vx = newVx; vy = newVy; vz = newVz; pinned = newPinned
         projectGroup = newProjGroup; topicGroup = newTopicGrp
         galaxyGroup = newGalaxyGrp

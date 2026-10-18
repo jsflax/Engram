@@ -4,6 +4,13 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.4] - 2026-10-18
+
+### Fixed
+- Reuse simulation node indices while the visualizer loads appended nodes instead
+  of rebuilding the full lookup each time. Refresh indices after deletion,
+  reordering or simulation replacement, and resolve nodes that arrive later.
+
 ## [0.15.3] - 2026-10-18
 
 ### Fixed
