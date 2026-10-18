@@ -79,6 +79,29 @@ class MigrationFixture:
         return sid
 
 
+class RuntimeInventoryTests(unittest.TestCase):
+    def test_expanded_inventory_hashes_every_module_and_stays_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary).resolve() / "scripts"
+            modules = package / "codex_learner"
+            modules.mkdir(parents=True)
+            paths = [modules / ("module_" + str(i) + ".py") for i in range(33)]
+            paths += [package / "learner_router.py", package / "codex_learner_migrate.py"]
+            for index, path in enumerate(paths):
+                path.write_text("value = " + str(index) + "\n")
+            with mock.patch.object(M, "__file__", str(paths[0])):
+                before = M._runtime()
+                self.assertEqual(before, {str(p.relative_to(package)): M.digest(p.read_bytes()) for p in paths})
+                paths[32].write_text("value = 'changed'\n")
+                self.assertNotEqual(M._runtime()["codex_learner/module_32.py"], before["codex_learner/module_32.py"])
+                for index in range(33, 62):
+                    (modules / ("module_" + str(index) + ".py")).write_text("value = 0\n")
+                self.assertEqual(len(M._runtime()), 64)
+                (modules / "module_62.py").write_text("value = 0\n")
+                with self.assertRaisesRegex(ValueError, "runtime_membership_invalid"):
+                    M._runtime()
+
+
 class MigrationTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
