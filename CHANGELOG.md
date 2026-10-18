@@ -4,6 +4,26 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.5] - 2026-10-18
+
+### Fixed
+- Route hooks and new learner batches to the installed, enabled Engram plugin
+  through the supported plugin registry, with a bounded lookup and one handoff.
+- Compare reviewed memory dates by their exact numeric value, so equivalent JSON
+  integer and SQLite real values do not create a false readback hold.
+- Create the standalone learner’s runs directory with private permissions even
+  when the shell uses a permissive default file mask.
+- Validate large excluded transcript records against the reviewed source interval
+  instead of the smaller report-file limit, retaining configured scan and JSON checks.
+- Recognize completed reviewed accounting with zero or more writes in hook
+  status, preserving strict receipt validation and historical outcomes.
+- Read project and topic counts with grouped database queries instead of loading
+  complete memories and issuing a separate count for every group.
+- Adopt Lattice 2.2.1 and LatticeCore 2.2.1, including grouped-count support and
+  a fix for concurrent reads repopulating cached rows while a store closes.
+- Reuse indexed glow color lookups and refresh selected particle links after
+  graph deletion, reordering or provider replacement.
+
 ## [0.15.4] - 2026-10-18
 
 ### Fixed
