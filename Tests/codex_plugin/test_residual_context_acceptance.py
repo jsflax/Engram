@@ -69,6 +69,37 @@ class ResidualContextAcceptanceTests(unittest.TestCase):
                 with self.no_processes(),self.assertRaises(ValueError):f.context.validate_marker()
                 self.assertEqual(f.current(),before)
 
+    def test_repeated_context_checks_reuse_only_identical_history_and_source_semantics(self):
+        f=self.fixture(prepared=False);context=f.context
+        with self.no_processes(),f.locks() as verify:
+            f.begin(verify)
+        context._source_cache.clear();context._projection_cache.clear();context._history_cache.clear()
+        with self.no_processes(), mock.patch.object(RC,'validate_history',wraps=RC.validate_history) as history, \
+             mock.patch.object(RC.transcript,'read_excerpt',wraps=RC.transcript.read_excerpt) as source, \
+             mock.patch.object(context,'_pinned',wraps=context._pinned) as pinned:
+            for _ in range(4):
+                self.assertIs(context.validate_inputs(context.manifest,context.plan,'before_native_forward'),True)
+            self.assertEqual(history.call_count,1)
+            self.assertEqual(source.call_count,2)  # General and residual projection once each.
+            self.assertEqual(pinned.call_count,4)
+            path=f.historical_run_dir/'provider.jsonl'
+            path.write_bytes(path.read_bytes()+b' ')
+            with self.assertRaisesRegex(ValueError,'history_changed'):
+                context.validate_inputs(context.manifest,context.plan,'before_native_forward')
+            self.assertEqual(history.call_count,1)
+
+    def test_cached_residual_validation_keeps_fresh_preserved_row_check(self):
+        f=self.fixture(prepared=False);context=f.context
+        with self.no_processes(),f.locks() as verify:
+            f.begin(verify)
+        self.assertIs(context.validate_inputs(context.manifest,context.plan,'before_native_forward'),True)
+        with contextlib.closing(sqlite3.connect(f.store)) as db:
+            db.execute('UPDATE Memory SET content=? WHERE globalId=?',('changed after preflight',SUCCESS_ID));db.commit()
+        before=f.current()
+        with self.no_processes(),self.assertRaises(ValueError):
+            context.validate_inputs(context.manifest,context.plan,'before_native_forward')
+        self.assertEqual(f.current(),before)
+
     def test_selected_old_update_semantics_must_remain_exact(self):
         f=self.fixture();before=f.current()
         for column,value in (('content','changed'),('project','changed'),('source','changed'),

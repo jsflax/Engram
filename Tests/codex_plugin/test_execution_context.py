@@ -172,6 +172,42 @@ class ExecutionContextTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), raw)
         self.assertEqual(json.loads(self.state_path.read_bytes())["offset"], self.frontier)
 
+    def test_identical_source_semantics_reused_but_current_bytes_and_authority_rechecked(self):
+        context = self.seal()
+        context._source_cache.clear()
+        with mock.patch.object(T, "read_excerpt", wraps=T.read_excerpt) as parse:
+            for _ in range(4):
+                self.assertIs(self.validate(context), True)
+            self.append("Append beyond the sealed interval is permitted.")
+            self.assertIs(self.validate(context), True)
+            self.assertEqual(parse.call_count, 1)
+            original = self.path.read_bytes()
+            self.path.write_bytes(original.replace(b"PRIVATE", b"CHANGED"))
+            with self.assertRaisesRegex(C.ContextError, "source_bytes_changed"):
+                self.validate(context)
+            self.path.write_bytes(original)
+            write_json(self.root / "admission.json", {**self.policy, "enabled": False})
+            with self.assertRaises(C.ContextError):
+                self.validate(context)
+            write_json(self.root / "admission.json", self.policy)
+            # The session metadata is before the consumed source interval.
+            # Admission must still reject its alteration on a parser-cache hit.
+            self.path.write_bytes(original.replace(SID.encode(), OWNER.encode()))
+            with self.assertRaises(C.ContextError):
+                self.validate(context)
+            self.assertEqual(parse.call_count, 1)
+
+    def test_cached_source_still_checks_parser_runtime_and_manifest(self):
+        context = self.seal()
+        self.assertIs(self.validate(context), True)
+        with mock.patch.object(C, "_parser_runtime", return_value={"sha256": "0" * 64}):
+            with self.assertRaises(C.ContextError):
+                self.validate(context)
+        manifest = self.manifest()
+        manifest["source"]["excerpt_sha256"] = "0" * 64
+        with self.assertRaises(C.ContextError):
+            context.validate_inputs(manifest, "before_forward")
+
     def test_processing_cursor_binding_activation_and_hold_changes_block(self):
         context = self.seal()
         modifications = [
@@ -341,6 +377,7 @@ class ExecutionContextTests(unittest.TestCase):
 
     def test_bounded_rederivation_uses_original_interval_and_original_parser_state(self):
         context = self.seal()
+        context._source_cache.clear()  # Exercise reconstruction, not the sealed cache hit.
         self.append("Later message must not enter the original excerpt.")
         with mock.patch.object(T, "read_excerpt", wraps=T.read_excerpt) as read:
             self.assertIs(self.validate(context), True)
