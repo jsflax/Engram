@@ -146,13 +146,23 @@ def readback(paths,expected):
     return True
 
 
-def historical(paths,plan,images,history=None):
-    diagnosis=review_reports(plan,images)
+def historical(paths,plan,images,history=None,*,verified=None):
     current={role:image(L._read_historical(paths.root,plan['legacy_run_id'],role)) for role in HISTORY}
+    # Current historical bytes are always read. Only the already-proved
+    # interpretation of identical sealed inputs can be reused by this context.
+    key=(J.sha256(J.encode(plan)),
+         tuple((name,J.sha256(unseal(images[name]))) for name in sorted(images)),
+         None if history is None else tuple((name,J.sha256(unseal(history[name]))) for name in sorted(history)),
+         tuple((name,J.sha256(unseal(current[name]))) for name in sorted(current)))
+    if verified is not None and verified.get('key')==key:
+        return current
+    diagnosis=review_reports(plan,images)
     for role,value in current.items():
         require(J.sha256(unseal(value))==diagnosis['inputs'][role]['sha256'],'history_changed')
     if history is not None:require(same(history,current),'history_changed')
     validate_history(plan,images,current)
+    if verified is not None:
+        verified.clear();verified['key']=key
     return current
 
 
@@ -286,7 +296,7 @@ def _runtime():
     return {p.name:{'path':str(p),'sha256':J.sha256(J.durable._read(p,private=False)[0])} for p in paths}
 
 
-def _source(plan,request,state,images,maximum,scan):
+def _source(plan,request,state,images,maximum,scan,*,verified=None):
     source=plan['source'];before=report(images,'current-chat-coverage-parser.private.json')['before']
     after=report(images,'current-chat-coverage-parser.private.json')['after']
     require(same(C._parser_state(state),C._parser_state(before))
@@ -294,6 +304,15 @@ def _source(plan,request,state,images,maximum,scan):
             and C._parser_runtime()['sha256']==source['parser_sha256'],'parser_review_changed')
     require(type(maximum) is int and 1<=maximum<=48000 and type(scan) is int
             and source['end']-source['start']<=scan<=C.MAX_SCAN,'parser_limits')
+    interval=C._interval(request['transcript_path'],source['identity'],source['start'],source['end'])
+    require(interval==source['interval_sha256'],'source_changed')
+    key=(J.sha256(J.encode(plan)),J.sha256(J.encode(request)),J.sha256(J.encode(state)),
+         tuple((name,J.sha256(unseal(images[name]))) for name in sorted(images)),maximum,scan)
+    if verified is not None and verified.get('key')==key:
+        require(C._interval(request['transcript_path'],source['identity'],source['start'],source['end'])
+                ==source['interval_sha256'] and C._parser_runtime()['sha256']==source['parser_sha256'],
+                'source_changed')
+        return None  # Validation-only callers; sealing still returns the projection.
     excerpt=transcript.read_excerpt(request['transcript_path'],source['start'],max_chars=maximum,
         max_scan_bytes=source['end']-source['start'],recent_messages=before['recent_messages'],
         current_turn_id=before['current_turn_id'],stable_identity=True)
@@ -313,6 +332,8 @@ def _source(plan,request,state,images,maximum,scan):
     require(interval==source['interval_sha256'],'source_changed')
     parser={'version':1,'input':C._parser_state(state),'limits':{'max_chars':maximum,'max_scan_bytes':scan},
             'runtime':C._parser_runtime(),'interval_sha256':interval}
+    if verified is not None:
+        verified.clear();verified['key']=key
     return excerpt,parser
 
 
@@ -353,6 +374,7 @@ class ResidualContext:
         self.plan=J._json(unseal(value['review']))
         self.review_sha256=value['review_sha256']
         self.run_id=paths.run_dir.name
+        self._source_cache,self._projection_cache,self._history_cache={},{},{}
 
     @property
     def transport(self): return copy.deepcopy(J._json(J._unseal(self.manifest['inputs']['backend_route']))['transport'])
@@ -372,21 +394,21 @@ class ResidualContext:
         _mutation_policy(decoded['backend_config'])
         return decoded
 
-    def validate_frozen_inputs(self,phase='frozen'):
-        decoded=self._pinned()
+    def validate_frozen_inputs(self,phase='frozen',*,decoded=None):
+        decoded=self._pinned() if decoded is None else decoded
         _pending_authority(self.paths,J._unseal(self.manifest['inputs']['request']))
-        C._source_backend_inputs(self.paths.base(),self.manifest,decoded)
-        historical(self.paths,self.plan,self.value['reports'],self.value['history'])
+        C._source_backend_inputs(self.paths.base(),self.manifest,decoded,source_cache=self._source_cache)
+        historical(self.paths,self.plan,self.value['reports'],self.value['history'],verified=self._history_cache)
         readback(self.paths,report(self.value['reports'],'current-chat-readback.private.json'))
         parser=decoded['parser_state']
         _source(self.plan,decoded['request'],decoded['cursor'],self.value['reports'],
-                parser['limits']['max_chars'],parser['limits']['max_scan_bytes'])
+                parser['limits']['max_chars'],parser['limits']['max_scan_bytes'],verified=self._projection_cache)
         return True
 
     def validate_inputs(self,manifest,plan,phase):
         require(same(manifest,self.manifest) and same(plan,self.plan),'execution_changed')
         decoded=self._pinned()
-        self.validate_frozen_inputs(phase)
+        self.validate_frozen_inputs(phase,decoded=decoded)
         pre=phase in {'prepare','before_intent','before_generation','after_generation'}
         execution=None if pre else {'run_id':self.run_id,'manifest_sha256':self.manifest_sha256}
         _held(self.paths,decoded['request'],J._unseal(manifest['inputs']['cursor']),decoded['admission'],self.plan,
@@ -394,7 +416,7 @@ class ResidualContext:
         return True
 
     def validate_marker(self):
-        decoded=self._pinned();self.validate_frozen_inputs('marker')
+        decoded=self._pinned();self.validate_frozen_inputs('marker',decoded=decoded)
         names=A.state_paths(self.paths.root,self.plan['session_id'])
         _,admitted,_=record(names['admissions'])
         execution=None if admitted.get('processing') is None else {'run_id':self.run_id,'manifest_sha256':self.manifest_sha256}

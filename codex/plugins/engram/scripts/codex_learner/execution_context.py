@@ -256,7 +256,7 @@ def _interval(path, identity, start, end):
         os.close(fd)
 
 
-def _source(request, parser, source, expected_next):
+def _source(request, parser, source, expected_next, *, verified=None):
     journal._keys(parser, {"version", "input", "limits", "runtime", "interval_sha256"})
     journal._version(parser["version"])
     journal._keys(parser["input"], {"offset", "recent_messages", "current_turn_id"})
@@ -271,16 +271,23 @@ def _source(request, parser, source, expected_next):
     path, start, end = request["transcript_path"], source["start_offset"], source["end_offset"]
     expected_hash = parser["interval_sha256"]
     _require(_interval(path, source["identity"], start, end) == expected_hash, "source_bytes_changed")
-    excerpt = transcript.read_excerpt(path, start, max_chars=maximum, max_scan_bytes=end - start,
-                                      recent_messages=parser["input"]["recent_messages"],
-                                      current_turn_id=parser["input"]["current_turn_id"], stable_identity=True)
-    _require(excerpt.metadata.session_id == request["session_id"]
-             and excerpt.metadata.identity == source["identity"]
-             and excerpt.next_offset == end and bool(excerpt.text)
-             and journal.sha256(excerpt.text.encode("utf-8")) == source["excerpt_sha256"]
-             and _same(_next_parser(excerpt), expected_next), "excerpt_or_parser_changed")
+    # Cache semantic reconstruction only. Exact interval bytes, stable file
+    # identity and parser source are checked on EVERY call, including appends.
+    key = journal.sha256(journal.encode({"inputs": [request, parser, source, expected_next]}))
+    if verified is None or verified.get("key") != key:
+        excerpt = transcript.read_excerpt(path, start, max_chars=maximum, max_scan_bytes=end - start,
+                                          recent_messages=parser["input"]["recent_messages"],
+                                          current_turn_id=parser["input"]["current_turn_id"], stable_identity=True)
+        _require(excerpt.metadata.session_id == request["session_id"]
+                 and excerpt.metadata.identity == source["identity"]
+                 and excerpt.next_offset == end and bool(excerpt.text)
+                 and journal.sha256(excerpt.text.encode("utf-8")) == source["excerpt_sha256"]
+                 and _same(_next_parser(excerpt), expected_next), "excerpt_or_parser_changed")
     _require(_interval(path, source["identity"], start, end) == expected_hash
              and _same(_parser_runtime(), parser["runtime"]), "source_or_parser_changed")
+    if verified is not None:
+        verified.clear()
+        verified["key"] = key
 
 
 def _decode_inputs(paths, manifest):
@@ -293,7 +300,7 @@ def _decode_inputs(paths, manifest):
     return decoded
 
 
-def _source_backend_inputs(paths, manifest, decoded):
+def _source_backend_inputs(paths, manifest, decoded, *, source_cache=None):
     """Read-only input checks; no held-fence or current target-pair authority."""
     request = decoded["request"]
     _require(_same(admission.check(paths.root, request), request["admission"]), "binding_changed")
@@ -301,7 +308,11 @@ def _source_backend_inputs(paths, manifest, decoded):
     _require(_same(configuration, decoded["backend_config"])
              and _same(route, decoded["backend_route"])
              and route["runtime"]["sha256"] == manifest["backend"]["runtime_sha256"], "backend_changed")
-    _source(request, decoded["parser_state"], manifest["source"], decoded["next_parser_state"])
+    arguments = (request, decoded["parser_state"], manifest["source"], decoded["next_parser_state"])
+    if source_cache is None:
+        _source(*arguments)
+    else:
+        _source(*arguments, verified=source_cache)
     _require(_same(admission.check(paths.root, request), request["admission"]), "binding_changed")
     return True
 
@@ -336,6 +347,7 @@ class ExecutionContext:
         self.manifest_sha256 = digest
         self._manifest = copy.deepcopy(manifest)
         self._fence = writer_fence
+        self._source_cache = {}
 
     @property
     @_safe
@@ -351,7 +363,7 @@ class ExecutionContext:
         return _decode_inputs(self.paths, manifest)
 
     def _source_backend(self, manifest, decoded):
-        _source_backend_inputs(self.paths, manifest, decoded)
+        _source_backend_inputs(self.paths, manifest, decoded, source_cache=self._source_cache)
         _require(self._fence.verify(manifest["fencing"]) is True, "writer_unfenced")
         return True
 
