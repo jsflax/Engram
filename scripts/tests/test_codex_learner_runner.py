@@ -48,6 +48,47 @@ def mcp_event(tool="recall", *, item_id="call-1", failed=False, server="memory")
     }
 
 
+class RunDirectoryTests(unittest.TestCase):
+    def test_fresh_runs_is_private_under_umask_022_without_chmod_existing_parent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            transcript = base / "rollout.jsonl"
+            transcript.write_text("\n".join(json.dumps(value) for value in (
+                native_record("session_meta", {"id": "permissions-session", "source": "vscode"}),
+                user_message("Preserve this synthetic decision."),
+            )) + "\n")
+            original_umask = os.umask(0o022)
+            try:
+                for existing in (False, True):
+                    with self.subTest(existing_parent=existing):
+                        root = base / ("existing" if existing else "fresh")
+                        runner.private_dir(root)
+                        runs = root / "runs"
+                        if existing:
+                            runs.mkdir(mode=0o755)
+                        request = runner.validate_request({"hook_event_name": "Stop",
+                            "session_id": "permissions-session", "transcript_path": str(transcript)}, root)
+                        seen = []
+
+                        def invoke(selected_root, run_dir, *args):
+                            self.assertEqual(selected_root, root)
+                            self.assertEqual(run_dir.parent, runs)
+                            self.assertEqual(runs.stat().st_mode & 0o777, 0o755 if existing else 0o700)
+                            self.assertEqual(run_dir.stat().st_mode & 0o777, 0o700)
+                            seen.append(run_dir)
+                            return {"status": "succeeded", "write_calls": 0, "outcome": "no_new_memories"}
+
+                        result = runner.process_request(root, request,
+                            {**runner.DEFAULTS, "min_chars": 0}, invoke=invoke)
+                        self.assertEqual(result, "succeeded")
+                        self.assertEqual(len(seen), 1)
+                        self.assertEqual(runs.stat().st_mode & 0o777, 0o755 if existing else 0o700)
+                        self.assertEqual(runner.load_json(root / "sessions" / "permissions-session.json")["offset"],
+                                         transcript.stat().st_size)
+            finally:
+                os.umask(original_umask)
+
+
 class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

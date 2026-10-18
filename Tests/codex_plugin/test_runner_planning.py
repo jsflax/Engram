@@ -173,6 +173,8 @@ class RunnerPlanningTests(unittest.TestCase):
         self.assertEqual(transport["provider_mode"], M.PLANNING_MODE)
         self.assertEqual(set(transport["allowed_tools"]), M.READ_TOOLS)
         prompt = kwargs["stdin"].read().decode()
+        self.actual_prompt = prompt
+        self.actual_schema = json.loads((self.run / 'schema.json').read_text())
         self.assertIn("No memory is stored during this planning turn", prompt)
         with _audit_context(self.run / "mcp-audit.jsonl") as audit:
             audit.write({"event": "relay_started"})
@@ -203,6 +205,40 @@ class RunnerPlanningTests(unittest.TestCase):
 
     def invoke(self):
         return R.run_planner(self.root, self.run, self.request, self.excerpt, self.config)
+
+    def test_new_manifest_selects_project_prompt_schema_and_preserves_false(self):
+        # Construct a fresh manifest before provider dispatch; never migrate one.
+        (self.run / 'execution-manifest.json').unlink()
+        self.manifest['plan_policy']['privacy'] = J.PROJECT_SYNC_PRIVACY
+        digest = J.publish_manifest(self.run, self.manifest, verify_fence=self.fence.verify)
+        self.context.manifest_sha256 = digest
+        specification = self.execution.specification()
+        specification['manifest_sha256'] = digest
+        self.execution.specification = lambda: specification
+        self.proposal['operations'][0]['arguments']['is_private'] = False
+        self.assertEqual(self.invoke()['status'], 'planned')
+        self.assertIn('Private means device-local', self.actual_prompt)
+        self.assertIn('exposed-group settings', self.actual_prompt)
+        self.assertNotIn('host enforces is_private=true', self.actual_prompt)
+        choice = next(c for c in self.actual_schema['properties']['operations']['items']['anyOf']
+                      if c['properties']['tool']['const'] == 'remember')
+        field = choice['properties']['arguments']['properties']['is_private']
+        self.assertEqual(field['type'], 'boolean')
+        self.assertNotIn('const', field); self.assertNotIn('anyOf', field)
+        plan = L.seal_plan(self.run, verify_fence=self.fence.verify, validate_inputs=lambda *_: True)
+        self.assertIs(J._json(J._unseal(plan['operations'][0]['request']))['mutation']['request']['isPrivate'], False)
+        self.assertFalse(list(self.run.glob('operation-*')))
+
+    def test_old_interrupted_planning_uses_original_prompt_schema_and_private_default(self):
+        self.assertNotIn('privacy', self.manifest['plan_policy'])
+        self.assertEqual(self.invoke()['status'], 'planned')
+        self.assertIn('host enforces is_private=true', self.actual_prompt)
+        self.assertNotIn('Private means device-local', self.actual_prompt)
+        self.assertEqual(self.actual_schema, L.PROPOSAL_SCHEMA)
+        template = Path(R.__file__).with_name('learner_prompt.md').read_text()
+        self.assertTrue(self.actual_prompt.startswith(R.render_learner_prompt(template, self.config, planning=True)))
+        plan = L.seal_plan(self.run, verify_fence=self.fence.verify, validate_inputs=lambda *_: True)
+        self.assertIs(J._json(J._unseal(plan['operations'][0]['request']))['mutation']['request']['isPrivate'], True)
 
     def test_complete_provider_returns_plan_without_any_mutation_or_stored_claim(self):
         result = self.invoke()

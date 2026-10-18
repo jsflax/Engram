@@ -278,7 +278,9 @@ def validate_source(request, review, excerpt, chunks):
         while position < source["end_offset"]:
             raw = stream.readline(source["end_offset"] - position)
             L._require(raw.endswith(b"\n"), "record_boundary_changed")
-            record = L._json(raw)
+            # Source records use the already bounded transcript interval, not
+            # the smaller retained-report limit. Keep the strict JSON checks.
+            record = L.codec._json(raw, maximum=min(L.context.MAX_SCAN, source["end_offset"] - position))
             L._require(type(record) is dict, "invalid_source_record")
             record_count += 1
             payload = record.get("payload")

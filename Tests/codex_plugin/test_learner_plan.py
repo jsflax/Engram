@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / 'codex/plugins/engram/scripts'))
 from codex_learner import learner_plan as P, planned_execution as E
 from codex_learner import execution_manifest as J, settlement as S, writer_fence as F
 from codex_learner import native_executor as N, operation_probe as Probe, execution_context as C
+from codex_learner import operation_gateway as G
 
 SID = '01900000-0000-7000-8000-000000000001'
 STORE = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
@@ -123,6 +124,82 @@ class LearnerPlanTests(unittest.TestCase):
         self.writer.close()
         with F.revoke(self.run, self.binding, validate=lambda *_: True) as recovery:
             return S.settle(self.run, manifest_sha256=self.digest, recovery_fence=recovery, validate_inputs=lambda *_: True)
+
+    def select_new_privacy_fixture(self):
+        # Fixture construction only, before any provider evidence or intent.
+        (self.run / 'execution-manifest.json').unlink()
+        self.manifest['plan_policy']['privacy'] = J.PROJECT_SYNC_PRIVACY
+        self.digest = J.publish_manifest(self.run, self.manifest, verify_fence=self.writer.verify)
+
+    def test_new_privacy_choices_survive_seal_lost_reply_and_exact_resume(self):
+        self.select_new_privacy_fixture()
+        operations = [{'key': f'op_{i}', 'tool': 'remember', 'arguments': {
+            'content': f'Fixture {i}', 'project': 'fixture-project', 'is_private': private}}
+            for i, private in enumerate((False, True), 1)]
+        plan = self.seal(operations)
+        before = (self.run / P.PLAN_NAME).read_bytes()
+        requests = [J._json(J._unseal(op['request'])) for op in plan['operations']]
+        self.assertEqual([r['mutation']['request']['isPrivate'] for r in requests], [False, True])
+        self.assertEqual([r['mutation']['request']['project'] for r in requests], ['fixture-project'] * 2)
+        self.ledger.lose.add(plan['operations'][1]['operation_id'])
+        self.assertEqual(self.execute()['status'], 'pending')
+        self.assertEqual(self.execute()['status'], 'complete')
+        self.assertEqual((self.run / P.PLAN_NAME).read_bytes(), before)
+        self.assertEqual(set(self.ledger.effects.values()), {1})
+        self.assertEqual(self.ledger.calls[-1], self.ledger.calls[-2])
+
+    def test_old_omitted_and_null_privacy_keep_exact_private_requests(self):
+        operations = [{'key': f'op_{i}', 'tool': 'remember', 'arguments': {
+            'content': f'Fixture {i}', **({'is_private': None} if i == 2 else {})}} for i in (1, 2)]
+        plan = self.seal(operations)
+        before = (self.run / P.PLAN_NAME).read_bytes()
+        for operation, original in zip(plan['operations'], operations):
+            expected = {'version': 1, 'operationID': operation['operation_id'], 'expectedScope': self.scope,
+                'provenance': {'host': 'fixture', 'sessionID': SID, 'runID': 'fixture-plan', 'source': {
+                    'startOffset': 10, 'endOffset': 20, 'excerptDigest': 'a' * 64}},
+                'mutation': {'kind': 'remember', 'request': {'content': original['arguments']['content'],
+                    'isPrivate': True, 'source': 'codex-session:' + SID}}}
+            self.assertEqual(J._unseal(operation['request']), J.encode(expected))
+        self.assertEqual(P.read_plan(self.run)[0], plan)
+        self.assertEqual(self.execute()['status'], 'complete')
+        self.assertEqual((self.run / P.PLAN_NAME).read_bytes(), before)
+        changed = copy.deepcopy(self.manifest)
+        changed['plan_policy']['privacy'] = J.PROJECT_SYNC_PRIVACY
+        with self.assertRaisesRegex(ValueError, 'immutable_record_conflict'):
+            J.publish_manifest(self.run, changed, verify_fence=self.writer.verify)
+
+    def test_new_policy_requires_explicit_boolean_and_keeps_other_write_guards(self):
+        self.select_new_privacy_fixture()
+        policy = P.manifest_policy(self.manifest)
+        proposal = {'schema_version': 1, 'outcome': 'proposed', 'summary': '', 'operations': [
+            {'key': 'op_1', 'tool': 'remember', 'arguments': {'content': 'Fixture', 'is_private': False}}]}
+        self.assertIs(P.validate_proposal(proposal, **policy, read_calls=1)['operations'][0]['arguments']['is_private'], False)
+        for alteration in ({}, {'is_private': None}, {'is_private': 0}, {'is_private': 'false'},
+                           {'is_private': False, 'force': True}, {'is_private': False, 'unknown': None},
+                           {'is_private': False, 'source': 'forged'}):
+            value = copy.deepcopy(proposal)
+            value['operations'][0]['arguments'] = {'content': 'Fixture', **alteration}
+            with self.subTest(alteration=alteration), self.assertRaises(ValueError):
+                P.validate_proposal(value, **policy, read_calls=1)
+        for field in ('is_private', 'project'):
+            value = copy.deepcopy(proposal)
+            value['operations'][0].update(tool='update', arguments={'id': MEMORY, 'append': 'Fixture', field: False})
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                P.validate_proposal(value, **policy, read_calls=1)
+        self.assertEqual(list(self.run.glob('operation-*')), [])
+
+    def test_privacy_selector_rejects_unknown_null_and_retrospective_origin(self):
+        for privacy in (None, False, 'private_only', 'future_policy'):
+            value = copy.deepcopy(self.manifest); value['plan_policy']['privacy'] = privacy
+            with self.subTest(privacy=privacy), self.assertRaises(ValueError): J._manifest(value)
+        value = copy.deepcopy(self.manifest)
+        value.pop('provider_mode'); value.update(plan_origin='reviewed_legacy_accounting', review_sha256='f' * 64)
+        value['plan_policy']['privacy'] = J.PROJECT_SYNC_PRIVACY
+        with self.assertRaises(ValueError): J._manifest(value)
+        with self.assertRaises(ValueError): P.manifest_policy(value)
+        args = {'content': 'Fixture', 'is_private': False, 'source': 'fixture'}
+        with self.assertRaisesRegex(ValueError, 'invalid_remember_policy'): G.mutation('remember', args)
+        self.assertIs(G.mutation('remember', args, privacy_policy=J.PROJECT_SYNC_PRIVACY)['request']['isPrivate'], False)
 
     def test_entire_proposal_validates_before_any_intent_or_dispatch(self):
         proposal = {'schema_version': 1, 'outcome': 'proposed', 'summary': '', 'operations': self.operations}

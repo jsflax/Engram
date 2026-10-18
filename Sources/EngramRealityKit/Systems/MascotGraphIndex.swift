@@ -28,4 +28,13 @@ final class MascotGraphIndex {
         }
         projects = Set(indicesByProject.keys)
     }
+
+    /// Point lights share the guarded first-match lookup. Colors remain live:
+    /// changing the palette does not require a node topology revision.
+    func projectColor(for nodeID: UUID, dataProvider: SceneDataProvider) -> SIMD3<Float> {
+        let nodes = dataProvider.nodes
+        update(nodes: nodes, topologyVersion: dataProvider.topologyVersion, provider: dataProvider)
+        guard let index = indexByID[nodeID] else { return SIMD3<Float>(repeating: 0.5) }
+        return dataProvider.projectColorMap[nodes[index].project] ?? SIMD3<Float>(repeating: 0.5)
+    }
 }

@@ -79,8 +79,10 @@ def capture(router_file, runner_module, admission_module, host_admission_module=
         runner_file = getattr(runner_module, "__file__", None)
         admission_file = getattr(admission_module, "__file__", None)
         template = Path(runner_file).with_name("learner_prompt.md") if runner_file else None
+        project_template = Path(runner_file).with_name("learner_prompt_project.md") if runner_file else None
         files = {"router": (router_file, ".py"), "runner": (runner_file, ".py"),
-                 "template": (template, ".md"), "admission": (admission_file, ".py")}
+                 "template": (template, ".md"), "project_template": (project_template, ".md"),
+                 "admission": (admission_file, ".py")}
         if host_admission_module is not None:
             files["host_admission"] = (getattr(host_admission_module, "__file__", None), ".py")
         file_identity_module = getattr(admission_module, "file_identity", None)

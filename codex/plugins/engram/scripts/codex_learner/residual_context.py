@@ -144,7 +144,7 @@ def readback(paths,expected):
         values=db.execute('SELECT '+','.join(columns)+' FROM Memory WHERE globalId=? COLLATE NOCASE LIMIT 2',(memory,)).fetchall()
         require(len(values)==1 and time.monotonic()<deadline,'readback_missing')
         actual=dict(zip(L.ROW_FIELDS,values[0]));actual['globalId']=J._uuid(actual['globalId'])
-        require(same(actual,{**row,'globalId':memory}) and db.total_changes==0,'readback_changed')
+        require(L._same_rows([actual],[{**row,'globalId':memory}]) and db.total_changes==0,'readback_changed')
         db.rollback()
     finally:db.close()
     after=paths.candidate_store.lstat()

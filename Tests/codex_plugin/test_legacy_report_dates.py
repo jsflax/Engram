@@ -1,6 +1,8 @@
 """Known retained report dates normalize without weakening exact SQL row pins."""
 import datetime as dt
+import copy
 import json
+import math
 import unittest
 from unittest import mock
 
@@ -73,6 +75,40 @@ class LegacyReportDateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "readback_changed"):
             L._rows(f.paths, f.review["rows"])
         self.assertEqual(L._json(L._raw(plan["review"]))["rows"], f.review["rows"])
+
+    def test_integer_json_dates_match_exact_sql_real_values_without_repinning(self):
+        f = self.fixture()
+        values = {"createdAt": 1767427200, "modifiedAt": 1767427201,
+                  "expiresAt": 64092211200}
+        for key, value in values.items():
+            f.update_row(key + "=?", (float(value),))
+            f.review["rows"][0][key] = value
+        pinned, database, state = copy.deepcopy(f.review["rows"]), f.store.read_bytes(), f.current()
+        L._rows(f.paths, f.review["rows"])
+        self.assertEqual(f.review["rows"], pinned)
+        self.assertEqual(f.store.read_bytes(), database)
+        self.assertEqual(f.current(), state)
+
+    def test_adjacent_representable_expiry_is_still_a_changed_row(self):
+        f = self.fixture()
+        expiry = 64092211200
+        f.review["rows"][0]["expiresAt"] = expiry
+        f.update_row("expiresAt=?", (math.nextafter(float(expiry), math.inf),))
+        with self.assertRaisesRegex(ValueError, "readback_changed"):
+            L._rows(f.paths, f.review["rows"])
+
+    def test_invalid_numeric_date_types_and_privacy_coercion_refuse(self):
+        f = self.fixture()
+        f.update_row("createdAt=?", (1.0,))
+        for invalid in (True, "1", None, math.inf, math.nan):
+            with self.subTest(date=invalid):
+                f.review["rows"][0]["createdAt"] = invalid
+                with self.assertRaisesRegex(ValueError, "readback_changed"):
+                    L._rows(f.paths, f.review["rows"])
+        f.review["rows"][0]["createdAt"] = 1
+        f.review["rows"][0]["isPrivate"] = True
+        with self.assertRaisesRegex(ValueError, "readback_changed"):
+            L._rows(f.paths, f.review["rows"])
 
 
 if __name__ == "__main__":

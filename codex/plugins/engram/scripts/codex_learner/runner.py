@@ -29,7 +29,7 @@ import uuid
 from .transcript import inspect_rollout, read_excerpt
 from .memory_proxy import verified_no_write_receipt, audit_planning_tools, PLANNING_MODE, read_startup_failure
 from . import admission, memory_config, host_admission, operation_gateway, learner_settings
-from . import runner_publication, settlement, worker_schedule
+from . import runner_publication, settlement, worker_schedule, runtime_routing
 
 EVENTS = {"Stop", "SubagentStop", "PreCompact", "SessionEnd"}
 GUARD = "ENGRAM_CODEX_LEARNER"
@@ -583,8 +583,11 @@ def spawn_worker(root: Path) -> None:
     log = root / "worker.log"
     with log.open("ab") as out:
         os.chmod(log, 0o600)
-        subprocess.Popen([sys.executable, str(entry), "worker", "--state-dir", str(root)],
-                         stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+        env = dict(os.environ, CLAUDE_PLUGIN_ROOT=str(entry.parent.parent))
+        env.pop(runtime_routing.HOP, None)  # New independent batch, not an exec hop.
+        env.pop(runtime_routing.HOOK_DEADLINE, None)
+        subprocess.Popen([sys.executable, "-B", str(entry), "worker", "--state-dir", str(root)],
+                         env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
                          start_new_session=True, close_fds=True)
 
 
@@ -638,7 +641,8 @@ def learner_command(root: Path, run_dir: Path, request: dict, config: dict, *, p
         manifest, _ = runner_publication.journal.read_manifest(run_dir)
         if manifest.get("provider_mode") != (PLANNING_MODE if planning else None):
             raise ValueError("provider_mode_changed")
-        if planning and manifest["plan_policy"] != {name: config[name] for name in ("max_tool_calls", "max_writes")}:
+        if planning and any(manifest["plan_policy"][name] != config[name]
+                            for name in ("max_tool_calls", "max_writes")):
             raise ValueError("planning_budget_changed")
         execution.context.validate_inputs(manifest, "before_intent")
         memory = execution.context.transport
@@ -657,26 +661,7 @@ def learner_command(root: Path, run_dir: Path, request: dict, config: dict, *, p
               "tools": tool_policies,
               "startup_timeout_sec": memory.get("startup_timeout_sec", 30),
               "tool_timeout_sec": memory.get("tool_timeout_sec", 120)}
-    binary = config.get("codex_bin")
-    if not binary:
-        # Desktop's bundled CLI supports the same hook/runtime generation; a
-        # separately installed ~/.local/bin/codex may be an older release.
-        for applications in (Path("/Applications"), Path.home() / "Applications"):
-            for app in ("ChatGPT.app", "Codex.app"):
-                candidate = applications / app / "Contents/Resources/codex"
-                if candidate.is_file() and os.access(candidate, os.X_OK):
-                    binary = str(candidate)
-                    break
-            if binary:
-                break
-    if not binary:
-        binary = shutil.which("codex")
-    if not binary:
-        candidate = Path.home() / ".local/bin/codex"
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            binary = str(candidate)
-    if not binary:
-        raise ValueError("codex_binary_not_found")
+    binary = runtime_routing.codex_binary(config)
     argv = [binary, "exec", "--ignore-user-config", "--ephemeral", "--skip-git-repo-check",
             "--sandbox", "read-only", "--json", "--color", "never", "--cd", str(run_dir / "workspace"),
             "--output-schema", str(run_dir / "schema.json"),
@@ -942,8 +927,11 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict, *
     private_dir(run_dir / "workspace")
     if planning:
         from . import learner_plan
-    atomic_json(run_dir / "schema.json", learner_plan.PROPOSAL_SCHEMA if planning else RESULT_SCHEMA)
-    template_name = "learner_prompt.md" if planning else "learner_prompt_legacy.md"
+        manifest, _ = runner_publication.journal.read_manifest(run_dir)
+        schema, template_name = learner_plan.provider_contract(manifest)
+    else:
+        schema, template_name = RESULT_SCHEMA, "learner_prompt_legacy.md"
+    atomic_json(run_dir / "schema.json", schema)
     system = render_learner_prompt(Path(__file__).with_name(template_name).read_text(), config, planning=planning)
     provenance = "codex-session:" + request["session_id"]
     if not planning:
@@ -1071,7 +1059,8 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict, *
             learner_plan.validate_proposal(result, provenance="codex-session:" + request["session_id"],
                 allowed_tools=memory_config.allowed_tools(backend["memory"], READ_TOOLS | WRITE_TOOLS),
                 max_tool_calls=config["max_tool_calls"], max_writes=config["max_writes"],
-                read_calls=observed["read_calls"])
+                read_calls=observed["read_calls"],
+                privacy_policy=learner_plan.manifest_policy(manifest)['privacy_policy'])
             valid_result = result["outcome"] in {"proposed", "no_new_memories"}
             observed["proposal_sha256"] = hashlib.sha256(raw).hexdigest()
         except (ValueError, OSError, TypeError, KeyError, UnicodeError, RecursionError):
@@ -1320,6 +1309,13 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=None,
 
 
 def worker(root: Path) -> int:
+    try:
+        runtime_routing.maybe_exec(Path(__file__).absolute().parents[2], "codex_learner.py",
+                                   ["worker", "--state-dir", str(root)], state_root=root)
+    except runtime_routing.Refused as exc:
+        # Refusal is not leadership or progress; preserve every queued plan.
+        print("Engram: " + str(exc), file=sys.stderr)
+        return 0
     # A missing/inactive policy must not even inspect or pause an old queue.
     active_policy = admission.check_activation(root)
     invalid_pending = set()

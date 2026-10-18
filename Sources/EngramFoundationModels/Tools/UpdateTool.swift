@@ -54,7 +54,7 @@ public struct UpdateTool: Tool {
         @Guide(description: "Update importance ranking (1-5).")
         public var importance: Int?
 
-        @Guide(description: "Set whether the memory is private.")
+        @Guide(description: "Set whether the memory stays on this device, excluded from personal cloud/device sync and group sharing. False follows the project's sync and sharing settings.")
         public var isPrivate: Bool?
     }
 

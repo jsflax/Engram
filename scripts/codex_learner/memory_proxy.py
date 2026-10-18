@@ -73,14 +73,15 @@ def learner_tool_descriptor(tool: dict[str, Any], provenance: str) -> dict[str, 
             "parent_id": {"type": "string", "description": "UUID of an existing parent memory, linked by part_of."},
             "source": {"type": "string", "const": provenance,
                        "description": "Optional: the gateway always supplies this learner's source provenance."},
-            "is_private": {"type": "boolean", "const": True, "default": True,
-                           "description": "New memories are always private; the gateway enforces true."},
+            "is_private": {"type": "boolean", "default": False,
+                           "description": "True keeps the memory on this device. False follows the project's personal sync and group exposure settings."},
             "force": {"type": "boolean", "const": False, "default": False,
                       "description": "Conflict detection stays enabled; omit this field or use false."},
         })
         required = ["content"]
-        description = ("Store one new private memory after checking for an existing equivalent. "
-                       "The gateway enforces private storage, session source provenance and conflict detection. "
+        description = ("Store one new memory after checking for an existing equivalent. "
+                       "Ordinary work memories default to following project sync and sharing settings; use private for device-local requirements. "
+                       "The gateway enforces session source provenance and conflict detection. "
                        "A near-duplicate warning is a no-write outcome; never force a duplicate.")
     elif name == "update":
         properties = dict(shared, **{
@@ -294,7 +295,10 @@ class Policy:
                     return self.deny_tool(request_id, tool, "unsupported remember fields")
                 if arguments.get("force", False) is not False:
                     return self.deny_tool(request_id, tool, "conflict overrides are not allowed")
-                arguments["is_private"] = True
+                privacy = arguments.get("is_private", False)
+                if type(privacy) is not bool:
+                    return self.deny_tool(request_id, tool, "is_private must be a boolean")
+                arguments["is_private"] = privacy
                 arguments["source"] = self.provenance
                 arguments["force"] = False
             elif tool == "update":

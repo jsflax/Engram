@@ -87,43 +87,56 @@ final class GalaxyDrainTests: XCTestCase {
     }
 
     func testStreamingLoaderReadsEveryPageAndKeepsObserversLive() async throws {
-        let lattice = try Lattice(Memory.self, MemoryEdge.self, configuration: .init(storage: .memory()))
-        var rows: [Memory] = []
-        for i in 0..<151 {
-            let row = Memory(content: "Streaming row \(i)", topic: "general", project: "Stream", importance: 1)
-            try lattice.add(row)
-            rows.append(row)
+        var phase = "init"
+        do {
+            let lattice = try Lattice(Memory.self, MemoryEdge.self, configuration: .init(storage: .memory()))
+            var rows: [Memory] = []
+            for i in 0..<151 {
+                let row = Memory(content: "Streaming row \(i)", topic: "general", project: "Stream", importance: 1)
+                phase = "seed-\(i)"
+                try lattice.add(row)
+                rows.append(row)
+            }
+            phase = "seed-identities"
+            let firstID = try XCTUnwrap(rows[0].globalId)
+            let lastID = try XCTUnwrap(rows[150].globalId)
+            phase = "edge"
+            let edge = MemoryEdge(sourceGlobalId: firstID, targetGlobalId: lastID, relation: .partOf)
+            try lattice.add(edge)
+            let galaxy = Galaxy(id: "stream", displayName: "Stream", lattice: lattice.sendableReference)
+            await galaxy.loadData()
+            XCTAssertTrue(galaxy.isLoaded)
+            XCTAssertEqual(galaxy.loadStatus, .complete)
+            XCTAssertEqual(galaxy.renderStore.allNodes.count, 151)
+            XCTAssertEqual(galaxy.renderStore.allEdges.count, 1)
+            rows[0].content = "Changed after baseline"
+            lattice.delete(rows[150])
+            lattice.delete(edge)
+            let added = Memory(content: "Arrived after baseline", topic: "general", project: "Stream", importance: 1)
+            phase = "post-baseline-add"
+            try lattice.add(added)
+            phase = "post-baseline-identity"
+            let addedID = try XCTUnwrap(added.globalId)
+            let deadline = Date().addingTimeInterval(3)
+            phase = "wait"
+            while Date() < deadline {
+                if galaxy.renderStore.allNodes[firstID]?.content == "Changed after baseline",
+                   galaxy.renderStore.allNodes[lastID] == nil,
+                   galaxy.renderStore.allNodes[addedID] != nil,
+                   galaxy.renderStore.allEdges.isEmpty { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            await galaxy.stopObservers()
+            XCTAssertEqual(galaxy.renderStore.allNodes[firstID]?.content, "Changed after baseline")
+            XCTAssertNil(galaxy.renderStore.allNodes[lastID])
+            XCTAssertNotNil(galaxy.renderStore.allNodes[addedID])
+            XCTAssertEqual(galaxy.renderStore.allNodes.count, 151)
+            XCTAssertTrue(galaxy.renderStore.allEdges.isEmpty)
+        } catch {
+            let failure = error as NSError
+            print("GalaxyDrainTests.streaming_loader failure phase=\(phase) domain=\(failure.domain) code=\(failure.code)")
+            throw error
         }
-        let firstID = try XCTUnwrap(rows[0].globalId)
-        let lastID = try XCTUnwrap(rows[150].globalId)
-        let edge = MemoryEdge(sourceGlobalId: firstID, targetGlobalId: lastID, relation: .partOf)
-        try lattice.add(edge)
-        let galaxy = Galaxy(id: "stream", displayName: "Stream", lattice: lattice.sendableReference)
-        await galaxy.loadData()
-        XCTAssertTrue(galaxy.isLoaded)
-        XCTAssertEqual(galaxy.loadStatus, .complete)
-        XCTAssertEqual(galaxy.renderStore.allNodes.count, 151)
-        XCTAssertEqual(galaxy.renderStore.allEdges.count, 1)
-        rows[0].content = "Changed after baseline"
-        lattice.delete(rows[150])
-        lattice.delete(edge)
-        let added = Memory(content: "Arrived after baseline", topic: "general", project: "Stream", importance: 1)
-        try lattice.add(added)
-        let addedID = try XCTUnwrap(added.globalId)
-        let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline {
-            if galaxy.renderStore.allNodes[firstID]?.content == "Changed after baseline",
-               galaxy.renderStore.allNodes[lastID] == nil,
-               galaxy.renderStore.allNodes[addedID] != nil,
-               galaxy.renderStore.allEdges.isEmpty { break }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        await galaxy.stopObservers()
-        XCTAssertEqual(galaxy.renderStore.allNodes[firstID]?.content, "Changed after baseline")
-        XCTAssertNil(galaxy.renderStore.allNodes[lastID])
-        XCTAssertNotNil(galaxy.renderStore.allNodes[addedID])
-        XCTAssertEqual(galaxy.renderStore.allNodes.count, 151)
-        XCTAssertTrue(galaxy.renderStore.allEdges.isEmpty)
     }
 
     func testPublishedDrainConfigCarriesAllGraphSettings() {

@@ -229,7 +229,8 @@ class Publications:
                 scope=scope, writer_fence=fence, max_chars=config["max_chars"],
                 max_scan_bytes=config["max_scan_bytes"], provider_mode=provider_mode,
                 plan_policy=None if provider_mode is None else {
-                    "max_tool_calls": config["max_tool_calls"], "max_writes": config["max_writes"]})
+                    "max_tool_calls": config["max_tool_calls"], "max_writes": config["max_writes"],
+                    "privacy": journal.PROJECT_SYNC_PRIVACY})
             return Execution(paths, context, fence, None)
         except BaseException:
             fence.close()

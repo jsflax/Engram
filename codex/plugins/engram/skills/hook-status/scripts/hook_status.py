@@ -298,7 +298,7 @@ def runtime_identity(value):
     sources = value.get("sources")
     if isinstance(sources, dict):
         out["sources"] = {key: observed_file(sources[key]) for key in
-                          ("router", "runner", "template", "admission", "host_admission", "file_identity")
+                          ("router", "runner", "template", "project_template", "admission", "host_admission", "file_identity")
                           if isinstance(sources.get(key), dict)}
     return out
 
@@ -616,21 +616,66 @@ def residual_reference(value):
     """Validate a content-free reference before selecting fixed receipt paths."""
     keys = {"version", "id", "legacy_run_id", "run_id", "manifest_sha256", "context_sha256",
             "review_sha256", "settlement_sha256", "interval", "preserved_memory_ids", "new_memory_ids"}
-    if type(value) is not dict or set(value) != keys:
+    if (type(value) is not dict or set(value) != keys
+            or type(value["version"]) is not int or value["version"] not in (1, 2)):
         raise ValueError("invalid_reference")
-    legacy_reference({"version": value["version"], "id": value["id"], "legacy_run_id": value["legacy_run_id"],
-        "evidence_sha256": value["review_sha256"], "interval": value["interval"], "memory_ids": value["preserved_memory_ids"]})
+    # Reuse the fixed path/interval checks; each residual version has its own ID bounds.
+    legacy_reference({"version": 1, "id": value["id"], "legacy_run_id": value["legacy_run_id"],
+        "evidence_sha256": value["review_sha256"], "interval": value["interval"], "memory_ids": []})
     if (type(value["run_id"]) is not str or RUN_ID.fullmatch(value["run_id"]) is None
             or value["run_id"] == value["legacy_run_id"]
-            or any(not _sha256(value[k]) for k in ("manifest_sha256", "context_sha256", "settlement_sha256"))
-            or len(value["preserved_memory_ids"]) != 1):
+            or any(not _sha256(value[k]) for k in ("manifest_sha256", "context_sha256", "settlement_sha256"))):
         raise ValueError("invalid_reference")
-    ids = value["new_memory_ids"]
-    if (type(ids) is not list or len(ids) != 5 or any(not valid_uuid(i) for i in ids)
-            or len(set(i.lower() for i in ids)) != len(ids)
-            or {i.lower() for i in ids} & {i.lower() for i in value["preserved_memory_ids"]}):
+    for key, exact, maximum in (("preserved_memory_ids", 1, 32), ("new_memory_ids", 5, 5)):
+        ids = value[key]
+        if (type(ids) is not list or (len(ids) != exact if value["version"] == 1 else len(ids) > maximum)
+                or any(not valid_uuid(i) for i in ids) or len(set(i.lower() for i in ids)) != len(ids)):
+            raise ValueError("invalid_ids")
+    if {i.lower() for i in value["new_memory_ids"]} & {i.lower() for i in value["preserved_memory_ids"]}:
         raise ValueError("invalid_ids")
     return json.loads(json.dumps(value, allow_nan=False))
+
+
+def reviewed_residual_progress(settled, ref):
+    """Check recorded plan metadata only; do not open or revalidate the private plan."""
+    progress = settled["progress"]
+    count = len(ref["new_memory_ids"])
+    if (settled["plan_origin"] != "reviewed_legacy_accounting" or not _sha256(settled["plan_sha256"])
+            or type(progress) is not dict or set(progress) != {"status", "reason", "plan_sha256", "operations",
+                "attempts", "applied_write_calls", "unchanged_write_calls", "memory_ids"}
+            or progress["status"] != "complete" or progress["reason"] != "verified_plan_completion"
+            or progress["plan_sha256"] != settled["plan_sha256"]
+            or type(progress["attempts"]) is not int or not count <= progress["attempts"] <= 1024
+            or (count == 0 and progress["attempts"] != 0)
+            or type(progress["applied_write_calls"]) is not int or progress["applied_write_calls"] != count
+            or type(progress["unchanged_write_calls"]) is not int or progress["unchanged_write_calls"] != 0
+            or not _json_equal(progress["memory_ids"], ref["new_memory_ids"])
+            or type(progress["operations"]) is not list or len(progress["operations"]) != count):
+        raise ValueError("progress_mismatch")
+    operations, memories = set(), set()
+    for item in progress["operations"]:
+        if (type(item) is not dict or set(item) != {"operation_id", "mutation", "dispatched", "settled", "receipt"}
+                or not valid_uuid(item["operation_id"]) or item["operation_id"].lower() in operations
+                or item["mutation"] != "remember" or item["dispatched"] is not True or item["settled"] is not True):
+            raise ValueError("operation_mismatch")
+        receipt = item["receipt"]
+        if (type(receipt) is not dict or set(receipt) != {"version", "operationID", "scope", "payloadDigest",
+                "mutation", "outcome", "memoryIDs", "edgeIDs", "committedAt"}
+                or type(receipt["version"]) is not int or receipt["version"] != 1
+                or not valid_uuid(receipt["operationID"]) or receipt["operationID"].lower() != item["operation_id"].lower()
+                or receipt["mutation"] != "remember" or receipt["outcome"] != "applied"
+                or type(receipt["scope"]) is not dict or not _sha256(receipt["payloadDigest"])
+                or type(receipt["committedAt"]) not in (int, float) or not -1e12 < receipt["committedAt"] < 1e12
+                or type(receipt["memoryIDs"]) is not list or len(receipt["memoryIDs"]) != 1
+                or not valid_uuid(receipt["memoryIDs"][0])
+                or type(receipt["edgeIDs"]) is not list or len(receipt["edgeIDs"]) > 127
+                or any(not valid_uuid(i) for i in receipt["edgeIDs"])
+                or len(set(i.lower() for i in receipt["edgeIDs"])) != len(receipt["edgeIDs"])):
+            raise ValueError("operation_receipt_mismatch")
+        operations.add(item["operation_id"].lower())
+        memories.add(receipt["memoryIDs"][0].lower())
+    if len(memories) != count or memories != {i.lower() for i in ref["new_memory_ids"]}:
+        raise ValueError("operation_memory_mismatch")
 
 
 def residual_reconciliation_view(learner, sid, state):
@@ -664,7 +709,7 @@ def residual_reconciliation_view(learner, sid, state):
             raise ValueError("invalid_receipt")
         qualification = {"historical_run_status": "failed", "historical_execution_sealed": False,
                          "source_binding_grade": "current_bounded_reconstruction", "provider_invoked": False,
-                         "applied_write_count": 5, "unchanged_write_count": 0}
+                         "applied_write_count": len(ref["new_memory_ids"]), "unchanged_write_count": 0}
         if not _json_equal({k: receipt[k] for k in qualification}, qualification):
             raise ValueError("invalid_qualification")
         publication = receipt["publication"]
@@ -680,24 +725,28 @@ def residual_reconciliation_view(learner, sid, state):
         if settled_raw is None:
             return view
         execution = {k: ref[k] for k in ("run_id", "manifest_sha256", "context_sha256", "review_sha256")}
-        settlement_keys = {"version", "kind", *execution, *qualification, "authorization_sha256", "generation_sha256s",
-                           "checkpoint_sha256", "evidence_heads", "operations", "preserved_memory_ids", "new_memory_ids",
+        settlement_keys = {"version", "kind", *execution, *qualification, "preserved_memory_ids", "new_memory_ids",
                            "successful_coverage"}
+        settlement_keys |= ({"authorization_sha256", "generation_sha256s", "checkpoint_sha256", "evidence_heads", "operations"}
+                            if ref["version"] == 1 else {"plan_origin", "plan_sha256", "progress"})
         labels = ["R1", "R2", "R3", "R4", "R5"]
         if (hashlib.sha256(settled_raw).hexdigest() != ref["settlement_sha256"] or set(settled) != settlement_keys
                 or type(settled["version"]) is not int or settled["version"] != 1
                 or settled["kind"] != "reviewed_residual_settlement" or settled["successful_coverage"] is not False
                 or not _json_equal({k: settled[k] for k in execution}, execution)
                 or not _json_equal({k: settled[k] for k in qualification}, qualification)
-                or not _sha256(settled["authorization_sha256"]) or not _sha256(settled["checkpoint_sha256"])
+                or any(not _json_equal(settled[k], ref[k]) for k in ("preserved_memory_ids", "new_memory_ids"))):
+            raise ValueError("settlement_mismatch")
+        if ref["version"] == 2:
+            reviewed_residual_progress(settled, ref)
+        elif (not _sha256(settled["authorization_sha256"]) or not _sha256(settled["checkpoint_sha256"])
                 or type(settled["generation_sha256s"]) is not list or not 1 <= len(settled["generation_sha256s"]) <= 64
                 or any(not _sha256(v) for v in settled["generation_sha256s"])
                 or type(settled["evidence_heads"]) is not dict or set(settled["evidence_heads"]) != set(labels)
                 or any(not _sha256(v) for v in settled["evidence_heads"].values())
-                or any(not _json_equal(settled[k], ref[k]) for k in ("preserved_memory_ids", "new_memory_ids"))
                 or type(settled["operations"]) is not list or len(settled["operations"]) != 5):
             raise ValueError("settlement_mismatch")
-        for label, operation in zip(labels, settled["operations"]):
+        for label, operation in zip(labels, settled["operations"] if ref["version"] == 1 else []):
             if (type(operation) is not dict or set(operation) != {"label", "operation_id", "receipt_sha256"}
                     or operation["label"] != label or not valid_uuid(operation["operation_id"])
                     or not _sha256(operation["receipt_sha256"])):

@@ -39,6 +39,7 @@ import uuid
 from . import admission, file_identity, migration as durable, writer_fence
 
 VERSION = 1
+PROJECT_SYNC_PRIVACY = "project_sync_with_explicit_private_v1"
 MAX_RECORD = 8 * 1024 * 1024
 MAX_INPUT = 1024 * 1024
 MAX_EVENTS = 1024
@@ -193,7 +194,11 @@ def _manifest(value):
     elif "provider_mode" in value:
         _require("review_sha256" not in value, "orphan_review")
         _require(value["provider_mode"] == "read_only_plan", "invalid_provider_mode")
-        _keys(value.get("plan_policy"), {"max_tool_calls", "max_writes"})
+        _keys(value.get("plan_policy"), {"max_tool_calls", "max_writes"}, {"privacy"})
+        # Absence preserves the original private-only contract, including a
+        # provider interrupted before sealing its plan. Never migrate old bytes.
+        if "privacy" in value["plan_policy"]:
+            _require(value["plan_policy"]["privacy"] == PROJECT_SYNC_PRIVACY, "invalid_plan_privacy")
         _integer(value["plan_policy"]["max_tool_calls"], 1, 20)
         _integer(value["plan_policy"]["max_writes"], 1, 5)
     else:

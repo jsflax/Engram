@@ -192,6 +192,92 @@ class ReviewedAccountingTests(unittest.TestCase):
     def fixture(self,**kwargs):
         f=AccountingFixture(**kwargs);self.addCleanup(f.close);return f
 
+    def prepend_source_record(self, f, raw):
+        original = f.path.read_bytes()
+        f.path.write_bytes(original[:f.start] + raw + original[f.start:f.end])
+        f.end += len(raw)
+        f.excerpt = L.transcript.read_excerpt(f.path, f.start,
+            max_chars=f.plan['parser']['max_chars'], max_scan_bytes=C.MAX_SCAN,
+            recent_messages=f.state['recent_messages'], current_turn_id=f.state['current_turn_id'],
+            stable_identity=True)
+        f.plan['source'].update(end=f.end,
+            interval_sha256=J.sha256(f.path.read_bytes()[f.start:f.end]),
+            excerpt_sha256=J.sha256(f.excerpt.text.encode()))
+        f.plan['parser'].update(next=C._next_parser(f.excerpt),
+            record_count=len(f.messages)+1, diagnostics=f.excerpt.diagnostics)
+        for message in f.plan['message_dispositions']:
+            message['record']['start_offset'] += len(raw)
+            message['record']['end_offset'] += len(raw)
+        f.refresh()
+
+    def test_source_coverage_accepts_large_excluded_record_without_expanding_report_limits(self):
+        f=self.fixture()
+        expected=f.excerpt.text; before=f.current(); history=f.history_snapshot()
+        raw=json.dumps({'type':'compacted','payload':{'summary':'x'*(4*1024*1024)}}).encode()+b'\n'
+        self.assertGreater(len(raw),L.MAX)
+        self.assertLess(len(raw),C.MAX_SCAN)
+        self.prepend_source_record(f,raw)
+        with self.no_external(),mock.patch.object(sqlite3,'connect',side_effect=AssertionError('no database read')):
+            excerpt,parser=R._source(f.plan,f.request,f.state,{},16000,C.MAX_SCAN)
+            with self.assertRaisesRegex(ValueError,'execution_manifest_invalid_record_size'):
+                L._json(raw)
+            with self.assertRaisesRegex(ValueError,'execution_manifest_invalid_record_size'):
+                J.seal_json(raw)
+        self.assertEqual(excerpt.text,expected)
+        self.assertEqual(excerpt.next_offset,f.end)
+        self.assertEqual(excerpt.message_count,len(f.messages))
+        self.assertEqual(excerpt.diagnostics['excluded_records'],1)
+        self.assertEqual(C._next_parser(excerpt),f.plan['parser']['next'])
+        self.assertEqual(parser['interval_sha256'],f.plan['source']['interval_sha256'])
+        self.assertEqual(f.current(),before);self.assertEqual(f.history_snapshot(),history)
+        self.assertEqual(f.calls,[])
+        self.assertFalse((f.run_dir/'execution-manifest.json').exists())
+
+    def test_excluded_source_records_keep_json_structure_and_complexity_guards(self):
+        deep='0'
+        for _ in range(34):deep='{"child":'+deep+'}'
+        cases={
+            'malformed':b'{"type":"compacted",\n',
+            'non_object':b'[]\n',
+            'depth':('{"type":"compacted","payload":'+deep+'}\n').encode(),
+            'nodes':json.dumps({'type':'compacted','payload':[0]*100001}).encode()+b'\n',
+            'nonfinite':b'{"type":"compacted","payload":NaN}\n',
+        }
+        for name,raw in cases.items():
+            with self.subTest(case=name):
+                f=self.fixture();before=f.current();history=f.history_snapshot()
+                self.prepend_source_record(f,raw)
+                with self.no_external(),mock.patch.object(sqlite3,'connect',side_effect=AssertionError('no database read')), \
+                     self.assertRaises(ValueError):
+                    R._source(f.plan,f.request,f.state,{},16000,C.MAX_SCAN)
+                self.assertEqual(f.current(),before);self.assertEqual(f.history_snapshot(),history)
+                self.assertEqual(f.calls,[])
+                self.assertFalse((f.run_dir/'execution-manifest.json').exists())
+
+    def test_source_interval_over_eight_mib_refuses_before_parsing(self):
+        f=self.fixture();before=f.current();history=f.history_snapshot()
+        raw=json.dumps({'type':'compacted','payload':'x'*(8*1024*1024)}).encode()+b'\n'
+        original=f.path.read_bytes()
+        f.path.write_bytes(original[:f.start]+raw+original[f.start:f.end])
+        f.plan['source']['end'] += len(raw)
+        f.plan['parser']['next']['offset'] += len(raw)
+        f.plan['source']['interval_sha256']=J.sha256(f.path.read_bytes()[f.start:])
+        f.refresh()
+        scan=8*1024*1024
+        self.assertGreater(f.plan['source']['end']-f.start,scan)
+        with self.no_external(),mock.patch.object(sqlite3,'connect',side_effect=AssertionError('no database read')), \
+             mock.patch.object(L.transcript,'read_excerpt',side_effect=AssertionError('oversized interval parsed')), \
+             self.assertRaisesRegex(ValueError,'residual_context_parser_review_changed'):
+            R._source(f.plan,f.request,f.state,{},16000,scan)
+        # The existing absolute ceiling remains distinct from this run's budget.
+        f.plan['source']['end']=f.start+C.MAX_SCAN+1
+        with mock.patch.object(L.transcript,'read_excerpt',side_effect=AssertionError('oversized interval parsed')), \
+             self.assertRaisesRegex(ValueError,'legacy_reconciliation_invalid_interval'):
+            R._source(f.plan,f.request,f.state,{},16000,C.MAX_SCAN)
+        self.assertEqual(f.current(),before);self.assertEqual(f.history_snapshot(),history)
+        self.assertEqual(f.calls,[])
+        self.assertFalse((f.run_dir/'execution-manifest.json').exists())
+
     def ci_interleaved_history(self, f, prose_kind='agent_message'):
         """Synthetic bytes with the retained CI's exact nine-call event order."""
         original=[J._json(v) for v in f.history['provider'].splitlines()]

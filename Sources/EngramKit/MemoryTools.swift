@@ -655,7 +655,7 @@ public actor MemoryTools {
                         ]),
                         "is_private": .object([
                             "type": .string("boolean"),
-                            "description": .string("Mark this memory as private. Private memories sync to your cloud backup but are excluded from group shared graphs. Default: false."),
+                            "description": .string("Keep this memory on this device. Private memories are excluded from personal cloud/device sync and group sharing, even when the project's sync policy is enabled. Default: false (follow the project's sync policy)."),
                         ]),
                     ]),
                     "required": .array([.string("content")]),
@@ -807,7 +807,7 @@ public actor MemoryTools {
                         ]),
                         "is_private": .object([
                             "type": .string("boolean"),
-                            "description": .string("Update the memory's private flag. Private memories sync to your cloud backup but are excluded from group shared graphs. AUTHOR-ONLY on group-shared memories, and flipping to true RETRACTS the memory from the group — the group's copy (including teammates' edits) is removed for all members."),
+                            "description": .string("Update the memory's private flag. Private memories stay on this device and are excluded from personal cloud/device sync and group sharing. AUTHOR-ONLY on group-shared memories, and flipping to true RETRACTS the memory from the group — the group's copy (including teammates' edits) is removed for all members."),
                         ]),
                         "undelete": .object([
                             "type": .string("boolean"),

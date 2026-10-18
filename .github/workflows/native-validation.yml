@@ -98,17 +98,23 @@ jobs:
         run: |
           set -euo pipefail
           cd "$VALIDATION_ROOT/repo"
+          python3 -B scripts/test_artifact_mirror_diagnostics.py
           artifact_url=https://github.com/sparkle-project/Sparkle/releases/download/2.8.1/Sparkle-for-Swift-Package-Manager.zip
           curl -sSfL --connect-timeout 20 --max-time 180 \
             -o "$VALIDATION_ROOT/mirror/Sparkle-for-Swift-Package-Manager.zip" "$artifact_url"
-          nohup python3 -B -m http.server 8765 --bind 127.0.0.1 --directory "$VALIDATION_ROOT/mirror" \
+          nohup python3 -B "$VALIDATION_ROOT/repo/scripts/artifact_mirror_server.py" --directory "$VALIDATION_ROOT/mirror" \
             > "$VALIDATION_ROOT/private/mirror.log" 2>&1 &
           echo "$!" > "$VALIDATION_ROOT/private/mirror.pid"
           for attempt in 1 2 3 4 5; do
             if curl -sSf --max-time 2 -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip; then break; fi
             sleep 1
           done
-          curl -sSf --max-time 5 -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip
+          mirror_status=0
+          curl -sSf --max-time 5 -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip || mirror_status=$?
+          if (( mirror_status != 0 )); then
+            python3 -B scripts/artifact_mirror_diagnostics.py failure --root "$VALIDATION_ROOT" --curl-status "$mirror_status" || true
+            exit "$mirror_status"
+          fi
           "$VALIDATION_ROOT/bin/swift-validation" package config set-mirror \
             --original "$artifact_url" \
             --mirror http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip
@@ -295,6 +301,12 @@ jobs:
           assert source_unchanged and unchanged and mirrors_preserved, 'Source or pinned dependency configuration changed'
           assert dependencies_match, 'Resolved checkout revisions do not match every dependency pin'
           PY
+
+      - name: Stop owned artifact mirror
+        if: ${{ always() && env.VALIDATION_ROOT != '' }}
+        timeout-minutes: 1
+        shell: bash
+        run: 'python3 -B "$VALIDATION_ROOT/repo/scripts/artifact_mirror_diagnostics.py" stop --root "$VALIDATION_ROOT"'
 
       - name: Upload explicit validation evidence
         if: ${{ always() && env.VALIDATION_ROOT != '' }}

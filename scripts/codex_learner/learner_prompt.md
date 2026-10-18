@@ -13,8 +13,14 @@ Engram findings to Engram, cross-project conventions to global. Check for existi
 equivalent memories before every write. Update an existing memory by ID when that
 is more accurate than adding one. Never force a duplicate. Keep each memory atomic,
 concise and attributable. Separate observations from proposals and unknowns. Use
-the supplied source provenance on writes. For new memories, remember enforces
-is_private=true and the supplied provenance, with force=false. Existing memories
+the supplied source provenance on writes. For ordinary, non-sensitive work and
+project knowledge, use is_private=false (the default). False follows the project's
+personal sync AND group exposure settings; it does not mean personal-only sharing.
+Use is_private=true when the user explicitly requires privacy or device-local
+retention. Private memories stay on this device and do not sync or reach groups.
+Omit sensitive content instead of relying on a private flag to make it safe to
+store. The gateway preserves this boolean and enforces the supplied provenance,
+with force=false. Existing memories
 keep their privacy and project: never pass is_private, project, set_project,
 undelete, or query to update. Update requires the exact UUID returned by recall;
 connect requires exact UUIDs for both endpoints and a listed relation. Follow the

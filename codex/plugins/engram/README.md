@@ -60,8 +60,10 @@ their creation time and inherited-history boundary are proven.
 
 One queue and provider lock serialize automatic learners on each Codex home.
 The learner has no project shell, browser, other integrations, or recursive hook
-access. Its memory proxy enforces approved tools, private new memories, session
-provenance, bounded calls/writes, and exact write receipts. Failure does not
+access. Its memory proxy enforces approved tools, each new memory's explicit privacy
+choice, session provenance, bounded calls/writes, and exact write receipts. Ordinary
+work and project memories follow project sync and sharing settings; explicitly private
+memories stay on this device. Failure does not
 advance saved progress. Interactive memory calls and another laptop remain independent.
 
 New plugin runs first read memory and propose a complete bounded plan. The
@@ -230,6 +232,29 @@ and owned locks are available; otherwise it reports a hold for explicit recovery
 Repeated application or recovery still requires the current published state and
 reviewed inputs. Later cursor or relevant memory changes require inspection;
 they never authorize republishing an old plan.
+
+### Installed plugin upgrades
+
+Selector-aware hooks and new worker batches ask the supported Codex plugin CLI
+for the installed, enabled version in their existing marketplace namespace.
+They never select the highest cache directory or an available marketplace
+source version. Discovery is bounded to half a second; refusal emits a fixed
+`routing_*` diagnostic, leaves hook input and learner state untouched, and does
+not fail the user's hook. A selected package must be owned, intact, enabled,
+and no older than the executing package. Explicit source-checkout commands
+retain their selected source behavior.
+
+A hook delegates before reading input and carries its original hook deadline
+without extending the host timeout. A worker delegates before acquiring its
+normal worker lock; an active batch finishes with its existing code and sealed
+plans before respawn. The selected worker resumes unfinished plans through the
+existing checks, retaining their operation IDs, native route and input seals.
+No cache files are rewritten and no Codex restart is requested.
+
+An already-running package that predates this selector cannot redirect itself.
+Its first transition still requires the supported new worker invocation after
+the old owner exits, or a hook loaded from the updated package. Installation
+alone does not prove that open tasks have reloaded their hook code.
 
 ### Previous installers
 

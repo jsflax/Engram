@@ -235,7 +235,8 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
             'Build release Engram native product': 'dependencies',
             'Verify actual native MCP lifecycle and contention cases': 'release_build',
         }
-        evidence_steps = {'Record source and dependency integrity', 'Upload explicit validation evidence'}
+        evidence_steps = {'Record source and dependency integrity', 'Stop owned artifact mirror',
+                          'Upload explicit validation evidence'}
         for name in re.findall(r'^      - name: (.*)$', text, re.M):
             conditions = re.findall(r'^        if: (.*)$', step_section(workflow, name), re.M)
             expected = []
@@ -245,7 +246,12 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
                 expected = ["${{ always() && env.VALIDATION_ROOT != '' }}"]
             self.assertEqual(conditions, expected, name)
         self.assertNotIn('continue-on-error', text)
-        self.assertNotIn('|| true', text)
+        # Mirror diagnostics must not replace the original failing curl status.
+        # No validation command may otherwise suppress its failure.
+        optional_diagnostic = ('python3 -B scripts/artifact_mirror_diagnostics.py failure '
+                              '--root "$VALIDATION_ROOT" --curl-status "$mirror_status" || true')
+        self.assertEqual(text.count(optional_diagnostic), 1)
+        self.assertNotIn('|| true', text.replace(optional_diagnostic, ''))
         diagnostic = 'Collect ledger BEGIN contention diagnostics (serial)'
         self.assertLess(text.index('      - name: Run ledger BEGIN timing regression (serial)\n'),
                         text.index('      - name: ' + diagnostic + '\n'))

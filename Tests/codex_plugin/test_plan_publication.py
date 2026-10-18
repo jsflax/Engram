@@ -42,7 +42,7 @@ class PlanPublicationTests(unittest.TestCase):
             J.durable._new(run_dir / 'mcp-audit.jsonl', b''.join(J.encode(row) + b'\n' for row in audit))
             proposal = {'schema_version': 1, 'outcome': 'proposed', 'summary': 'Synthetic complete plan',
                 'operations': [{'key': f'op_{i}', 'tool': 'remember',
-                    'arguments': {'content': f'Synthetic fact {i}'}} for i in (1, 2)]}
+                    'arguments': {'content': f'Synthetic fact {i}', 'is_private': i == 2}} for i in (1, 2)]}
             J.durable._new(run_dir / 'proposal.json', J.encode(proposal))
         P.settlement.persist_observation(run_dir, {'started': True, 'terminated': True,
             'returncode': 1 if self.failed else 0, 'turn_completed': not self.failed,
@@ -82,6 +82,10 @@ class PlanPublicationTests(unittest.TestCase):
         self.assertEqual(len(self.ledger), 2)
         self.assertEqual(self.f.state_path.read_bytes(), old_state)
         run = self.provider_runs[0]
+        self.assertEqual(J.read_manifest(run)[0]['plan_policy']['privacy'], J.PROJECT_SYNC_PRIVACY)
+        plan = L.read_plan(run)[0]
+        self.assertEqual([J._json(J._unseal(op['request']))['mutation']['request']['isPrivate']
+                          for op in plan['operations']], [False, True])
         plan_before = (run / L.PLAN_NAME).read_bytes()
         self.assertFalse((run / F.REVOCATION_NAME).exists())
         before_calls = list(self.calls)

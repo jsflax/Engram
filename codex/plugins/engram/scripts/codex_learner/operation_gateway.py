@@ -48,15 +48,17 @@ def envelope(result):
     return copy.deepcopy(value)
 
 
-def mutation(tool, arguments):
+def mutation(tool, arguments, *, privacy_policy=None):
     """Translate the existing learner contract without silently dropping fields."""
     _require(type(arguments) is dict, "invalid_arguments")
+    _require(privacy_policy in (None, journal.PROJECT_SYNC_PRIVACY), "invalid_privacy_policy")
     args = journal._json(journal.encode(arguments), journal.MAX_INPUT)
     common = {"content", "topic", "source", "importance", "expires_in_days"}
     if tool == "remember":
         allowed = common | {"project", "is_private", "parent_id", "force"}
         _require(set(args) <= allowed and args.get("force", False) is False
-                 and args.get("is_private") is True and type(args.get("source")) is str,
+                 and (type(args.get("is_private")) is bool if privacy_policy else args.get("is_private") is True)
+                 and type(args.get("source")) is str,
                  "invalid_remember_policy")
         args.pop("force", None)
         # Legacy remember documents zero as its default. The typed API uses an

@@ -83,15 +83,21 @@ jobs:
           set -euo pipefail
           cd "$VALIDATION_ROOT/repo"
           test -n "$SWIFTLM_CLONE_TOKEN" || { echo '::error::Read-only SwiftLM clone credential unavailable'; exit 1; }
+          python3 -B scripts/test_artifact_mirror_diagnostics.py
           artifact_url=https://github.com/sparkle-project/Sparkle/releases/download/2.8.1/Sparkle-for-Swift-Package-Manager.zip
           curl -sSfL --connect-timeout 20 --max-time 180 -o "$VALIDATION_ROOT/mirror/Sparkle-for-Swift-Package-Manager.zip" "$artifact_url"
-          nohup python3 -B -m http.server 8765 --bind 127.0.0.1 --directory "$VALIDATION_ROOT/mirror" > "$VALIDATION_ROOT/private/mirror.log" 2>&1 &
+          nohup python3 -B "$VALIDATION_ROOT/repo/scripts/artifact_mirror_server.py" --directory "$VALIDATION_ROOT/mirror" > "$VALIDATION_ROOT/private/mirror.log" 2>&1 &
           echo "$!" > "$VALIDATION_ROOT/private/mirror.pid"
           for attempt in 1 2 3 4 5; do
             if curl -sSf --max-time 2 -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip; then break; fi
             sleep 1
           done
-          curl -sSf --max-time 5 -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip
+          mirror_status=0
+          curl -sSf --max-time 5 -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip || mirror_status=$?
+          if (( mirror_status != 0 )); then
+            python3 -B scripts/artifact_mirror_diagnostics.py failure --root "$VALIDATION_ROOT" --curl-status "$mirror_status" || true
+            exit "$mirror_status"
+          fi
           swift package --scratch-path "$VALIDATION_ROOT/scratch" --cache-path "$VALIDATION_ROOT/cache" \
             --config-path "$VALIDATION_ROOT/config" --security-path "$VALIDATION_ROOT/security" \
             config set-mirror --original "$artifact_url" --mirror http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip
@@ -142,17 +148,10 @@ jobs:
           python3 -B scripts/prepare_visualizer_tests.py audit --root "$VALIDATION_ROOT"
 
       - name: Stop owned artifact mirror
-        if: always()
+        if: ${{ always() && env.VALIDATION_ROOT != '' }}
+        timeout-minutes: 1
         shell: bash
-        run: |
-          set -euo pipefail
-          if test -f "$VALIDATION_ROOT/private/mirror.pid"; then
-            pid=$(cat "$VALIDATION_ROOT/private/mirror.pid")
-            command_text=$(ps -p "$pid" -o command= || true)
-            if [[ "$command_text" == *"http.server 8765 --bind 127.0.0.1 --directory $VALIDATION_ROOT/mirror"* ]]; then
-              kill "$pid"
-            fi
-          fi
+        run: 'python3 -B "$VALIDATION_ROOT/repo/scripts/artifact_mirror_diagnostics.py" stop --root "$VALIDATION_ROOT"'
 
       - name: Upload original app validation evidence
         if: always()
