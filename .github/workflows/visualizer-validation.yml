@@ -137,7 +137,6 @@ jobs:
             xcodebuild test-without-building \
             -xctestrun "$VALIDATION_ROOT/derived/Build/Products/VisualizerValidation.xctestrun" \
             -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO \
-            -maximum-concurrent-test-macos-destinations 1 \
             -resultBundlePath "$VALIDATION_ROOT/evidence/tests.xcresult"
           python3 -B scripts/prepare_visualizer_tests.py verify-inputs --root "$VALIDATION_ROOT"
           python3 -B scripts/prepare_visualizer_tests.py audit --root "$VALIDATION_ROOT"
