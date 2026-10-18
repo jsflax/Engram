@@ -103,24 +103,45 @@ def validate_proposal(value, *, provenance, allowed_tools, max_tool_calls, max_w
 
 
 def manifest_policy(manifest):
-    _require(manifest.get('provider_mode') == MODE, 'wrong_provider_mode')
+    reviewed = manifest.get('plan_origin') == 'reviewed_legacy_accounting'
+    _require(reviewed or manifest.get('provider_mode') == MODE, 'wrong_provider_mode')
     policy = manifest.get('plan_policy')
     J._keys(policy, {'max_tool_calls', 'max_writes'})
     J._integer(policy['max_tool_calls'], 1, 64)
     J._integer(policy['max_writes'], 0, MAX_WRITES)
     configuration = J._json(J._unseal(manifest['inputs']['backend_config']))
     allowed = memory_config.allowed_tools(configuration['memory'], READ_TOOLS | WRITE_TOOLS)
-    _require('recall' in allowed, 'recall_not_permitted')
+    _require(reviewed or 'recall' in allowed, 'recall_not_permitted')
     return dict(policy, provenance='codex-session:' + manifest['session_id'], allowed_tools=allowed)
 
 
 def _inputs(run_dir):
     raws, binding = {}, {}
-    for name in INPUTS:
-        raw, identity = durable._read(run_dir / name, maximum=J.MAX_INPUT)
+    manifest, _ = J.read_manifest(run_dir)
+    names = ('residual-context.json',) if manifest.get('plan_origin') == 'reviewed_legacy_accounting' else INPUTS
+    for name in names:
+        raw, identity = durable._read(run_dir / name, maximum=J.MAX_RECORD if name=='residual-context.json' else J.MAX_INPUT)
         raws[name] = raw
         binding[name] = {'sha256': J.sha256(raw), 'identity': identity}
     return raws, binding
+
+
+def _reviewed_proposal(manifest, digest, raw):
+    from . import legacy_reconciliation as L
+    context = J._json(raw['residual-context.json'], J.MAX_RECORD)
+    review_raw = L._raw(context['review'])
+    review = L.accounting_review(J._json(review_raw, J.MAX_INPUT))
+    _require(context['manifest_sha256'] == digest and context['review_sha256'] == manifest['review_sha256']
+             == J.sha256(review_raw) and review['session_id'] == manifest['session_id'], 'review_origin_changed')
+    source = manifest['source']; historical = review['source']
+    _require(source == {'identity': historical['identity'], 'start_offset': historical['start'],
+             'end_offset': historical['end'], 'excerpt_sha256': historical['excerpt_sha256']}, 'review_source_changed')
+    L.accounting_history(review, context['history'])
+    proposal = {'schema_version': 1, 'outcome': 'proposed' if review['operations'] else 'no_new_memories',
+        'summary': 'Explicit retrospective full review; historical successes are preserved without replay.',
+        'operations': [{'key': op['id'], 'tool': op['tool'], 'arguments': op['arguments']} for op in review['operations']]}
+    return proposal, {'origin': L.REVIEWED_ACCOUNTING, 'review_sha256': manifest['review_sha256'],
+                     'historical_execution_sealed': False, 'tool_calls': 0}
 
 
 def _candidate(run_dir):
@@ -128,16 +149,20 @@ def _candidate(run_dir):
     manifest, digest = J.read_manifest(run_dir)
     policy = manifest_policy(manifest)
     raw, binding = _inputs(run_dir)
-    _require(raw['provider-dispatch.json'] == J.encode({'version': 1, 'manifest_sha256': digest}),
-             'provider_dispatch_changed')
-    observation = J._json(raw['provider-observation.json'])
-    J._keys(observation, {'version', 'manifest_sha256', 'observation'})
-    J._version(observation['version'])
-    _require(observation['manifest_sha256'] == digest and S._provider_clean(S._observation(observation['observation'])),
-             'provider_not_complete')
-    audit = memory_proxy.audit_planning_bytes(raw['mcp-audit.jsonl'], allow_clean_interrupt=True)
-    _require(audit['tool_errors'] == 0 and audit['successful_recalls'] > 0, 'read_audit_failed')
-    proposal = validate_proposal(J._json(raw['proposal.json']), **policy, read_calls=audit['tool_calls'])
+    if manifest.get('plan_origin') == 'reviewed_legacy_accounting':
+        proposal, audit = _reviewed_proposal(manifest, digest, raw)
+    else:
+        _require(raw['provider-dispatch.json'] == J.encode({'version': 1, 'manifest_sha256': digest}),
+                 'provider_dispatch_changed')
+        observation = J._json(raw['provider-observation.json'])
+        J._keys(observation, {'version', 'manifest_sha256', 'observation'})
+        J._version(observation['version'])
+        _require(observation['manifest_sha256'] == digest and S._provider_clean(S._observation(observation['observation'])),
+                 'provider_not_complete')
+        audit = memory_proxy.audit_planning_bytes(raw['mcp-audit.jsonl'], allow_clean_interrupt=True)
+        _require(audit['tool_errors'] == 0 and audit['successful_recalls'] > 0, 'read_audit_failed')
+        proposal = J._json(raw['proposal.json'])
+    proposal = validate_proposal(proposal, **policy, read_calls=audit['tool_calls'])
     _require(proposal['outcome'] != 'failed', 'proposal_failed')
     source = manifest['source']
     requests = []

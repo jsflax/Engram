@@ -16,6 +16,7 @@ from . import admission as A, execution_manifest as J, execution_context as C, w
 from . import residual_context as R
 from . import residual_driver as D
 from . import native_executor as N
+from . import learner_plan as LP, planned_execution as PE
 
 KIND='legacy_residual'
 RESULT='legacy_reconciled_with_residuals'
@@ -48,9 +49,16 @@ def _ticket(context,purpose):
 
 def _authorization(context):
     value,digest=_read(_work(context)/'residual-authorization.json')
-    require(same(value,{'version':1,'kind':KIND,**_pin(context),
-        'operation_ids':[J.operation_id(context.paths.run_dir,D.G.call_key(x)) for x in ('R1','R2','R3','R4','R5')],
-        'max_generations':D.MAX_GENERATIONS}),'authorization_changed')
+    if R.reviewed(context.plan):
+        plan,plan_sha=LP.read_plan(context.paths.run_dir)
+        expected={'version':1,'kind':KIND,**_pin(context),'plan_origin':R.L.REVIEWED_ACCOUNTING,
+            'plan_sha256':plan_sha,'operation_ids':[item['operation_id'] for item in plan['operations']],
+            'max_generations':1}
+    else:
+        expected={'version':1,'kind':KIND,**_pin(context),
+            'operation_ids':[J.operation_id(context.paths.run_dir,D.G.call_key(x)) for x in ('R1','R2','R3','R4','R5')],
+            'max_generations':D.MAX_GENERATIONS}
+    require(same(value,expected),'authorization_changed')
     return value,digest
 
 def _evidence(context):
@@ -91,11 +99,20 @@ def begin(context,*,writer,verify_locks):
     _guard(verify_locks);context.validate_marker()
     sid=context.plan['session_id'];selected=_paths(context.paths.root,sid,create=True)
     require(_active(context.paths.root,sid) is None,'other_active_publication')
-    driver=D.ResidualDriver.prepare(context.paths.run_dir,reviewed_raw=R.unseal(context.value['review']),
-        reviewed_sha256=context.review_sha256,manifest_sha256=context.manifest_sha256,
-        writer=writer,validate_inputs=context.validate_inputs)
-    authorization={'version':1,'kind':KIND,**_pin(context),
-        'operation_ids':[driver._intent(label)[0] for label in driver.operations],'max_generations':D.MAX_GENERATIONS}
+    if R.reviewed(context.plan):
+        plan=LP.seal_plan(context.paths.run_dir,verify_fence=writer.verify,
+            validate_inputs=lambda *_:context.validate_marker())
+        plan_sha=LP.read_plan(context.paths.run_dir)[1]
+        driver=None
+        authorization={'version':1,'kind':KIND,**_pin(context),'plan_origin':R.L.REVIEWED_ACCOUNTING,
+            'plan_sha256':plan_sha,'operation_ids':[item['operation_id'] for item in plan['operations']],
+            'max_generations':1}
+    else:
+        driver=D.ResidualDriver.prepare(context.paths.run_dir,reviewed_raw=R.unseal(context.value['review']),
+            reviewed_sha256=context.review_sha256,manifest_sha256=context.manifest_sha256,
+            writer=writer,validate_inputs=context.validate_inputs)
+        authorization={'version':1,'kind':KIND,**_pin(context),
+            'operation_ids':[driver._intent(label)[0] for label in driver.operations],'max_generations':D.MAX_GENERATIONS}
     _guard(verify_locks);Q._immutable(_work(context)/'residual-authorization.json',authorization,'residual_authorization')
     evidence=_evidence(context);decoded=C._decode_inputs(context.paths.base(),context.manifest)
     request=decoded['request'];state_raw=J._unseal(context.manifest['inputs']['cursor'])
@@ -122,6 +139,7 @@ def begin(context,*,writer,verify_locks):
 
 
 def _driver(context,verify_locks,view=None):
+    if R.reviewed(context.plan):return None
     def validate(manifest,plan,phase):
         _guard(verify_locks)
         require(same(manifest,context.manifest) and same(plan,context.plan),'execution_changed')
@@ -141,6 +159,26 @@ def _qualified_memory_ids(summary):
 
 
 def _settlement(context,driver,recoveries,verify_locks):
+    if R.reviewed(context.plan):
+        _guard(verify_locks)
+        require(len(recoveries)==1 and type(recoveries[0]) is F.HeldFence
+                and recoveries[0].mode=='exclusive','original_revoked_writer_required')
+        recoveries[0].verify(context.manifest['fencing'])
+        progress=PE.inspect_plan(context.paths.run_dir)
+        require(progress['status']=='complete' and progress['unchanged_write_calls']==0,'reviewed_plan_incomplete')
+        require(all(record['receipt']['outcome']=='applied' and len(record['receipt']['memoryIDs'])==1
+                for record in progress['operations']),'reviewed_effect_changed')
+        ids=progress['memory_ids'];preserved=context.plan['preserve_without_replay']['memory_ids']
+        require(len(ids)==len(progress['operations']) and not set(ids)&set(preserved),'reviewed_effect_changed')
+        settled={'version':1,'kind':'reviewed_residual_settlement',**_pin(context),
+            'plan_origin':R.L.REVIEWED_ACCOUNTING,'plan_sha256':progress['plan_sha256'],'progress':progress,
+            'preserved_memory_ids':preserved,'new_memory_ids':ids,'applied_write_count':len(ids),
+            'unchanged_write_count':0,'provider_invoked':False,'successful_coverage':False,
+            'historical_execution_sealed':False,'historical_run_status':'failed',
+            'source_binding_grade':'current_bounded_reconstruction'}
+        path=_work(context)/'residual-settlement.json'
+        J._publish_atomic(path,J.encode(settled));_guard(verify_locks)
+        return settled,J.sha256(J.encode(settled))
     _guard(verify_locks);driver._check('before_settlement',recoveries=recoveries)
     summary=driver.summary()
     _qualified_memory_ids(summary)
@@ -168,7 +206,7 @@ def _settlement(context,driver,recoveries,verify_locks):
 
 def _reference(context,settled,digest):
     source=context.manifest['source'];parser=J._json(J._unseal(context.manifest['inputs']['parser_state']))
-    return {'version':1,'id':_ticket(context,'final'),
+    return {'version':2 if R.reviewed(context.plan) else 1,'id':_ticket(context,'final'),
         'legacy_run_id':context.plan['legacy_run_id'],**_pin(context),'settlement_sha256':digest,
         'interval':{'start_offset':source['start_offset'],'end_offset':source['end_offset'],
             'interval_sha256':parser['interval_sha256'],'excerpt_sha256':source['excerpt_sha256']},
@@ -246,7 +284,7 @@ def finish(context,*,recoveries,verify_locks):
     driver=_driver(context,verify_locks,view)
     # Final status is explicit and durable. During final pair recovery an
     # existing checkpoint is verified without adding or replacing evidence.
-    driver.reconcile(recoveries=recoveries,probe=N.status_probe(driver,context.transport))
+    if driver is not None:driver.reconcile(recoveries=recoveries,probe=N.status_probe(driver,context.transport))
     settled,digest=_settlement(context,driver,recoveries,verify_locks)
     marker,marker_complete=_marker(context);reference=_state_reference(_reference(context,settled,digest))
     request_id=marker_complete['ticket']['request_id'];evidence={**_evidence(context),'settlement_sha256':digest}
@@ -276,7 +314,7 @@ def finish(context,*,recoveries,verify_locks):
         'completion_sha256':J.sha256(J.durable.encode(completed['completion'])),
         'historical_run_status':'failed','historical_execution_sealed':False,
         'source_binding_grade':'current_bounded_reconstruction','provider_invoked':False,
-        'applied_write_count':5,'unchanged_write_count':0}
+        'applied_write_count':settled['applied_write_count'],'unchanged_write_count':settled['unchanged_write_count']}
     _guard(verify_locks);Q._immutable(_work(context)/'residual-receipt.json',receipt,'residual_receipt')
     _guard(verify_locks);boundary('receipt_durable');return receipt
 
@@ -299,7 +337,7 @@ def _pins(value,*,settlement=False):
 def _state_reference(value):
     J._keys(value,{'version','id','legacy_run_id','run_id','manifest_sha256','context_sha256',
         'review_sha256','settlement_sha256','interval','preserved_memory_ids','new_memory_ids'})
-    require(type(value['version']) is int and value['version']==1,'invalid_reference')
+    require(type(value['version']) is int and value['version'] in (1,2),'invalid_reference')
     A._uuid(value['id'],4);_run_id(value['legacy_run_id']);_run_id(value['run_id'])
     for key in ('manifest_sha256','context_sha256','review_sha256','settlement_sha256'):J._digest(value[key])
     interval=value['interval'];J._keys(interval,{'start_offset','end_offset','interval_sha256','excerpt_sha256'})
@@ -307,9 +345,10 @@ def _state_reference(value):
     require(interval['end_offset']>interval['start_offset'],'invalid_interval')
     for key in ('interval_sha256','excerpt_sha256'):J._digest(interval[key])
     for key,count in (('preserved_memory_ids',1),('new_memory_ids',5)):
-        require(type(value[key]) is list and len(value[key])==count,'invalid_memory_ids')
+        require(type(value[key]) is list and (len(value[key])==count if value['version']==1 else
+            len(value[key])<= (32 if key=='preserved_memory_ids' else 5)),'invalid_memory_ids')
         ids=[J._uuid(item) for item in value[key]]
-        require(len(set(ids))==count,'invalid_memory_ids')
+        require(len(set(ids))==len(ids),'invalid_memory_ids')
     require(not {J._uuid(x) for x in value['new_memory_ids']}
             &{J._uuid(x) for x in value['preserved_memory_ids']},'invalid_memory_ids')
     return value
@@ -340,7 +379,7 @@ def _receipt_metadata(root,sid,reference):
         and same(receipt['reference'],reference) and receipt['historical_run_status']=='failed'
         and receipt['historical_execution_sealed'] is False and receipt['provider_invoked'] is False
         and receipt['source_binding_grade']=='current_bounded_reconstruction'
-        and type(receipt['applied_write_count']) is int and receipt['applied_write_count']==5
+        and type(receipt['applied_write_count']) is int and receipt['applied_write_count']==len(reference['new_memory_ids'])
         and type(receipt['unchanged_write_count']) is int and receipt['unchanged_write_count']==0,'receipt_changed')
     PJ._identifier(receipt['request_id']);J._digest(receipt['completion_sha256'])
     publication=receipt['publication'];J._keys(publication,{'ticket_id','ticket_sha256'})
@@ -363,11 +402,13 @@ def _receipt_metadata(root,sid,reference):
         and all(settled.get(key)==reference[key] for key in ('run_id','manifest_sha256','context_sha256','review_sha256'))
         and same(settled.get('preserved_memory_ids'),reference['preserved_memory_ids'])
         and same(settled.get('new_memory_ids'),reference['new_memory_ids'])
-        and type(settled.get('applied_write_count')) is int and settled['applied_write_count']==5
+        and type(settled.get('applied_write_count')) is int and settled['applied_write_count']==len(reference['new_memory_ids'])
         and type(settled.get('unchanged_write_count')) is int and settled['unchanged_write_count']==0
         and settled.get('provider_invoked') is False and settled.get('successful_coverage') is False
         and settled.get('historical_execution_sealed') is False and settled.get('historical_run_status')=='failed'
         and settled.get('source_binding_grade')=='current_bounded_reconstruction','settlement_metadata_changed')
+    require((reference['version']==1 and 'plan_origin' not in settled) or
+            (reference['version']==2 and settled.get('plan_origin')==R.L.REVIEWED_ACCOUNTING),'settlement_origin_changed')
     return receipt
 
 
@@ -507,6 +548,27 @@ def recover_locked(paths,*,session_id,verify_locks,allow_continuation=False,runt
     require(context.plan['session_id']==session_id and context.review_sha256==ref['review_sha256']
             and _authorization(context)[1]==ref['authorization_sha256'],'selected_context_changed')
     _recover_marker(context,verify_locks)
+    if R.reviewed(context.plan):
+        # This origin uses the ordinary whole-plan executor and its ORIGINAL
+        # nonrevoked generation. A read-only recovery never calls operation_apply.
+        # Explicit execute can replay exact native IDs; continue-absent retains
+        # the older controller's distinct revoked-generation contract.
+        require(not allow_continuation,'reviewed_plan_requires_execute')
+        progress=PE.inspect_plan(paths.run_dir)
+        if progress['status']!='complete':
+            context.validate_inputs(context.manifest,context.plan,'reviewed_recovery')
+            _,marker_complete=_marker(context)
+            return {'status':'reviewed_plan_pending','run_id':context.run_id,
+                    'request_id':marker_complete['ticket']['request_id'],'provider_invoked':False,
+                    'successful_coverage':False,'cursor_changed':False,'memory_ids':progress['memory_ids']}
+        view=_final_view(context)
+        def validate_reviewed(binding,phase):
+            _guard(verify_locks)
+            if view is None:context.validate_inputs(context.manifest,context.plan,'reviewed_'+phase)
+            else:context.validate_frozen_inputs(phase);_current_pair(context,view)
+            return True
+        with F.revoke(paths.run_dir,context.manifest['fencing'],validate=validate_reviewed) as recovery:
+            return finish(context,recoveries=[recovery],verify_locks=verify_locks)
     view=_final_view(context);driver=_driver(context,verify_locks,view)
     def validate(binding,phase):
         _guard(verify_locks)

@@ -179,17 +179,25 @@ def _fencing(value):
 
 def _manifest(value):
     _keys(value, {"version", "host", "session_id", "run_id", "inputs", "source",
-                  "expected_scope", "backend", "fencing"}, {"provider_mode", "plan_policy"})
+                  "expected_scope", "backend", "fencing"}, {"provider_mode", "plan_policy", "plan_origin", "review_sha256"})
     _version(value["version"])
     # Old sealed runs have no selector. New planning runs bind their read-only
     # provider contract into the manifest digest and therefore every operation ID.
-    if "provider_mode" in value:
+    if "plan_origin" in value:
+        _require(value["plan_origin"] == "reviewed_legacy_accounting" and "provider_mode" not in value,
+                 "invalid_plan_origin")
+        _digest(value.get("review_sha256"))
+        _keys(value.get("plan_policy"), {"max_tool_calls", "max_writes"})
+        _integer(value["plan_policy"]["max_tool_calls"], 1, 20)
+        _integer(value["plan_policy"]["max_writes"], 1, 5)
+    elif "provider_mode" in value:
+        _require("review_sha256" not in value, "orphan_review")
         _require(value["provider_mode"] == "read_only_plan", "invalid_provider_mode")
         _keys(value.get("plan_policy"), {"max_tool_calls", "max_writes"})
         _integer(value["plan_policy"]["max_tool_calls"], 1, 20)
         _integer(value["plan_policy"]["max_writes"], 1, 5)
     else:
-        _require("plan_policy" not in value, "orphan_plan_policy")
+        _require("plan_policy" not in value and "review_sha256" not in value, "orphan_plan_policy")
     for key in ("host", "session_id", "run_id"):
         _identifier(value[key])
     _uuid(value["session_id"])

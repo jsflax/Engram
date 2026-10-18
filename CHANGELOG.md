@@ -6,6 +6,11 @@ All notable changes to Engram are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Account fully reviewed historical learner attempts through the existing complete-plan
+  executor and publication flow. Preserve acknowledged writes, reject unknown outcomes
+  and expired intent replay, and keep the original hold until all reviewed residuals settle.
+
 ## [0.15.2] - 2026-10-18
 
 ### Fixed
