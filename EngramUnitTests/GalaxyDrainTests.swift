@@ -17,12 +17,13 @@ final class GalaxyDrainTests: XCTestCase {
     private let config = DrainConfig(hiddenProjects: [], hiddenRelations: [], timeFilter: nil,
                                      is3D: true, soundEnabled: false, notificationsEnabled: false)
 
-    func testStreamingPagesPublishBeforeEdgesAndReconcileLatestRows() throws {
+    func testStreamingPagesPublishBeforeEdgesAndReconcileLatestRows() async throws {
         let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
         let registry = GalaxyRegistry()
         let galaxy = Galaxy(id: "stream", displayName: "Stream", lattice: lattice.sendableReference)
         registry.register(galaxy)
-        let generation = galaxy.loadChanges.withLock { $0.begin() }
+        let changes = await galaxy.loadChanges
+        let generation = changes.withLock { $0.begin() }
         let nodes = makeNodes(101)
         galaxy.loadStatus = .loading
         galaxy.applyLoadChunk(nodes: (0..<50).map { (Int64($0 + 1), nodes[$0]) }, generation: generation)
@@ -52,30 +53,32 @@ final class GalaxyDrainTests: XCTestCase {
         XCTAssertEqual(Set(galaxy.renderStore.nodes.map(\.id)).count, 100)
     }
 
-    func testRemovedGalaxyRejectsQueuedStreamChunksAndOldGeneration() throws {
+    func testRemovedGalaxyRejectsQueuedStreamChunksAndOldGeneration() async throws {
         let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
         let registry = GalaxyRegistry()
         let galaxy = Galaxy(id: "stream", displayName: "Stream", lattice: lattice.sendableReference)
         registry.register(galaxy)
-        let generation = galaxy.loadChanges.withLock { $0.begin() }
+        let changes = await galaxy.loadChanges
+        let generation = changes.withLock { $0.begin() }
         let nodes = makeNodes(2)
         galaxy.applyLoadChunk(nodes: [(1, nodes[0])], generation: generation)
         registry.remove("stream")
         galaxy.applyLoadChunk(nodes: [(2, nodes[1])], generation: generation)
         XCTAssertEqual(galaxy.renderStore.allNodes.count, 1)
         XCTAssertEqual(registry.unifiedSimulation.nodeCount, 0)
-        XCTAssertFalse(galaxy.loadChanges.withLock { $0.accepts(generation) })
+        XCTAssertFalse(changes.withLock { $0.accepts(generation) })
     }
 
-    func testPartialFailureIsNotReportedAsAnEmptyCompleteGraph() throws {
+    func testPartialFailureIsNotReportedAsAnEmptyCompleteGraph() async throws {
         let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
         let registry = GalaxyRegistry()
         let galaxy = Galaxy(id: "stream", displayName: "Stream", lattice: lattice.sendableReference)
         registry.register(galaxy)
-        let generation = galaxy.loadChanges.withLock { $0.begin() }
+        let changes = await galaxy.loadChanges
+        let generation = changes.withLock { $0.begin() }
         galaxy.applyLoadChunk(nodes: [(1, makeNodes(1)[0])], generation: generation)
         galaxy.loadStatus = .failed
-        galaxy.loadChanges.withLock { $0.failed(generation: generation) }
+        changes.withLock { $0.failed(generation: generation) }
         registry.mergeRenderData()
         XCTAssertFalse(galaxy.isLoaded)
         XCTAssertEqual(galaxy.renderStore.allNodes.count, 1)
