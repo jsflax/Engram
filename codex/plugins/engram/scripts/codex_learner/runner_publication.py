@@ -38,6 +38,31 @@ class Continuation(str):
         return value
 
 
+@dataclass
+class ZeroIntentReady:
+    session_id: str
+    paths: object
+    manifest: dict
+    context: object
+    fence: object
+    receipt: dict
+    receipt_sha256: str
+    marker: dict
+
+    def close(self):
+        self.fence.close()
+
+
+def zero_intent_candidate(state):
+    """Cheap scheduling hint only; no missing-file inference or authority."""
+    gate = state.get("reconciliation_required") if type(state) is dict else None
+    return (type(gate) is dict and state.get("status") == "reconciliation_required"
+            and gate.get("issues") == ["audit_unsettled"] and gate.get("memory_ids") == []
+            and gate.get("reason") == "unverified_completion"
+            and gate.get("run_id") == state.get("last_run")
+            and gate.get("settlement_sha256") == state.get("settlement_sha256"))
+
+
 @dataclass(frozen=True)
 class PlanReady:
     """Worker-owned continuation to execute after releasing enqueue.lock."""
@@ -453,6 +478,7 @@ class Publications:
         now = dt.datetime.now(dt.timezone.utc)
         next_state = {**state, "status": verified["status"], "last_run": paths.run_dir.name,
                       "settlement_sha256": verified["settlement_sha256"], "updated_at": now.isoformat()}
+        next_state.pop("zero_intent_retry", None)
         if verified["status"] == "succeeded":
             next_state.update(journal._json(journal._unseal(manifest["inputs"]["next_parser_state"])))
             next_state.update(last_excerpt_sha256=manifest["source"]["excerpt_sha256"],
@@ -483,6 +509,132 @@ class Publications:
             outcome=_outcome(result), validate=validate, completed_marker=marker_reference)
         coordinator.acknowledge(selected, session_id=manifest["session_id"], validate=validate)
         return Outcome(result, request["request_id"])
+
+    def prepare_zero_intent_retry(self, session_id, config):
+        """Worker-owned proof preparation OUTSIDE enqueue.lock; no native calls."""
+        selected = self.paths(session_id)
+        active = coordinator._active(selected, session_id)
+        view = None
+        if active is not None:
+            if active[0]["input_evidence"].get("kind") != settlement.ZERO_KIND:
+                return None
+            view = {**active[0], "publication": coordinator._plan(selected, active[0])}
+            old_state = _image(view["publication"], "state", "old")
+            old_admission = _image(view["publication"], "admission", "old")
+        else:
+            old_state = durable._read(selected.state)[0]
+            old_admission = durable._read(selected.admission)[0]
+        state, record = journal._json(old_state), journal._json(old_admission)
+        if not zero_intent_candidate(state):
+            return None
+        paths = self.context_paths(state["last_run"])
+        manifest, digest = journal.read_manifest(paths.run_dir)
+        _require(manifest["session_id"] == session_id, "zero_intent_session_changed")
+        context = contexts.ZeroIntentInputs(paths, digest)
+        original_state = journal._json(journal._unseal(manifest["inputs"]["cursor"]))
+        original_admission = journal._json(journal._unseal(manifest["inputs"]["admission"]))
+        _require(_same(contexts._parser_state(state), contexts._parser_state(original_state))
+                 and all(_same({"value": state.get(k)}, {"value": original_state.get(k)})
+                         for k in ("session_id", "transcript_path", "identity", "admission"))
+                 and record.get("processing") is None and "processing_execution" not in record
+                 and _same(_authority(record), {**_authority(original_admission),
+                           "state_sha256": durable.object_digest(state)}), "zero_intent_hold_changed")
+        def validate(binding, phase):
+            _require(_same(binding, manifest["fencing"]), "fence_changed")
+            context.verify(manifest)
+            if view is not None:
+                self._current_pair(view)
+            else:
+                _require(durable._read(selected.state)[0] == old_state
+                         and _same(_authority(_record(selected.admission)[1]), _authority(record)),
+                         "zero_intent_hold_changed")
+            return True
+        fence = writer_fence.revoke(paths.run_dir, manifest["fencing"], validate=validate)
+        try:
+            original, original_ref, proof = settlement.original_zero_intent_hold(
+                paths.run_dir, state["settlement_sha256"])
+            _require(_same(state["reconciliation_required"], {
+                "run_id": paths.run_dir.name, "reason": original["reason"], "issues": original["issues"],
+                "memory_ids": [], "settlement_sha256": state["settlement_sha256"]}), "zero_intent_gate_changed")
+            marker, _ = self._marker(paths, manifest)
+            receipt = {"version": 1, "kind": settlement.ZERO_KIND, "status": "failed",
+                "reason": "verified_zero_intent_failure", "manifest_sha256": digest,
+                "run_id": paths.run_dir.name, "session_id": session_id,
+                "original_settlement": original_ref, "proof": proof, "marker": marker,
+                "old_state": journal.seal_json(old_state), "old_authority": _authority(record)}
+            # Existing same-byte publication is resynced; original evidence is never replaced.
+            receipt_raw = coordinator._immutable(paths.run_dir / settlement.ZERO_RETRY, receipt, "zero_intent_retry")
+            ready = ZeroIntentReady(session_id, paths, manifest, context, fence, receipt,
+                                    journal.sha256(receipt_raw), marker)
+            self._verify_zero_intent_ready(ready)
+            return ready
+        except BaseException:
+            fence.close()
+            raise
+
+    def _verify_zero_intent_ready(self, ready):
+        _require(type(ready) is ZeroIntentReady, "invalid_zero_intent_preparation")
+        manifest, digest = journal.read_manifest(ready.paths.run_dir)
+        _require(_same(manifest, ready.manifest) and digest == ready.receipt["manifest_sha256"],
+                 "zero_intent_manifest_changed")
+        _require(ready.fence.mode == "exclusive" and ready.fence.verify(manifest["fencing"]) is True,
+                 "zero_intent_unfenced")
+        ready.context.verify(manifest)
+        _, original, proof = settlement.original_zero_intent_hold(ready.paths.run_dir,
+            ready.receipt["original_settlement"]["sha256"])
+        _require(_same(original, ready.receipt["original_settlement"])
+                 and _same(proof, ready.receipt["proof"])
+                 and durable._read(ready.paths.run_dir / settlement.ZERO_RETRY)[0] == durable.encode(ready.receipt),
+                 "zero_intent_proof_changed")
+        marker, _ = self._marker(ready.paths, manifest)
+        _require(_same(marker, ready.marker), "marker_changed")
+        return True
+
+    def finish_zero_intent_retry(self, ready):
+        """Publish under worker -> enqueue; no hashing/scanning the transcript."""
+        self._verify_zero_intent_ready(ready)
+        selected, receipt = self.paths(ready.session_id), ready.receipt
+        request = journal._json(journal._unseal(ready.manifest["inputs"]["request"]))
+        old_state = journal._json(journal._unseal(receipt["old_state"]))
+        active = coordinator._active(selected, ready.session_id)
+        old_admission_raw = (_record(selected.admission)[0] if active is None else
+                             _image(coordinator._plan(selected, active[0]), "admission", "old"))
+        old_admission = journal._json(old_admission_raw)
+        _require(_same(_authority(old_admission), receipt["old_authority"]), "zero_intent_admission_changed")
+        reference = {"run_id": ready.paths.run_dir.name, "manifest_sha256": receipt["manifest_sha256"],
+                     "retry_sha256": ready.receipt_sha256}
+        next_state = {**old_state, "status": "failed", "zero_intent_retry": reference}
+        next_state.pop("reconciliation_required")
+        # Keep original retry_after: an already elapsed failure is eligible now.
+        next_admission = {**old_admission, "state_sha256": durable.object_digest(next_state)}
+        def validate(view, phase):
+            self._verify_zero_intent_ready(ready)
+            _require(_same(view["input_evidence"], {"kind": settlement.ZERO_KIND, **reference})
+                     and _same(view["run_evidence"], {**reference, "marker": ready.marker})
+                     and view["outcome"] == _outcome("failed")
+                     and view["request_id"] == request["request_id"]
+                     and _same(view["binding"], request["admission"])
+                     and _image(view["publication"], "state", "old") == journal._unseal(receipt["old_state"])
+                     and _same(_authority(journal._json(_image(view["publication"], "admission", "old"))),
+                               receipt["old_authority"])
+                     and _image(view["publication"], "state", "new") == durable.encode(next_state)
+                     and _image(view["publication"], "admission", "new") == durable.encode(next_admission),
+                     "zero_intent_publication_changed")
+            self._current_pair(view)
+            return True
+        active = coordinator._active(selected, ready.session_id)
+        if active is None:
+            pending_raw, _ = durable._read(selected.pending)
+            coordinator.start(selected, ticket_id=str(uuid.uuid4()), session_id=ready.session_id,
+                request_id=request["request_id"], binding=request["admission"],
+                expected_old_state_sha256=receipt["old_state"]["sha256"],
+                expected_old_admission_sha256=journal.sha256(old_admission_raw),
+                expected_pending_sha256=durable.digest(pending_raw), new_state=next_state,
+                new_admission=next_admission, input_evidence={"kind": settlement.ZERO_KIND, **reference},
+                run_evidence={**reference, "marker": ready.marker}, outcome=_outcome("failed"),
+                validate=validate, completed_marker=ready.marker)
+        coordinator.acknowledge(selected, session_id=ready.session_id, validate=validate)
+        return Outcome("failed", request["request_id"])
 
     def recover(self, session_id, config, *, plan_finished=None):
         """Complete the exact active transition before ordinary pair validation.

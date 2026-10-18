@@ -9,6 +9,8 @@ All notable changes to Engram are documented in this file.
 ## [0.15.2] - 2026-10-18
 
 ### Fixed
+- Release zero-write learner startup holds when the pinned durable gateway proves
+  no mutation was forwarded; preserve the old receipt, cursor, queue and backoff.
 - Treat recoverable provider reconnect notices as notices when the same turn
   completes successfully. Keep malformed, terminal and write failures visible.
 - Retry failed learner runs with authenticated proof that every operation is

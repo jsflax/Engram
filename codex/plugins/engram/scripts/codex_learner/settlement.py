@@ -402,7 +402,110 @@ def _result(raw, memory_ids):
     _require(value["outcome"] == ("stored" if ids else "no_new_memories"), "provider_outcome_mismatch")
 
 
-def _compute(run_dir, manifest, digest):
+# Reviewed 0.15.1 durable gateway/launcher contract. This recognizes the
+# historical write-ahead protocol, never grants old runtime execution authority.
+PINNED_DURABLE_0151 = {'runner.py': '5023d137ba790c8979417ca63c5a181fe4323d1bc6b9e489c135bd26928a379c', 'memory_proxy.py': '2c8670ca9591f649e5abcacec20ae865381fc295c516fa9e2969945947d263bd', 'operation_gateway.py': '333eabc06b20ff6a7c0b4dda05b70fad2b80c91b07faf40778edcedb602205e6', 'execution_manifest.py': 'ca886dbbb7a6f15e83ebac253fa6137665282996b548523d0a27267666df3a50', 'stdio_bridge.py': '737089019694cc0fdde0cfed724d28e31d96bda9addf303d53268f6c9815fb05', 'writer_fence.py': 'e55e1c6a993cdf84ea0ff5acab01b84ef72495f58f7f78ff6648fc57a9ca44e3'}
+ZERO_RETRY = "zero-intent-retry.json"
+ZERO_KIND = "zero_intent_retry"
+
+
+def _gateway_contract(plugin_root):
+    root = Path(plugin_root)
+    _require(root.is_absolute() and root.resolve(strict=True) == root, "unbound_gateway")
+    current_root = Path(__file__).resolve().parent
+    evidence, hashes, current = {}, {}, {}
+    for name in PINNED_DURABLE_0151:
+        path = root / "scripts" / "codex_learner" / name
+        value, identity = durable._read(path, private=False, maximum=1024 * 1024)
+        _require(not identity["mode"] & 0o022, "unsafe_gateway")
+        hashes[name] = journal.sha256(value)
+        evidence[name] = {"sha256": hashes[name], "identity": identity}
+        current[name] = journal.sha256(durable._read(current_root / name, private=False,
+                                                    maximum=1024 * 1024)[0])
+    _require(hashes == PINNED_DURABLE_0151 or hashes == current, "unknown_gateway_contract")
+    return evidence
+
+
+def zero_intent_proof(run_dir, manifest, digest):
+    """Prove no learner mutation, not provider success or zero DB housekeeping.
+
+    Only the known durable launcher/gateway qualifies. That gateway fsyncs an
+    intent and dispatch before forwarding every allowed mutation, without raw
+    fallback. A revoked EX owner separately drains it before using this proof.
+    Missing audit alone is never the proof; the bound write-ahead protocol is.
+    """
+    _require(manifest.get("provider_mode") is None, "not_legacy_durable_run")
+    files, raw, operations = _snapshot(run_dir)
+    _require(not operations and raw[ABSENCE_CHECKPOINT] is None
+             and raw["mcp-audit.jsonl"] is None and raw["result.json"] is None,
+             "not_zero_intent_startup")
+    _require(not any(os.path.lexists(run_dir / name) for name in
+                     ("learner-plan.json", "plan-attempts", "successful-coverage.json")),
+             "unexpected_execution_evidence")
+    _require(raw["provider-dispatch.json"] == journal.encode({"version": 1, "manifest_sha256": digest}),
+             "provider_dispatch_missing")
+    value = journal._json(raw["provider-observation.json"])
+    journal._keys(value, {"version", "manifest_sha256", "observation"})
+    journal._version(value["version"])
+    owner = _observation(value["observation"])
+    _require(value["manifest_sha256"] == digest and owner["started"] and owner["terminated"]
+             and not owner["unexpected_tool"], "zero_intent_owner_unproven")
+    route = journal._json(journal._unseal(manifest["inputs"]["backend_route"]))
+    backend = journal._json(journal._unseal(manifest["inputs"]["backend_config"]))
+    transport_raw, identity = durable._read(run_dir / "transport.json", maximum=journal.MAX_INPUT)
+    config = journal._json(transport_raw, journal.MAX_INPUT)
+    journal._keys(config, {"execution", "transport", "audit_path", "provenance",
+                          "max_tool_calls", "max_writes", "allowed_tools"})
+    expected_paths = route["paths"]
+    _require(expected_paths["run_dir"] == str(run_dir)
+             and expected_paths["root"] == str(run_dir.parent.parent)
+             and _same(config["execution"], {**expected_paths, "manifest_sha256": digest})
+             and _same(config["transport"], route["transport"])
+             and config["audit_path"] == str(run_dir / "mcp-audit.jsonl")
+             and config["provenance"] == "codex-session:" + manifest["session_id"],
+             "unbound_durable_gateway")
+    from . import memory_config, learner_settings
+    allowed = sorted(memory_config.allowed_tools(backend["memory"], READ_TOOLS | WRITE_TOOLS))
+    limits = learner_settings.bounded({} if backend["settings"] is None else backend["settings"]["value"])
+    _require(config["allowed_tools"] == allowed and all(type(config[name]) is int
+             and 0 <= config[name] <= limits[name] for name in ("max_tool_calls", "max_writes")),
+             "gateway_policy_changed")
+    contract = _gateway_contract(expected_paths["plugin_root"])
+    # The known files must have been in place before the trusted owner logged
+    # dispatch; known replacement bytes installed afterward do not prove what ran.
+    dispatched = files["provider-dispatch.json"]["identity"]["mtime_ns"]
+    _require(max(identity["mtime_ns"], identity["ctime_ns"]) <= dispatched,
+             "gateway_configuration_installed_after_dispatch")
+    _require(all(max(item["identity"]["mtime_ns"], item["identity"]["ctime_ns"]) <= dispatched
+                 for item in contract.values()), "gateway_installed_after_dispatch")
+    revocation = _revocation_evidence(run_dir, manifest)
+    _require(_same(_snapshot(run_dir)[0], files), "evidence_changed")
+    return {"version": 1, "kind": "durable_zero_intent", "manifest_sha256": digest,
+            "fencing": manifest["fencing"], "revocation": revocation, "files": files,
+            "transport": {"sha256": journal.sha256(transport_raw), "identity": identity},
+            "gateway_contract": contract}
+
+
+def original_zero_intent_hold(run_dir, expected_sha256):
+    """Authenticate old classification unchanged before deriving a failure."""
+    raw, identity = durable._read(run_dir / "settlement.json", maximum=journal.MAX_RECORD)
+    _require(journal.sha256(raw) == expected_sha256, "settlement_digest_changed")
+    value = journal._json(raw)
+    manifest, digest = _manifest(run_dir, value.get("manifest_sha256"))
+    _require(raw == journal.encode(_compute(run_dir, manifest, digest, zero_intent=False))
+             and value["status"] == "reconciliation_required"
+             and value["reason"] == "unverified_completion"
+             and value["issues"] == ["audit_unsettled"]
+             and value["operations"] == [] and value["memory_ids"] == []
+             and all(value[name] == 0 for name in ("attempted_write_calls", "applied_write_calls",
+                                                   "unchanged_write_calls")), "not_original_zero_intent_hold")
+    proof = zero_intent_proof(run_dir, manifest, digest)
+    _require(durable._read(run_dir / "settlement.json", maximum=journal.MAX_RECORD) == (raw, identity),
+             "settlement_changed")
+    return value, {"sha256": expected_sha256, "identity": identity}, proof
+
+
+def _compute(run_dir, manifest, digest, *, zero_intent=True):
     if manifest.get('provider_mode') == 'read_only_plan':
         return _compute_plan(run_dir, manifest, digest)
     files, raw, operation_ids = _snapshot(run_dir)
@@ -464,9 +567,17 @@ def _compute(run_dir, manifest, digest):
     success = (not uncertain and not issues and observation is not None and _provider_clean(observation)
                and audit is not None and audit["tool_calls"] > 0 and audit["tool_errors"] == 0 and result_valid
                and len(records) == len(applied) + len(unchanged))
+    no_effect = None
+    if zero_intent and issues == ["audit_unsettled"] and not operation_ids:
+        try:
+            no_effect = zero_intent_proof(run_dir, manifest, digest)
+            uncertain, issues = False, []
+        except (ValueError, TypeError, KeyError, OSError):
+            pass  # Unbound/partial evidence retains the original conservative hold.
     status = "succeeded" if success else ("reconciliation_required" if uncertain or applied else "failed")
     reason = "verified_completion" if success else ("never_dispatched" if never_dispatched else
              "provider_not_started" if positive_no_start else
+             "verified_zero_intent_failure" if no_effect is not None else
              "verified_no_effect_failure" if verified_absent and not uncertain and not issues and not applied else
              "unverified_completion")
     return {"version": 1, "kind": "learner_settlement", "manifest_sha256": digest,
@@ -475,7 +586,8 @@ def _compute(run_dir, manifest, digest):
             "status": status, "reason": reason, "issues": sorted(set(issues)), "files": files,
             "operations": records, "attempted_write_calls": sum(record["dispatched"] is True for record in records),
             "applied_write_calls": len(applied), "unchanged_write_calls": len(unchanged),
-            "memory_ids": memory_ids, "audit": audit}
+            "memory_ids": memory_ids, "audit": audit,
+            **({"zero_intent_proof": no_effect} if no_effect is not None else {})}
 
 
 def _compute_plan(run_dir, manifest, digest):
@@ -568,11 +680,15 @@ def verify_settlement(run_dir, *, expected_sha256, recovery_fence, validate_inpu
     value = journal._json(raw)
     manifest, digest = _manifest(run_dir, value.get("manifest_sha256"))
     _validate(manifest, recovery_fence, validate_inputs, "verify_settlement")
-    _require(raw == journal.encode(_compute(run_dir, manifest, digest)), "settlement_evidence_changed")
+    _require(raw in (journal.encode(_compute(run_dir, manifest, digest)),
+                     journal.encode(_compute(run_dir, manifest, digest, zero_intent=False))),
+             "settlement_evidence_changed")
     _require(durable._read(run_dir / "settlement.json", maximum=journal.MAX_RECORD) == (raw, identity), "settlement_changed")
     _validate(manifest, recovery_fence, validate_inputs, "after_verify_settlement")
     _manifest(run_dir, digest)
-    _require(raw == journal.encode(_compute(run_dir, manifest, digest)), "settlement_evidence_changed")
+    _require(raw in (journal.encode(_compute(run_dir, manifest, digest)),
+                     journal.encode(_compute(run_dir, manifest, digest, zero_intent=False))),
+             "settlement_evidence_changed")
     return copy.deepcopy(value)
 
 

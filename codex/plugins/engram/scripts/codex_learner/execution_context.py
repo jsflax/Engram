@@ -503,3 +503,41 @@ def load_execution(paths, *, manifest_sha256, writer_fence, before_marker=False,
     else:
         context._validate(manifest)
     return context
+
+
+class ZeroIntentInputs:
+    """No-write publication guard, never an execution/replay context.
+
+    Hash the original interval outside enqueue.lock. During the short metadata
+    transaction retain its exact file identity (including ctime/mtime/size) and
+    recheck admission/header and immutable manifest. Any concurrent append/edit
+    refuses this attempt; a later preparation can admit an append afresh. The
+    historical route remains sealed evidence: today's ambient PATH and native
+    process are irrelevant when no operation could have been forwarded.
+    """
+    def __init__(self, paths, manifest_sha256):
+        self.paths, self.manifest_sha256 = paths, manifest_sha256
+        paths.check()
+        manifest, digest = journal.read_manifest(paths.run_dir)
+        _require(digest == manifest_sha256, "manifest_changed")
+        self.manifest = manifest
+        decoded = _decode_inputs(paths, manifest)
+        self.request = decoded["request"]
+        self.source_path = Path(self.request["transcript_path"])
+        before = durable._identity(self.source_path.lstat())
+        _require(_same(admission.check(paths.root, self.request), self.request["admission"]), "binding_changed")
+        _require(_interval(str(self.source_path), manifest["source"]["identity"],
+                           manifest["source"]["start_offset"], manifest["source"]["end_offset"])
+                 == decoded["parser_state"]["interval_sha256"], "source_bytes_changed")
+        self.source_identity = durable._identity(self.source_path.lstat())
+        _require(before == self.source_identity, "source_changed")
+        self.verify(manifest)
+
+    def verify(self, manifest):
+        current, digest = journal.read_manifest(self.paths.run_dir)
+        _require(digest == self.manifest_sha256 and _same(current, self.manifest)
+                 and _same(manifest, self.manifest), "manifest_changed")
+        _require(self.source_path.resolve(strict=True) == self.source_path
+                 and durable._identity(self.source_path.lstat()) == self.source_identity, "source_changed")
+        _require(_same(admission.check(self.paths.root, self.request), self.request["admission"]), "binding_changed")
+        return True

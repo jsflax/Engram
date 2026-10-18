@@ -39,7 +39,7 @@ STATUSES = {"emitted", "empty", "invalid", "timeout", "cancelled", "cleanup_time
             "legacy_reconciled_no_new_mutation", "legacy_reconciled_with_residuals"}
 OUTCOMES = {"stored", "no_new_memories", "failed"}
 SETTLEMENT_REASONS = {"verified_completion", "never_dispatched", "provider_not_started", "unverified_completion",
-                      "verified_no_effect_failure", "planning_not_complete"}
+                      "verified_no_effect_failure", "planning_not_complete", "verified_zero_intent_failure"}
 GATE_REASONS = {"successful_or_unverified_write", "write_status_unknown"} | SETTLEMENT_REASONS
 # Only fixed diagnostic codes from the runner; never exception text.
 STARTUP_STAGES = frozenset({"provider_policy", "writer_fence", "execution_context",
@@ -771,7 +771,7 @@ def linked_settlement(learner, linked, sid, expected_sha256):
                 value["status"] != "failed" or value["attempted_write_calls"] == 0
                 or value["applied_write_calls"] != 0 or value["unchanged_write_calls"] != 0):
             raise ValueError
-        if value["reason"] == "planning_not_complete" and (
+        if value["reason"] in {"planning_not_complete", "verified_zero_intent_failure"} and (
                 value["status"] != "failed" or any(value[key] != 0 for key in counts)):
             raise ValueError
         view["metadata"] = {"status": value["status"], "reason": value["reason"], "run_id": linked,
