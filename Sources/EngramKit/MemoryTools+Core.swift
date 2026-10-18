@@ -1394,34 +1394,15 @@ extension MemoryTools {
         // Per-project breakdown
         if projectFilter == nil {
             lines.append("\nBy project:")
-            let grouped = base.group(by: \.project)
-            var projectLines: [String] = []
-            for mem in grouped {
-                var countQuery = db.objects(Memory.self).distinct(by: \.globalId).where { $0.project == mem.project && $0.deletedAt == nil }
-                if excludeForeignAuthored {
-                    countQuery = countQuery.where { $0.authorUserId == nil || $0.authorUserId == me }
-                }
-                projectLines.append("  \(mem.project): \(countQuery.count)")
-            }
-            projectLines.sort()
+            let projectLines = try base.groupedCounts(by: \.project)
+                .map { "  \($0.key): \($0.count)" }.sorted()
             lines.append(contentsOf: projectLines)
         }
 
         // Per-topic breakdown
         lines.append("\nBy topic:")
-        let topicGrouped = base.group(by: \.topic)
-        var topicLines: [String] = []
-        for mem in topicGrouped {
-            var countQuery = db.objects(Memory.self).distinct(by: \.globalId).where { $0.topic == mem.topic && $0.deletedAt == nil }
-            if let resolvedProjects {
-                countQuery = countQuery.where { $0.project.in(resolvedProjects) }
-            }
-            if excludeForeignAuthored {
-                countQuery = countQuery.where { $0.authorUserId == nil || $0.authorUserId == me }
-            }
-            topicLines.append("  \(mem.topic): \(countQuery.count)")
-        }
-        topicLines.sort()
+        let topicLines = try base.groupedCounts(by: \.topic)
+            .map { "  \($0.key): \($0.count)" }.sorted()
         lines.append(contentsOf: topicLines)
 
         return CallTool.Result(content: [.text(lines.joined(separator: "\n"))], isError: false)
@@ -1555,24 +1536,12 @@ extension MemoryTools {
             base = base.where { $0.authorUserId == nil || $0.authorUserId == me }
         }
 
-        let grouped = base.group(by: \.topic)
-        if grouped.endIndex == 0 {
+        let grouped = try base.groupedCounts(by: \.topic)
+        if grouped.isEmpty {
             return CallTool.Result(content: [.text("No memories stored.")], isError: false)
         }
 
-        var lines: [String] = []
-        for memory in grouped {
-            var countQuery = db.objects(Memory.self).distinct(by: \.globalId).where { $0.topic == memory.topic && $0.deletedAt == nil }
-            if let resolvedProjects {
-                countQuery = countQuery.where { $0.project.in(resolvedProjects) }
-            }
-            if excludeForeignAuthored {
-                countQuery = countQuery.where { $0.authorUserId == nil || $0.authorUserId == me }
-            }
-            let count = countQuery.count
-            lines.append("\(memory.topic): \(count) memories")
-        }
-        lines.sort()
+        let lines = grouped.map { "\($0.key): \($0.count) memories" }.sorted()
 
         let header = projectFilter.map { "Topics for project '\($0)':" } ?? "All topics:"
         return CallTool.Result(
