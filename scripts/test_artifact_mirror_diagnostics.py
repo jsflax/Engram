@@ -98,6 +98,41 @@ class MirrorDiagnosticsTests(unittest.TestCase):
         self.assertFalse(receipt['stopped_or_not_started'])
         self.assertNotIn('reaped', receipt)
 
+    def test_cleanup_observes_argv_exit_transition_until_actual_absence(self):
+        owned = f'12345 {os.getuid()} Sun Oct 18 14:55:31 2026 {self.command}\n'
+        exited_argv = f'12345 {os.getuid()} Sun Oct 18 14:55:31 2026 (Python)\n'
+        outputs = [{'status': 'complete', 'exit_code': 0, 'stdout': row}
+                   for row in (owned, owned, exited_argv)]
+        outputs.append({'status': 'complete', 'exit_code': 1, 'stdout': ''})
+        with patch.object(M, 'command', side_effect=outputs) as command, patch.object(M.os, 'kill') as kill, patch.object(M.time, 'monotonic', side_effect=[0, 0.25]), patch.object(M.time, 'sleep') as sleep:
+            receipt = M.stop(self.root)
+        kill.assert_called_once_with(12345, signal.SIGTERM)
+        self.assertEqual(command.call_count, 4)
+        sleep.assert_called_once_with(0.1)
+        self.assertEqual(receipt['after'], self.absent)
+        self.assertTrue(receipt['stopped_or_not_started'])
+        self.assertEqual(receipt['first_transition'], {
+            'status': 'identity_mismatch', 'pid': 12345,
+            'started': 'Sun Oct 18 14:55:31 2026',
+            'command_sha256': M.hashlib.sha256(b'(Python)').hexdigest(),
+        })
+        self.assertEqual(json.loads((self.root / 'evidence/mirror-cleanup.json').read_text()), receipt)
+
+    def test_cleanup_changed_or_reused_pid_never_qualifies_without_absence(self):
+        transition = {'status': 'identity_mismatch', 'pid': 12345,
+                      'started': self.row['started'], 'command_sha256': 'exited-argv'}
+        reused = dict(transition, started='later birth', command_sha256='unrelated-argv')
+        for final in (transition, reused):
+            with self.subTest(final=final), patch.object(M, 'process', side_effect=[self.row, self.row, transition, final]) as process, patch.object(M.os, 'kill') as kill, patch.object(M.time, 'monotonic', side_effect=[0, 1, 3]), patch.object(M.time, 'sleep') as sleep:
+                receipt = M.stop(self.root)
+            kill.assert_called_once_with(12345, signal.SIGTERM)
+            self.assertEqual(process.call_count, 4)
+            sleep.assert_called_once_with(0.1)
+            self.assertEqual(receipt['first_transition'], transition)
+            self.assertEqual(receipt['after'], final)
+            self.assertFalse(receipt['stopped_or_not_started'])
+            self.assertNotIn('reaped', receipt)
+
     def test_process_inspection_timeout_and_output_limit_are_typed_no_raw_stderr(self):
         with patch.object(M.subprocess, 'run', side_effect=subprocess.TimeoutExpired('ps', 2)):
             self.assertEqual(M.command(['ps']), {'status': 'timeout'})

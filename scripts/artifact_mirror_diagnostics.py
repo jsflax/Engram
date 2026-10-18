@@ -168,9 +168,16 @@ def stop(root):
             deadline = time.monotonic() + 3
             while True:
                 after = process(current['pid'], root)
+                if after['status'] != 'absent' and after != current:
+                    # Exiting processes can lose argv before disappearing. Keep
+                    # observing, but never signal a changed identity or accept
+                    # the transition itself as successful cleanup.
+                    receipt.setdefault('first_transition', {
+                        key: after[key] for key in
+                        ('status', 'pid', 'started', 'command_sha256', 'inspection')
+                        if key in after
+                    })
                 if after['status'] == 'absent' or time.monotonic() >= deadline:
-                    break
-                if after != current:
                     break
                 time.sleep(0.1)
             receipt['after'] = after

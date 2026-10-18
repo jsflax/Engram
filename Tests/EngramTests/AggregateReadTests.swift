@@ -107,6 +107,6 @@ private extension MemoryTools {
         let topicsBefore = Lattice.threadSQLStatementCount
         let topics = try handleListTopics(nil)
         let topicStatements = Lattice.threadSQLStatementCount - topicsBefore
-        return (stats, topicStatements, text(from: topics).split(separator: "\n").count)
+        return (stats, topicStatements, EngramTests.text(from: topics).split(separator: "\n").count)
     }
 }
