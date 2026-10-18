@@ -110,6 +110,6 @@ On each follow-up: reconcile an existing run first; do not start duplicate work.
 python3 -m unittest discover -s release-train -p 'test_*.py'
 ```
 
-These tests exercise SemVer precedence, invalid input, exact CI selection, dependency mismatch, candidate identity, native receipt binding, publication paths and artifact tampering, including an end-to-end temporary local Git repository. They do not build any product. `release-train-checks.yml` runs only these Python checks. Native/platform behavior is validated by the existing release pipelines, not by this test suite.
+These tests exercise SemVer precedence, invalid input, exact CI selection, dependency mismatch, candidate identity, native receipt binding, publication paths and artifact tampering, including an end-to-end temporary local Git repository. They do not build any product. `release-train-checks.yml` also runs the release workflow command-contract tests with fake tools, without building native products. Native/platform behavior is validated by the existing release pipelines, not by this test suite.
 
 Sources: [Semantic Versioning 2.0.0](https://semver.org/), [GitHub workflow triggering and token behavior](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow).

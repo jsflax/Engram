@@ -267,6 +267,8 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
             (validation / 'scratch/release').mkdir(parents=True)
             native = validation / 'scratch/release/Engram'
             native.write_text('#!/bin/sh\nexit 99\n'); native.chmod(0o700)
+            migration = validation / 'scratch/release/EngramDaemon'
+            migration.write_text('#!/bin/sh\nexit 99\n'); migration.chmod(0o700)
             log = root / 'calls.jsonl'
             fake = '#!' + sys.executable + '\n' + """import json,os,sys
 from pathlib import Path
@@ -275,7 +277,7 @@ with open(os.environ['CALL_LOG'],'a') as stream:
     stream.write(json.dumps({'tool':Path(sys.argv[0]).name,'args':args,'cwd':str(Path.cwd())})+'\\n')
 key = (args[args.index('--filter')+1] if '--filter' in args else
        args[args.index('--case')+1] if '--case' in args else
-       'release' if Path(sys.argv[0]).name=='swift-validation' else 'fixtures')
+       args[args.index('--product')+1] if Path(sys.argv[0]).name=='swift-validation' else 'fixtures')
 raise SystemExit(29 if key in json.loads(os.environ['FAIL_KEYS']) else 0)
 """
             for command in (bin_dir / 'python3', validation / 'bin/swift-validation'):
@@ -307,11 +309,13 @@ raise SystemExit(29 if key in json.loads(os.environ['FAIL_KEYS']) else 0)
                 ('Validate Python MCP harness fixtures', ['fixtures'],
                     [supervised('mcp-harness-fixtures', 180, 60,
                                 ['python3', '-B', '-m', 'unittest', 'discover', '-s', 'scripts', '-p', 'test_mcp_locks.py'])], False),
-                ('Build release Engram native product', ['release'],
-                    [['build', '--force-resolved-versions', '--disable-index-store', '-c', 'release', '--product', 'Engram']], False),
+                ('Build release Engram native product', ['Engram', 'EngramDaemon'],
+                    [['build', '--force-resolved-versions', '--disable-index-store', '-c', 'release', '--product', product]
+                     for product in ('Engram', 'EngramDaemon')], False),
                 ('Verify actual native MCP lifecycle and contention cases', cases,
                     [supervised('mcp-' + case, 180, 90,
-                                ['python3', '-B', 'scripts/verify-mcp-locks.py', '--binary', str(native), '--case', case])
+                                ['python3', '-B', 'scripts/verify-mcp-locks.py', '--binary', str(native),
+                                 '--migration-binary', str(migration), '--case', case])
                      for case in cases], True),
             ]
             for name, keys, expected_args, aggregated in checks:
@@ -329,8 +333,20 @@ raise SystemExit(29 if key in json.loads(os.environ['FAIL_KEYS']) else 0)
                                          result.stdout + result.stderr)
                         self.assertEqual(continued.exists(), not failures and not aggregated)
                         calls = [json.loads(line) for line in log.read_text().splitlines()]
-                        self.assertEqual(calls, [{'tool': 'swift-validation' if keys == ['release'] else 'python3',
-                            'args': arguments, 'cwd': str(validation / 'repo')} for arguments in expected_args])
+                        building = name == 'Build release Engram native product'
+                        reached = (expected_args[:keys.index(failures[0]) + 1]
+                                   if building and failures else expected_args)
+                        self.assertEqual(calls, [{'tool': 'swift-validation' if building else 'python3',
+                            'args': arguments, 'cwd': str(validation / 'repo')} for arguments in reached])
+            # The migration prerequisite must fail before any supervised MCP
+            # case, rather than being mistaken for the injected tool failure.
+            migration.unlink()
+            log.unlink(missing_ok=True)
+            result = subprocess.run(['/bin/bash', '-e', '-c', run_block(workflow,
+                'Verify actual native MCP lifecycle and contention cases')], cwd=validation / 'repo',
+                env=dict(env, FAIL_KEYS='[]'), capture_output=True, text=True, timeout=20)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(log.exists())
 
     def test_begin_diagnostics_requires_explicit_native_opt_in(self):
         flag = 'ENGRAM_BEGIN_DIAGNOSTICS'
@@ -430,8 +446,9 @@ raise SystemExit(37 if case==os.environ['FAILING_CASE'] else 0)
                     observed = [json.loads(line) for line in log.read_text().splitlines()]
                     selected = expected[:4] if failing else expected
                     self.assertEqual(observed, [{
-                        'args': ['-B', 'scripts/verify-mcp-locks.py', '--binary', '.build/release/Engram', '--case', case],
-                        'cwd': str(root), 'home': str(root / 'build/mcp-test-home'),
+                        'args': ['-B', 'scripts/verify-mcp-locks.py', '--binary', '.build/release/Engram',
+                                 '--migration-binary', '.build/release/EngramDaemon', '--case', case],
+                        'cwd': str(root), 'home': env['HOME'],
                         'foundation_home': str(root / 'build/mcp-test-home'),
                         'tmp': str(root / 'build/mcp-test-tmp'),
                     } for case in selected])
