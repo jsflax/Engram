@@ -289,7 +289,8 @@ def main(argv=None):
         return 0
     except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
         text = str(error)
-        prefixes = ("residual_", "execution_", "operation_probe_", "writer_fence_", "migration_")
+        prefixes = ("residual_", "execution_", "operation_probe_", "writer_fence_", "migration_",
+                    "legacy_reconciliation_")
         reason = text if text.startswith(prefixes) and re.fullmatch(r"[a-z][a-z0-9_]{0,150}", text) else "residual_cli_unavailable_or_changed"
         result = {"status": "held", "reason": reason, "provider_invoked": False,
                   "historical_provider_success": False, "successful_coverage": False, **_retained_summary(args)}

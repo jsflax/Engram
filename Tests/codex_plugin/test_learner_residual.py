@@ -102,6 +102,25 @@ class ResidualCLITests(unittest.TestCase):
             self.assertEqual((recovered, done['status']), (0, 'already_reconciled'))
             self.assertEqual(len(calls), 5)
 
+    def test_changed_reviewed_row_reports_fixed_reason_without_dispatch(self):
+        from test_reviewed_accounting import AccountingFixture
+        f = AccountingFixture()
+        self.addCleanup(f.close)
+        f.writer.close()
+        review = f.base / 'cli-reviewed.json'
+        review.write_bytes(f.reviewed_raw); review.chmod(0o600)
+        f.base_fixture.update_row('content=?', ('PRIVATE changed after review',))
+        before, rows = f.current(), f.store.read_bytes()
+        args = self.arguments(f, 'prepare', pins=False) + ['--review', str(review),
+            '--review-sha256', f.reviewed_sha256, '--evidence-directory', str(f.evidence)]
+        with mock.patch.object(CLI.operation_probe, 'probe_scope', return_value=f.scope):
+            code, result = self.invoke(args)
+        self.assertEqual(code, 2)
+        self.assertEqual(result['reason'], 'legacy_reconciliation_readback_changed')
+        self.assertEqual(f.current(), before)
+        self.assertEqual(f.store.read_bytes(), rows)
+        self.assertFalse(result['provider_invoked'])
+
     def test_absence_requires_explicit_continuation_and_preserves_operation_ids(self):
         f = self.fixture()
         old_state = f.state_path.read_bytes()

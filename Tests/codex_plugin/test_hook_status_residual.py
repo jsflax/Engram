@@ -3,6 +3,7 @@ import copy
 import hashlib
 import json
 import unittest
+import uuid
 from unittest.mock import patch
 
 import test_hook_status as base
@@ -26,7 +27,7 @@ class ResidualHealthTests(unittest.TestCase):
         path.chmod(0o600)
         return path
 
-    def fixture(self, *, pending=None):
+    def fixture(self, *, pending=None, reviewed_ops=None):
         execution = {'run_id': RESIDUAL_RUN, 'manifest_sha256': 'a'*64,
                      'context_sha256': 'b'*64, 'review_sha256': 'c'*64}
         self.qualification = {'historical_run_status': 'failed', 'historical_execution_sealed': False,
@@ -42,6 +43,26 @@ class ResidualHealthTests(unittest.TestCase):
             'settlement_sha256': '0'*64, 'interval': {'start_offset': 100, 'end_offset': 200,
                 'excerpt_sha256': '3'*64, 'interval_sha256': '4'*64},
             'preserved_memory_ids': [MEMORY], 'new_memory_ids': NEW_MEMORIES}
+        if reviewed_ops is not None:
+            self.qualification['applied_write_count'] = reviewed_ops
+            new_ids = NEW_MEMORIES[:reviewed_ops]
+            preserved_ids = [MEMORY, base.OTHER]
+            self.reference.update(version=2, preserved_memory_ids=preserved_ids, new_memory_ids=new_ids)
+            operations = []
+            for index, memory in enumerate(new_ids):
+                operation = f'01234567-89ab-4cde-8f01-23456789abc{index}'
+                operations.append({'operation_id': operation, 'mutation': 'remember', 'dispatched': True,
+                    'settled': True, 'receipt': {'version': 1, 'operationID': operation,
+                        'scope': {'version': 1, 'storeID': base.OTHER,
+                                  'principal': {'kind': 'agent', 'groupIds': [], 'scopes': []}},
+                        'payloadDigest': '8'*64, 'mutation': 'remember', 'outcome': 'applied',
+                        'memoryIDs': [memory.upper()], 'edgeIDs': [RID], 'committedAt': 123.0}})
+            self.settled = {'version': 1, 'kind': 'reviewed_residual_settlement', **execution,
+                **self.qualification, 'plan_origin': 'reviewed_legacy_accounting', 'plan_sha256': '9'*64,
+                'progress': {'status': 'complete', 'reason': 'verified_plan_completion', 'plan_sha256': '9'*64,
+                    'operations': operations, 'attempts': reviewed_ops, 'applied_write_calls': reviewed_ops,
+                    'unchanged_write_calls': 0, 'memory_ids': new_ids},
+                'preserved_memory_ids': preserved_ids, 'new_memory_ids': new_ids, 'successful_coverage': False}
         self.root = self.learner_fixture(session={'offset': 200, 'status': 'legacy_reconciled_with_residuals',
             'last_run': base.RUN, 'last_residual_reconciliation': self.reference}, pending=pending)
         self.private(self.root/'runs'/base.RUN/'run.json', {'session_id': base.SID, 'status': 'failed',
@@ -168,6 +189,87 @@ class ResidualHealthTests(unittest.TestCase):
         self.assertEqual(health['headline'], 'batch_limit')
         self.assertEqual(health['outcomes']['queue']['state'], 'paused')
         self.assertEqual((self.root/'pending'/(base.SID+'.json')).read_bytes(), before)
+
+    def test_reviewed_zero_and_one_operation_completion_is_metadata_only(self):
+        for count in (0, 1):
+            with self.subTest(count=count):
+                self.fixture(reviewed_ops=count, pending={'paused_request_id': base.REQUEST,
+                    'pause_reason': 'batch_limit', 'size_bytes': 900})
+                before = {p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+                with patch.object(STATUS, 'read_bounded', wraps=STATUS.read_bounded) as reads:
+                    report = self.report()
+                health = report['learner']['health']
+                residual = health['outcomes']['residual_reconciliation']
+                self.assertEqual(residual['state'], 'recorded_completed')
+                self.assertEqual(residual['applied_write_count'], count)
+                self.assertEqual(residual['reference']['version'], 2)
+                self.assertEqual(health['headline'], 'batch_limit')
+                self.assertEqual(health['outcomes']['provider_completion']['run_status'], 'failed')
+                self.assertIs(residual['provider_invoked'], False)
+                self.assertEqual(health['outcomes']['independent_readback']['state'], 'not_performed')
+                self.assertNotIn('last_residual_reconciliation', report['learner']['session'].get('invalid_fields', []))
+                self.assertNotIn('PRIVATE_PENDING', json.dumps(report))
+                allowed = {self.receipt_path, self.pin_path, self.settled_path, self.complete_path}
+                self.assertTrue(all(c.args[0] in allowed for c in reads.call_args_list
+                                    if RESIDUAL_RUN in str(c.args[0]) or RID in str(c.args[0])))
+                forbidden = ('residual-context', 'residual-review', 'learner-plan', 'execution-manifest', '.sqlite')
+                self.assertFalse(any(any(name in str(c.args[0]) for name in forbidden) for c in reads.call_args_list))
+                self.assertEqual({p: p.read_bytes() for p in before}, before)
+
+    def test_reviewed_reference_unknown_versions_duplicate_and_overlapping_ids_refuse(self):
+        self.fixture(reviewed_ops=0)
+        for changed in ({'version': 3}, {'version': True}, {'version': 1},
+                        {'preserved_memory_ids': [MEMORY, MEMORY.upper()]},
+                        {'preserved_memory_ids': [str(uuid.UUID(int=i)) for i in range(33)]},
+                        {'new_memory_ids': NEW_MEMORIES + [RID]},
+                        {'new_memory_ids': [MEMORY]}, {'new_memory_ids': [NEW_MEMORIES[0]]*2},
+                        {'new_memory_ids': ['../private']}, {'run_id': '../private'}):
+            with self.subTest(changed=changed):
+                self.update_state(last_residual_reconciliation={**self.reference, **changed})
+                with patch.object(STATUS, 'read_bounded', wraps=STATUS.read_bounded) as reads:
+                    self.assert_pending()
+                self.assertFalse(any('residual-receipt' in str(c.args[0]) for c in reads.call_args_list))
+
+    def test_reviewed_rehashed_origin_progress_and_operation_corruption_refuse(self):
+        self.fixture(reviewed_ops=1)
+        changes = [('plan_origin', 'provider'), ('plan_sha256', '0'*64), ('applied_write_count', True),
+                   ('progress.status', 'pending'), ('progress.applied_write_calls', 0),
+                   ('progress.attempts', 0), ('progress.attempts', True), ('progress.attempts', 1025),
+                   ('progress.unchanged_write_calls', 1), ('progress.memory_ids', []),
+                   ('progress.operations', []), ('progress.operations.0.dispatched', False),
+                   ('progress.operations.0.settled', False), ('progress.operations.0.mutation', 'update'),
+                   ('progress.operations.0.receipt.operationID', MEMORY),
+                   ('progress.operations.0.receipt.outcome', 'unchanged'),
+                   ('progress.operations.0.receipt.memoryIDs', [MEMORY]),
+                   ('progress.operations.0.receipt.edgeIDs', [RID, RID.upper()]),
+                   ('progress.operations.0.receipt.payloadDigest', 'private'),
+                   ('progress.operations.0.receipt.extra', 'PRIVATE_SECRET')]
+        original = copy.deepcopy(self.settled)
+        for key, value in changes:
+            with self.subTest(key=key, value=value):
+                altered = copy.deepcopy(original); target = altered
+                keys = key.split('.')
+                for part in keys[:-1]:
+                    target = target[int(part)] if isinstance(target, list) else target[part]
+                target[keys[-1]] = value
+                self.repin_settlement(altered)
+                self.assert_pending()
+                self.assertNotIn('PRIVATE_SECRET', json.dumps(self.report()))
+
+    def test_reviewed_final_completion_and_private_bounded_reads_remain_required(self):
+        self.fixture(reviewed_ops=0)
+        for path, limit in ((self.receipt_path, STATUS.MAX_JSON_BYTES), (self.pin_path, STATUS.MAX_JSON_BYTES),
+                            (self.settled_path, STATUS.MAX_SETTLEMENT_BYTES), (self.complete_path, STATUS.MAX_SETTLEMENT_BYTES)):
+            with self.subTest(path=path.name):
+                raw = path.read_bytes(); path.unlink(); self.assert_pending()
+                path.write_bytes(raw); path.chmod(0o644); self.assert_pending(); path.chmod(0o600)
+                path.write_bytes(b' '*(limit+1)); self.assert_pending(); path.write_bytes(raw)
+                saved = path.with_suffix('.saved'); path.rename(saved); path.symlink_to(saved)
+                self.assert_pending(); path.unlink(); saved.rename(path)
+        self.private(self.complete_path, {**self.completion, 'disposition': 'unknown'})
+        self.receipt['completion_sha256'] = hashlib.sha256(self.complete_path.read_bytes()).hexdigest()
+        self.private(self.receipt_path, self.receipt)
+        self.assert_pending()
 
 
 if __name__ == '__main__':

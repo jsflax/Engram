@@ -16,6 +16,7 @@ import copy
 from dataclasses import dataclass
 import datetime as dt
 import functools
+import math
 import os
 from pathlib import Path
 import re
@@ -223,6 +224,32 @@ def _same(a, b):
     return durable.encode(a) == durable.encode(b)
 
 
+def _same_rows(actual, expected):
+    """Compare date values exactly across JSON integers and SQLite REALs.
+
+    Only numeric date representation may differ. Review bytes remain sealed;
+    content, privacy, IDs and every other field keep their strict comparison.
+    """
+    if len(actual) != len(expected):
+        return False
+    normalized = []
+    for row, pinned in zip(actual, expected):
+        if type(pinned) is not dict or set(row) != set(pinned):
+            return False
+        projected = dict(pinned)
+        for key in ("createdAt", "modifiedAt", "expiresAt", "deletedAt"):
+            value, previous = row[key], pinned[key]
+            if value is None or previous is None:
+                if value is not previous:
+                    return False
+            elif (type(value) not in (int, float) or type(previous) not in (int, float)
+                  or not math.isfinite(value) or not math.isfinite(previous) or value != previous):
+                return False
+            projected[key] = value
+        normalized.append(projected)
+    return _same(actual, normalized)
+
+
 def _boundary(label):
     """Fixture seam; never controls production authorization."""
 
@@ -338,7 +365,7 @@ def _rows(paths, expected, *, count=2):
     after = paths.candidate_store.lstat()
     identity = {"device": before.st_dev, "inode": before.st_ino, "uid": before.st_uid}
     _require(identity == {"device": after.st_dev, "inode": after.st_ino, "uid": after.st_uid}
-             and _same(actual, expected), "readback_changed")
+             and _same_rows(actual, expected), "readback_changed")
     return identity
 
 
