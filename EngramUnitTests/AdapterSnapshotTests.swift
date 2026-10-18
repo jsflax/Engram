@@ -272,6 +272,89 @@ final class AdapterSnapshotTests: XCTestCase {
         XCTAssertEqual(adapter.positionArray, [pc, pb])
     }
 
+    func testStreamingCentroidsKeepPreviewUntilFrameThirtyWithoutDelayingNodes() async throws {
+        let (lattice, registry, galaxy, generation, adapter) = try await streamingFixture()
+        defer { lattice.close() }
+        let a = node(), b = node()
+        let origin = SIMD3<Float>.zero, next = SIMD3<Float>(60, 0, 0)
+        galaxy.applyLoadChunk(nodes: [(1, a)], generation: generation)
+        registry.unifiedSimulation.setPosition(a.id, to: origin)
+        adapter.tick(dt: 1 / 60) // Frame 1: the first preview is immediate.
+        XCTAssertFalse(galaxy.isDrainingInitialSnapshot)
+        XCTAssertEqual(galaxy.loadStatus, .loading)
+        XCTAssertEqual(adapter.projectCentroids[a.project], origin)
+        XCTAssertEqual(adapter.nebulaClusters.first?.count, 1)
+        XCTAssertEqual(adapter.galaxySnapshots.first?.nodeCount, 1)
+
+        galaxy.applyLoadChunk(nodes: [(2, b)], generation: generation)
+        registry.unifiedSimulation.setPosition(b.id, to: next)
+        adapter.tick(dt: 1 / 60) // Frame 2: render data still publishes immediately.
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id])
+        XCTAssertEqual(adapter.positionArray, [origin, next])
+        XCTAssertTrue(registry.galaxyForNode(a.id) === galaxy)
+        XCTAssertTrue(registry.galaxyForNode(b.id) === galaxy)
+        for _ in 3...29 { adapter.tick(dt: 1 / 60) }
+        XCTAssertEqual(adapter.projectCentroids[a.project], origin)
+        XCTAssertEqual(adapter.nebulaClusters.first?.count, 1)
+        XCTAssertEqual(adapter.galaxySnapshots.first?.nodeCount, 1)
+
+        adapter.tick(dt: 1 / 60) // Frame 30: all derived aggregates catch up.
+        XCTAssertEqual(adapter.projectCentroids[a.project], SIMD3<Float>(30, 0, 0))
+        let cluster = try XCTUnwrap(adapter.nebulaClusters.first)
+        XCTAssertEqual(cluster.count, 2)
+        XCTAssertEqual(cluster.centroid, SIMD3<Float>(30, 0, 0))
+        XCTAssertEqual(cluster.radius, 70, accuracy: 0.0001)
+        XCTAssertEqual(adapter.galaxySnapshots.first?.nodeCount, 2)
+        XCTAssertEqual(adapter.positionArray, [origin, next])
+    }
+
+    func testStreamingTerminalStatesAndCompletedEditsRefreshCentroidsImmediately() async throws {
+        for terminal in [GalaxyLoadStatus.complete, .failed, .cancelled] {
+            let (lattice, registry, galaxy, generation, adapter) = try await streamingFixture()
+            defer { lattice.close() }
+            let a = node(), b = node(), c = node()
+            galaxy.applyLoadChunk(nodes: [(1, a)], generation: generation)
+            registry.unifiedSimulation.setPosition(a.id, to: .zero)
+            adapter.tick(dt: 1 / 60)
+            galaxy.applyLoadChunk(nodes: [(2, b)], generation: generation)
+            registry.unifiedSimulation.setPosition(b.id, to: SIMD3<Float>(60, 0, 0))
+            adapter.tick(dt: 1 / 60)
+            XCTAssertEqual(adapter.projectCentroids[a.project], .zero)
+            XCTAssertEqual(adapter.galaxySnapshots.first?.nodeCount, 1)
+
+            // Match setLoadStatus's existing terminal-state/topology publication.
+            galaxy.loadStatus = terminal
+            galaxy.isLoaded = terminal == .complete
+            galaxy.renderStore.bumpTopology()
+            adapter.tick(dt: 1 / 60) // Frame 3, not the periodic frame 30.
+            XCTAssertEqual(adapter.projectCentroids[a.project], SIMD3<Float>(30, 0, 0))
+            XCTAssertEqual(adapter.nebulaClusters.first?.count, 2)
+            XCTAssertEqual(adapter.galaxySnapshots.first?.nodeCount, 2)
+            if terminal == .complete {
+                galaxy.applyLoadChunk(nodes: [(3, c)], generation: generation)
+                registry.unifiedSimulation.setPosition(c.id, to: SIMD3<Float>(120, 0, 0))
+                adapter.tick(dt: 1 / 60) // An ordinary live edit also refreshes now.
+                XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id, c.id])
+                XCTAssertEqual(adapter.projectCentroids[a.project], SIMD3<Float>(60, 0, 0))
+                XCTAssertEqual(adapter.nebulaClusters.first?.count, 3)
+                XCTAssertEqual(adapter.galaxySnapshots.first?.nodeCount, 3)
+            }
+        }
+    }
+
+    private func streamingFixture() async throws
+        -> (Lattice, GalaxyRegistry, Galaxy, UInt64, GalaxyRegistryAdapter) {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        let registry = GalaxyRegistry()
+        registry.unifiedSimulation.isActive = false
+        let galaxy = Galaxy(id: "personal", displayName: "Personal", lattice: lattice.sendableReference)
+        registry.register(galaxy)
+        let changes = await galaxy.loadChanges
+        let generation = changes.withLock { $0.begin() }
+        galaxy.loadStatus = .loading
+        return (lattice, registry, galaxy, generation, GalaxyRegistryAdapter(registry: registry))
+    }
+
     private func node(id: UUID = UUID(), label: String = "Original", topic: String = "Topic") -> NodeData {
         NodeData(id: id, project: "Project", topic: topic, label: label, content: label,
                  createdAt: .distantPast, lastAccessedAt: .distantPast, importance: 3)
