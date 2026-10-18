@@ -60,8 +60,10 @@ their creation time and inherited-history boundary are proven.
 
 One queue and provider lock serialize automatic learners on each Codex home.
 The learner has no project shell, browser, other integrations, or recursive hook
-access. Its memory proxy enforces approved tools, private new memories, session
-provenance, bounded calls/writes, and exact write receipts. Failure does not
+access. Its memory proxy enforces approved tools, each new memory's explicit privacy
+choice, session provenance, bounded calls/writes, and exact write receipts. Ordinary
+work and project memories follow project sync and sharing settings; explicitly private
+memories stay on this device. Failure does not
 advance saved progress. Interactive memory calls and another laptop remain independent.
 
 New plugin runs first read memory and propose a complete bounded plan. The

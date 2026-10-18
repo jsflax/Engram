@@ -38,7 +38,9 @@ so automatic learning consumes Codex usage. It sends a bounded excerpt of visibl
 user/assistant messages to that model, then calls your local Engram MCP to recall
 and store useful findings. It excludes hidden reasoning, tool output, and inherited
 fork history. Common credential patterns are redacted; this is not a general
-secret detector. New memories are private and include their source session ID.
+secret detector. New memories include their source session ID. Ordinary work and
+project memories follow the project's sync and sharing settings; explicitly private
+memories stay on this device.
 The current learner supports a local **stdio** memory MCP, not a remote HTTP MCP.
 Subagent compaction events use separate child cursors even when Codex supplies
 the parent session ID; the mapping requires explicit child metadata and a known

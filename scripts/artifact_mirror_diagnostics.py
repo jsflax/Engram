@@ -53,7 +53,8 @@ def process(pid, root):
     if len(fields) != 8 or fields[0] != str(pid) or fields[1] != str(os.getuid()):
         return {'status': 'identity_mismatch', 'pid': pid}
     argv = fields[7]
-    suffix = ' -B -m http.server 8765 --bind 127.0.0.1 --directory ' + str(root / 'mirror')
+    suffix = (' -B ' + str(root / 'repo/scripts/artifact_mirror_server.py')
+              + ' --directory ' + str(root / 'mirror'))
     interpreter = argv[:-len(suffix)] if argv.endswith(suffix) else ''
     matched = bool(interpreter and ' ' not in interpreter
                    and re.fullmatch(r'(?:Python|python3(?:\.\d+)?)', Path(interpreter).name))

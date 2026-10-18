@@ -102,7 +102,7 @@ jobs:
           artifact_url=https://github.com/sparkle-project/Sparkle/releases/download/2.8.1/Sparkle-for-Swift-Package-Manager.zip
           curl -sSfL --connect-timeout 20 --max-time 180 \
             -o "$VALIDATION_ROOT/mirror/Sparkle-for-Swift-Package-Manager.zip" "$artifact_url"
-          nohup python3 -B -m http.server 8765 --bind 127.0.0.1 --directory "$VALIDATION_ROOT/mirror" \
+          nohup python3 -B "$VALIDATION_ROOT/repo/scripts/artifact_mirror_server.py" --directory "$VALIDATION_ROOT/mirror" \
             > "$VALIDATION_ROOT/private/mirror.log" 2>&1 &
           echo "$!" > "$VALIDATION_ROOT/private/mirror.pid"
           for attempt in 1 2 3 4 5; do

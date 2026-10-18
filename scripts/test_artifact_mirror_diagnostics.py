@@ -1,17 +1,26 @@
-"""Mirror diagnostics controls; no server, network, native build or real signals."""
+"""Mirror controls; loopback fixture HTTP only, no native build or real signals."""
+from contextlib import redirect_stderr
+from functools import partial
+from http.client import HTTPConnection
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import signal
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('mirror_diagnostics', Path(__file__).with_name('artifact_mirror_diagnostics.py'))
 M = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(M)
+server_spec = importlib.util.spec_from_file_location('mirror_server', Path(__file__).with_name('artifact_mirror_server.py'))
+S = importlib.util.module_from_spec(server_spec)
+server_spec.loader.exec_module(S)
 
 
 class MirrorDiagnosticsTests(unittest.TestCase):
@@ -24,7 +33,8 @@ class MirrorDiagnosticsTests(unittest.TestCase):
         for name in ('private', 'evidence', 'mirror'):
             (self.root / name).mkdir()
         (self.root / 'private/mirror.pid').write_text('12345\n')
-        self.command = '/opt/python/bin/python3.12 -B -m http.server 8765 --bind 127.0.0.1 --directory ' + str(self.root / 'mirror')
+        self.command = ('/opt/python/bin/python3.12 -B ' + str(self.root / 'repo/scripts/artifact_mirror_server.py')
+                        + ' --directory ' + str(self.root / 'mirror'))
         self.row = {'status': 'owned', 'pid': 12345, 'started': 'Sun Oct 18 14:55:31 2026',
                     'command': self.command, 'command_sha256': 'test-command-hash'}
         self.absent = {'status': 'absent', 'pid': 12345}
@@ -57,12 +67,55 @@ class MirrorDiagnosticsTests(unittest.TestCase):
         for row, expected in ((good, 'owned'), (good.replace('/mirror\n', '/other\n'), 'identity_mismatch'),
                               (good.replace('12345 ', '12346 ', 1), 'identity_mismatch'),
                               (good.replace(f' {os.getuid()} ', ' 999999 ', 1), 'identity_mismatch'),
+                              (good.replace('/repo/scripts/artifact_mirror_server.py', '/other/artifact_mirror_server.py'), 'identity_mismatch'),
+                              (good.replace(self.command, '/opt/python/bin/python3.12 -B -m http.server 8765 --bind 127.0.0.1 --directory ' + str(self.root / 'mirror')), 'identity_mismatch'),
                               (good.replace(self.command, 'unrelated --token=secret'), 'identity_mismatch')):
             with self.subTest(expected=expected), patch.object(M, 'command', return_value={'status': 'complete', 'exit_code': 0, 'stdout': row}):
                 receipt = M.process(12345, self.root)
                 self.assertEqual(receipt['status'], expected)
                 if expected != 'owned': self.assertNotIn('command', receipt)
                 self.assertNotIn('secret', json.dumps(receipt))
+
+    def test_numeric_bind_serves_identical_artifact_when_reverse_dns_fails(self):
+        data = bytes(range(256)) * 19
+        (self.root / 'mirror/Sparkle-for-Swift-Package-Manager.zip').write_bytes(data)
+        handler = partial(SimpleHTTPRequestHandler, directory=str(self.root / 'mirror'))
+        with patch('socket.getfqdn', side_effect=AssertionError('reverse DNS must not run')) as fqdn, patch('socket.gethostbyaddr', side_effect=AssertionError('reverse DNS must not run')) as reverse, redirect_stderr(io.StringIO()):
+            # The control reaches the original failure seam on this interpreter.
+            with self.assertRaisesRegex(AssertionError, 'reverse DNS must not run'):
+                HTTPServer(('127.0.0.1', 0), handler)
+            fqdn.reset_mock()
+            with S.NumericLoopbackServer(('127.0.0.1', 0), handler) as server:
+                self.assertEqual(server.server_name, '127.0.0.1')
+                self.assertEqual(server.server_port, server.server_address[1])
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                client = HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+                try:
+                    for method in ('GET', 'HEAD'):
+                        client.request(method, '/Sparkle-for-Swift-Package-Manager.zip')
+                        response = client.getresponse()
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual(response.version, 10)
+                        self.assertEqual(int(response.getheader('Content-Length')), len(data))
+                        self.assertEqual(response.read(), data if method == 'GET' else b'')
+                finally:
+                    client.close()
+                    server.shutdown()
+                    thread.join(timeout=2)
+                    self.assertFalse(thread.is_alive())
+            fqdn.assert_not_called()
+            reverse.assert_not_called()
+
+    def test_server_cli_keeps_fixed_loopback_port_and_standard_handler(self):
+        with patch.object(S, 'NumericLoopbackServer') as server:
+            S.main(['--directory', str(self.root / 'mirror')])
+        args, kwargs = server.call_args
+        self.assertEqual(args[0], ('127.0.0.1', 8765))
+        self.assertIs(args[1].func, SimpleHTTPRequestHandler)
+        self.assertEqual(args[1].keywords, {'directory': str(self.root / 'mirror')})
+        self.assertEqual(kwargs, {})
+        server.return_value.__enter__.return_value.serve_forever.assert_called_once_with()
 
     def test_pid_and_stderr_symlinks_refuse_without_following_or_signal(self):
         outside = self.root / 'outside'; outside.write_text('not diagnostic input')
@@ -240,6 +293,8 @@ class MirrorDiagnosticsTests(unittest.TestCase):
             self.assertIn('curl -sSf --max-time 2', text)
             self.assertIn('curl -sSf --max-time 5', block)
             self.assertIn('artifact_mirror_diagnostics.py" stop --root "$VALIDATION_ROOT"', text)
+            self.assertIn('nohup python3 -B "$VALIDATION_ROOT/repo/scripts/artifact_mirror_server.py" --directory "$VALIDATION_ROOT/mirror"', text)
+            self.assertNotIn('-m http.server', text)
             for status in (0, 28):
                 code = f'curl() {{ return {status}; }}\npython3() {{ echo "$*"; return 99; }}\n' + block
                 result = subprocess.run(['/bin/bash', '-eu', '-o', 'pipefail', '-c', code],
