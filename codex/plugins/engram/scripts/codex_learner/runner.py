@@ -110,7 +110,6 @@ def lock_file(path: Path, blocking: bool = True, *, descriptor: bool = False):
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
         f.close()
         raise ValueError("lock_not_owned_regular")
-    os.fchmod(f.fileno(), 0o600)
     acquired = False
     token = None
     try:
@@ -120,6 +119,8 @@ def lock_file(path: Path, blocking: bool = True, *, descriptor: bool = False):
         except BlockingIOError:
             pass
         if acquired:
+            # Losing contenders must not change metadata of another owner's lock.
+            os.fchmod(f.fileno(), 0o600)
             token = _HELD_LOCKS.set((*_HELD_LOCKS.get(), (str(path.absolute()), f.fileno(),
                                                         info.st_dev, info.st_ino)))
         yield f.fileno() if acquired and descriptor else acquired

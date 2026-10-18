@@ -183,9 +183,17 @@ def _runtime(path):
         os.close(fd)
 
 
-def _effective_transport(paths, transport):
+# The native executable is already an authenticated absolute path. Only its
+# implicit tool-search PATH uses these fixed system directories; explicit env
+# or env_vars PATH remains user-controlled and freshly checked.
+DEFAULT_NATIVE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def _effective_transport(paths, transport, *, stable_path=False):
     _require(type(transport) is dict, "invalid_transport")
     value = copy.deepcopy(transport)
+    if stable_path and "PATH" not in value.get("env", {}) and "PATH" not in value.get("env_vars", []):
+        value.setdefault("env", {})["PATH"] = DEFAULT_NATIVE_PATH
     if value.get("cwd") is None:
         workspace = paths.run_dir / "workspace"
         durable._directory(workspace)
@@ -195,21 +203,21 @@ def _effective_transport(paths, transport):
 
 @_safe
 def effective_transport(paths, transport):
-    """Bind omitted cwd before the probe; caller creates the private workspace."""
+    """Bind omitted cwd and implicit PATH before a new normal execution probe."""
     _require(type(paths) is ContextPaths, "invalid_context")
     paths.check()
-    value = _effective_transport(paths, transport)
+    value = _effective_transport(paths, transport, stable_path=True)
     stdio_bridge._transport(value)
     return value
 
 
-def _backend(paths):
+def _backend(paths, *, stable_path=False):
     config_raw, _ = durable._read(paths.config_path, private=False, maximum=memory_config.MAX_CONFIG)
     _require(not paths.config_path.stat().st_mode & 0o022, "unsafe_config")
     _, memory = memory_config.resolve(paths.config_path, paths.plugin_root, config_bytes=config_raw)
     allowed = memory_config.allowed_tools(memory, READ_TOOLS | WRITE_TOOLS)
     _require("recall" in allowed and bool(allowed & WRITE_TOOLS), "memory_policy_disallows_learning")
-    transport = _effective_transport(paths, memory_config.transport(memory))
+    transport = _effective_transport(paths, memory_config.transport(memory), stable_path=stable_path)
     argv, env, cwd = stdio_bridge._transport(transport)
     _require(len(argv) == 1, "runtime_arguments_unsupported")
     _require(cwd is None or Path(cwd).resolve(strict=True) == Path(cwd), "unbound_cwd")
@@ -227,6 +235,15 @@ def _parser_runtime():
     raw, _ = durable._read(path, private=False, maximum=1048576)
     _require(not path.stat().st_mode & 0o022, "unsafe_parser")
     return {"path": str(path), "sha256": journal.sha256(raw)}
+
+
+def _parser_matches(expected, runtime_admission=None):
+    current = _parser_runtime()
+    if runtime_admission is None:
+        return _same(current, expected)
+    from .residual_runtime_compatibility import RuntimeAdmission
+    _require(type(runtime_admission) is RuntimeAdmission, "invalid_runtime_admission")
+    return runtime_admission.verify_parser(expected, current)
 
 
 def _interval(path, identity, start, end):
@@ -256,7 +273,7 @@ def _interval(path, identity, start, end):
         os.close(fd)
 
 
-def _source(request, parser, source, expected_next, *, verified=None):
+def _source(request, parser, source, expected_next, *, verified=None, runtime_admission=None):
     journal._keys(parser, {"version", "input", "limits", "runtime", "interval_sha256"})
     journal._version(parser["version"])
     journal._keys(parser["input"], {"offset", "recent_messages", "current_turn_id"})
@@ -267,7 +284,7 @@ def _source(request, parser, source, expected_next, *, verified=None):
              and source["start_offset"] == parser["input"]["offset"]
              and source["end_offset"] - source["start_offset"] <= scan, "invalid_parser_limits")
     _require(source["identity"] == request["identity"]
-             and _same(_parser_runtime(), parser["runtime"]), "parser_or_source_changed")
+             and _parser_matches(parser["runtime"], runtime_admission), "parser_or_source_changed")
     path, start, end = request["transcript_path"], source["start_offset"], source["end_offset"]
     expected_hash = parser["interval_sha256"]
     _require(_interval(path, source["identity"], start, end) == expected_hash, "source_bytes_changed")
@@ -284,7 +301,7 @@ def _source(request, parser, source, expected_next, *, verified=None):
                  and journal.sha256(excerpt.text.encode("utf-8")) == source["excerpt_sha256"]
                  and _same(_next_parser(excerpt), expected_next), "excerpt_or_parser_changed")
     _require(_interval(path, source["identity"], start, end) == expected_hash
-             and _same(_parser_runtime(), parser["runtime"]), "source_or_parser_changed")
+             and _parser_matches(parser["runtime"], runtime_admission), "source_or_parser_changed")
     if verified is not None:
         verified.clear()
         verified["key"] = key
@@ -300,19 +317,22 @@ def _decode_inputs(paths, manifest):
     return decoded
 
 
-def _source_backend_inputs(paths, manifest, decoded, *, source_cache=None):
+def _source_backend_inputs(paths, manifest, decoded, *, source_cache=None, runtime_admission=None):
     """Read-only input checks; no held-fence or current target-pair authority."""
     request = decoded["request"]
     _require(_same(admission.check(paths.root, request), request["admission"]), "binding_changed")
-    configuration, route = _backend(paths)
+    # Only an already-sealed explicit default selects stable PATH validation.
+    # Older seals without it retain exact ambient-PATH semantics unchanged.
+    stable_path = decoded["backend_route"]["transport"].get("env", {}).get("PATH") == DEFAULT_NATIVE_PATH
+    configuration, route = _backend(paths, stable_path=stable_path)
     _require(_same(configuration, decoded["backend_config"])
              and _same(route, decoded["backend_route"])
              and route["runtime"]["sha256"] == manifest["backend"]["runtime_sha256"], "backend_changed")
     arguments = (request, decoded["parser_state"], manifest["source"], decoded["next_parser_state"])
-    if source_cache is None:
+    if source_cache is None and runtime_admission is None:
         _source(*arguments)
     else:
-        _source(*arguments, verified=source_cache)
+        _source(*arguments, verified=source_cache, runtime_admission=runtime_admission)
     _require(_same(admission.check(paths.root, request), request["admission"]), "binding_changed")
     return True
 
@@ -437,9 +457,9 @@ def seal_execution(paths, *, host, request, state, excerpt, expected_next_parser
               "limits": {"max_chars": max_chars, "max_scan_bytes": max_scan_bytes}, "runtime": _parser_runtime(),
               "interval_sha256": _interval(request["transcript_path"], source["identity"],
                                           source["start_offset"], source["end_offset"])}
-    configuration, route = _backend(paths)
+    configuration, route = _backend(paths, stable_path=True)
     _require(_same(configuration["memory"], memory)
-             and _same(route["transport"], _effective_transport(paths, transport)), "backend_changed")
+             and _same(route["transport"], _effective_transport(paths, transport, stable_path=True)), "backend_changed")
     inputs = {"request": journal.encode(request), "admission": admission_raw, "cursor": state_raw,
               "parser_state": journal.encode(parser), "next_parser_state": journal.encode(expected_next_parser),
               "backend_route": journal.encode(route), "backend_config": journal.encode(configuration)}

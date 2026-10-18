@@ -64,6 +64,7 @@ RUNTIME_SCRIPTS = (
     "codex_learner/legacy_reconciliation.py", "codex_learner/legacy_expired_update.py",
     "codex_learner/legacy_completed_remember.py", "learner_reconcile.py",
     "codex_learner/residual_context.py", "codex_learner/residual_driver.py",
+    "codex_learner/residual_runtime_compatibility.py",
     "codex_learner/residual_publication.py", "codex_learner/native_executor.py", "learner_residual.py",
 )
 VERSION = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:alpha|beta|rc)\.[1-9]\d*)?")

@@ -80,7 +80,6 @@ def event_log(root: Path, event: str, **fields) -> None:
 def lock_file(path: Path, blocking: bool = True):
     private_dir(path.parent)
     f = path.open("a+")
-    os.chmod(path, 0o600)
     acquired = False
     try:
         try:
@@ -88,6 +87,9 @@ def lock_file(path: Path, blocking: bool = True):
             acquired = True
         except BlockingIOError:
             pass
+        if acquired:
+            # Losing contenders must not change metadata of another owner's lock.
+            os.fchmod(f.fileno(), 0o600)
         yield acquired
     finally:
         if acquired:

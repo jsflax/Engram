@@ -368,8 +368,9 @@ def _held(paths,request,state_raw,record_before,plan,*,processing,execution):
 
 
 class ResidualContext:
-    def __init__(self,paths,manifest,digest,value,context_sha):
+    def __init__(self,paths,manifest,digest,value,context_sha,*,runtime_admission=None):
         self.paths,self.manifest,self.manifest_sha256=paths,copy.deepcopy(manifest),digest
+        self.runtime_admission=runtime_admission
         self.value,self.context_sha256=copy.deepcopy(value),context_sha
         self.plan=J._json(unseal(value['review']))
         self.review_sha256=value['review_sha256']
@@ -383,7 +384,14 @@ class ResidualContext:
         self.paths.check()
         J._keys(self.value,{'version','kind','paths','manifest_sha256','review_sha256','review','reports','history','runtime'})
         require(type(self.value['version']) is int and self.value['version']==1 and self.value['kind']==KIND
-                and self.value['paths']==self.paths.check() and same(self.value['runtime'],_runtime()),'context_changed')
+                and self.value['paths']==self.paths.check(),'context_changed')
+        if self.runtime_admission is None:
+            require(same(self.value['runtime'],_runtime()),'context_changed')
+        else:
+            from .residual_runtime_compatibility import RuntimeAdmission
+            require(type(self.runtime_admission) is RuntimeAdmission,'invalid_runtime_admission')
+            require(self.runtime_admission.old_root == self.paths.plugin_root,'runtime_root_changed')
+            self.runtime_admission.verify_runtime(self.value['runtime'],_runtime())
         raw,_=J.durable._read(self.paths.run_dir/'residual-context.json',maximum=MAX)
         require(J.sha256(raw)==self.context_sha256 and raw==J.encode(self.value)
                 and J.read_manifest(self.paths.run_dir)[1]==self.manifest_sha256
@@ -397,7 +405,8 @@ class ResidualContext:
     def validate_frozen_inputs(self,phase='frozen',*,decoded=None):
         decoded=self._pinned() if decoded is None else decoded
         _pending_authority(self.paths,J._unseal(self.manifest['inputs']['request']))
-        C._source_backend_inputs(self.paths.base(),self.manifest,decoded,source_cache=self._source_cache)
+        C._source_backend_inputs(self.paths.base(),self.manifest,decoded,source_cache=self._source_cache,
+                                 runtime_admission=self.runtime_admission)
         historical(self.paths,self.plan,self.value['reports'],self.value['history'],verified=self._history_cache)
         readback(self.paths,report(self.value['reports'],'current-chat-readback.private.json'))
         parser=decoded['parser_state']
@@ -463,11 +472,15 @@ def seal_context(paths,*,reviewed_raw,reviewed_sha256,evidence_directory,host,sc
     return context
 
 
-def load_context(paths,*,manifest_sha256,context_sha256):
+def load_context(paths,*,manifest_sha256,context_sha256,runtime_profile=None):
     require(type(paths) is ResidualPaths,'paths_required');paths.check()
     manifest,digest=J.read_manifest(paths.run_dir);require(digest==manifest_sha256,'manifest_changed')
     raw,_=J.durable._read(paths.run_dir/'residual-context.json',maximum=MAX)
     require(J.sha256(raw)==context_sha256,'context_changed')
-    context=ResidualContext(paths,manifest,digest,J._json(raw),context_sha256)
+    admission=None
+    if runtime_profile is not None:
+        from .residual_runtime_compatibility import admit
+        admission=admit(runtime_profile,paths.plugin_root)
+    context=ResidualContext(paths,manifest,digest,J._json(raw),context_sha256,runtime_admission=admission)
     context._pinned()
     return context

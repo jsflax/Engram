@@ -48,6 +48,7 @@ for line in sys.stdin:
                 mode=(root/'mode').read_text() if (root/'mode').exists() else 'applied'
                 if mode=='die_before': os.kill(os.getpid(),signal.SIGKILL)
                 receipt={'version':1,'operationID':args['operationID'],'scope':scope,'payloadDigest':'d'*64,'mutation':'remember','outcome':'unchanged' if mode=='unchanged' else 'applied','memoryIDs':['11111111-2222-4333-8444-555555555555'],'edgeIDs':[],'committedAt':800000000.25}
+                if (root/'edges.json').exists(): receipt['edgeIDs']=json.loads((root/'edges.json').read_text())
                 p.write_text(json.dumps(receipt))
                 if mode=='die_after': os.kill(os.getpid(),signal.SIGKILL)
             payload={'version':1,'kind':'committed','receipt':receipt}
@@ -126,12 +127,22 @@ class ResidualTests(unittest.TestCase):
         self.assertFalse((f.run/'provider-observation.json').exists())
     def test_lost_ack_commit_status_is_retained_never_replayed(self):
         f=self.f;(f.root/'mode').write_text('die_after')
+        edges=['abcdef01-2222-4333-8444-55555555555'+str(i) for i in range(3)]
+        (f.root/'edges.json').write_text(json.dumps(edges))
         result=f.execute();self.assertEqual(result['memory_ids'],[])
         f.revoke();result=f.reconcile();self.assertEqual(result['memory_ids'],[MEMORY])
+        operation=f.driver._intent('R1')[0]
+        self.assertEqual(J.read_evidence(f.run,operation)[-1]['evidence']['receipt']['edgeIDs'],edges)
+        self.assertEqual(result['applied'],['R1'])
+        checkpoint=J._json((f.run/'residual-reconciliation-000.json').read_bytes())
+        self.assertEqual([label for label,status in checkpoint['statuses'].items()
+                          if status['kind']=='absent'],['R2','R3','R4','R5'])
         old=f.driver._intent('R1')[1];f.continue_()
         with self.assertRaisesRegex(ValueError,'dispatch_not_authorized'):f.execute('R1')
         self.assertEqual(old,f.driver._intent('R1')[1])
         self.assertEqual(f.driver.summary()['committed'],['R1'])
+        calls=[json.loads(line)['tool'] for line in (f.root/'calls.jsonl').read_text().splitlines()]
+        self.assertEqual(calls.count('operation_apply'),1)
     def test_absent_allows_explicit_new_generation_same_identity_bytes(self):
         f=self.f;(f.root/'mode').write_text('die_before');f.execute()
         operation,raw,_=f.driver._intent('R1')
@@ -219,10 +230,35 @@ class ResidualTests(unittest.TestCase):
         f=self.f;request=f.driver._intent('R1')[2]
         valid={'version':1,'operationID':request['operationID'],'scope':f.scope,'payloadDigest':'d'*64,
                'mutation':'remember','outcome':'applied','memoryIDs':[MEMORY],'edgeIDs':[],'committedAt':1}
-        for ids,edges in (([],[]),([MEMORY],[STORE]),([MEMORY,STORE],[])):
+        for ids,edges in (([],[]),([MEMORY,STORE],[])):
             receipt={**valid,'memoryIDs':ids,'edgeIDs':edges}
             with self.assertRaisesRegex(ValueError,'invalid_remember_effect_ids'):
                 D._response({'kind':'committed','receipt':receipt},request)
+
+    def test_applied_remember_edges_keep_common_receipt_guards(self):
+        f=self.f;request=f.driver._intent('R1')[2]
+        edge='abcdef01-2222-4333-8444-555555555555'
+        valid={'version':1,'operationID':request['operationID'],'scope':f.scope,'payloadDigest':'d'*64,
+               'mutation':'remember','outcome':'applied','memoryIDs':[MEMORY],'edgeIDs':[edge],'committedAt':1}
+        value={'kind':'committed','receipt':valid}
+        self.assertIs(D._response(value,request),value)
+        for edit in ('malformed_edge','duplicate_edge','too_many_edges','wrong_scope',
+                     'wrong_operation','bad_digest','wrong_mutation','unchanged_edges'):
+            with self.subTest(edit=edit):
+                receipt=copy.deepcopy(valid)
+                if edit=='malformed_edge':receipt['edgeIDs']=['not-a-uuid']
+                elif edit=='duplicate_edge':receipt['edgeIDs']=[edge,edge.upper()]
+                elif edit=='too_many_edges':receipt['edgeIDs']=[str(__import__('uuid').UUID(int=i)) for i in range(128)]
+                elif edit=='wrong_scope':receipt['scope']['storeID']=MEMORY
+                elif edit=='wrong_operation':receipt['operationID']=MEMORY
+                elif edit=='bad_digest':receipt['payloadDigest']='invalid'
+                elif edit=='wrong_mutation':receipt['mutation']='update'
+                else:receipt['outcome']='unchanged'
+                with self.assertRaises(ValueError):D._response({'kind':'committed','receipt':receipt},request)
+        for edit in ('edgeIDs','payloadDigest'):
+            receipt=copy.deepcopy(valid);receipt[edit]=[STORE] if edit=='edgeIDs' else 'e'*64
+            with self.subTest(retained_change=edit),self.assertRaisesRegex(ValueError,'native_receipt_changed|native_payload_digest_conflict'):
+                J._response({'kind':'committed','receipt':receipt},request,valid)
 
     def test_real_inherited_child_fence_prevents_premature_revocation(self):
         f=self.f;fd,=f.writer.pass_fds()

@@ -247,6 +247,19 @@ def _identity(info):
             "nlink": info.st_nlink}
 
 
+
+def _lock_identity(info):
+    """Coordination files may be chmodded to the same mode by old contenders.
+
+    Ignore only ctime: inode, ownership, permissions, links and content metadata
+    must still match both the held descriptor and its original path. Immutable
+    journal/source reads continue to use the full identity above.
+    """
+    identity = _identity(info)
+    del identity["ctime_ns"]
+    return identity
+
+
 def _read(path, *, absent=False, private=True, maximum=admission.MAX_BYTES):
     """Descriptor-bound, bounded read with exact ownership and replacement checks."""
     path = Path(path)
@@ -327,7 +340,7 @@ class Locks:
                 except BaseException:
                     os.close(fd)
                     raise
-                self.held.append((path, fd, _identity(info)))
+                self.held.append((path, fd, _lock_identity(info)))
                 self.verify()
             return self
         except BaseException:
@@ -336,7 +349,7 @@ class Locks:
 
     def verify(self):
         for path, fd, expected in self.held:
-            require(_identity(path.lstat()) == _identity(os.fstat(fd)) == expected, "lock_changed")
+            require(_lock_identity(path.lstat()) == _lock_identity(os.fstat(fd)) == expected, "lock_changed")
 
     def __exit__(self, *_):
         while self.held:

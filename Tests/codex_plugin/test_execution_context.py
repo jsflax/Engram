@@ -159,6 +159,99 @@ class ExecutionContextTests(unittest.TestCase):
         loaded = C.load_execution(self.paths, manifest_sha256=digest, writer_fence=self.fence)
         self.assertIs(self.validate(loaded), True)
 
+    def test_default_path_is_identical_across_ephemeral_process_environments(self):
+        first = str(self.base / "codex-exec-first") + ":/usr/bin:/bin"
+        second = str(self.base / "codex-exec-second") + ":/usr/bin:/bin"
+        with mock.patch.dict(os.environ, {"PATH": first}):
+            prepared = C.effective_transport(self.paths, self.transport)
+            self.assertEqual(C.stdio_bridge._transport(prepared)[1]["PATH"], C.DEFAULT_NATIVE_PATH)
+            context = self.seal(transport=prepared)
+            manifest = self.manifest()
+            before = (self.run_dir / "execution-manifest.json").read_bytes()
+            initial = C.stdio_bridge._fenced_transport(context.transport, self.fence)
+            self.assertEqual(initial[0], [str(self.runtime)])
+            self.assertEqual(initial[1]["PATH"], C.DEFAULT_NATIVE_PATH)
+        self.fence.close()
+        with mock.patch.dict(os.environ, {"PATH": second}):
+            # Reopen the real durable manifest and original fence generation;
+            # no cached context or provider/native fake grants validation.
+            self.fence = F.acquire_shared(self.run_dir, self.binding)
+            self.addCleanup(self.fence.close)
+            self.assertIs(C.validate_recovery_inputs(self.paths,
+                manifest_sha256=context.manifest_sha256), True)
+            resumed = C.load_execution(self.paths, manifest_sha256=context.manifest_sha256,
+                                       writer_fence=self.fence)
+            for phase in C.PHASES:
+                self.assertIs(resumed.validate_inputs(manifest, phase), True)
+            actual = C.stdio_bridge._fenced_transport(resumed.transport, self.fence)
+            self.assertEqual(actual[0], initial[0])
+            self.assertEqual(actual[2], initial[2])
+            descriptor = C.stdio_bridge.FENCE_DESCRIPTOR_ENV
+            self.assertEqual({k: v for k, v in actual[1].items() if k != descriptor},
+                             {k: v for k, v in initial[1].items() if k != descriptor})
+            # Descriptor numbers may legitimately differ after reopening.
+            self.assertEqual(actual[1][descriptor], str(actual[3][0]))
+            self.assertEqual(resumed.manifest_sha256, context.manifest_sha256)
+            self.assertEqual((self.run_dir / "execution-manifest.json").read_bytes(), before)
+            self.assertEqual(json.loads(self.state_path.read_bytes())["offset"], self.frontier)
+
+    def test_explicit_path_is_preserved_and_config_changes_still_refuse(self):
+        explicit = str(self.base / "user-tools") + ":/usr/bin"
+        self.config_path.write_text(self.config_text + "[mcp_servers.memory.env]\nPATH = "
+                                    + json.dumps(explicit) + "\n")
+        self.memory = C.memory_config.resolve(self.config_path, self.plugin)[1]
+        self.transport = C.memory_config.transport(self.memory)
+        with mock.patch.dict(os.environ, {"PATH": "/ambient/first"}):
+            context = self.seal()
+        with mock.patch.dict(os.environ, {"PATH": "/ambient/second"}):
+            resumed = C.load_execution(self.paths, manifest_sha256=context.manifest_sha256,
+                                       writer_fence=self.fence)
+            self.assertEqual(C.stdio_bridge._fenced_transport(resumed.transport, self.fence)[1]["PATH"], explicit)
+            self.config_path.write_text(self.config_path.read_text().replace(explicit, explicit + ":/changed"))
+            with self.assertRaisesRegex(C.ContextError, "backend_changed"):
+                self.validate(resumed)
+
+    def test_requested_inherited_path_remains_live_and_exact(self):
+        self.config_path.write_text(self.config_text + 'env_vars = ["PATH"]\n')
+        self.memory = C.memory_config.resolve(self.config_path, self.plugin)[1]
+        self.transport = C.memory_config.transport(self.memory)
+        with mock.patch.dict(os.environ, {"PATH": "/requested/first:/usr/bin"}):
+            context = self.seal()
+            self.assertNotIn("PATH", context.transport.get("env", {}))
+            self.assertIs(self.validate(context), True)
+        with mock.patch.dict(os.environ, {"PATH": "/requested/second:/usr/bin"}):
+            with self.assertRaisesRegex(C.ContextError, "backend_changed"):
+                C.load_execution(self.paths, manifest_sha256=context.manifest_sha256,
+                                 writer_fence=self.fence)
+
+    def test_existing_ambient_path_seal_is_never_silently_normalized(self):
+        original = C._effective_transport
+        # Reproduce the pre-fix wire representation: omitted PATH remains
+        # implicit. Every other sealing/admission/fsync check is real.
+        def old_transport(paths, transport, **_):
+            return original(paths, transport, stable_path=False)
+        with mock.patch.dict(os.environ, {"PATH": "/original/ephemeral:/usr/bin"}):
+            with mock.patch.object(C, "_effective_transport", side_effect=old_transport):
+                context = self.seal()
+            before = (self.run_dir / "execution-manifest.json").read_bytes()
+            self.assertNotIn("PATH", context.transport.get("env", {}))
+            self.assertIs(self.validate(context), True)
+            resumed = C.load_execution(self.paths, manifest_sha256=context.manifest_sha256,
+                                       writer_fence=self.fence)
+            self.assertEqual(C.stdio_bridge._fenced_transport(resumed.transport, self.fence)[1]["PATH"],
+                             "/original/ephemeral:/usr/bin")
+        with mock.patch.dict(os.environ, {"PATH": "/new/ephemeral:/usr/bin"}):
+            with self.assertRaisesRegex(C.ContextError, "backend_changed"):
+                self.validate(context)
+        self.assertEqual((self.run_dir / "execution-manifest.json").read_bytes(), before)
+
+    def test_stable_default_path_does_not_relax_other_environment_fields(self):
+        context = self.seal()
+        for field in ("TMPDIR", "USER", "LOGNAME", "LANG", "LC_ALL", "SHELL"):
+            with self.subTest(field=field), mock.patch.dict(os.environ, {field: "changed-fixture-value"}):
+                with self.assertRaisesRegex(C.ContextError, "backend_changed"):
+                    self.validate(context)
+
     def test_later_append_pending_and_last_event_are_allowed_and_preserved(self):
         context = self.seal()
         self.append("Later private fact remains pending for the next Stop.")
