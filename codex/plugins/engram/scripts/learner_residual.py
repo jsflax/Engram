@@ -116,7 +116,8 @@ def _load(args):
     require(args.run_id and args.manifest_sha256 and args.context_sha256, "missing_execution_pins")
     J._digest(args.manifest_sha256); J._digest(args.context_sha256)
     return _selected(R.load_context(_paths(args, args.run_id),
-        manifest_sha256=args.manifest_sha256, context_sha256=args.context_sha256), args)
+        manifest_sha256=args.manifest_sha256, context_sha256=args.context_sha256,
+        runtime_profile=getattr(args, "runtime_compatibility", None)), args)
 
 
 def _prepare(args, locks):
@@ -177,7 +178,8 @@ def _recover(args, locks, *, continuation):
         args.run_id, args.manifest_sha256 = ref["run_id"], ref["manifest_sha256"]
         args.context_sha256, args.review_sha256 = ref["context_sha256"], ref["review_sha256"]
         receipt = P.recover_locked(_paths(args, ref["run_id"]), session_id=args.session_id,
-            verify_locks=locks.verify, allow_continuation=continuation)
+            verify_locks=locks.verify, allow_continuation=continuation,
+            runtime_profile=getattr(args, "runtime_compatibility", None))
         return receipt or {"status": "already_reconciled", "run_id": ref["run_id"],
                            "provider_invoked": False, "successful_coverage": False}
 
@@ -237,8 +239,11 @@ def main(argv=None):
     parser.add_argument("--evidence-directory", type=Path)
     parser.add_argument("--manifest-sha256")
     parser.add_argument("--context-sha256")
+    parser.add_argument("--runtime-compatibility", choices=("engram-0.15.1-validation-budget-v1",))
     args = parser.parse_args(argv)
     try:
+        require(args.runtime_compatibility is None or args.command in ("recover", "continue-absent"),
+                "runtime_compatibility_recovery_only")
         _base_paths(args)
         with Coordination(args.root).worker() as locks:
             if args.command == "prepare":

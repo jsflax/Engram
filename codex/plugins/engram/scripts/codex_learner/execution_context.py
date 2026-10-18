@@ -229,6 +229,15 @@ def _parser_runtime():
     return {"path": str(path), "sha256": journal.sha256(raw)}
 
 
+def _parser_matches(expected, runtime_admission=None):
+    current = _parser_runtime()
+    if runtime_admission is None:
+        return _same(current, expected)
+    from .residual_runtime_compatibility import RuntimeAdmission
+    _require(type(runtime_admission) is RuntimeAdmission, "invalid_runtime_admission")
+    return runtime_admission.verify_parser(expected, current)
+
+
 def _interval(path, identity, start, end):
     _require(type(start) is int and type(end) is int and 0 <= start < end
              and end - start <= MAX_SCAN, "invalid_source_interval")
@@ -256,7 +265,7 @@ def _interval(path, identity, start, end):
         os.close(fd)
 
 
-def _source(request, parser, source, expected_next, *, verified=None):
+def _source(request, parser, source, expected_next, *, verified=None, runtime_admission=None):
     journal._keys(parser, {"version", "input", "limits", "runtime", "interval_sha256"})
     journal._version(parser["version"])
     journal._keys(parser["input"], {"offset", "recent_messages", "current_turn_id"})
@@ -267,7 +276,7 @@ def _source(request, parser, source, expected_next, *, verified=None):
              and source["start_offset"] == parser["input"]["offset"]
              and source["end_offset"] - source["start_offset"] <= scan, "invalid_parser_limits")
     _require(source["identity"] == request["identity"]
-             and _same(_parser_runtime(), parser["runtime"]), "parser_or_source_changed")
+             and _parser_matches(parser["runtime"], runtime_admission), "parser_or_source_changed")
     path, start, end = request["transcript_path"], source["start_offset"], source["end_offset"]
     expected_hash = parser["interval_sha256"]
     _require(_interval(path, source["identity"], start, end) == expected_hash, "source_bytes_changed")
@@ -284,7 +293,7 @@ def _source(request, parser, source, expected_next, *, verified=None):
                  and journal.sha256(excerpt.text.encode("utf-8")) == source["excerpt_sha256"]
                  and _same(_next_parser(excerpt), expected_next), "excerpt_or_parser_changed")
     _require(_interval(path, source["identity"], start, end) == expected_hash
-             and _same(_parser_runtime(), parser["runtime"]), "source_or_parser_changed")
+             and _parser_matches(parser["runtime"], runtime_admission), "source_or_parser_changed")
     if verified is not None:
         verified.clear()
         verified["key"] = key
@@ -300,7 +309,7 @@ def _decode_inputs(paths, manifest):
     return decoded
 
 
-def _source_backend_inputs(paths, manifest, decoded, *, source_cache=None):
+def _source_backend_inputs(paths, manifest, decoded, *, source_cache=None, runtime_admission=None):
     """Read-only input checks; no held-fence or current target-pair authority."""
     request = decoded["request"]
     _require(_same(admission.check(paths.root, request), request["admission"]), "binding_changed")
@@ -309,10 +318,10 @@ def _source_backend_inputs(paths, manifest, decoded, *, source_cache=None):
              and _same(route, decoded["backend_route"])
              and route["runtime"]["sha256"] == manifest["backend"]["runtime_sha256"], "backend_changed")
     arguments = (request, decoded["parser_state"], manifest["source"], decoded["next_parser_state"])
-    if source_cache is None:
+    if source_cache is None and runtime_admission is None:
         _source(*arguments)
     else:
-        _source(*arguments, verified=source_cache)
+        _source(*arguments, verified=source_cache, runtime_admission=runtime_admission)
     _require(_same(admission.check(paths.root, request), request["admission"]), "binding_changed")
     return True
 
