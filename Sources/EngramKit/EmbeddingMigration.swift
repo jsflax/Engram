@@ -74,8 +74,15 @@ public enum EmbeddingMigration {
         batchSize: Int = 64,
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws -> Report {
+        // This handle is independent of foreground MemoryTools handles.
+        // Their request cleanup cannot release this migration's keepers.
+        defer { lattice.retireAllGenerations() }
         var report = Report()
         let stored = useMarker ? storedVersion(in: lattice) : 1
+        // A marker lookup creates a read generation even when no row exists.
+        // Retire after that read, before model loading can suspend. Calling
+        // retire before the first read would not latch a new coordinator.
+        lattice.retireAllGenerations()
         guard force || !useMarker || stored < EmbeddingSpace.currentVersion else {
             report.skipped = true
             return report
@@ -90,6 +97,9 @@ public enum EmbeddingMigration {
         }
 
         let rows = lattice.objects(Memory.self).snapshot()
+        // Markerless spokes first acquire their coordinator here. The rows
+        // are materialized; no keeper may span the per-row embedding awaits.
+        lattice.retireAllGenerations()
         let total = rows.count
         log("Embedding migration: \(total) rows → space v\(EmbeddingSpace.currentVersion) (stored v\(stored)\(force ? ", forced" : ""))")
 

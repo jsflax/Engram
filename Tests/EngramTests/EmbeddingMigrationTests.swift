@@ -6,19 +6,31 @@ import Foundation
 
 private final class MigrationSweepClock: @unchecked Sendable {
     private let lock = NSLock()
+    private let lattice: Lattice
     private var started: ContinuousClock.Instant?
+    private var readGenerations: Int?
+
+    init(lattice: Lattice) { self.lattice = lattice }
 
     func record(_ message: String) {
         guard message.hasPrefix("Embedding migration: 0 rows ") else { return }
+        let outstanding = lattice.backend.localReadGenerationsOutstanding()
         lock.lock()
         defer { lock.unlock() }
         started = ContinuousClock.now
+        readGenerations = outstanding
     }
 
     func elapsed() -> Duration? {
         lock.lock()
         defer { lock.unlock() }
         return started?.duration(to: .now)
+    }
+
+    func readGenerationsAtSweepStart() -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        return readGenerations
     }
 }
 
@@ -85,19 +97,24 @@ struct EmbeddingMigrationTests {
         #expect(reader.objects(Memory.self).snapshot().isEmpty)
         #expect(reader.lastQueryError() == nil)
         #expect(reader.backend.localReadGenerationsOutstanding() > 0)
-        let clock = MigrationSweepClock()
+        let clock = MigrationSweepClock(lattice: migration)
         let report = try await EmbeddingMigration.runIfNeeded(
             on: migration, embedder: sharedEmbedder, log: clock.record)
         // runIfNeeded calls load() again. Its first sweep log is emitted after
         // that await, so model loading cannot consume this storage budget.
         let elapsed = try #require(clock.elapsed())
         #expect(elapsed < .seconds(2), "Empty migration held the writer gate for \(elapsed)")
+        #expect(clock.readGenerationsAtSweepStart() == 0,
+                "Migration must release its snapshot before any embedding awaits")
+        #expect(migration.backend.localReadGenerationsOutstanding() == 0)
         #expect(reader.backend.localReadGenerationsOutstanding() > 0)
         #expect(!report.skipped)
         #expect(report.reembedded == 0)
         #expect(report.failed == 0)
         #expect(EmbeddingMigration.storedVersion(in: migration) == EmbeddingSpace.currentVersion)
         #expect(migration.objects(Memory.self).snapshot().isEmpty)
+        #expect(migration.backend.localReadGenerationsOutstanding() == 0,
+                "Later migration reads must remain unpinned after retirement")
 
         // The first foreground vector query must still be able to lazily
         // create its index on a separate connection after the empty sweep.
@@ -124,6 +141,7 @@ struct EmbeddingMigrationTests {
         #expect(report.reembedded == 2)
         #expect(report.failed == 0)
         #expect(!report.skipped)
+        #expect(lattice.backend.localReadGenerationsOutstanding() == 0)
         #expect(EmbeddingMigration.storedVersion(in: lattice) == EmbeddingSpace.currentVersion)
 
         // Rows carry the CURRENT model's vector for their own content.
@@ -147,9 +165,12 @@ struct EmbeddingMigrationTests {
 
         #expect(report.skipped)
         #expect(report.reembedded == 0)
+        #expect(lattice.backend.localReadGenerationsOutstanding() == 0,
+                "An already-current marker must not leave an idle read generation")
         // The stale vector proves no work happened.
         let mem = lattice.objects(Memory.self).first!
         #expect(Array(mem.embedding)[0] == 1.0, "no-op run must not touch rows")
+        #expect(lattice.backend.localReadGenerationsOutstanding() == 0)
     }
 
     /// Spoke schema is [Memory, Edge, GroupProjectMap] — the markerless mode
@@ -164,6 +185,8 @@ struct EmbeddingMigrationTests {
             on: lattice, embedder: sharedEmbedder, useMarker: false)
 
         #expect(report.reembedded == 1)
+        #expect(lattice.backend.localReadGenerationsOutstanding() == 0,
+                "Markerless sweeps must retire their own snapshot too")
         // No HookState table may exist in the file.
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
@@ -188,7 +211,10 @@ struct EmbeddingMigrationTests {
         await #expect(throws: EmbeddingMigration.MigrationError.self) {
             try await EmbeddingMigration.runIfNeeded(on: lattice, embedder: broken)
         }
+        #expect(lattice.backend.localReadGenerationsOutstanding() == 0,
+                "A model-load failure must not strand the marker lookup's keeper")
         #expect(EmbeddingMigration.storedVersion(in: lattice) == 1,
                 "a failed sweep must never advance the marker")
+        #expect(lattice.backend.localReadGenerationsOutstanding() == 0)
     }
 }
