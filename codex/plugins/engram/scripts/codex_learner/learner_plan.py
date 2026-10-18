@@ -23,18 +23,20 @@ WRITE_TOOLS = frozenset({"remember", "update", "connect"})
 INPUTS = ("provider-dispatch.json", "provider-observation.json", "mcp-audit.jsonl", "proposal.json")
 
 
-def _tool_schemas():
+def _tool_schemas(privacy_policy=None):
     from .memory_proxy import learner_tool_descriptor
-    return {tool: learner_tool_descriptor({'name': tool}, 'learner')['inputSchema'] for tool in WRITE_TOOLS}
+    return {tool: learner_tool_descriptor({'name': tool}, 'learner', privacy_policy=privacy_policy)['inputSchema']
+            for tool in WRITE_TOOLS}
 
 
 _ARGUMENT_SCHEMAS = _tool_schemas()
 
 
-def _schema():
+def _schema(privacy_policy=None):
+    schemas = _ARGUMENT_SCHEMAS if privacy_policy is None else _tool_schemas(privacy_policy)
     choices = []
     for tool in sorted(WRITE_TOOLS):
-        arguments = copy.deepcopy(_ARGUMENT_SCHEMAS[tool])
+        arguments = copy.deepcopy(schemas[tool])
         if 'source' in arguments['properties']:
             arguments['properties']['source'].pop('const', None)
         # Strict Structured Outputs requires every property in required. Null
@@ -60,14 +62,23 @@ def _schema():
 PROPOSAL_SCHEMA = _schema()
 
 
+def provider_contract(manifest):
+    """Use the original sealed policy even before an interrupted plan exists."""
+    policy = manifest_policy(manifest)['privacy_policy']
+    return (_schema(policy), 'learner_prompt_project.md' if policy else 'learner_prompt.md')
+
+
 def _require(ok, reason):
     if not ok:
         raise ValueError("learner_plan_" + reason)
 
 
-def validate_proposal(value, *, provenance, allowed_tools, max_tool_calls, max_writes, read_calls):
+def validate_proposal(value, *, provenance, allowed_tools, max_tool_calls, max_writes, read_calls,
+                      privacy_policy=None):
     """Return normalized learner arguments after validating the entire cohort."""
     value = J._json(J.encode(value), J.MAX_INPUT)
+    _require(privacy_policy in (None, J.PROJECT_SYNC_PRIVACY), 'invalid_privacy_policy')
+    schemas = _ARGUMENT_SCHEMAS if privacy_policy is None else _tool_schemas(privacy_policy)
     J._keys(value, {"schema_version", "outcome", "summary", "operations"})
     J._version(value['schema_version'])
     J._string(value['summary'], 4096, nonempty=False)
@@ -85,20 +96,22 @@ def validate_proposal(value, *, provenance, allowed_tools, max_tool_calls, max_w
         _require(item['key'] == f'op_{index}' and item['tool'] in WRITE_TOOLS
                  and item['tool'] in allowed_tools and type(item['arguments']) is dict, 'invalid_operation')
         args, tool = item['arguments'], item['tool']
-        argument_schema = _ARGUMENT_SCHEMAS[tool]
+        argument_schema = schemas[tool]
         optional = set(argument_schema['properties']) - set(argument_schema['required'])
         args = {key: value for key, value in args.items() if key not in optional or value is not None}
         item['arguments'] = args
         if tool == 'remember':
-            _require(args.get('is_private', True) is True and args.get('force', False) is False,
+            private = args.get('is_private') if privacy_policy else args.get('is_private', True)
+            _require((type(private) is bool if privacy_policy else private is True)
+                     and args.get('force', False) is False,
                      'invalid_remember_policy')
             _require(args.get('source', provenance) == provenance, 'invalid_provenance')
-            args.update(is_private=True, force=False, source=provenance)
+            args.update(is_private=private, force=False, source=provenance)
         elif tool == 'update' and 'source' in args:
             _require(args['source'] == provenance, 'invalid_provenance')
         # The typed native validator rejects objects in UUID fields, arbitrary
         # edits, policy overrides and malformed values before ANY operation runs.
-        G.mutation(tool, args)
+        G.mutation(tool, args, privacy_policy=privacy_policy)
     return value
 
 
@@ -106,13 +119,17 @@ def manifest_policy(manifest):
     reviewed = manifest.get('plan_origin') == 'reviewed_legacy_accounting'
     _require(reviewed or manifest.get('provider_mode') == MODE, 'wrong_provider_mode')
     policy = manifest.get('plan_policy')
-    J._keys(policy, {'max_tool_calls', 'max_writes'})
+    J._keys(policy, {'max_tool_calls', 'max_writes'}, set() if reviewed else {'privacy'})
+    if 'privacy' in policy:
+        _require(policy['privacy'] == J.PROJECT_SYNC_PRIVACY, 'invalid_privacy_policy')
     J._integer(policy['max_tool_calls'], 1, 64)
     J._integer(policy['max_writes'], 0, MAX_WRITES)
     configuration = J._json(J._unseal(manifest['inputs']['backend_config']))
     allowed = memory_config.allowed_tools(configuration['memory'], READ_TOOLS | WRITE_TOOLS)
     _require(reviewed or 'recall' in allowed, 'recall_not_permitted')
-    return dict(policy, provenance='codex-session:' + manifest['session_id'], allowed_tools=allowed)
+    return dict(max_tool_calls=policy['max_tool_calls'], max_writes=policy['max_writes'],
+                privacy_policy=policy.get('privacy'),
+                provenance='codex-session:' + manifest['session_id'], allowed_tools=allowed)
 
 
 def _inputs(run_dir):
@@ -173,7 +190,7 @@ def _candidate(run_dir):
             'provenance': {'host': manifest['host'], 'sessionID': manifest['session_id'],
                 'runID': manifest['run_id'], 'source': {'startOffset': source['start_offset'],
                 'endOffset': source['end_offset'], 'excerptDigest': source['excerpt_sha256']}},
-            'mutation': G.mutation(item['tool'], item['arguments'])}
+            'mutation': G.mutation(item['tool'], item['arguments'], privacy_policy=policy['privacy_policy'])}
         native = J.encode(request)
         J._request(native, manifest, operation)
         requests.append({'key': item['key'], 'call_id': call, 'operation_id': operation, 'request': J.seal_json(native)})

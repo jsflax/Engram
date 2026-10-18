@@ -641,7 +641,8 @@ def learner_command(root: Path, run_dir: Path, request: dict, config: dict, *, p
         manifest, _ = runner_publication.journal.read_manifest(run_dir)
         if manifest.get("provider_mode") != (PLANNING_MODE if planning else None):
             raise ValueError("provider_mode_changed")
-        if planning and manifest["plan_policy"] != {name: config[name] for name in ("max_tool_calls", "max_writes")}:
+        if planning and any(manifest["plan_policy"][name] != config[name]
+                            for name in ("max_tool_calls", "max_writes")):
             raise ValueError("planning_budget_changed")
         execution.context.validate_inputs(manifest, "before_intent")
         memory = execution.context.transport
@@ -926,8 +927,11 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict, *
     private_dir(run_dir / "workspace")
     if planning:
         from . import learner_plan
-    atomic_json(run_dir / "schema.json", learner_plan.PROPOSAL_SCHEMA if planning else RESULT_SCHEMA)
-    template_name = "learner_prompt.md" if planning else "learner_prompt_legacy.md"
+        manifest, _ = runner_publication.journal.read_manifest(run_dir)
+        schema, template_name = learner_plan.provider_contract(manifest)
+    else:
+        schema, template_name = RESULT_SCHEMA, "learner_prompt_legacy.md"
+    atomic_json(run_dir / "schema.json", schema)
     system = render_learner_prompt(Path(__file__).with_name(template_name).read_text(), config, planning=planning)
     provenance = "codex-session:" + request["session_id"]
     if not planning:
@@ -1055,7 +1059,8 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict, *
             learner_plan.validate_proposal(result, provenance="codex-session:" + request["session_id"],
                 allowed_tools=memory_config.allowed_tools(backend["memory"], READ_TOOLS | WRITE_TOOLS),
                 max_tool_calls=config["max_tool_calls"], max_writes=config["max_writes"],
-                read_calls=observed["read_calls"])
+                read_calls=observed["read_calls"],
+                privacy_policy=learner_plan.manifest_policy(manifest)['privacy_policy'])
             valid_result = result["outcome"] in {"proposed", "no_new_memories"}
             observed["proposal_sha256"] = hashlib.sha256(raw).hexdigest()
         except (ValueError, OSError, TypeError, KeyError, UnicodeError, RecursionError):

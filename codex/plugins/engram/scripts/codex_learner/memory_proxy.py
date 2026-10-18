@@ -270,13 +270,20 @@ def audit_planning_bytes(raw: bytes, *, allow_clean_interrupt: bool = False) -> 
     return audit_planning_tools(raw=raw, allow_clean_interrupt=allow_clean_interrupt)
 
 
-def learner_tool_descriptor(tool: dict[str, Any], provenance: str) -> dict[str, Any]:
+def learner_tool_descriptor(tool: dict[str, Any], provenance: str, *, privacy_policy=None) -> dict[str, Any]:
     """Advertise the learner contract, without changing the native descriptor.
 
     Build closed write schemas instead of retaining native schema fragments that
     could require or recommend fields the learner gateway rejects.
     """
     name = tool.get("name")
+    if privacy_policy is not None:
+        try:
+            from .execution_manifest import PROJECT_SYNC_PRIVACY
+        except ImportError:  # Direct invocation of the packaged proxy.
+            from codex_learner.execution_manifest import PROJECT_SYNC_PRIVACY
+        if privacy_policy != PROJECT_SYNC_PRIVACY:
+            raise ProxyError("Unsupported learner privacy policy")
     if name not in WRITE_TOOLS:
         return tool
     exact_uuid = {"type": "string", "pattern": f"^{UUID_PATTERN}$",
@@ -304,6 +311,13 @@ def learner_tool_descriptor(tool: dict[str, Any], provenance: str) -> dict[str, 
         description = ("Store one new private memory after checking for an existing equivalent. "
                        "The gateway enforces private storage, session source provenance and conflict detection. "
                        "A near-duplicate warning is a no-write outcome; never force a duplicate.")
+        if privacy_policy is not None:
+            properties["is_private"] = {"type": "boolean", "description":
+                "True keeps this memory device-local. False follows existing project sync and exposed-group settings. "
+                "Use false for ordinary work/project knowledge, true for explicitly private/device-local material."}
+            required.append("is_private")
+            description = ("Propose one new memory after checking for an existing equivalent. "
+                           "Choose its device-local privacy explicitly; provenance and conflict detection remain enforced.")
     elif name == "update":
         properties = dict(shared, **{
             "id": exact_uuid,
@@ -763,8 +777,8 @@ def durable_execution(config, cleanup, *, diagnostic=None):
     mode = manifest.get("provider_mode")
     if mode != config.get("provider_mode") or mode not in (None, PLANNING_MODE):
         raise ProxyError("Durable provider mode changed")
-    if mode == PLANNING_MODE and manifest["plan_policy"] != {
-            name: config[name] for name in ("max_tool_calls", "max_writes")}:
+    if mode == PLANNING_MODE and any(manifest["plan_policy"][name] != config[name]
+                                    for name in ("max_tool_calls", "max_writes")):
         raise ProxyError("Durable planning budgets changed")
     if diagnostic is not None:
         diagnostic.stage = "writer_fence"

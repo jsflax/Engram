@@ -336,6 +336,7 @@ class RouterTests(unittest.TestCase):
         runner = sources / "runner.py"; runner.write_text("# synthetic runner\n")
         admission = sources / "admission.py"; admission.write_text("# synthetic admission\n")
         (sources / "learner_prompt.md").write_text("Synthetic template\n")
+        (sources / "learner_prompt_project.md").write_text("Synthetic project template\n")
         return router, types.SimpleNamespace(__file__=str(runner)), types.SimpleNamespace(__file__=str(admission))
 
     def test_complete_identity_uses_module_paths_not_environment(self):
@@ -350,6 +351,9 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(value["package"]["version"], "fixture.1")
         self.assertEqual(value["sources"]["runner"]["sha256"], self.digest(Path(runner.__file__)))
         self.assertEqual(value["sources"]["template"]["path"], str(Path(runner.__file__).with_name("learner_prompt.md")))
+        self.assertEqual(value["sources"]["project_template"]["sha256"],
+                         self.digest(Path(runner.__file__).with_name("learner_prompt_project.md")))
+        self.assertNotIn('selected_template', value)  # Package observation, not a run-policy attestation.
 
     def test_identity_reports_observed_new_bytes_without_claiming_loaded_bytecode(self):
         router, runner, admission = self.identity_package()

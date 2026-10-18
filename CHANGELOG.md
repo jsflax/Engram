@@ -7,6 +7,12 @@ All notable changes to Engram are documented in this file.
 ## [0.15.5] - 2026-10-18
 
 ### Fixed
+- Let new Codex learner plans classify ordinary project knowledge for configured
+  sync and sharing instead of forcing every new memory to be device-local.
+  Explicitly private memories stay local; existing sealed plans retain their
+  original privacy policy and operation payloads.
+- Correct model comments and tool descriptions that claimed private memories
+  sync to personal cloud backup. Private means device-local.
 - Route hooks and new learner batches to the installed, enabled Engram plugin
   through the supported plugin registry, with a bounded lookup and one handoff.
 - Compare reviewed memory dates by their exact numeric value, so equivalent JSON

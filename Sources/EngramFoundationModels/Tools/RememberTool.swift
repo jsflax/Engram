@@ -38,7 +38,7 @@ public struct RememberTool: Tool {
         @Guide(description: "UUID of a parent memory. Creates a 'part_of' edge automatically for building hierarchies.")
         public var parentId: String?
 
-        @Guide(description: "If true, the memory is private and excluded from team graphs.")
+        @Guide(description: "If true, keep the memory on this device, excluding personal cloud/device sync and group sharing. False follows the project's sync and sharing settings.")
         public var isPrivate: Bool?
     }
 

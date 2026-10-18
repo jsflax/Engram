@@ -298,7 +298,7 @@ def runtime_identity(value):
     sources = value.get("sources")
     if isinstance(sources, dict):
         out["sources"] = {key: observed_file(sources[key]) for key in
-                          ("router", "runner", "template", "admission", "host_admission", "file_identity")
+                          ("router", "runner", "template", "project_template", "admission", "host_admission", "file_identity")
                           if isinstance(sources.get(key), dict)}
     return out
 

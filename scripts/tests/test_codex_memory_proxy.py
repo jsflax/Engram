@@ -57,16 +57,27 @@ class PolicyTests(unittest.TestCase):
         self.audit = CaptureAudit()
         self.policy = proxy.Policy(self.audit, "codex:session:fixture", 20, 10)
 
-    def test_remember_forces_private_and_provenance_without_logging_content(self):
+    def test_remember_preserves_privacy_and_forces_provenance_without_logging_content(self):
         forwarded, denied = self.policy.client_message(call(1, "remember", {"content": "PRIVATE_TEST_SENTINEL", "source": "fake", "is_private": False}))
         self.assertIsNone(denied)
-        self.assertTrue(forwarded["params"]["arguments"]["is_private"])
+        self.assertIs(forwarded["params"]["arguments"]["is_private"], False)
         self.assertEqual(forwarded["params"]["arguments"]["source"], "codex:session:fixture")
         self.assertIs(forwarded["params"]["arguments"]["force"], False)
         self.policy.server_message(result(1, f"Stored memory (id: {ID_A}, project: test): PRIVATE_TEST_SENTINEL"))
         self.assertEqual(self.audit.records[-1], {"event": "tool_result", "id": 1, "tool": "remember", "ok": True, "memory_ids": [ID_A]})
         self.assertNotIn("PRIVATE_TEST_SENTINEL", json.dumps(self.audit.records))
         self.assertNotIn("fake", json.dumps(self.audit.records))
+
+    def test_remember_rejects_nonboolean_privacy_before_forwarding(self):
+        for index, privacy in enumerate((None, 0, 1, 0.0, 1.0, "false", "true", [], {})):
+            with self.subTest(privacy=privacy):
+                forwarded, denied = self.policy.client_message(
+                    call(index, "remember", {"content": "PRIVATE_SENTINEL", "is_private": privacy}))
+                self.assertIsNone(forwarded)
+                self.assertTrue(denied["result"]["isError"])
+                self.assertFalse(self.audit.records[-1]["ok"])
+        self.assertEqual(self.policy.pending, {})
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(self.audit.records))
 
     def test_forbidden_tools_and_force_never_forward_and_mark_failure(self):
         for index, (tool, arguments) in enumerate([("forget", {"id": ID_A}), ("remember", {"content": "x", "force": True}), ("remember", {"content": "x", "force": 1})]):
@@ -227,20 +238,22 @@ class LearnerToolContractTests(unittest.TestCase):
                          {"relates_to", "contradicts", "supersedes", "derived_from", "part_of", "summarized_by"})
         self.assertNotIn("unsupported_relation", relation["enum"])
 
-    def test_remember_advertises_and_enforces_private_provenance_and_no_force(self):
+    def test_remember_advertises_and_preserves_boolean_privacy_provenance_and_no_force(self):
         props = self.listed()["remember"]["inputSchema"]["properties"]
-        self.assertIs(props["is_private"]["const"], True)
-        self.assertIs(props["is_private"]["default"], True)
+        self.assertEqual(props["is_private"]["type"], "boolean")
+        self.assertNotIn("const", props["is_private"])
+        self.assertIs(props["is_private"]["default"], False)
         self.assertIs(props["force"]["const"], False)
         self.assertIs(props["force"]["default"], False)
         self.assertEqual(props["source"]["const"], "codex:session:fixture")
-        for index, options in enumerate(({}, {"is_private": False, "source": "untrusted"}, {"force": False})):
+        for index, options in enumerate(({}, {"is_private": False, "source": "untrusted"},
+                                         {"is_private": True}, {"force": False})):
             request = call(index, "remember", {"content": "fixture", **options})
             before = copy.deepcopy(request)
             forwarded, denied = self.policy.client_message(request)
             self.assertIsNone(denied)
             args = forwarded["params"]["arguments"]
-            self.assertIs(args["is_private"], True)
+            self.assertIs(args["is_private"], options.get("is_private", False))
             self.assertIs(args["force"], False)
             self.assertEqual(args["source"], "codex:session:fixture")
             self.assertEqual(request, before)
@@ -289,6 +302,27 @@ class PackagedLearnerToolContractTests(LearnerToolContractTests):
     def setUp(self):
         super().setUp()
         self.policy = packaged_proxy.Policy(self.audit, "codex:session:fixture", 100, 50)
+
+    def test_remember_advertises_and_preserves_boolean_privacy_provenance_and_no_force(self):
+        # The packaged legacy writer remains private-only. Its prospective
+        # normal-plan selector has a separate sealed contract and tests.
+        props = self.listed()["remember"]["inputSchema"]["properties"]
+        self.assertIs(props["is_private"]["const"], True)
+        self.assertIs(props["is_private"]["default"], True)
+        self.assertIs(props["force"]["const"], False)
+        self.assertIs(props["force"]["default"], False)
+        self.assertEqual(props["source"]["const"], "codex:session:fixture")
+        for index, options in enumerate(({}, {"is_private": False, "source": "untrusted"},
+                                         {"is_private": True}, {"force": False})):
+            request = call(index, "remember", {"content": "fixture", **options})
+            before = copy.deepcopy(request)
+            forwarded, denied = self.policy.client_message(request)
+            self.assertIsNone(denied)
+            args = forwarded["params"]["arguments"]
+            self.assertIs(args["is_private"], True)
+            self.assertIs(args["force"], False)
+            self.assertEqual(args["source"], "codex:session:fixture")
+            self.assertEqual(request, before)
 
 
 class NoWriteContractTests(unittest.TestCase):
@@ -567,6 +601,33 @@ for line in sys.stdin:
         process = self.invoke([])
         self.assertNotEqual(process.returncode, 0)
         self.assertIn("private regular file", process.stderr)
+
+    def test_privacy_selection_and_rejection_reach_only_expected_real_pipe_calls(self):
+        self.config.update(max_tool_calls=10, max_writes=10)
+        self.write_config()
+        self.server.write_text(self.server.read_text().replace(
+            "No matching memories.", f"Stored memory (id: {ID_A}, project: test): fixture"))
+        messages = [call(1, "remember", {"content": "PIPE_SENTINEL"}),
+                    call(2, "remember", {"content": "PIPE_SENTINEL", "is_private": False}),
+                    call(3, "remember", {"content": "PIPE_SENTINEL", "is_private": True,
+                                         "source": "untrusted"}),
+                    call(4, "remember", {"content": "PIPE_SENTINEL", "is_private": "false"})]
+        process = self.invoke(messages)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        received = [json.loads(line) for line in self.received.read_text().splitlines()]
+        self.assertEqual([m["id"] for m in received], [1, 2, 3])
+        for message, privacy in zip(received, (False, False, True)):
+            self.assertIs(message["params"]["arguments"]["is_private"], privacy)
+            self.assertIs(message["params"]["arguments"]["force"], False)
+            self.assertEqual(message["params"]["arguments"]["source"], "fixture")
+        responses = {m["id"]: m for m in map(json.loads, process.stdout.splitlines())}
+        self.assertTrue(responses[4]["result"]["isError"])
+        audit = self.audit_path.read_text()
+        self.assertNotIn("PIPE_SENTINEL", audit)
+        self.assertNotIn("untrusted", audit)
+        results = {r["id"]: r["ok"] for r in map(json.loads, audit.splitlines())
+                   if r["event"] == "tool_result"}
+        self.assertEqual(results, {1: True, 2: True, 3: True, 4: False})
 
     def test_invalid_child_response_fails_and_marks_outstanding_write(self):
         self.server.write_text('import sys\nfor line in sys.stdin:\n print("not-json", flush=True)\n')

@@ -134,9 +134,11 @@ class StatusTests(unittest.TestCase):
                "package": {"path": "/private/secret", "version": "0.2.0+codex.20260917123456",
                            "status": "ok", "manifest": {"sha256": DIGEST, "status": "ok"}},
                "sources": {"host_admission": {"path": "/secret.py", "sha256": DIGEST, "status": "ok"},
+                           "project_template": {"path": "/secret.md", "sha256": DIGEST, "status": "ok"},
                            "secret": {"sha256": DIGEST}}}
         view = STATUS.metadata({"runtime_identity": raw})["runtime_identity"]
         self.assertEqual(view["sources"]["host_admission"]["sha256"], DIGEST)
+        self.assertEqual(view['sources']['project_template']['sha256'], DIGEST)
         self.assertNotIn("secret", json.dumps(view))
         self.assertNotIn("path", json.dumps(view))
         raw["package"]["version"] = "private detail"

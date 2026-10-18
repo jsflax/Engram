@@ -51,8 +51,9 @@ public final class Memory {
     /// Explicit importance rating (1-5). 0 means unset. Higher values boost recall ranking.
     public var importance: Int
 
-    /// Whether this memory is private (excluded from group shared graphs).
-    /// Private memories still sync to the user's own cloud backup. Default: false.
+    /// Whether this memory stays on this device. Private memories are excluded
+    /// from personal cloud/device sync and group sharing, even when the project's
+    /// sync policy is enabled. Default: false (follow the project's sync policy).
     ///
     /// Retract semantics: flipping this to `true` on a memory ALREADY shared
     /// with a group emits a real DELETE to the group DB (row-level filter
