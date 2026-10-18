@@ -183,9 +183,17 @@ def _runtime(path):
         os.close(fd)
 
 
-def _effective_transport(paths, transport):
+# The native executable is already an authenticated absolute path. Only its
+# implicit tool-search PATH uses these fixed system directories; explicit env
+# or env_vars PATH remains user-controlled and freshly checked.
+DEFAULT_NATIVE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def _effective_transport(paths, transport, *, stable_path=False):
     _require(type(transport) is dict, "invalid_transport")
     value = copy.deepcopy(transport)
+    if stable_path and "PATH" not in value.get("env", {}) and "PATH" not in value.get("env_vars", []):
+        value.setdefault("env", {})["PATH"] = DEFAULT_NATIVE_PATH
     if value.get("cwd") is None:
         workspace = paths.run_dir / "workspace"
         durable._directory(workspace)
@@ -195,21 +203,21 @@ def _effective_transport(paths, transport):
 
 @_safe
 def effective_transport(paths, transport):
-    """Bind omitted cwd before the probe; caller creates the private workspace."""
+    """Bind omitted cwd and implicit PATH before a new normal execution probe."""
     _require(type(paths) is ContextPaths, "invalid_context")
     paths.check()
-    value = _effective_transport(paths, transport)
+    value = _effective_transport(paths, transport, stable_path=True)
     stdio_bridge._transport(value)
     return value
 
 
-def _backend(paths):
+def _backend(paths, *, stable_path=False):
     config_raw, _ = durable._read(paths.config_path, private=False, maximum=memory_config.MAX_CONFIG)
     _require(not paths.config_path.stat().st_mode & 0o022, "unsafe_config")
     _, memory = memory_config.resolve(paths.config_path, paths.plugin_root, config_bytes=config_raw)
     allowed = memory_config.allowed_tools(memory, READ_TOOLS | WRITE_TOOLS)
     _require("recall" in allowed and bool(allowed & WRITE_TOOLS), "memory_policy_disallows_learning")
-    transport = _effective_transport(paths, memory_config.transport(memory))
+    transport = _effective_transport(paths, memory_config.transport(memory), stable_path=stable_path)
     argv, env, cwd = stdio_bridge._transport(transport)
     _require(len(argv) == 1, "runtime_arguments_unsupported")
     _require(cwd is None or Path(cwd).resolve(strict=True) == Path(cwd), "unbound_cwd")
@@ -313,7 +321,10 @@ def _source_backend_inputs(paths, manifest, decoded, *, source_cache=None, runti
     """Read-only input checks; no held-fence or current target-pair authority."""
     request = decoded["request"]
     _require(_same(admission.check(paths.root, request), request["admission"]), "binding_changed")
-    configuration, route = _backend(paths)
+    # Only an already-sealed explicit default selects stable PATH validation.
+    # Older seals without it retain exact ambient-PATH semantics unchanged.
+    stable_path = decoded["backend_route"]["transport"].get("env", {}).get("PATH") == DEFAULT_NATIVE_PATH
+    configuration, route = _backend(paths, stable_path=stable_path)
     _require(_same(configuration, decoded["backend_config"])
              and _same(route, decoded["backend_route"])
              and route["runtime"]["sha256"] == manifest["backend"]["runtime_sha256"], "backend_changed")
@@ -446,9 +457,9 @@ def seal_execution(paths, *, host, request, state, excerpt, expected_next_parser
               "limits": {"max_chars": max_chars, "max_scan_bytes": max_scan_bytes}, "runtime": _parser_runtime(),
               "interval_sha256": _interval(request["transcript_path"], source["identity"],
                                           source["start_offset"], source["end_offset"])}
-    configuration, route = _backend(paths)
+    configuration, route = _backend(paths, stable_path=True)
     _require(_same(configuration["memory"], memory)
-             and _same(route["transport"], _effective_transport(paths, transport)), "backend_changed")
+             and _same(route["transport"], _effective_transport(paths, transport, stable_path=True)), "backend_changed")
     inputs = {"request": journal.encode(request), "admission": admission_raw, "cursor": state_raw,
               "parser_state": journal.encode(parser), "next_parser_state": journal.encode(expected_next_parser),
               "backend_route": journal.encode(route), "backend_config": journal.encode(configuration)}

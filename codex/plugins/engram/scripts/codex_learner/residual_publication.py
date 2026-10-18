@@ -150,7 +150,7 @@ def _settlement(context,driver,recoveries,verify_locks):
     proof,proof_sha=D.read(context.paths.run_dir/f'residual-reconciliation-{index:03d}.json')
     driver._checkpoint(proof,generations)
     require(proof['heads']==driver._heads() and all(v['kind']=='committed' and v['receipt']['outcome']=='applied'
-        and len(v['receipt']['memoryIDs'])==1 and v['receipt']['edgeIDs']==[] for v in proof['statuses'].values()),
+        and len(v['receipt']['memoryIDs'])==1 for v in proof['statuses'].values()),
         'final_status_not_qualified')
     value={'version':1,'kind':'reviewed_residual_settlement',**_pin(context),
         'authorization_sha256':_authorization(context)[1],'generation_sha256s':[v[1] for v in generations],

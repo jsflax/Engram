@@ -262,6 +262,21 @@ class LearnerPlanTests(unittest.TestCase):
         self.assertEqual((progress['status'], progress['applied_write_calls']), ('pending', 0))
         self.assertEqual(progress['reason'], 'native_reply_invalid')
 
+    def test_applied_remember_auto_edges_settle_without_entering_memory_coverage(self):
+        self.seal(self.operations[:1])
+        def auto_connected(raw,*_):
+            value=receipt_envelope(J._json(raw))
+            value['result']['structuredContent']['engram_operation']['receipt']['edgeIDs']=[EDGE]
+            value['result']['content'][0]['text']=J.encode(value['result']['structuredContent']).decode()
+            return value
+        progress=self.execute(execute=auto_connected)
+        self.assertEqual((progress['status'],progress['memory_ids']),('complete',[MEMORY]))
+        self.assertEqual(progress['operations'][0]['receipt']['edgeIDs'],[EDGE])
+        final=self.settle()
+        self.assertEqual((final['status'],final['applied_write_calls']),('succeeded',1))
+        self.assertEqual(final['memory_ids'],[MEMORY])
+        self.assertIsNotNone(final['coverage_reference'])
+
     def test_unchanged_commit_completes_without_claiming_new_memory(self):
         self.seal(self.operations[:1])
         progress = self.execute(execute=lambda raw, *_: receipt_envelope(J._json(raw), outcome='unchanged'))
