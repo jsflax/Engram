@@ -24,12 +24,15 @@ from __future__ import annotations
 
 import base64
 import copy
+import ctypes
+import errno
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
+import sys
 import unicodedata
 import uuid
 
@@ -176,8 +179,17 @@ def _fencing(value):
 
 def _manifest(value):
     _keys(value, {"version", "host", "session_id", "run_id", "inputs", "source",
-                  "expected_scope", "backend", "fencing"})
+                  "expected_scope", "backend", "fencing"}, {"provider_mode", "plan_policy"})
     _version(value["version"])
+    # Old sealed runs have no selector. New planning runs bind their read-only
+    # provider contract into the manifest digest and therefore every operation ID.
+    if "provider_mode" in value:
+        _require(value["provider_mode"] == "read_only_plan", "invalid_provider_mode")
+        _keys(value.get("plan_policy"), {"max_tool_calls", "max_writes"})
+        _integer(value["plan_policy"]["max_tool_calls"], 1, 20)
+        _integer(value["plan_policy"]["max_writes"], 1, 5)
+    else:
+        _require("plan_policy" not in value, "orphan_plan_policy")
     for key in ("host", "session_id", "run_id"):
         _identifier(value[key])
     _uuid(value["session_id"])
@@ -251,6 +263,91 @@ def _publish(path, raw):
     durable._fsync(path.parent)
     _boundary("after_directory_fsync")
     _require(durable._read(path, maximum=MAX_RECORD)[0] == raw, "file_changed")
+
+
+def _rename_exclusive(source, destination):
+    """Atomic no-replace rename; never degrade to a check-then-overwrite."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == 'darwin':
+        operation = libc.renamex_np
+        operation.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        arguments = (os.fsencode(source), os.fsencode(destination), 4)  # RENAME_EXCL
+    elif sys.platform.startswith('linux') and hasattr(libc, 'renameat2'):
+        operation = libc.renameat2
+        operation.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        arguments = (-100, os.fsencode(source), -100, os.fsencode(destination), 1)  # AT_FDCWD, NOREPLACE
+    else:
+        raise ValueError('execution_manifest_atomic_rename_unavailable')
+    operation.restype = ctypes.c_int
+    if operation(*arguments) != 0:
+        code = ctypes.get_errno()
+        if code == errno.EEXIST:
+            raise FileExistsError(code, 'atomic destination exists')
+        raise OSError(code, 'atomic publication refused')
+
+
+def _sync_existing(path, raw):
+    """Make the exact complete existing record durable without creating it."""
+    actual, identity = durable._read(path, maximum=MAX_RECORD)
+    _require(actual == raw, 'file_changed')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        _require(durable._identity(os.fstat(fd)) == identity, 'file_changed')
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    durable._fsync(path.parent)
+    _require(durable._read(path, maximum=MAX_RECORD) == (raw, identity), 'file_changed')
+
+
+def _event_paths(directory, *, planning=False):
+    """Bound the entire directory, including ignored unpublished temporaries."""
+    paths = []
+    with os.scandir(directory) as entries:
+        for count, entry in enumerate(entries):
+            _require(count < 4096, 'event_directory_limit')
+            if planning and entry.name.startswith('.plan-publish-'):
+                continue
+            paths.append(directory / entry.name)
+    return sorted(paths)
+
+
+def _publish_atomic(path, raw):
+    """Complete bytes or no final record, including when the worker is killed.
+
+    Leftover private temporary names are not authority. No-replace rename keeps
+    the existing single-link reader contract even if killed at publication.
+    """
+    _private(path.parent)
+    _json(raw)
+    if os.path.lexists(path):
+        _require(durable._read(path, maximum=MAX_RECORD)[0] == raw, 'immutable_record_conflict')
+        _sync_existing(path, raw)
+        return
+    temporary = path.parent / ('.plan-publish-' + str(uuid.uuid4()))
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        _boundary('atomic_after_create')
+        remaining = memoryview(raw)
+        while remaining:
+            written = os.write(fd, remaining)
+            _require(written > 0, 'short_write')
+            remaining = remaining[written:]
+        _boundary('atomic_after_write')
+        os.fsync(fd)
+        _boundary('atomic_after_file_fsync')
+        try:
+            _rename_exclusive(temporary, path)
+        except FileExistsError:
+            _require(durable._read(path, maximum=MAX_RECORD)[0] == raw, 'immutable_record_conflict')
+        _boundary('atomic_after_rename')
+    finally:
+        os.close(fd)
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+    durable._fsync(path.parent)
+    _boundary('atomic_after_directory_fsync')
+    _require(durable._read(path, maximum=MAX_RECORD)[0] == raw, 'file_changed')
 
 
 def publish_manifest(run_dir, manifest, *, verify_fence):
@@ -338,7 +435,7 @@ def _intent_path(run_dir, operation):
     return Path(run_dir) / ("operation-" + _uuid(operation) + ".json")
 
 
-def publish_intent(run_dir, call_id, native_request_raw, *, verify_fence):
+def publish_intent(run_dir, call_id, native_request_raw, *, verify_fence, atomic=False):
     """Persist BEFORE dispatch. Forward only these returned exact request bytes."""
     manifest, manifest_hash = read_manifest(run_dir)
     operation = operation_id(run_dir, call_id)
@@ -347,7 +444,7 @@ def publish_intent(run_dir, call_id, native_request_raw, *, verify_fence):
               "operation_id": operation, "request": seal_json(native_request_raw),
               "local_json_sha256": sha256(encode(request))}
     _check_fence(manifest, verify_fence)
-    _publish(_intent_path(run_dir, operation), encode(record))
+    (_publish_atomic if atomic else _publish)(_intent_path(run_dir, operation), encode(record))
     _check_fence(manifest, verify_fence)
     return read_intent(run_dir, operation)[0]
 
@@ -425,7 +522,7 @@ def read_evidence(run_dir, operation):
         _require(not directory.is_symlink(), "unsafe_evidence_directory")
         return []
     _private(directory)
-    paths = sorted(directory.iterdir())
+    paths = _event_paths(directory, planning=manifest.get('provider_mode') == 'read_only_plan')
     _require(len(paths) <= MAX_EVENTS, "too_many_events")
     result, previous, prior, dispatched = [], None, None, False
     for index, path in enumerate(paths):
@@ -453,7 +550,7 @@ def read_evidence(run_dir, operation):
     return result
 
 
-def _append(run_dir, operation, evidence, verify_fence):
+def _append(run_dir, operation, evidence, verify_fence, *, atomic=False):
     manifest, manifest_hash = read_manifest(run_dir)
     events = read_evidence(run_dir, operation)
     _require(len(events) < MAX_EVENTS, "too_many_events")
@@ -465,12 +562,12 @@ def _append(run_dir, operation, evidence, verify_fence):
     event = {"version": VERSION, "sequence": len(events), "previous_sha256": previous,
              "manifest_sha256": manifest_hash, "operation_id": _uuid(operation), "evidence": evidence}
     _check_fence(manifest, verify_fence)
-    _publish(directory / f"{len(events):06d}.json", encode(event))
+    (_publish_atomic if atomic else _publish)(directory / f"{len(events):06d}.json", encode(event))
     _check_fence(manifest, verify_fence)
     return read_evidence(run_dir, operation)[-1]
 
 
-def record_dispatch(run_dir, operation, *, verify_fence):
+def record_dispatch(run_dir, operation, *, verify_fence, atomic=False):
     """Record one dispatch before forwarding persisted bytes; never grant replay."""
     events = read_evidence(run_dir, operation)
     _require(not any(e["evidence"]["kind"] in ("dispatch", "committed") for e in events),
@@ -478,15 +575,15 @@ def record_dispatch(run_dir, operation, *, verify_fence):
     manifest, _ = read_manifest(run_dir)
     native_raw, _ = read_intent(run_dir, operation)
     _append(run_dir, operation, {"kind": "dispatch", "request_sha256": sha256(native_raw),
-                                "fencing": manifest["fencing"]}, verify_fence)
+                                "fencing": manifest["fencing"]}, verify_fence, atomic=atomic)
     return native_raw
 
 
-def record_response(run_dir, operation, response, *, verify_fence):
+def record_response(run_dir, operation, response, *, verify_fence, atomic=False):
     """Append a content-free native receipt/status observation, not raw MCP prose."""
     response = _json(encode(response))
     events = read_evidence(run_dir, operation)
     _, request = read_intent(run_dir, operation)
     receipts = [e["evidence"]["receipt"] for e in events if e["evidence"]["kind"] == "committed"]
     _response(response, request, receipts[-1] if receipts else None)
-    return _append(run_dir, operation, response, verify_fence)
+    return _append(run_dir, operation, response, verify_fence, atomic=atomic)

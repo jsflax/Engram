@@ -340,7 +340,10 @@ class RouterTests(unittest.TestCase):
 
     def test_complete_identity_uses_module_paths_not_environment(self):
         router, runner, admission = self.identity_package()
-        with mock.patch.dict(ROUTER.os.environ, {"CODEX_HOME": "/decoy", "CLAUDE_PLUGIN_ROOT": "/decoy"}):
+        identity_os = types.SimpleNamespace(**{name: getattr(ROUTER.runtime_identity.os, name)
+                                              for name in dir(ROUTER.runtime_identity.os)})
+        identity_os.environ = {"CODEX_HOME": "/decoy", "CLAUDE_PLUGIN_ROOT": "/decoy"}
+        with mock.patch.object(ROUTER.runtime_identity, "os", identity_os):
             value = ROUTER.runtime_identity.capture(str(router), runner, admission)
         self.assertEqual(value["status"], "complete")
         self.assertEqual(value["package"]["path"], str(router.parent.parent))

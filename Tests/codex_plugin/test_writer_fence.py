@@ -86,6 +86,40 @@ class WriterFenceTests(unittest.TestCase):
             F.create(self.root, generation_id=self.epoch, owner_id=self.owner)
         self.assertEqual((self.root / F.LOCK_NAME).stat().st_ino, self.identity)
 
+    def test_plan_drain_refuses_live_writer_then_preserves_same_generation(self):
+        old = F.acquire_shared(self.root, self.binding)
+        try:
+            with self.assertRaisesRegex(ValueError, "busy"):
+                F.drain_and_acquire_shared(self.root, self.binding, validate=authorized, timeout_seconds=0)
+        finally:
+            old.close()
+        with F.drain_and_acquire_shared(self.root, self.binding, validate=authorized) as resumed:
+            self.assertEqual(resumed.mode, "shared")
+            self.assertEqual(resumed.binding(), self.binding)
+            self.assertEqual(os.fstat(resumed.pass_fds()[0]).st_ino, self.identity)
+            self.assertFalse((self.root / F.REVOCATION_NAME).exists())
+        self.assertEqual((self.root / F.LOCK_NAME).read_bytes(), self.raw)
+
+    def test_plan_drain_never_revives_revoked_generation(self):
+        with self.revoke():
+            pass
+        with self.assertRaisesRegex(ValueError, "generation_revoked"):
+            F.drain_and_acquire_shared(self.root, self.binding, validate=authorized)
+
+    def test_plan_drain_conversion_is_nonblocking_and_revalidates(self):
+        phases = []
+        def validate(binding, phase):
+            phases.append(phase)
+            return phase != "after_downgrade"
+        with mock.patch.object(F.fcntl, "flock", wraps=F.fcntl.flock) as flock:
+            with self.assertRaisesRegex(ValueError, "validation_refused"):
+                F.drain_and_acquire_shared(self.root, self.binding, validate=validate)
+            self.assertTrue(all(call.args[1] & F.fcntl.LOCK_NB for call in flock.call_args_list))
+        self.assertEqual(phases, ["before_acquire", "after_acquire", "after_downgrade"])
+        self.assertFalse((self.root / F.REVOCATION_NAME).exists())
+        with F.drain_and_acquire_shared(self.root, self.binding, validate=authorized):
+            pass
+
     def test_exclusive_recovery_is_idempotent_and_validates_exact_revocation(self):
         with self.revoke() as held:
             receipt = self.root / F.REVOCATION_NAME

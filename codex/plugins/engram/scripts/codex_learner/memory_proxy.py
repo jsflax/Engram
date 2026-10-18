@@ -24,6 +24,8 @@ from typing import Any
 
 ALLOWED_TOOLS = frozenset({"recall", "graph", "list_topics", "stats", "timeline", "remember", "update", "connect"})
 WRITE_TOOLS = frozenset({"remember", "update", "connect"})
+READ_TOOLS = ALLOWED_TOOLS - WRITE_TOOLS
+PLANNING_MODE = "read_only_plan"
 REMEMBER_FIELDS = frozenset({"content", "project", "topic", "source", "expires_in_days", "importance", "is_private", "parent_id", "force"})
 UPDATE_FIELDS = frozenset({"id", "content", "append", "prepend", "find", "replace", "topic", "source", "importance", "expires_in_days"})
 RELATIONS = frozenset({"relates_to", "contradicts", "supersedes", "derived_from", "part_of", "summarized_by"})
@@ -47,6 +49,106 @@ def valid_id(value: Any) -> bool:
 
 def id_key(value: Any) -> tuple[type, Any]:
     return type(value), value
+
+
+def audit_planning_tools(path: Path | None = None, *, allow_clean_interrupt: bool = False,
+                         raw: bytes | None = None) -> dict:
+    """Read the bounded independent relay evidence for a write-free provider.
+
+    This does not authorize a plan. The plan sealer must separately join the
+    provider's terminal observation, proposal, manifest and current inputs.
+    """
+    calls, results = {}, {}
+    errors = 0
+    started = finished = interrupted = False
+    recalls = 0
+
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            if key in value:
+                raise ValueError("duplicate audit field")
+            value[key] = item
+        return value
+
+    try:
+        if raw is None:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as stream:
+                before = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(before.st_mode) or before.st_mode & 0o077
+                        or before.st_size > 1024 * 1024):
+                    raise ValueError("invalid planning audit")
+                raw = stream.read(1024 * 1024 + 1)
+                after = os.fstat(stream.fileno())
+            if (len(raw) != before.st_size or before.st_size != after.st_size
+                    or before.st_mtime_ns != after.st_mtime_ns):
+                raise ValueError("planning audit changed")
+        elif path is not None:
+            raise ValueError("supply exactly one planning audit input")
+        if type(raw) is not bytes or len(raw) > 1024 * 1024 or not raw.endswith(b"\n"):
+            raise ValueError("planning audit invalid or truncated")
+        lines = raw.splitlines()
+        if len(lines) > 256:
+            raise ValueError("planning audit limit")
+        for line in lines:
+            entry = json.loads(line, object_pairs_hook=pairs)
+            if type(entry) is not dict or finished:
+                raise ValueError("invalid planning audit sequence")
+            event = entry.get("event")
+            if not started:
+                if entry != {"event": "relay_started"}:
+                    raise ValueError("planning relay did not start")
+                started = True
+                continue
+            if interrupted and event != "relay_finished":
+                raise ValueError("event after planning relay interruption")
+            if event == "relay_finished":
+                peaks = {"peak_inflight", "peak_client_queue_bytes", "peak_server_queue_bytes"}
+                if (set(entry) - ({"event", "child_reaped", "cleanup_overrun"} | peaks)
+                        or any(type(entry[name]) is not int or entry[name] < 0 for name in peaks & set(entry))
+                        or entry.get("child_reaped") is not True
+                        or entry.get("cleanup_overrun") is not False
+                        or set(calls) != set(results)):
+                    raise ValueError("planning relay did not cleanly finish")
+                finished = True
+            elif event == "relay_interrupted":
+                if (entry != {"event": "relay_interrupted"}
+                        or allow_clean_interrupt is not True or interrupted or not calls
+                        or set(calls) != set(results)):
+                    raise ValueError("planning relay interrupted before completion")
+                interrupted = True
+            elif event == "initialize_compat":
+                if entry != {"event": "initialize_compat", "omitted_capability": "codex/auth-change"}:
+                    raise ValueError("unknown planning compatibility event")
+            elif event == "tool_call":
+                if (set(entry) != {"event", "id", "tool"} or not valid_id(entry["id"])
+                        or entry["tool"] not in READ_TOOLS or id_key(entry["id"]) in calls):
+                    raise ValueError("planning call is not an allowed unique read")
+                calls[id_key(entry["id"])] = entry["tool"]
+            elif event == "tool_result":
+                if (set(entry) != {"event", "id", "tool", "ok", "memory_ids", "forwarded"}
+                        or not valid_id(entry["id"]) or entry["ok"] is not True
+                        or entry["forwarded"] is not True or entry["memory_ids"] != []):
+                    raise ValueError("planning read failed or claimed a mutation")
+                key = id_key(entry["id"])
+                if key not in calls or key in results or calls[key] != entry["tool"]:
+                    raise ValueError("planning result is unpaired")
+                results[key] = entry
+                recalls += entry["tool"] == "recall"
+            else:
+                raise ValueError("unexpected planning relay event")
+        if not (started and finished and recalls and set(calls) == set(results)):
+            raise ValueError("planning read coverage incomplete")
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+        errors = 1
+    return {"tool_calls": len(calls), "read_calls": len(calls), "successful_recalls": recalls,
+            "write_calls": 0, "writes": [], "tool_errors": errors}
+
+
+def audit_planning_bytes(raw: bytes, *, allow_clean_interrupt: bool = False) -> dict:
+    """Validate exactly the bytes already descriptor-bound by the plan sealer."""
+    return audit_planning_tools(raw=raw, allow_clean_interrupt=allow_clean_interrupt)
 
 
 def learner_tool_descriptor(tool: dict[str, Any], provenance: str) -> dict[str, Any]:
@@ -261,12 +363,20 @@ def compatible_initialize(message: dict[str, Any]) -> dict[str, Any]:
 
 class Policy:
     def __init__(self, audit: Audit, provenance: str, max_tool_calls: int, max_writes: int, allowed_tools: list[str] | None = None,
-                 *, operations=None):
+                 *, operations=None, provider_mode=None):
+        if provider_mode not in (None, PLANNING_MODE):
+            raise ProxyError("Unsupported provider mode")
+        if provider_mode == PLANNING_MODE and operations is not None:
+            raise ProxyError("A planning provider cannot receive mutation authority")
         self.audit = audit
         self.provenance = provenance
         self.max_tool_calls = max_tool_calls
         self.max_writes = max_writes
         self.allowed_tools = ALLOWED_TOOLS if allowed_tools is None else ALLOWED_TOOLS.intersection(allowed_tools)
+        if provider_mode == PLANNING_MODE:
+            # Enforce this at dispatch as well as discovery. A provider cannot
+            # bypass the plan by naming a hidden mutation or native operation.
+            self.allowed_tools = self.allowed_tools.intersection(READ_TOOLS)
         self.total_calls = 0
         self.write_calls = 0
         self.pending: dict[tuple[type, Any], dict[str, Any]] = {}
@@ -465,6 +575,10 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ProxyError("audit_path must be absolute")
     if "allowed_tools" in config and (not isinstance(config["allowed_tools"], list) or any(not isinstance(name, str) for name in config["allowed_tools"])):
         raise ProxyError("allowed_tools must be an array of tool names")
+    if config.get("provider_mode") not in (None, PLANNING_MODE):
+        raise ProxyError("Unsupported provider mode")
+    if config.get("provider_mode") == PLANNING_MODE and "execution" not in config:
+        raise ProxyError("Planning requires a sealed execution")
     return config
 
 
@@ -480,7 +594,8 @@ def run(config: dict[str, Any]) -> int:
         audit = Audit(Path(config["audit_path"]))
         cleanup.callback(audit.close)
         policy = Policy(audit, config["provenance"], config["max_tool_calls"],
-                        config["max_writes"], config.get("allowed_tools"), operations=operations)
+                        config["max_writes"], config.get("allowed_tools"), operations=operations,
+                        provider_mode=config.get("provider_mode"))
         try:
             return run_relay(transport, policy.client_message,
                              policy.server_message, limits=RelayLimits(max_inflight=64),
@@ -518,10 +633,18 @@ def durable_execution(config, cleanup):
     manifest, digest = journal.read_manifest(paths.run_dir)
     if digest != specification["manifest_sha256"]:
         raise ProxyError("Durable execution manifest changed")
+    mode = manifest.get("provider_mode")
+    if mode != config.get("provider_mode") or mode not in (None, PLANNING_MODE):
+        raise ProxyError("Durable provider mode changed")
+    if mode == PLANNING_MODE and manifest["plan_policy"] != {
+            name: config[name] for name in ("max_tool_calls", "max_writes")}:
+        raise ProxyError("Durable planning budgets changed")
     fence = cleanup.enter_context(writer_fence.acquire_shared(paths.run_dir, manifest["fencing"]))
     context = contexts.load_execution(paths, manifest_sha256=digest, writer_fence=fence)
     backend = journal._json(journal._unseal(manifest["inputs"]["backend_config"]))
     allowed = sorted(memory_config.allowed_tools(backend["memory"], ALLOWED_TOOLS))
+    if mode == PLANNING_MODE:
+        allowed = sorted(set(allowed).intersection(READ_TOOLS))
     settings = learner_settings.bounded({} if backend["settings"] is None else backend["settings"]["value"])
     if any(type(config[name]) is not int or not 0 <= config[name] <= settings[name]
            for name in ("max_tool_calls", "max_writes")):
@@ -531,8 +654,10 @@ def durable_execution(config, cleanup):
             or config["provenance"] != "codex-session:" + manifest["session_id"]
             or config.get("allowed_tools") != allowed):
         raise ProxyError("Durable execution policy changed")
-    operations = operation_gateway.OperationGateway(paths.run_dir, manifest_sha256=digest,
-        writer_fence=fence, validate_inputs=context.validate_inputs)
+    operations = None
+    if mode is None:
+        operations = operation_gateway.OperationGateway(paths.run_dir, manifest_sha256=digest,
+            writer_fence=fence, validate_inputs=context.validate_inputs)
     return operations, fence, context.transport
 
 
