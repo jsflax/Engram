@@ -4,6 +4,17 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.6] - 2026-10-18
+
+### Fixed
+- Let the Codex learner process a complete message that exceeds its normal batch
+  target using the existing 48,000-character ceiling, without truncating or skipping
+  messages. Existing settings and previously sealed plans retain their limits.
+- Throttle centroid and cluster calculations during streamed graph loading while
+  preserving the first preview, immediate node updates, and the final refresh.
+- Clarify that existing Codex MCP connections have a separate refresh lifecycle
+  from plugin hooks and learner workers.
+
 ## [0.15.5] - 2026-10-18
 
 ### Fixed
