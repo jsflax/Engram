@@ -145,7 +145,7 @@ public final class EngramRealityScene {
 
     // MARK: - Init
 
-    public init() {
+    public init(audioTemporaryDirectory: URL = FileManager.default.temporaryDirectory) {
         guard let device = MTLCreateSystemDefaultDevice(),
               let commandQueue = device.makeCommandQueue() else {
             fatalError("Metal is required for EngramRealityKit")
@@ -185,7 +185,7 @@ public final class EngramRealityScene {
         self.galaxyTitleSystem = GalaxyTitleSystem()
         self.mascotSystem = RKMascotSystem()
         self.flowParticleSystem = RKFlowParticleSystem()
-        self.spatialAudioSystem = RKSpatialAudioSystem()
+        self.spatialAudioSystem = RKSpatialAudioSystem(temporaryDirectory: audioTemporaryDirectory)
         self.labelAtlasGenerator = RKLabelAtlasGenerator(device: device)
 
         // Generate sphere template (after all stored properties initialized)

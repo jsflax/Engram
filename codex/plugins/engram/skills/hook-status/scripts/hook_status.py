@@ -41,6 +41,20 @@ OUTCOMES = {"stored", "no_new_memories", "failed"}
 SETTLEMENT_REASONS = {"verified_completion", "never_dispatched", "provider_not_started", "unverified_completion",
                       "verified_no_effect_failure", "planning_not_complete"}
 GATE_REASONS = {"successful_or_unverified_write", "write_status_unknown"} | SETTLEMENT_REASONS
+# Only fixed diagnostic codes from the runner; never exception text.
+STARTUP_STAGES = frozenset({"provider_policy", "writer_fence", "execution_context",
+                            "gateway_policy", "operation_gateway", "audit_open"})
+STARTUP_REASONS = frozenset({
+    "provider_mode_changed", "planning_budgets_changed", "budgets_changed", "policy_changed",
+    "execution_context_backend_changed", "execution_context_binding_changed",
+    "execution_context_processing_changed", "execution_context_cursor_changed",
+    "execution_context_cursor_binding_changed", "execution_context_reconciliation_required",
+    "execution_context_runtime_changed", "execution_context_runtime_read_deadline",
+    "execution_context_unsafe_runtime", "execution_context_unbound_runtime",
+    "execution_context_source_changed", "execution_context_source_or_parser_changed",
+    "execution_context_parser_or_source_changed", "execution_context_unavailable_or_changed",
+    "writer_fence_generation_revoked", "writer_fence_lock_changed", "writer_fence_generation_changed",
+    "validation_failed", "io_error", "unexpected_error"})
 WRITE_TOOLS = {"remember", "update", "connect", "merge", "consolidate", "organize"}
 # Exact codes emitted by the bundled admission/runner source. Never accept a
 # prefix or arbitrary exception text: reasons may otherwise contain private data.
@@ -357,6 +371,11 @@ def metadata(record):
             out["plan_sha256"] = record["plan_sha256"]
     if isinstance(record.get("reason"), str) and record["reason"] in REASONS:
         out["reason"] = record["reason"]
+    diagnostic = record.get("gateway_startup_failure")
+    if (type(diagnostic) is dict and set(diagnostic) == {"stage", "reason"}
+            and type(diagnostic["stage"]) is str and diagnostic["stage"] in STARTUP_STAGES
+            and type(diagnostic["reason"]) is str and diagnostic["reason"] in STARTUP_REASONS):
+        out["gateway_startup_failure"] = dict(diagnostic)
     for key, allowed in (("failure_phase", FAILURE_PHASES), ("error_kind", ERROR_KINDS)):
         if isinstance(record.get(key), str) and record[key] in allowed:
             out[key] = record[key]
@@ -969,6 +988,8 @@ def health_summary(learner, *, backlog=None, now=None):
         failure = {"class": "timeout" if reason == "timeout" else "unverified_completion" if reason == "unverified_completion"
                    else "budget_limit" if reason in {"output_limit", "output_line_limit", "tool_limit"}
                    else "unexpected_tool" if reason == "unexpected_tool" else "run_failed"}
+    if "gateway_startup_failure" in receipt:
+        failure["gateway_startup_failure"] = receipt["gateway_startup_failure"]
     if receipt.get("reason"):
         failure["run_reason"] = receipt["reason"]
     if type(receipt.get("tool_errors")) is int:

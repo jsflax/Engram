@@ -219,6 +219,38 @@ class RunnerPlanningTests(unittest.TestCase):
         self.assertFalse(list(self.run.glob("operation-*")))
         self.assertEqual(J._json(J._unseal(plan["operations"][0]["request"]))["mutation"]["request"]["isPrivate"], True)
 
+    def startup_diagnostic(self):
+        diagnostic = M._StartupDiagnostic()
+        diagnostic.bind(SimpleNamespace(run_dir=self.run), self.manifest, self.context.manifest_sha256, J)
+        diagnostic.stage = "execution_context"
+        diagnostic.record(ValueError("execution_context_backend_changed"))
+
+    def test_failed_provider_reports_bound_startup_code_without_authorizing_a_plan(self):
+        def failed_provider(*args, **kwargs):
+            self.startup_diagnostic()
+            return SimpleNamespace(returncode=1, poll=lambda: 1, wait=lambda **kwargs: 1)
+        with mock.patch.object(R.subprocess, "Popen", side_effect=failed_provider):
+            result = self.invoke()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "unverified_completion")
+        self.assertEqual(result["gateway_startup_failure"],
+                         {"stage": "execution_context", "reason": "execution_context_backend_changed"})
+        self.assertEqual(result["write_calls"], 0)
+        self.assertFalse(list(self.run.glob("operation-*")))
+        with self.assertRaises(ValueError):
+            L.seal_plan(self.run, verify_fence=self.fence.verify, validate_inputs=lambda *args: True)
+        settled = R.settlement._compute(self.run, self.manifest, self.context.manifest_sha256)
+        self.assertEqual((settled["status"], settled["reason"]), ("failed", "planning_not_complete"))
+
+    def test_diagnostic_is_not_a_success_or_plan_validation_input(self):
+        self.startup_diagnostic()
+        result = self.invoke()
+        self.assertEqual(result["status"], "planned")
+        self.assertNotIn("gateway_startup_failure", result)
+        plan = L.seal_plan(self.run, verify_fence=self.fence.verify, validate_inputs=lambda *args: True)
+        self.assertEqual(len(plan["operations"]), 1)
+        self.assertFalse(list(self.run.glob("operation-*")))
+
     def test_failed_terminal_cannot_authorize_even_a_valid_complete_proposal(self):
         self.failed_turn = True
         self.assertEqual(self.invoke()["status"], "failed")

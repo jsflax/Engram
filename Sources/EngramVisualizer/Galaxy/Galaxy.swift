@@ -109,10 +109,6 @@ actor Galaxy: Identifiable {
     /// Lock-protected update buffer — written by Galaxy actor, drained by MainActor.
     let pendingUpdate = OSAllocatedUnfairLock<RenderUpdate>(initialState: .init())
 
-    /// Lock-protected pk→gid mirror for edges — maintained alongside pendingUpdate so
-    /// the edge delete observer can resolve pk→gid without dispatching to MainActor.
-    let edgePkToGidLock = OSAllocatedUnfairLock<[Int64: UUID]>(initialState: [:])
-
     // World-space center (set by GalaxyRegistry.computeWorldLayout)
     @MainActor var worldCenter: SIMD3<Float> = .zero
 
@@ -129,6 +125,7 @@ actor Galaxy: Identifiable {
     }
     nonisolated func setNodeFilter(_ filter: (@Sendable (Memory) -> Bool)?) {
         nodeFilterLock.set(filter)
+        requestRescan()
     }
 
     /// effectiveProject resolution (decision 13) for GROUP galaxies: members
@@ -145,6 +142,7 @@ actor Galaxy: Identifiable {
     }
     nonisolated func setProjectResolver(_ resolver: (@Sendable (UUID?, String) -> String)?) {
         projectResolverLock.set(resolver)
+        requestRescan()
     }
 
     /// Resolved display project for a memory in this galaxy.
@@ -160,6 +158,7 @@ actor Galaxy: Identifiable {
     @MainActor var flushTimingFile: UnsafeMutablePointer<FILE>? = nil
     #endif
 
+    @MainActor var loadStatus: GalaxyLoadStatus = .waiting
     @MainActor var isLoaded = false
     @MainActor var isInitialLoad = true
     @MainActor private var loadingUpdate: RenderUpdate?
@@ -175,6 +174,10 @@ actor Galaxy: Identifiable {
     /// pressure that triggered the sqlite OOM crash. Checked and set
     /// synchronously on the actor, before any await — no window.
     private var loadInFlight = false
+    let loadChanges = OSAllocatedUnfairLock(initialState: GalaxyLoadChanges())
+    private var clusterTask: Task<Void, Never>?
+
+    private enum LoadFailure: Error { case storageUnavailable }
 
     @MainActor init(id: String, displayName: String, lattice: LatticeThreadSafeReference,
          hierarchyLevel: Int = 0, parentGalaxyId: String? = nil) {
@@ -188,173 +191,287 @@ actor Galaxy: Identifiable {
     var nodeObserver: AnyCancellable?
     var edgeObserver: AnyCancellable?
 
-    /// Set up live Lattice observers. Callbacks push raw data into pendingUpdate —
-    /// all filtering (hidden projects/relations, time) happens during drain via DrainConfig.
-    func startObservers() {
-        guard !Task.isCancelled else { return }
-        // Sign-out (or any teardown) can invalidate the lattice while the
-        // initial load is still in flight — observers just don't start.
-        // Crashing here took the app down when signing out mid-load.
-        guard let lattice = latticeRef.resolve() else { return }
-
-        edgeObserver = lattice.objects(MemoryEdge.self).observe { [pendingUpdate, edgePkToGidLock] change in
-            // Lattice torn down (sign-out) — drop the change, observer dies with it.
-            guard let bg = self.latticeRef.resolve() else { return }
+    /// Register before the first read. Callbacks only coalesce primary keys;
+    /// the single loader rereads current rows after the baseline has drained.
+    private func startObservers(generation: UInt64) -> Bool {
+        guard !Task.isCancelled, let lattice = latticeRef.resolve() else { return false }
+        nodeObserver?.cancel()
+        edgeObserver?.cancel()
+        edgeObserver = lattice.objects(MemoryEdge.self).observe { [weak self] change in
+            let pk: Int64
             switch change {
-            case .insert(let pk):
-                guard let edge = bg.object(MemoryEdge.self, primaryKey: pk),
-                      let gid = edge.globalId else { return }
-                let data = EdgeData(id: gid, sourceId: edge.sourceGlobalId,
-                                    targetId: edge.targetGlobalId, relation: edge.relation.rawValue)
-                edgePkToGidLock.withLock { $0[pk] = gid }
-                pendingUpdate.withLock { $0.insertedEdges.append((pk, data)) }
-            case .update(let pk):
-                guard let edge = bg.object(MemoryEdge.self, primaryKey: pk),
-                      let gid = edge.globalId else { return }
-                let data = EdgeData(id: gid, sourceId: edge.sourceGlobalId,
-                                    targetId: edge.targetGlobalId, relation: edge.relation.rawValue)
-                pendingUpdate.withLock { $0.updatedEdges.append(data) }
-            case .delete(let pk):
-                // Resolve pk→gid under lock, push to pendingUpdate for drain processing.
-                // No MainActor dispatch needed — the lock mirror is maintained alongside
-                // pendingUpdate on inserts and bulk loads.
-                guard let gid = edgePkToGidLock.withLock({ $0.removeValue(forKey: pk) }) else { return }
-                pendingUpdate.withLock { $0.removedEdgeGids.append(gid) }
+            case .insert(let value), .update(let value), .delete(let value): pk = value
             }
+            self?.recordChange(pk, edge: true, generation: generation)
         }
-
-        nodeObserver = lattice.objects(Memory.self).observe { [pendingUpdate] change in
-            // Lattice torn down (sign-out) — drop the change, observer dies with it.
-            guard let bg = self.latticeRef.resolve() else { return }
+        nodeObserver = lattice.objects(Memory.self).observe { [weak self] change in
+            let pk: Int64
             switch change {
-            case .insert(let pk):
-                guard let memory = bg.object(Memory.self, primaryKey: pk),
-                      let gid = memory.globalId else { return }
-                // Same structural partition loadData applies — without it a
-                // post-load memory lands in every galaxy whose DB has it.
-                if let filter = self.nodeFilter, !filter(memory) { return }
-                let node = NodeData(
-                    id: gid, project: self.displayProject(memory), topic: memory.topic,
-                    label: extractLabel(content: memory.content, topic: memory.topic),
-                    content: memory.content,
-                    createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
-                    importance: memory.importance)
-                pendingUpdate.withLock { $0.insertedNodes.append((pk, node)) }
-            case .update(let pk):
-                guard let memory = bg.object(Memory.self, primaryKey: pk),
-                      let gid = memory.globalId else { return }
-                if let filter = self.nodeFilter, !filter(memory) {
-                    // Fell out of this galaxy's partition (e.g. project
-                    // toggled to sync) — remove; no-op if never present.
-                    pendingUpdate.withLock { $0.removedNodePks.append(pk) }
-                    return
-                }
-                let node = NodeData(
-                    id: gid, project: self.displayProject(memory), topic: memory.topic,
-                    label: extractLabel(content: memory.content, topic: memory.topic),
-                    content: memory.content,
-                    createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
-                    importance: memory.importance)
-                pendingUpdate.withLock { $0.updatedNodes.append((pk, node)) }
-            case .delete(let pk):
-                pendingUpdate.withLock { $0.removedNodePks.append(pk) }
+            case .insert(let value), .update(let value), .delete(let value): pk = value
             }
+            self?.recordChange(pk, edge: false, generation: generation)
+        }
+        return true
+    }
+
+    nonisolated private func recordChange(_ pk: Int64, edge: Bool, generation: UInt64) {
+        let launch = loadChanges.withLock { $0.record(pk, edge: edge, generation: generation) }
+        if launch {
+            Task { [weak self] in await self?.runLoader(generation: generation) }
         }
     }
 
+    nonisolated private func requestRescan() {
+        if let generation = loadChanges.withLock({ $0.requestScan() }) {
+            Task { [weak self] in await self?.runLoader(generation: generation) }
+        }
+    }
+
+    /// Invalidate synchronously during registry removal, before an already
+    /// queued MainActor chunk or observer callback can touch the shared scene.
+    nonisolated func cancelLoading() { loadChanges.withLock { $0.stop() } }
+
     func stopObservers() {
+        cancelLoading()
         nodeObserver?.cancel()
         edgeObserver?.cancel()
         nodeObserver = nil
         edgeObserver = nil
+        clusterTask?.cancel()
+        clusterTask = nil
     }
-    
-    /// Load all data from a galaxy's Lattice into its renderStore + simulation.
-    /// Reads ALL data — visual filtering (hiddenProjects, etc.) happens during
-    /// drain via DrainConfig. Only `nodeFilter` (structural partition) is applied here.
+
     func loadData() async {
-        guard !Task.isCancelled else { return }
-        // Guard against duplicate loads (onAppear + syncManager.didConnect can
-        // both fire). loadInFlight is checked/set synchronously on the actor
-        // — airtight; the isLoaded check alone suspends and lets both through.
-        guard !loadInFlight else { return }
+        guard !Task.isCancelled, !loadInFlight else { return }
         loadInFlight = true
         defer { loadInFlight = false }
         guard await !isLoaded else { return }
-
-        let batchSize = 50
-        let ref = latticeRef
-        let nodeFilter = nodeFilter
-        let projectResolver = projectResolver
-
-        guard let bgLattice = ref.resolve() else { return }
-
-        // 1. Read all edges AND build dictionaries off main actor.
-        var allEdges: [UUID: EdgeData] = [:]
-        var edgePkToGlobalId: [Int64: UUID] = [:]
-        var edgesByNode: [UUID: [EdgeData]] = [:]
-        for e in bgLattice.objects(MemoryEdge.self) {
-            guard !Task.isCancelled else { return }
-            guard let (pk, ed) = Self.snapshotEdge(e) else { continue }
-            allEdges[ed.id] = ed
-            edgePkToGlobalId[pk] = ed.id
-            edgesByNode[ed.sourceId, default: []].append(ed)
-            edgesByNode[ed.targetId, default: []].append(ed)
+        let generation = loadChanges.withLock { $0.begin() }
+        guard loadChanges.withLock({ $0.accepts(generation) }) else { return }
+        await setLoadStatus(.loading, generation: generation)
+        guard startObservers(generation: generation) else {
+            loadChanges.withLock { $0.failed(generation: generation) }
+            await setLoadStatus(.failed, generation: generation)
+            return
         }
+        await runLoader(generation: generation)
+    }
 
-        // Push bulk edges into the update buffer + populate pk→gid lock mirror
-        let finalEdges = allEdges
-        let finalPkToGid = edgePkToGlobalId
-        let finalByNode = edgesByNode
-        let finalEdgeCounts = edgesByNode.mapValues(\.count)
-        edgePkToGidLock.withLock { $0 = finalPkToGid }
-        pendingUpdate.withLock {
-            $0.bulkEdges = (finalEdges, finalPkToGid, finalByNode)
-            $0.bulkEdgeCounts = finalEdgeCounts
+    private func checkLoad(_ generation: UInt64) throws {
+        guard !Task.isCancelled, loadChanges.withLock({ $0.accepts(generation) }) else {
+            throw CancellationError()
         }
+    }
 
-        // 2. Read nodes in batches — all off MainActor
-        var nodeBatch: [(pk: Int64, node: NodeData)] = []
-        var allProjects = Set<String>()
-        for m in bgLattice.objects(Memory.self) {
-            guard !Task.isCancelled else { return }
-            guard let record = Self.snapshotNode(m, filter: nodeFilter, projectResolver: projectResolver) else { continue }
-            allProjects.insert(record.node.project)
-            nodeBatch.append(record)
-            if nodeBatch.count >= batchSize {
-                let batch = nodeBatch
-                nodeBatch = []
-                pendingUpdate.withLock { $0.bulkNodeBatches.append(batch) }
+    /// There is only one producer. Each 50-row chunk is consumed on MainActor
+    /// before the next query; neither hydrated models nor an unbounded batch
+    /// queue survive the await. A full scan is nodes-first, then edges.
+    private func runLoader(generation: UInt64) async {
+        do {
+            while true {
+                try checkLoad(generation)
+                switch loadChanges.withLock({ $0.next(generation: generation) }) {
+                case .scan:
+                    await setLoadStatus(.loading, generation: generation)
+                    try await scan(generation: generation)
+                case .rows(let nodes, let edges):
+                    try await reconcile(nodes: nodes, edges: edges, generation: generation)
+                case .idle:
+                    let revision = loadChanges.withLock { $0.revision }
+                    await finishLoad(generation: generation, revision: revision)
+                    if loadChanges.withLock({ $0.finishIfIdle(generation: generation) }) {
+                        scheduleClusters(generation: generation, revision: revision)
+                        return
+                    }
+                }
             }
+        } catch {
+            loadChanges.withLock { $0.failed(generation: generation) }
+            await setLoadStatus(error is CancellationError ? .cancelled : .failed, generation: generation)
         }
-        if !nodeBatch.isEmpty {
-            let batch = nodeBatch
-            pendingUpdate.withLock { $0.bulkNodeBatches.append(batch) }
+    }
+
+    private func scan(generation: UInt64) async throws {
+        // A primary-key tail preview is indexed and bounded. It puts recent
+        // arrivals on screen before the complete ascending scan, without an
+        // unindexed createdAt sort or changing final graph membership.
+        try checkLoad(generation)
+        guard let previewLattice = latticeRef.resolve() else { throw LoadFailure.storageUnavailable }
+        let preview = previewLattice.objects(Memory.self).sortedBy(\.primaryKey, order: .reverse).snapshot(limit: 50)
+        guard previewLattice.lastQueryError() == nil else { throw LoadFailure.storageUnavailable }
+        let previewNodes = preview.compactMap { Self.snapshotNode($0, filter: nodeFilter, projectResolver: projectResolver) }
+        await applyLoadChunk(nodes: previewNodes, generation: generation)
+        var seenNodes: Set<Int64> = []
+        var seenEdges: Set<Int64> = []
+        var cursor = Int64.min
+        while true {
+            try checkLoad(generation)
+            guard let lattice = latticeRef.resolve() else { throw LoadFailure.storageUnavailable }
+            let after = cursor
+            let rows = lattice.objects(Memory.self).where { $0.primaryKey > after }
+                .sortedBy(\.primaryKey).snapshot(limit: 50)
+            // Must be read on the querying thread, before any await/getter.
+            guard lattice.lastQueryError() == nil else { throw LoadFailure.storageUnavailable }
+            if rows.isEmpty { break }
+            guard let last = rows.last?.primaryKey, last > cursor else { throw LoadFailure.storageUnavailable }
+            cursor = last
+            let batch = rows.compactMap { Self.snapshotNode($0, filter: nodeFilter, projectResolver: projectResolver) }
+            seenNodes.formUnion(batch.map(\.pk))
+            await applyLoadChunk(nodes: batch, generation: generation)
         }
+        cursor = Int64.min
+        while true {
+            try checkLoad(generation)
+            guard let lattice = latticeRef.resolve() else { throw LoadFailure.storageUnavailable }
+            let after = cursor
+            let rows = lattice.objects(MemoryEdge.self).where { $0.primaryKey > after }
+                .sortedBy(\.primaryKey).snapshot(limit: 50)
+            guard lattice.lastQueryError() == nil else { throw LoadFailure.storageUnavailable }
+            if rows.isEmpty { break }
+            guard let last = rows.last?.primaryKey, last > cursor else { throw LoadFailure.storageUnavailable }
+            cursor = last
+            let batch = rows.compactMap(Self.snapshotEdge)
+            seenEdges.formUnion(batch.map(\.pk))
+            await applyLoadChunk(edges: batch, generation: generation)
+        }
+        // Required on overflow/retry: rows deleted before a fresh scan have no
+        // new callback to replay. Only a successful complete scan may prune.
+        let missing = await missingKeys(nodes: seenNodes, edges: seenEdges, generation: generation)
+        for offset in stride(from: 0, to: missing.nodes.count, by: 50) {
+            try checkLoad(generation)
+            await applyLoadChunk(removedNodes: Array(missing.nodes[offset..<min(offset + 50, missing.nodes.count)]), generation: generation)
+        }
+        for offset in stride(from: 0, to: missing.edges.count, by: 50) {
+            try checkLoad(generation)
+            await applyLoadChunk(removedEdges: Array(missing.edges[offset..<min(offset + 50, missing.edges.count)]), generation: generation)
+        }
+    }
 
-        // 3. Mark finalize — drain loop will recomputeDerivedData + wake sim
-        pendingUpdate.withLock { $0.finalize = true }
+    private func reconcile(nodes: [Int64], edges: [Int64], generation: UInt64) async throws {
+        try checkLoad(generation)
+        guard let lattice = latticeRef.resolve() else { throw LoadFailure.storageUnavailable }
+        var nodeRows: [(pk: Int64, node: NodeData)] = []
+        var edgeRows: [(pk: Int64, edge: EdgeData)] = []
+        var removedNodes: [Int64] = []
+        var removedEdges: [Int64] = []
+        for pk in nodes {
+            let row = lattice.object(Memory.self, primaryKey: pk)
+            guard lattice.lastQueryError() == nil else { throw LoadFailure.storageUnavailable }
+            if let row, let data = Self.snapshotNode(row, filter: nodeFilter, projectResolver: projectResolver) {
+                nodeRows.append(data)
+            } else { removedNodes.append(pk) }
+        }
+        for pk in edges {
+            let row = lattice.object(MemoryEdge.self, primaryKey: pk)
+            guard lattice.lastQueryError() == nil else { throw LoadFailure.storageUnavailable }
+            if let row, let data = Self.snapshotEdge(row) { edgeRows.append(data) }
+            else { removedEdges.append(pk) }
+        }
+        await applyLoadChunk(nodes: nodeRows, edges: edgeRows, removedNodes: removedNodes,
+                             removedEdges: removedEdges, generation: generation)
+    }
 
-        // 4. Cluster computation off main actor — push result into update buffer.
-        // Serialized ACROSS galaxies: the per-project vector queries are the
-        // most allocation-heavy phase of a load, and three galaxies running
-        // them concurrently over multi-GB DBs is what pushed the SQLite page
-        // cache to ~1GB and into transient OOM (crash 2026-08-05). Nodes and
-        // edges above still load fully in parallel; only this tail is gated.
-        let projects = allProjects
-        let finalClusters = await ClusterPassGate.shared.run { [ref] in
-            guard let lat = ref.resolve() else { return [[UUID]]() }
-            var clusters: [[UUID]] = []
-            for project in projects {
-                guard !Task.isCancelled else { return [[UUID]]() }
-                clusters.append(contentsOf: findMemoryClusters(
-                    in: lat, project: project,
-                    minClusterSize: 2, neighborLimit: 20).clusters)
+    @MainActor private func missingKeys(nodes: Set<Int64>, edges: Set<Int64>, generation: UInt64)
+        -> (nodes: [Int64], edges: [Int64]) {
+        guard loadChanges.withLock({ $0.accepts(generation) }) else { return ([], []) }
+        return (renderStore.pkToGlobalId.keys.filter { !nodes.contains($0) },
+                renderStore.edgePkToGlobalId.keys.filter { !edges.contains($0) })
+    }
+
+    @MainActor func applyLoadChunk(
+        nodes: [(pk: Int64, node: NodeData)] = [], edges: [(pk: Int64, edge: EdgeData)] = [],
+        removedNodes: [Int64] = [], removedEdges: [Int64] = [], generation: UInt64
+    ) {
+        guard !Task.isCancelled, loadChanges.withLock({ $0.accepts(generation) }) else { return }
+        let config = registry?.currentDrainConfig ?? DrainConfig(
+            hiddenProjects: [], hiddenRelations: [], timeFilter: nil, is3D: false,
+            soundEnabled: false, notificationsEnabled: false)
+        let apply = {
+            let store = self.renderStore
+            self.handleNodeDeletes(Set(removedNodes), config: config)
+            for pk in removedEdges {
+                if let gid = store.edgePkToGlobalId.removeValue(forKey: pk) { self.handleEdgeDelete(gid) }
             }
-            return clusters
+            for (pk, node) in nodes {
+                store.pkToGlobalId[pk] = node.id
+                let visible = !config.hiddenProjects.contains(node.project)
+                    && (config.timeFilter == nil || node.createdAt <= config.timeFilter!)
+                if store.visibleNodeIds.contains(node.id) && !visible {
+                    self.handleNodeDeletes([pk], config: config)
+                }
+                if store.allNodes[node.id] == nil || (!store.visibleNodeIds.contains(node.id) && visible) {
+                    store.pendingNodeInserts.append((pk, node))
+                } else if visible {
+                    self.handleNodeUpdate(pk: pk, node: node, config: config)
+                } else {
+                    store.allNodes[node.id] = node
+                    store.nodeById.removeValue(forKey: node.id)
+                    self.ensureProjectColors([node.project])
+                    store.bumpTopology()
+                }
+            }
+            self.flushPendingNodeInserts(config: config)
+            for (pk, edge) in edges {
+                store.edgePkToGlobalId[pk] = edge.id
+                if store.allEdges[edge.id] == nil { store.pendingEdgeInserts.append((edge.id, edge)) }
+                else { self.handleEdgeUpdate(edge, config: config) }
+            }
+            self.flushPendingEdgeInserts(config: config)
         }
-        guard !Task.isCancelled else { return }
-        pendingUpdate.withLock { $0.clusterGroups = finalClusters }
+        if let registry { registry.withReleasedSingleGalaxySnapshot(for: self, apply) }
+        else { apply() }
+    }
+
+    @MainActor private func setLoadStatus(_ status: GalaxyLoadStatus, generation: UInt64) {
+        guard loadChanges.withLock({ $0.accepts(generation) }) else { return }
+        loadStatus = status
+        isLoaded = status == .complete
+        renderStore.bumpTopology()
+        if let registry { registry.panelSnapshot.refresh(from: registry) }
+    }
+
+    @MainActor private func finishLoad(generation: UInt64, revision: UInt64) {
+        guard !Task.isCancelled, loadChanges.withLock({ $0.accepts(generation) && $0.revision == revision && !$0.needsScan && $0.nodes.isEmpty && $0.edges.isEmpty }) else { return }
+        recomputeDerivedData()
+        isInitialLoad = false
+        setLoadStatus(.complete, generation: generation)
+        simulation3D?.wake()
+    }
+
+    /// Clustering is optional derived work. It never delays subscriptions or
+    /// graph completion, and an old generation/revision cannot publish it.
+    private func scheduleClusters(generation: UInt64, revision: UInt64) {
+        guard clusterTask == nil else { return }
+        clusterTask = Task { [weak self] in
+            guard let self else { return }
+            let projects = await self.loadedProjects()
+            let ref = self.latticeRef
+            let changes = self.loadChanges
+            let clusters = await ClusterPassGate.shared.run {
+                guard !Task.isCancelled, changes.withLock({ $0.accepts(generation) && $0.revision == revision }),
+                      let lattice = ref.resolve() else { return [[UUID]]() }
+                var result: [[UUID]] = []
+                for project in projects {
+                    guard !Task.isCancelled, changes.withLock({ $0.accepts(generation) && $0.revision == revision }) else { return [] }
+                    result.append(contentsOf: findMemoryClusters(in: lattice, project: project,
+                                                                 minClusterSize: 2, neighborLimit: 20).clusters)
+                }
+                return result
+            }
+            if !Task.isCancelled { await self.publishClusters(clusters, generation: generation, revision: revision) }
+            await self.finishClusterTask()
+        }
+    }
+
+    private func finishClusterTask() {
+        clusterTask = nil
+    }
+
+    @MainActor private func loadedProjects() -> Set<String> { Set(renderStore.allNodes.values.map(\.project)) }
+
+    @MainActor private func publishClusters(_ clusters: [[UUID]], generation: UInt64, revision: UInt64) {
+        guard loadChanges.withLock({ $0.accepts(generation) && $0.revision == revision }) else { return }
+        renderStore.clusterGroups = clusters
     }
 
     /// Scope the hydrated scalar cache to one row. This replaces one SQL read
@@ -558,6 +675,7 @@ actor Galaxy: Identifiable {
         if config.is3D { simulation3D?.wake() }
         isInitialLoad = false
         isLoaded = true
+        loadStatus = .complete
         loadingUpdate = nil
         loadingBatchIndex = 0
         initialDerivedData = nil
@@ -768,7 +886,7 @@ actor Galaxy: Identifiable {
             let gid = node.id
             store.pkToGlobalId[pk] = gid
             store.allNodes[gid] = node
-            store.newNodeGlows[gid] = Date()
+            if !isInitialLoad { store.newNodeGlows[gid] = Date() }
             // Even a hidden project's first row must expose a project entry
             // in the sidebar so it can subsequently be made visible.
             if store.colorMap[node.project] == nil {

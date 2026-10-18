@@ -7,20 +7,28 @@ final class GalaxyPanelSnapshot {
     private(set) var visibleCount = 0
     private(set) var totalCount = 0
     private(set) var edgeCount = 0
+    private(set) var loadingStores = 0
+    private(set) var incompleteStores = 0
     private(set) var projectCounts: [String: Int] = [:]
     private(set) var projects: [String] = []
     private(set) var colorMap: [String: Color] = [:]
     private(set) var recentNodes: [NodeData] = []
     private(set) var relationCounts: [(key: String, value: Int)] = []
     @ObservationIgnored private var needsRefresh = false
+    @ObservationIgnored private var publishedLoadingPreview = false
     @ObservationIgnored nonisolated(unsafe) private var refreshTask: Task<Void, Never>?
 
     func refresh(from registry: GalaxyRegistry) {
+        loadingStores = registry.galaxies.values.filter { $0.loadStatus == .waiting || $0.loadStatus == .loading }.count
+        incompleteStores = registry.galaxies.values.filter { $0.loadStatus == .failed || $0.loadStatus == .cancelled }.count
         needsRefresh = true
         guard refreshTask == nil else { return }
         refreshTask = Task { [weak self, weak registry] in
             while !Task.isCancelled {
-                do { try await Task.sleep(for: .milliseconds(100)) } catch { break }
+                // Publish the first partial page promptly, then limit copies of
+                // the growing graph to one per second while the scan runs.
+                let delay = (self?.loadingStores ?? 0) > 0 && self?.publishedLoadingPreview == true ? 1_000 : 100
+                do { try await Task.sleep(for: .milliseconds(delay)) } catch { break }
                 guard let self, let registry else { break }
                 // onAppear can request a refresh independently of the registry,
                 // and a scheduled refresh may outlive the start of bulk loading.
@@ -39,6 +47,7 @@ final class GalaxyPanelSnapshot {
                     Self.derive(allNodes: nodes, visible: visible)
                 }.value
                 guard !Task.isCancelled else { break }
+                self.publishedLoadingPreview = self.loadingStores > 0
                 self.totalCount = derived.totalCount
                 self.visibleCount = visible.count
                 self.edgeCount = edgeCount

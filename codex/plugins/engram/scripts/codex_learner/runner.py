@@ -27,7 +27,7 @@ import tomllib
 import uuid
 
 from .transcript import inspect_rollout, read_excerpt
-from .memory_proxy import verified_no_write_receipt, audit_planning_tools, PLANNING_MODE
+from .memory_proxy import verified_no_write_receipt, audit_planning_tools, PLANNING_MODE, read_startup_failure
 from . import admission, memory_config, host_admission, operation_gateway, learner_settings
 from . import runner_publication, settlement
 
@@ -1047,6 +1047,10 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict, *
                "session_id": request["session_id"], "event": request["event"],
                "returncode": proc.returncode, "reason": reason or (None if success else "unverified_completion"),
                "outcome": result.get("outcome"), **observed}
+    if not success and execution is not None:
+        diagnostic = read_startup_failure(run_dir, execution.context.manifest_sha256)
+        if diagnostic is not None:
+            summary["gateway_startup_failure"] = diagnostic
     atomic_json(run_dir / "run.json", summary)
     # No need to retain a second copy of the excerpt after the subprocess exits.
     prompt_path.unlink(missing_ok=True)

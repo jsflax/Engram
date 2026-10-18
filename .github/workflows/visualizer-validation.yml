@@ -1,0 +1,164 @@
+name: Visualizer validation
+run-name: Visualizer validation at ${{ github.event.pull_request.head.sha || github.sha }}
+
+on:
+  pull_request:
+    paths:
+      - 'Sources/EngramVisualizer/**'
+      - 'EngramUnitTests/**'
+      - 'Engram.xcodeproj/**'
+      - 'Package.swift'
+      - 'Package.resolved'
+      - '.swiftpm/configuration/mirrors.json'
+      - 'scripts/prepare_visualizer_tests.py'
+      - 'scripts/test_prepare_visualizer_tests.py'
+      - '.github/workflows/visualizer-validation.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: visualizer-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app-tests:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: macos-26
+    timeout-minutes: 110
+    env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out exact source under localdev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          task_root="$HOME/localdev/engram-visualizer-validation-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$HOME/localdev"
+          mkdir -m 700 "$task_root"
+          mkdir -m 700 -p "$task_root"/{scratch,cache,config,security,module-cache,tmp,evidence,fixtures,private,mirror,test-home,derived}
+          {
+            echo "VALIDATION_ROOT=$task_root"
+            echo "TMPDIR=$task_root/tmp"
+            echo "CLANG_MODULE_CACHE_PATH=$task_root/module-cache"
+            echo "SWIFTPM_MODULECACHE_OVERRIDE=$task_root/module-cache"
+            echo "CFFIXED_USER_HOME=$task_root/test-home"
+          } >> "$GITHUB_ENV"
+          gh auth setup-git
+          git init "$task_root/repo"
+          git -C "$task_root/repo" remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git -C "$task_root/repo" fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git -C "$task_root/repo" checkout --detach "$SOURCE_SHA"
+          test "$(git -C "$task_root/repo" rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C "$task_root/repo" diff --exit-code
+          cp "$task_root/repo/Package.resolved" "$task_root/private/Package.resolved"
+          cmp "$task_root/private/Package.resolved" "$task_root/repo/Engram.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+          cp "$task_root/repo/.swiftpm/configuration/mirrors.json" "$task_root/private/mirrors.json"
+          VALIDATION_ROOT="$task_root" python3 -B - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['VALIDATION_ROOT']); repo = root / 'repo'
+          paths = subprocess.check_output(['git', 'ls-files', '-z'], cwd=repo).decode().split('\0')
+          hashes = {p: hashlib.sha256((repo / p).read_bytes()).hexdigest() for p in paths if p}
+          (root / 'evidence/source-identity.json').write_text(json.dumps({
+              'source_sha': os.environ['SOURCE_SHA'], 'files_sha256': hashes,
+              'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT']}, indent=2) + '\n')
+          PY
+          xcodebuild -version > "$task_root/evidence/xcode-version.txt"
+          xcrun --find swift > "$task_root/evidence/swift-path.txt"
+          xcrun swift --version > "$task_root/evidence/swift-version.txt"
+
+      - name: Check isolated launch preparation controls
+        run: 'python3 -I -B "$VALIDATION_ROOT/repo/scripts/test_prepare_visualizer_tests.py" -v'
+
+      - name: Mirror identical Sparkle artifact and resolve exact dependencies
+        timeout-minutes: 20
+        env:
+          SWIFTLM_CLONE_TOKEN: ${{ secrets.SWIFTLM_CLONE_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VALIDATION_ROOT/repo"
+          test -n "$SWIFTLM_CLONE_TOKEN" || { echo '::error::Read-only SwiftLM clone credential unavailable'; exit 1; }
+          artifact_url=https://github.com/sparkle-project/Sparkle/releases/download/2.8.1/Sparkle-for-Swift-Package-Manager.zip
+          curl -sSfL --connect-timeout 20 --max-time 180 -o "$VALIDATION_ROOT/mirror/Sparkle-for-Swift-Package-Manager.zip" "$artifact_url"
+          nohup python3 -B -m http.server 8765 --bind 127.0.0.1 --directory "$VALIDATION_ROOT/mirror" > "$VALIDATION_ROOT/private/mirror.log" 2>&1 &
+          echo "$!" > "$VALIDATION_ROOT/private/mirror.pid"
+          for attempt in 1 2 3 4 5; do
+            if curl -sSf --max-time 2 -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip; then break; fi
+            sleep 1
+          done
+          curl -sSf --max-time 5 -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip
+          swift package --scratch-path "$VALIDATION_ROOT/scratch" --cache-path "$VALIDATION_ROOT/cache" \
+            --config-path "$VALIDATION_ROOT/config" --security-path "$VALIDATION_ROOT/security" \
+            config set-mirror --original "$artifact_url" --mirror http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${SWIFTLM_CLONE_TOKEN}@github.com/jsflax/SwiftLM.insteadOf"
+          export GIT_CONFIG_VALUE_0=https://github.com/jsflax/SwiftLM
+          # One bounded resolution. Credential-bearing diagnostics stay private.
+          if ! perl -e 'alarm(15*60); exec @ARGV' -- swift package \
+            --scratch-path "$VALIDATION_ROOT/scratch" --cache-path "$VALIDATION_ROOT/cache" \
+            --config-path "$VALIDATION_ROOT/config" --security-path "$VALIDATION_ROOT/security" \
+            resolve --force-resolved-versions > "$VALIDATION_ROOT/private/resolve.log" 2>&1; then
+            echo '::error::Exact dependency resolution failed; private log retained'; exit 1
+          fi
+          cmp Package.resolved "$VALIDATION_ROOT/private/Package.resolved"
+          python3 -B scripts/prepare_visualizer_tests.py verify-inputs --root "$VALIDATION_ROOT"
+
+      - name: Full app and unit target build for testing
+        timeout-minutes: 75
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VALIDATION_ROOT/repo"
+          python3 -B scripts/run_native_tests.py --diagnostics-dir "$VALIDATION_ROOT/evidence/build" \
+            --timeout-seconds 4200 --silence-seconds 600 -- \
+            xcodebuild build-for-testing -project Engram.xcodeproj -scheme Engram -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' -derivedDataPath "$VALIDATION_ROOT/derived" \
+            -clonedSourcePackagesDirPath "$VALIDATION_ROOT/scratch" -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile -skipMacroValidation -skipPackagePluginValidation \
+            -only-testing:EngramUnitTests -parallel-testing-enabled NO -jobs 2 \
+            -resultBundlePath "$VALIDATION_ROOT/evidence/build.xcresult" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+      - name: Bind isolated test host and run focused Galaxy regressions
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VALIDATION_ROOT/repo"
+          python3 -B scripts/prepare_visualizer_tests.py prepare --root "$VALIDATION_ROOT"
+          python3 -B scripts/run_native_tests.py --diagnostics-dir "$VALIDATION_ROOT/evidence/tests" \
+            --timeout-seconds 360 --silence-seconds 90 -- \
+            xcodebuild test-without-building \
+            -xctestrun "$VALIDATION_ROOT/derived/Build/Products/VisualizerValidation.xctestrun" \
+            -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO \
+            -resultBundlePath "$VALIDATION_ROOT/evidence/tests.xcresult"
+          python3 -B scripts/prepare_visualizer_tests.py verify-inputs --root "$VALIDATION_ROOT"
+          python3 -B scripts/prepare_visualizer_tests.py audit --root "$VALIDATION_ROOT"
+
+      - name: Stop owned artifact mirror
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f "$VALIDATION_ROOT/private/mirror.pid"; then
+            pid=$(cat "$VALIDATION_ROOT/private/mirror.pid")
+            command_text=$(ps -p "$pid" -o command= || true)
+            if [[ "$command_text" == *"http.server 8765 --bind 127.0.0.1 --directory $VALIDATION_ROOT/mirror"* ]]; then
+              kill "$pid"
+            fi
+          fi
+
+      - name: Upload original app validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visualizer-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.VALIDATION_ROOT }}/evidence
+          if-no-files-found: error
+          retention-days: 7

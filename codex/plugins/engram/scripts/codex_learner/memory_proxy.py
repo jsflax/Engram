@@ -37,6 +37,125 @@ class ProxyError(Exception):
     pass
 
 
+STARTUP_FAILURE_FILE = "gateway-startup-failure.json"
+STARTUP_STAGES = frozenset({"provider_policy", "writer_fence", "execution_context",
+                            "gateway_policy", "operation_gateway", "audit_open"})
+STARTUP_REASONS = frozenset({
+    "provider_mode_changed", "planning_budgets_changed", "budgets_changed", "policy_changed",
+    "execution_context_backend_changed", "execution_context_binding_changed",
+    "execution_context_processing_changed", "execution_context_cursor_changed",
+    "execution_context_cursor_binding_changed", "execution_context_reconciliation_required",
+    "execution_context_runtime_changed", "execution_context_runtime_read_deadline",
+    "execution_context_unsafe_runtime", "execution_context_unbound_runtime",
+    "execution_context_source_changed", "execution_context_source_or_parser_changed",
+    "execution_context_parser_or_source_changed", "execution_context_unavailable_or_changed",
+    "writer_fence_generation_revoked", "writer_fence_lock_changed", "writer_fence_generation_changed",
+    "validation_failed", "io_error", "unexpected_error"})
+_STARTUP_PROXY_REASONS = {
+    "Durable provider mode changed": "provider_mode_changed",
+    "Durable planning budgets changed": "planning_budgets_changed",
+    "Durable execution budgets changed": "budgets_changed",
+    "Durable execution policy changed": "policy_changed"}
+
+
+def _startup_directory(info):
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_mode & 0o077):
+        raise ValueError("unsafe_startup_directory")
+    return (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode)
+
+
+class _StartupDiagnostic:
+    """Best-effort metadata only. Never evidence of absence or mutation authority."""
+    def __init__(self):
+        self.target = None
+        self.stage = "provider_policy"
+
+    def bind(self, paths, manifest, digest, journal):
+        # Called only after ContextPaths.check and a matching, private manifest.
+        try:
+            if manifest["run_id"] == paths.run_dir.name:
+                self.target = (paths.run_dir, _startup_directory(paths.run_dir.lstat()),
+                               manifest["session_id"], digest, journal)
+        except Exception:
+            self.target = None
+
+    def record(self, error):
+        if self.target is None or self.stage not in STARTUP_STAGES:
+            return
+        try:
+            run_dir, identity, session_id, digest, journal = self.target
+            if run_dir.resolve(strict=True) != run_dir:
+                return
+            fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                if _startup_directory(os.fstat(fd)) != identity:
+                    return
+                manifest, current = journal.read_manifest(run_dir)
+                if (current != digest or manifest["run_id"] != run_dir.name
+                        or manifest["session_id"] != session_id
+                        or _startup_directory(run_dir.lstat()) != identity):
+                    return
+                # Do not serialize exception text, paths, argv, or environment.
+                text = error.args[0] if error.args and type(error.args[0]) is str else None
+                reason = _STARTUP_PROXY_REASONS.get(text)
+                if reason is None:
+                    reason = text if text in STARTUP_REASONS else (
+                        "io_error" if isinstance(error, OSError) else
+                        "validation_failed" if isinstance(error, (ProxyError, ValueError, TypeError, KeyError))
+                        else "unexpected_error")
+                value = {"version": 1, "kind": "gateway_startup_failure", "run_id": run_dir.name,
+                         "session_id": session_id, "manifest_sha256": digest,
+                         "stage": self.stage, "reason": reason}
+                raw = journal.encode(value)
+                output = os.open(STARTUP_FAILURE_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                 | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=fd)
+                try:
+                    info = os.fstat(output)
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                            or info.st_nlink != 1 or info.st_mode & 0o077):
+                        return
+                    remaining = memoryview(raw)
+                    while remaining:
+                        count = os.write(output, remaining)
+                        if count <= 0:
+                            return
+                        remaining = remaining[count:]
+                    os.fsync(output)
+                finally:
+                    os.close(output)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except Exception:
+            # Preserve the original startup failure even if diagnostics fail.
+            pass
+
+
+def read_startup_failure(run_dir, manifest_sha256):
+    """Return only fixed diagnostic codes; callers must not use them to settle."""
+    try:
+        from . import execution_manifest as journal
+        run_dir = Path(run_dir)
+        if run_dir.resolve(strict=True) != run_dir:
+            return None
+        _startup_directory(run_dir.lstat())
+        manifest, digest = journal.read_manifest(run_dir)
+        if digest != manifest_sha256 or manifest["run_id"] != run_dir.name:
+            return None
+        raw, _ = journal.durable._read(run_dir / STARTUP_FAILURE_FILE, maximum=2048)
+        value = journal._json(raw)
+        if (set(value) != {"version", "kind", "run_id", "session_id", "manifest_sha256", "stage", "reason"}
+                or type(value["version"]) is not int or value["version"] != 1
+                or value["kind"] != "gateway_startup_failure" or value["run_id"] != run_dir.name
+                or value["session_id"] != manifest["session_id"] or value["manifest_sha256"] != digest
+                or value["stage"] not in STARTUP_STAGES or value["reason"] not in STARTUP_REASONS):
+            return None
+        return {key: value[key] for key in ("stage", "reason")}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        return None
+
+
 def normalized_uuid(value: Any) -> str | None:
     if not isinstance(value, str) or re.fullmatch(UUID_PATTERN, value) is None:
         return None
@@ -589,9 +708,15 @@ def run(config: dict[str, Any]) -> int:
         from stdio_bridge import RelayLimits, run_relay
     with contextlib.ExitStack() as cleanup:
         operations, fence, transport = None, None, config["transport"]
-        if "execution" in config:
-            operations, fence, transport = durable_execution(config, cleanup)
-        audit = Audit(Path(config["audit_path"]))
+        diagnostic = _StartupDiagnostic()
+        try:
+            if "execution" in config:
+                operations, fence, transport = durable_execution(config, cleanup, diagnostic=diagnostic)
+            diagnostic.stage = "audit_open"
+            audit = Audit(Path(config["audit_path"]))
+        except Exception as error:
+            diagnostic.record(error)
+            raise
         cleanup.callback(audit.close)
         policy = Policy(audit, config["provenance"], config["max_tool_calls"],
                         config["max_writes"], config.get("allowed_tools"), operations=operations,
@@ -605,7 +730,7 @@ def run(config: dict[str, Any]) -> int:
             policy.fail_pending()
 
 
-def durable_execution(config, cleanup):
+def durable_execution(config, cleanup, *, diagnostic=None):
     """Load a runner-issued manifest; JSON never supplies a lock descriptor.
 
     The gateway reacquires the sealed generation and validates the live marker
@@ -633,14 +758,22 @@ def durable_execution(config, cleanup):
     manifest, digest = journal.read_manifest(paths.run_dir)
     if digest != specification["manifest_sha256"]:
         raise ProxyError("Durable execution manifest changed")
+    if diagnostic is not None:
+        diagnostic.bind(paths, manifest, digest, journal)
     mode = manifest.get("provider_mode")
     if mode != config.get("provider_mode") or mode not in (None, PLANNING_MODE):
         raise ProxyError("Durable provider mode changed")
     if mode == PLANNING_MODE and manifest["plan_policy"] != {
             name: config[name] for name in ("max_tool_calls", "max_writes")}:
         raise ProxyError("Durable planning budgets changed")
+    if diagnostic is not None:
+        diagnostic.stage = "writer_fence"
     fence = cleanup.enter_context(writer_fence.acquire_shared(paths.run_dir, manifest["fencing"]))
+    if diagnostic is not None:
+        diagnostic.stage = "execution_context"
     context = contexts.load_execution(paths, manifest_sha256=digest, writer_fence=fence)
+    if diagnostic is not None:
+        diagnostic.stage = "gateway_policy"
     backend = journal._json(journal._unseal(manifest["inputs"]["backend_config"]))
     allowed = sorted(memory_config.allowed_tools(backend["memory"], ALLOWED_TOOLS))
     if mode == PLANNING_MODE:
@@ -656,6 +789,8 @@ def durable_execution(config, cleanup):
         raise ProxyError("Durable execution policy changed")
     operations = None
     if mode is None:
+        if diagnostic is not None:
+            diagnostic.stage = "operation_gateway"
         operations = operation_gateway.OperationGateway(paths.run_dir, manifest_sha256=digest,
             writer_fence=fence, validate_inputs=context.validate_inputs)
     return operations, fence, context.transport

@@ -17,6 +17,115 @@ final class GalaxyDrainTests: XCTestCase {
     private let config = DrainConfig(hiddenProjects: [], hiddenRelations: [], timeFilter: nil,
                                      is3D: true, soundEnabled: false, notificationsEnabled: false)
 
+    func testStreamingPagesPublishBeforeEdgesAndReconcileLatestRows() async throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        let registry = GalaxyRegistry()
+        let galaxy = Galaxy(id: "stream", displayName: "Stream", lattice: lattice.sendableReference)
+        registry.register(galaxy)
+        let changes = await galaxy.loadChanges
+        let generation = changes.withLock { $0.begin() }
+        let nodes = makeNodes(101)
+        galaxy.loadStatus = .loading
+        galaxy.applyLoadChunk(nodes: (0..<50).map { (Int64($0 + 1), nodes[$0]) }, generation: generation)
+        registry.mergeRenderData()
+        XCTAssertEqual(registry.mergedNodes.count, 50, "The first page is visible before edges or finalization")
+        XCTAssertFalse(galaxy.isLoaded)
+        XCTAssertEqual(registry.panelSnapshot.loadingStores, 1)
+        galaxy.applyLoadChunk(nodes: (50..<101).map { (Int64($0 + 1), nodes[$0]) }, generation: generation)
+        let edge = EdgeData(id: UUID(), sourceId: nodes[0].id, targetId: nodes[100].id, relation: "relates_to")
+        galaxy.applyLoadChunk(edges: [(1, edge)], generation: generation)
+        XCTAssertEqual(galaxy.renderStore.nodes.count, 101)
+        XCTAssertEqual(galaxy.renderStore.edges.map(\.id), [edge.id])
+        // A scan may have queued an old row. Reconciliation is deliberately
+        // applied after that baseline, using the current row or its absence.
+        let changed = NodeData(id: nodes[0].id, project: nodes[0].project, topic: nodes[0].topic,
+                               label: "Updated", content: "Updated while loading", createdAt: nodes[0].createdAt,
+                               lastAccessedAt: nodes[0].lastAccessedAt, importance: nodes[0].importance)
+        galaxy.applyLoadChunk(nodes: [(1, changed)], removedNodes: [101], removedEdges: [1], generation: generation)
+        XCTAssertEqual(galaxy.renderStore.allNodes[changed.id]?.content, changed.content)
+        XCTAssertNil(galaxy.renderStore.allNodes[nodes[100].id])
+        XCTAssertNil(galaxy.renderStore.pkToGlobalId[101])
+        XCTAssertTrue(galaxy.renderStore.edges.isEmpty)
+        XCTAssertTrue(galaxy.renderStore.allEdges.isEmpty)
+        // Repeated current-state reads must not duplicate adjacency or nodes.
+        galaxy.applyLoadChunk(nodes: [(1, changed)], generation: generation)
+        XCTAssertEqual(galaxy.renderStore.nodes.count, 100)
+        XCTAssertEqual(Set(galaxy.renderStore.nodes.map(\.id)).count, 100)
+    }
+
+    func testRemovedGalaxyRejectsQueuedStreamChunksAndOldGeneration() async throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        let registry = GalaxyRegistry()
+        let galaxy = Galaxy(id: "stream", displayName: "Stream", lattice: lattice.sendableReference)
+        registry.register(galaxy)
+        let changes = await galaxy.loadChanges
+        let generation = changes.withLock { $0.begin() }
+        let nodes = makeNodes(2)
+        galaxy.applyLoadChunk(nodes: [(1, nodes[0])], generation: generation)
+        registry.remove("stream")
+        galaxy.applyLoadChunk(nodes: [(2, nodes[1])], generation: generation)
+        XCTAssertEqual(galaxy.renderStore.allNodes.count, 1)
+        XCTAssertEqual(registry.unifiedSimulation.nodeCount, 0)
+        XCTAssertFalse(changes.withLock { $0.accepts(generation) })
+    }
+
+    func testPartialFailureIsNotReportedAsAnEmptyCompleteGraph() async throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        let registry = GalaxyRegistry()
+        let galaxy = Galaxy(id: "stream", displayName: "Stream", lattice: lattice.sendableReference)
+        registry.register(galaxy)
+        let changes = await galaxy.loadChanges
+        let generation = changes.withLock { $0.begin() }
+        galaxy.applyLoadChunk(nodes: [(1, makeNodes(1)[0])], generation: generation)
+        galaxy.loadStatus = .failed
+        changes.withLock { $0.failed(generation: generation) }
+        registry.mergeRenderData()
+        XCTAssertFalse(galaxy.isLoaded)
+        XCTAssertEqual(galaxy.renderStore.allNodes.count, 1)
+        XCTAssertEqual(registry.panelSnapshot.incompleteStores, 1)
+        XCTAssertEqual(registry.panelSnapshot.loadingStores, 0)
+    }
+
+    func testStreamingLoaderReadsEveryPageAndKeepsObserversLive() async throws {
+        let lattice = try Lattice(Memory.self, MemoryEdge.self, configuration: .init(storage: .memory()))
+        var rows: [Memory] = []
+        for i in 0..<151 {
+            let row = Memory(content: "Streaming row \(i)", topic: "general", project: "Stream", importance: 1)
+            try lattice.add(row)
+            rows.append(row)
+        }
+        let firstID = try XCTUnwrap(rows[0].globalId)
+        let lastID = try XCTUnwrap(rows[150].globalId)
+        let edge = MemoryEdge(sourceGlobalId: firstID, targetGlobalId: lastID, relation: .partOf)
+        try lattice.add(edge)
+        let galaxy = Galaxy(id: "stream", displayName: "Stream", lattice: lattice.sendableReference)
+        await galaxy.loadData()
+        XCTAssertTrue(galaxy.isLoaded)
+        XCTAssertEqual(galaxy.loadStatus, .complete)
+        XCTAssertEqual(galaxy.renderStore.allNodes.count, 151)
+        XCTAssertEqual(galaxy.renderStore.allEdges.count, 1)
+        rows[0].content = "Changed after baseline"
+        lattice.delete(rows[150])
+        lattice.delete(edge)
+        let added = Memory(content: "Arrived after baseline", topic: "general", project: "Stream", importance: 1)
+        try lattice.add(added)
+        let addedID = try XCTUnwrap(added.globalId)
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if galaxy.renderStore.allNodes[firstID]?.content == "Changed after baseline",
+               galaxy.renderStore.allNodes[lastID] == nil,
+               galaxy.renderStore.allNodes[addedID] != nil,
+               galaxy.renderStore.allEdges.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await galaxy.stopObservers()
+        XCTAssertEqual(galaxy.renderStore.allNodes[firstID]?.content, "Changed after baseline")
+        XCTAssertNil(galaxy.renderStore.allNodes[lastID])
+        XCTAssertNotNil(galaxy.renderStore.allNodes[addedID])
+        XCTAssertEqual(galaxy.renderStore.allNodes.count, 151)
+        XCTAssertTrue(galaxy.renderStore.allEdges.isEmpty)
+    }
+
     func testPublishedDrainConfigCarriesAllGraphSettings() {
         let registry = GalaxyRegistry()
         let settings = VisualizerConfig()

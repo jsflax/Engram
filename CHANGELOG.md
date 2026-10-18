@@ -6,6 +6,44 @@ All notable changes to Engram are documented in this file.
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-10-18
+
+### Fixed
+- Treat recoverable provider reconnect notices as notices when the same turn
+  completes successfully. Keep malformed, terminal and write failures visible.
+- Retry failed learner runs with authenticated proof that every operation is
+  absent, preserving their cursor and backoff instead of creating a false hold.
+- Make the Codex plugin learner collect and validate a complete read-only plan
+  before writing memory. Save stable operation IDs and resume interrupted writes
+  from that plan without rerunning the provider or duplicating completed writes.
+- Keep slow learner startup and native execution outside lifecycle enqueue locks.
+- Start the native status-request timeout after transcript preflight and reuse
+  validation of identical source/history bytes. Continue checking current bytes,
+  permissions, saved memories and execution ownership before each request.
+- Preserve native auto-connect edge IDs when accepting a committed remember
+  receipt, so a successful write does not leave the learner falsely held.
+- Bind a stable default native PATH for new learner plans so temporary host
+  PATH prefixes cannot prevent a later process from resuming the saved plan.
+  Explicit user environments and existing sealed routes remain exact.
+- Prevent losing learner lock contenders from changing the active owner's lock
+  metadata. Tolerate older runners reapplying the same lock permissions while retaining
+  file replacement, ownership and permission checks; report actual contention.
+- Release background embedding-migration read snapshots before model waits and
+  on every exit, preventing idle database read locks from outliving a request.
+- Load the visualizer in bounded batches, show recent memories early, and attach
+  observers before the baseline read so changes during loading are not lost.
+  Optional clustering no longer delays graph completion.
+- Prevent an older running app from replacing newer installed command-line tools.
+- Bound hook-status output while preserving held and incomplete learner states.
+- Retain private, typed gateway startup diagnostics and show their stage and cause
+  in failed-run and hook-status reports without exposing prompts or environment.
+
+### Compatibility
+- Existing held runs still require evidence-based reconciliation; upgrading does
+  not discard successful writes, move transcript cursors, or reset memory lifetimes.
+- The complete-plan learner applies to the Codex plugin. Claude Code keeps its
+  existing native hook and session-learner integration.
+
 ## [0.15.1] - 2026-10-17
 
 ### Fixed

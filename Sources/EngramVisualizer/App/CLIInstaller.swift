@@ -23,6 +23,16 @@ enum CLIInstaller {
         let fm = FileManager.default
         guard fm.fileExists(atPath: cliDir.path) else { return }
 
+        let installedVersion = (try? String(contentsOfFile: versionFile, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // A retained older app must not replace support scripts or registrations
+        // belonging to a newer installation, even when it skips native binaries.
+        if let installedVersion,
+           compareVersions(installedVersion, isNewerThan: bundledVersion) {
+            return
+        }
+
         // Retry host registration even when the binary version is current.
         // A GUI launch may precede installation of Claude, Codex or Python.
         // Interpreter discovery and config I/O must not block app startup.
@@ -30,13 +40,17 @@ enum CLIInstaller {
         // memory command exists before the Codex registration is validated.
         defer {
             DispatchQueue.global(qos: .utility).async {
+                // Another app may have upgraded the installation while this
+                // registration work waited on the utility queue.
+                if let currentVersion = try? String(contentsOfFile: versionFile, encoding: .utf8),
+                   compareVersions(currentVersion.trimmingCharacters(in: .whitespacesAndNewlines),
+                                   isNewerThan: bundledVersion) {
+                    return
+                }
                 registerMCPServer()
                 syncCodexSupport(from: cliDir)
             }
         }
-
-        let installedVersion = (try? String(contentsOfFile: versionFile, encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard installedVersion == nil || compareVersions(bundledVersion, isNewerThan: installedVersion!) else {
             return

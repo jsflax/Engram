@@ -94,6 +94,7 @@ final class GalaxyRegistry {
         galaxy.registry = nil
         galaxy.embeddingProjection.invalidate()
         reconcileSimulationOwnership(for: galaxy.renderStore.visibleNodeIds)
+        galaxy.cancelLoading()
         Task { await galaxy.stopObservers() }
         computeWorldLayout()
     }
@@ -220,7 +221,6 @@ final class GalaxyRegistry {
             if let resolver = projectResolver { galaxy.setProjectResolver(resolver) }
             await galaxy.loadData()
             guard !Task.isCancelled else { return }
-            await galaxy.startObservers()
         }
     }
 

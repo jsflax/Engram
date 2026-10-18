@@ -65,6 +65,7 @@ public final class RKSpatialAudioSystem {
     /// Temp WAV files that back AudioFileResources. PHASE loads audio data
     /// asynchronously — files must stay on disk until the system is torn down.
     private var tempFileURLs: [URL] = []
+    private let temporaryDirectory: URL
 
     // MARK: - Throttling
 
@@ -73,7 +74,8 @@ public final class RKSpatialAudioSystem {
 
     // MARK: - Init
 
-    public init() {
+    public init(temporaryDirectory: URL = FileManager.default.temporaryDirectory) {
+        self.temporaryDirectory = temporaryDirectory
         generateAudioResources()
         let proxCount = proximityToneResources.count
         let hasEdge = edgeHumResource != nil
@@ -541,7 +543,7 @@ public final class RKSpatialAudioSystem {
         }
 
         // Write to temp file — must persist for PHASE async loading
-        let tempURL = FileManager.default.temporaryDirectory
+        let tempURL = temporaryDirectory
             .appendingPathComponent("engram_tone_\(UUID().uuidString).wav")
         do {
             try wav.write(to: tempURL)

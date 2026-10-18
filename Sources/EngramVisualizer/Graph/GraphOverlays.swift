@@ -64,6 +64,14 @@ struct StatsOverlay: View {
                 Text("\(totalMemories) memories")
                     .font(.system(size: 13, weight: .medium, design: .monospaced))
             }
+            if galaxyRegistry.panelSnapshot.incompleteStores > 0 {
+                Text("Incomplete — showing loaded memories")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.orange)
+            } else if galaxyRegistry.panelSnapshot.loadingStores > 0 {
+                Text("Loading — counts so far")
+                    .font(.system(size: 11, design: .monospaced))
+            }
             Text("\(visibleEdgeCount) edges")
                 .font(.system(size: 13, weight: .medium, design: .monospaced))
             Text("db: \(dbFileSize)")
