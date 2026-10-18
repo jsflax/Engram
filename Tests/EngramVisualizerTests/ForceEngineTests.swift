@@ -243,7 +243,13 @@ struct ForceEngineTests {
         // The initial allocation has capacity 512. Force new group storage and
         // verify all 513 outputs, not merely unchanged preparation counters.
         let grownGroups = (0..<513).map { $0 % 3 }
-        let grownX = (0..<513).map { Float($0 % 3) * 100 + Float(($0 / 3) % 2) * 10 }
+        let grownX: [Float] = (0..<513).map { (index: Int) -> Float in
+            let group: Int = index % 3
+            let alternatingOffset: Int = (index / 3) % 2
+            let groupPosition: Float = Float(group) * 100
+            let offset: Float = Float(alternatingOffset) * 10
+            return groupPosition + offset
+        }
         let grown = preparationSnapshot(x: grownX, groups: grownGroups, dirty: true)
         let grownResult = try #require(engine.encodeForcePassSync(queue: queue, snapshot: grown))
         try expectPreparationForces(grownResult, snapshot: grown)

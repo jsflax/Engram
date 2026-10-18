@@ -4,6 +4,17 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.7] - 2026-10-18
+
+### Fixed
+- Avoid duplicate centroid calculations and group-buffer uploads when GPU force
+  topology changes. Compute centroids from the latest positions on the first force
+  pass while preserving the existing refresh cadence.
+
+### Validation
+- Require three Metal regressions covering first-pass positions and refresh
+  cadence, group reassignment and buffer growth, and asynchronous preparation.
+
 ## [0.15.6] - 2026-10-18
 
 ### Fixed
