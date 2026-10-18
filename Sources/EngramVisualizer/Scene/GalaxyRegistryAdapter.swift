@@ -220,15 +220,17 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
             frameNewGlows[id] = Float(now.timeIntervalSince(start))
         }
 
-        // Project centroids — full scan throttled to every 30 frames (plus
-        // topology changes): positions drift during settling, so anchors
-        // refresh continuously but not per frame. The SAME pass now also
-        // builds the (galaxy, project) nebula clusters and per-galaxy
-        // aggregates — this is the only layer holding nodeToGalaxy, the
-        // color map, and positions together, and folding them into one scan
-        // keeps the per-30-frame cost at O(n).
+        // Project centroids — publish the first preview, then throttle loading
+        // and position drift to every 30 frames. Completed/live topology changes
+        // refresh immediately. Both streaming chunks and legacy bulk draining
+        // are loading; streaming does not populate loadingUpdate. This refresh
+        // also builds (galaxy, project) nebula clusters and per-galaxy aggregates.
+        // This layer holds nodeToGalaxy, colors and positions together; the
+        // shared centroid and extent passes keep each refresh at O(n).
         frameCounter &+= 1
-        let isLoading = registry.galaxies.values.contains { $0.isDrainingInitialSnapshot }
+        let isLoading = registry.galaxies.values.contains {
+            $0.isDrainingInitialSnapshot || $0.loadStatus == .loading
+        }
         let topologyNeedsCentroids = lastTopologyVersion != centroidsTopologyVersion
             && (!isLoading || frameCentroids.isEmpty || frameCounter % 30 == 0)
         if topologyNeedsCentroids
