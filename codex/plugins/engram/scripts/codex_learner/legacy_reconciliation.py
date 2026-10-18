@@ -904,11 +904,14 @@ def _active_if_present(selected, session_id):
 
 
 def _pending_pause(request, *, completed=False):
+    # Structural queue validation, not authority to accept a held interval.
+    # Every historical profile separately authenticates its state/gate, source,
+    # history and readback. Keep the keyword for existing residual callers.
     _identifier(request.get("request_id"))
     if "paused_request_id" in request or "pause_reason" in request:
         _require(request.get("paused_request_id") == request["request_id"]
-                 and request.get("pause_reason") in ({"batch_limit", "failed", "backoff", "blocked"}
-                     | ({"reconciliation_required"} if completed else set())),
+                 and request.get("pause_reason") in {"batch_limit", "failed", "backoff", "blocked",
+                                                      "reconciliation_required"},
                  "unsupported_pending_pause")
 
 
@@ -939,7 +942,7 @@ def _validate(paths, plan):
     codec._keys(plan["inputs"], {"state", "admission", "pending"})
     values = {key: _json(publication._raw(image, old=True)) for key, image in plan["inputs"].items()}
     request, state, record = values["pending"], values["state"], values["admission"]
-    _pending_pause(request, completed=review["kind"] == completed_remember.KIND)
+    _pending_pause(request)
     binding = admission.check(paths.root, request)
     _require(binding.get("mode") == host_admission.MODE_V2 and _same(request["admission"], binding)
              and _same(state.get("admission"), binding) and _same(record.get("binding"), binding)
@@ -1082,7 +1085,7 @@ def _validator(paths, plan, plan_sha256, locks):
                            {k: v for k, v in expected.items() if k != "last_event"}), "published_admission_changed")
         pending_raw, pending_identity = durable._read(selected.pending)
         current_pending = _json(pending_raw)
-        _pending_pause(current_pending, completed=review["kind"] == completed_remember.KIND)
+        _pending_pause(current_pending)
         _require(_same(admission.check(paths.root, current_pending), values["pending"]["admission"]), "pending_not_admitted")
         if current_pending["request_id"] == values["pending"]["request_id"]:
             original_pending = plan["inputs"]["pending"]

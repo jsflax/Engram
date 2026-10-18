@@ -321,6 +321,84 @@ class ExpiredUpdateAcceptanceTests(acceptance.LegacyAcceptanceTests):
                 f.apply(plan)
         self.assertEqual(f.current(), before)
 
+    def reconciliation_pause(self, fixture):
+        fixture.request = {**fixture.request, "pause_reason": "reconciliation_required"}
+        write_json(fixture.pending_path, fixture.request)
+        return fixture.pending_path.read_bytes()
+
+    def assert_reconciliation_result(self, fixture, plan, result, pending):
+        state = json.loads(fixture.state_path.read_bytes())
+        record = json.loads(fixture.record_path.read_bytes())
+        self.assertEqual(state, plan["next_state"])
+        self.assertEqual(state["offset"], fixture.end)
+        self.assertEqual(state["admission"]["frontier_offset"], fixture.frontier)
+        self.assertNotIn("reconciliation_required", state)
+        self.assertEqual(state["status"], "legacy_reconciled_no_new_mutation")
+        self.assertEqual(record["state_sha256"], L.durable.object_digest(state))
+        self.assertIsNone(record["processing"])
+        self.assertEqual(fixture.pending_path.read_bytes(), pending)
+        self.assertEqual(result["native_mutations_performed"], 0)
+        self.assertIs(result["historical_execution_sealed"], False)
+        self.assertFalse((fixture.root / "publications" / SID / "active.json").exists())
+
+    def test_reconciliation_pause_prepare_apply_recover_preserves_exact_request(self):
+        f = self.fixture()
+        pending = self.reconciliation_pause(f)
+        before, history, database = f.current(), f.history_snapshot(), f.store.read_bytes()
+        with self.no_external_effects(f):
+            plan = f.prepare()
+            self.assertEqual(f.current(), before)
+            result = f.apply(plan)
+            self.assert_reconciliation_result(f, plan, result, pending)
+            self.assertEqual(f.recover(plan), result)
+            self.assertEqual(f.apply(plan), result)
+        self.assertEqual(f.history_snapshot(), history)
+        self.assertEqual(f.store.read_bytes(), database)
+
+    def test_reconciliation_pause_sigkill_recovers_publication_and_retirement(self):
+        for boundary in ("admission_replaced", "before_retire"):
+            with self.subTest(boundary=boundary):
+                f = self.fixture()
+                pending = self.reconciliation_pause(f)
+                plan, history, database = f.prepare(), f.history_snapshot(), f.store.read_bytes()
+                with self.no_external_effects(f):
+                    self.kill_at(f, plan, boundary)
+                    result = f.recover(plan)
+                    self.assert_reconciliation_result(f, plan, result, pending)
+                    self.assertEqual(f.recover(plan), result)
+                self.assertEqual(f.history_snapshot(), history)
+                self.assertEqual(f.store.read_bytes(), database)
+
+    def test_reconciliation_pause_unknown_or_mismatched_request_refuses_prepare(self):
+        for change in ({"pause_reason": "manual_review_required"},
+                       {"paused_request_id": "different-request"},
+                       {"paused_request_id": None}, {"pause_reason": None}):
+            with self.subTest(change=change):
+                f = self.fixture()
+                self.reconciliation_pause(f)
+                write_json(f.pending_path, {**f.request, **change})
+                self.refused(f, reason="unsupported_pending_pause")
+
+    def test_reconciliation_pause_changes_cannot_bypass_apply_or_crash_recovery(self):
+        for boundary in (None, "before_retire"):
+            for change in ({"pause_reason": "manual_review_required"},
+                           {"paused_request_id": "different-request"},
+                           {"pause_reason": "batch_limit"}):
+                with self.subTest(boundary=boundary, change=change):
+                    f = self.fixture()
+                    self.reconciliation_pause(f)
+                    plan, history, database = f.prepare(), f.history_snapshot(), f.store.read_bytes()
+                    with self.no_external_effects(f):
+                        if boundary:
+                            self.kill_at(f, plan, boundary)
+                        write_json(f.pending_path, {**f.request, **change})
+                        before = f.current()
+                        with self.assertRaises(ValueError):
+                            f.recover(plan) if boundary else f.apply(plan)
+                        self.assertEqual(f.current(), before)
+                    self.assertEqual(f.history_snapshot(), history)
+                    self.assertEqual(f.store.read_bytes(), database)
+
 
 if __name__ == "__main__":
     import unittest

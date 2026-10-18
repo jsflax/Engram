@@ -23,7 +23,7 @@ MODULES = (
     "test_fenced_relay", "test_operation_gateway", "test_operation_probe",
     "test_operation_recovery_probe", "test_execution_context", "test_parser_context",
     "test_publication_coordinator", "test_settlement", "test_proxy_execution",
-    "test_runner_publication", "test_zero_intent_retry", "test_runner_reconnect", "test_runner_planning", "test_runner_durable", "test_plan_publication", "test_learner_plan", "test_runner_legacy_entry", "test_runner_legacy_dispatch",
+    "test_runner_publication", "test_zero_intent_retry", "test_worker_fairness", "test_runner_reconnect", "test_runner_planning", "test_runner_durable", "test_plan_publication", "test_learner_plan", "test_runner_legacy_entry", "test_runner_legacy_dispatch",
     "test_legacy_acceptance", "test_legacy_expired_update", "test_legacy_completed_remember", "test_legacy_report_dates", "test_legacy_cli",
     'test_runner_residual_dispatch',
     'test_residual_driver',

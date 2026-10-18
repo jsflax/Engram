@@ -29,7 +29,7 @@ import uuid
 from .transcript import inspect_rollout, read_excerpt
 from .memory_proxy import verified_no_write_receipt, audit_planning_tools, PLANNING_MODE, read_startup_failure
 from . import admission, memory_config, host_admission, operation_gateway, learner_settings
-from . import runner_publication, settlement
+from . import runner_publication, settlement, worker_schedule
 
 EVENTS = {"Stop", "SubagentStop", "PreCompact", "SessionEnd"}
 GUARD = "ENGRAM_CODEX_LEARNER"
@@ -1324,6 +1324,12 @@ def worker(root: Path) -> int:
     invalid_pending = set()
     recovery_failures = set()
     deferred_plans = set()
+    recovery_cache = {}
+
+    def recoverable(sid):
+        if sid not in recovery_cache:
+            recovery_cache[sid] = has_recoverable_transition(root, sid)
+        return recovery_cache[sid]
 
     def ready_pending():
         values = []
@@ -1337,19 +1343,38 @@ def worker(root: Path) -> int:
                 r = load_pending(p)
                 if not r:
                     invalid_pending.add(p)
-                elif r.get("paused_request_id") != r.get("request_id"):
+                elif (r.get("paused_request_id") != r.get("request_id")
+                      and not recoverable(sid)):
                     values.append((p.stat().st_mtime_ns, p, r))
             except (OSError, ValueError):
                 continue
         return sorted(values, key=lambda v: v[0])
 
-    def recovery_session():
+    def recovery_session(schedule):
         # A missing or paused queue slot cannot hide an active publication.
-        for sid in admission.enrollment_ids(root, active_policy):
-            if sid in recovery_failures or sid in deferred_plans:
+        for sid in schedule.order("recovery", admission.enrollment_ids(root, active_policy)):
+            if (sid in recovery_failures or sid in deferred_plans
+                    or not schedule.eligible(sid, time.time())):
                 continue
-            if has_recoverable_transition(root, sid):
+            if recoverable(sid):
                 return sid
+        return None
+
+    def select_work(schedule):
+        # Persisted lane and SID cursors prevent a short-lived worker from
+        # restarting forever at the same held cohort, including when cap == 1.
+        first = schedule.value["next_lane"]
+        for lane in (first, "pending" if first == "recovery" else "recovery"):
+            if lane == "recovery":
+                sid = recovery_session(schedule)
+                if sid is not None:
+                    return lane, sid, None
+            else:
+                candidates = {p.stem: (p, request) for _, p, request in ready_pending()}
+                ordered = schedule.order("pending", candidates)
+                if ordered:
+                    sid = ordered[0]
+                    return lane, sid, candidates[sid]
         return None
 
     more = {}
@@ -1357,12 +1382,21 @@ def worker(root: Path) -> int:
         if not acquired:
             return 0
         config = settings(root)
+        schedule = worker_schedule.Schedule(root)
+        if schedule.reset:
+            event_log(root, "worker_schedule_reset", reason="invalid_advisory_metadata_preserved")
         handled = 0
         pending_dir = private_dir(root / "pending")
         while handled < config["max_runs_per_worker"]:
             with lock_file(root / "enqueue.lock"):
-                sid = recovery_session()
-            if sid is not None:
+                choice = select_work(schedule)
+            if choice is None:
+                break
+            lane, sid, pending_work = choice
+            # Scheduler publication is outside enqueue.lock and grants no
+            # execution authority. Existing operation checks still run below.
+            schedule.reserve(lane, sid, time.time(), config["retry_seconds"])
+            if lane == "recovery":
                 try:
                     publisher = publications(root)
                     ready = publisher.prepare_zero_intent_retry(sid, config)
@@ -1391,13 +1425,18 @@ def worker(root: Path) -> int:
                 except Exception as exc:
                     # Preserve an unfinished transition's pending preimage.
                     recovery_failures.add(sid)
-                    event_log(root, "publication_recovery_held", session_id=sid, reason=type(exc).__name__)
+                    fields = {"reason": type(exc).__name__}
+                    code = str(exc)
+                    if re.fullmatch(r"[a-z][a-z0-9_]{0,127}", code):
+                        fields["error_code"] = code
+                    event_log(root, "publication_recovery_held", session_id=sid, **fields)
+                recovery_cache.pop(sid, None)
+                if (sid not in recovery_failures and sid not in deferred_plans
+                        and not recoverable(sid)):
+                    schedule.recovered(sid)
                 handled += 1
                 continue
-            candidates = ready_pending()
-            if not candidates:
-                break
-            _, pending, request = candidates[0]
+            pending, request = pending_work
             try:
                 outcome = process_request(root, request, config)
             except Exception as exc:
@@ -1406,6 +1445,7 @@ def worker(root: Path) -> int:
                 if has_recoverable_transition(root, request["session_id"]):
                     recovery_failures.add(request["session_id"])
             handled += 1
+            recovery_cache.pop(sid, None)
             if isinstance(outcome, runner_publication.Continuation):
                 # Preserve the processing marker and exact pending preimage.
                 # A later hook resumes this plan after its bounded backoff.
@@ -1445,9 +1485,12 @@ def worker(root: Path) -> int:
         event_log(root, "worker_idle", handled=handled, pending=len(list(pending_dir.glob("*.json"))),
                   invalid_pending=len(invalid_pending))
     # Recheck after releasing the leader lock: a concurrent hook may have queued
-    # work while its own worker lost that lock. Never lose that last wakeup.
+    # work while its own worker lost that lock. Recheck recovery eligibility too,
+    # without respawning solely for unchanged held/cooling work. No timer loop:
+    # a later natural event wakes expired backoff.
     with lock_file(root / "enqueue.lock"):
-        if ready_pending():
+        recovery_cache.clear()
+        if select_work(schedule) is not None:
             spawn_worker(root)
     return 0
 

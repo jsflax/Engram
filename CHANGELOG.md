@@ -4,9 +4,18 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
-## [Unreleased]
+## [0.15.3] - 2026-10-18
 
 ### Fixed
+- Prevent failed learner recoveries from monopolizing the shared worker. Persist
+  fair scheduling across worker restarts and back off unchanged failures so
+  other sessions and later recovery candidates can make progress.
+- Accept the normal reconciliation pause during fully reviewed historical
+  recovery, including expired updates, while retaining exact request, source,
+  admission, saved-write and publication checks.
+- Accept explicitly reviewed installation evidence when an upgrade restored the
+  same known durable gateway bytes, so proven zero-write startup failures can
+  retry without changing their original settlement, cursor or backoff.
 - Account fully reviewed historical learner attempts through the existing complete-plan
   executor and publication flow. Preserve acknowledged writes, reject unknown outcomes
   and expired intent replay, and keep the original hold until all reviewed residuals settle.
