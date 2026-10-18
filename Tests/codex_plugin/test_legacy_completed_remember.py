@@ -162,6 +162,26 @@ class CompletedRememberTests(unittest.TestCase):
         self.assertIn("newly eligible", excerpt.text)
         self.assertNotIn("PRIVATE", excerpt.text)
 
+    def test_uppercase_final_uuid_matches_canonical_row_without_rewriting_history(self):
+        case_id = "a1111111-b222-4333-8444-55555555555f"
+        with mock.patch("legacy_fixture.SUCCESS_ID", case_id), mock.patch(__name__ + ".SUCCESS_ID", case_id):
+            f = self.fixture()
+            f.result["memory_ids"] = [SUCCESS_ID.upper()]
+            f.provider[-2]["item"]["text"] = json.dumps(f.result)
+            f.refresh_history()
+            history, database = f.history_snapshot(), f.store.read_bytes()
+            with self.no_external_effects(f):
+                plan = f.prepare()
+                result = f.apply(plan)
+            self.assertEqual(result["native_mutations_performed"], 0)
+            self.assertEqual(f.history_snapshot(), history)
+            self.assertEqual(f.store.read_bytes(), database)
+            # Semantic UUID equality must not hide a changed final provider result.
+            f = self.fixture()
+            f.result["memory_ids"] = [SUCCESS_ID.upper()]
+            f.refresh_history()
+            self.refused(f)
+
     def test_terminal_tool_and_cleanup_errors_refuse_even_with_rehashed_reports(self):
         changes = {
             "turn-failed": lambda f: f.provider.insert(-1, {"type": "turn.failed", "error": {"message": "failure"}}),

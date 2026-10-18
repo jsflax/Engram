@@ -182,7 +182,9 @@ def validate_history(review, history):
                and previous.get("end_offset") == review["source"]["start_offset"], "start_uncorroborated")
     L.codec._keys(result, {"outcome", "summary", "memory_ids"})
     L.codec._string(result["summary"], 65536)
-    L._require(result["outcome"] == "stored" and result["memory_ids"] == review["preserved_memory_ids"]
+    L._require(result["outcome"] == "stored" and type(result["memory_ids"]) is list
+               and len(result["memory_ids"]) == 1
+               and [L.codec._uuid(value) for value in result["memory_ids"]] == review["preserved_memory_ids"]
                and bool(messages) and L._same(L._json(messages[-1].encode()), result), "final_result_changed")
     writes = [(start, finish, event) for (start, finish), event in zip(calls, audit) if start["tool"] == "remember"]
     L._require(len(writes) == 1, "mutation_count_changed")

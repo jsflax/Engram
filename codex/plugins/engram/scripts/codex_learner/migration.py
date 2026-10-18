@@ -350,7 +350,7 @@ class Locks:
 def _runtime():
     here = Path(__file__).resolve().parent
     files = sorted(here.glob("*.py")) + [here.parent / "learner_router.py", here.parent / "codex_learner_migrate.py"]
-    require(1 <= len(files) <= 32, "runtime_membership_invalid")
+    require(1 <= len(files) <= 64, "runtime_membership_invalid")
     return {str(path.relative_to(here.parent)): digest(_read(path, private=False)[0]) for path in files}
 
 
