@@ -57,6 +57,22 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 self.assertEqual(len(sdk), len(expected))
                 self.assertEqual({entry['original']: entry['mirror'] for entry in sdk}, expected)
 
+        # The release must use the same DNS-free server qualified by the native
+        # and app workflows, while retaining its artifact/readiness contract.
+        name = 'Mirror Sparkle artifact from localhost'
+        section = step_section('release.yml', name)
+        block = run_block('release.yml', name)
+        self.assertEqual(re.findall(r'^        timeout-minutes: (.*)$', section, re.M), ['5'])
+        self.assertIn('(cd /tmp/sparkle-mirror-root && nohup python3 '
+                      '"$GITHUB_WORKSPACE/scripts/artifact_mirror_server.py" '
+                      '--directory /tmp/sparkle-mirror-root > /tmp/mirror.log 2>&1 &)', block)
+        self.assertEqual(block.count('nohup python3'), 1)
+        self.assertNotIn('-m http.server', block)
+        self.assertIn('curl -sSfL -o /tmp/sparkle-mirror-root/Sparkle-for-Swift-Package-Manager.zip --create-dirs', block)
+        self.assertIn('sleep 2\n', block)
+        self.assertIn('curl -sSf -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip && echo "mirror serving OK"', block)
+        self.assertIn('--mirror http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip', block)
+
     def test_release_and_linux_commands_enforce_locks_and_xcode_version(self):
         with tempfile.TemporaryDirectory(prefix='engram-workflow-') as temporary:
             root = Path(temporary)

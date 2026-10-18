@@ -92,7 +92,7 @@ jobs:
         run: |
           curl -sSfL -o /tmp/sparkle-mirror-root/Sparkle-for-Swift-Package-Manager.zip --create-dirs \
             https://github.com/sparkle-project/Sparkle/releases/download/2.8.1/Sparkle-for-Swift-Package-Manager.zip
-          (cd /tmp/sparkle-mirror-root && nohup python3 -m http.server 8765 > /tmp/mirror.log 2>&1 &)
+          (cd /tmp/sparkle-mirror-root && nohup python3 "$GITHUB_WORKSPACE/scripts/artifact_mirror_server.py" --directory /tmp/sparkle-mirror-root > /tmp/mirror.log 2>&1 &)
           sleep 2
           curl -sSf -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip && echo "mirror serving OK"
           swift package config set-mirror \
