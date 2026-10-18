@@ -494,7 +494,9 @@ def accounting_history(review, history):
             continue
         _require(type(item) is dict, "unknown_provider_event")
         if item.get("type") in {"agent_message", "reasoning"}:
-            _require(kind == "item.completed" and pending is None, "unaccounted_provider_item")
+            # Completed prose may interleave with a pending call; it supplies no
+            # write evidence and must not consume or replace that call's pairing.
+            _require(kind == "item.completed", "unaccounted_provider_item")
             codec._keys(item, {"id", "type", "text"}); codec._string(item["text"], 65536)
             continue
         _require(item.get("type") == "mcp_tool_call" and item.get("server") == "memory"

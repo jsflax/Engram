@@ -192,6 +192,86 @@ class ReviewedAccountingTests(unittest.TestCase):
     def fixture(self,**kwargs):
         f=AccountingFixture(**kwargs);self.addCleanup(f.close);return f
 
+    def ci_interleaved_history(self, f, prose_kind='agent_message'):
+        """Synthetic bytes with the retained CI's exact nine-call event order."""
+        original=[J._json(v) for v in f.history['provider'].splitlines()]
+        mutations=[copy.deepcopy(v['item']) for v in original if v['type']=='item.completed']
+        first,second=mutations
+        args={'id':f.plan['preserve_without_replay']['memory_ids'][0],
+              'content':f.messages[0],'source':'codex-session:'+SID}
+        first.update(id='item_7',tool='update',arguments=args)
+        first['result']={'content':[{'type':'text','text':
+            'Updated memory (id: '+args['id']+', project: synthetic): '+args['content']}],
+            'structured_content':None}
+        second['id']='item_10'
+        for attempt,item,audit_id in zip(f.plan['attempts'],(first,second),(7,10)):
+            attempt.update(item_id=item['id'],audit_id=audit_id,tool=item['tool'],
+                arguments=copy.deepcopy(item['arguments']),native_result_sha256=J.sha256(J.encode(item['result'])))
+        f.plan['message_dispositions'][0]['attempt_ids']=['item_7']
+        f.plan['message_dispositions'][1]['attempt_ids']=['item_10']
+        def prose(index,kind='agent_message'):
+            return {'type':'item.completed','item':{'id':f'item_{index}','type':kind,
+                'text':'Synthetic non-authoritative progress prose.'}}
+        provider=[{'type':'thread.started','thread_id':SID},{'type':'turn.started'},prose(0)]
+        audit=[{'event':'relay_started'}]
+        for index in (1,2,3,4,6,7,8,9,10):
+            if index==6:provider.append(prose(5))
+            finish=copy.deepcopy(first if index==7 else second if index==10 else {
+                'id':f'item_{index}','type':'mcp_tool_call','server':'memory','tool':'recall',
+                'arguments':{'query':'synthetic'},'status':'completed','error':None,
+                'result':{'content':[],'structured_content':None}})
+            start={key:value for key,value in finish.items() if key not in ('result','error','status')}
+            provider.append({'type':'item.started','item':{**start,'status':'in_progress','result':None}})
+            if index==10:provider.append(prose(11,prose_kind))
+            provider.append({'type':'item.completed','item':finish})
+            audit.extend([{'event':'tool_call','id':index+1 if index<6 else index,'tool':finish['tool']},
+                {'event':'tool_result','id':index+1 if index<6 else index,'tool':finish['tool'],'ok':True,
+                 'memory_ids':[f.plan['preserve_without_replay']['memory_ids'][0 if index==7 else 1]]
+                     if index in (7,10) else [],'forwarded':True}])
+        # Recall item_6 uses audit id 6, so all original ids are 2 through 10.
+        provider.extend([prose(12),{'type':'turn.completed'}])
+        audit.append({'event':'relay_interrupted','signal':15})
+        run=J._json(f.history['run']);run.update(tool_calls=9,write_calls=2,
+            writes=[{'tool':item['tool'],'memory_ids':attempt['memory_ids']}
+                    for item,attempt in zip((first,second),f.plan['attempts'])])
+        transport=J._json(f.history['transport']);transport['allowed_tools']=['recall','remember','update']
+        for role,value in (('run',run),('provider',provider),('audit',audit),('transport',transport)):
+            f.change_history(role,value)
+        return provider
+
+    def test_completed_prose_between_ci_tool_start_and_ack_preserves_accounting(self):
+        for kind in ('agent_message','reasoning'):
+            with self.subTest(kind=kind):
+                f=self.fixture(residuals=0,successes=2,missing_tail=True)
+                self.ci_interleaved_history(f,kind)
+                before=f.current();history=f.history_snapshot()
+                with self.no_external():
+                    result=L.accounting_history(f.plan,{k:L._sealed(v) for k,v in f.retained().items()})
+                self.assertEqual(result,{'attempts':2,'relay_terminal_retained':False,'historical_execution_sealed':False})
+                self.assertEqual(f.current(),before);self.assertEqual(f.history_snapshot(),history)
+                self.assertEqual(f.plan['operations'],[]);self.assertEqual(f.calls,[])
+
+    def test_pending_prose_does_not_relax_tool_pairing_or_unknown_frames(self):
+        f=self.fixture(residuals=0,successes=2,missing_tail=True)
+        baseline=self.ci_interleaved_history(f)
+        for change in ('overlap','ack_id','ack_arguments','ack_result','unknown_item','unfinished_prose','extra_prose_field'):
+            with self.subTest(change=change):
+                provider=copy.deepcopy(baseline)
+                message=next(i for i,event in enumerate(provider) if event.get('item',{}).get('id')=='item_11')
+                ack=provider[message+1]['item']
+                if change=='overlap':
+                    provider[message]=copy.deepcopy(provider[message-1]);provider[message]['item']['id']='overlapping_call'
+                elif change=='ack_id':ack['id']='different_call'
+                elif change=='ack_arguments':ack['arguments']['content']='Changed after dispatch.'
+                elif change=='ack_result':ack['result']['content'][0]['text']='Contradictory result.'
+                elif change=='unknown_item':provider[message]['item']['type']='command_execution'
+                elif change=='unfinished_prose':provider[message]['type']='item.started'
+                else:provider[message]['item']['unexpected']='not allowed'
+                f.change_history('provider',provider)
+                with self.no_external(),self.assertRaises(ValueError):
+                    L.accounting_history(f.plan,{k:L._sealed(v) for k,v in f.retained().items()})
+                self.assertEqual(f.plan['operations'],[]);self.assertEqual(f.calls,[])
+
     @contextlib.contextmanager
     def no_external(self):
         with contextlib.ExitStack() as stack:
