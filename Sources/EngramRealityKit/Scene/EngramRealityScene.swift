@@ -136,6 +136,7 @@ public final class EngramRealityScene {
     // Point light pool (max 16)
     var pointLightPool: [Entity] = []
     let maxPointLights = 16
+    private let pointLightNodeIndex = MascotGraphIndex()
 
     // MARK: - Scale Factor
 
@@ -706,9 +707,6 @@ public final class EngramRealityScene {
     }
 
     func projectColor(for nodeId: UUID, dataProvider: SceneDataProvider) -> SIMD3<Float> {
-        if let node = dataProvider.nodes.first(where: { $0.id == nodeId }) {
-            return dataProvider.projectColorMap[node.project] ?? SIMD3<Float>(0.5, 0.5, 0.5)
-        }
-        return SIMD3<Float>(0.5, 0.5, 0.5)
+        pointLightNodeIndex.projectColor(for: nodeId, dataProvider: dataProvider)
     }
 }

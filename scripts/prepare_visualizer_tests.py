@@ -10,7 +10,8 @@ import plistlib
 import re
 import subprocess
 
-CLASSES = ('GalaxyLoadChangesTests', 'GalaxyDrainTests', 'VisualizerHostIsolationTests', 'AdapterSnapshotTests')
+CLASSES = ('GalaxyLoadChangesTests', 'GalaxyDrainTests', 'VisualizerHostIsolationTests', 'AdapterSnapshotTests',
+           'FrameLookupInvalidationTests')
 
 def require(ok, message):
     if not ok:

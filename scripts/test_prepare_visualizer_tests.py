@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import tempfile
 import unittest
 
@@ -82,7 +83,7 @@ class HostPreparationTests(unittest.TestCase):
             original = products / 'Engram.xctestrun'
             original.write_bytes(plistlib.dumps(self.original))
             result = M.prepare(root)
-            self.assertEqual(result['expected_tests'], 4)
+            self.assertEqual(result['expected_tests'], 5)
             output = plistlib.loads(Path(result['prepared']).read_bytes())
             environment = output['TestConfigurations'][0]['TestTargets'][0]['EnvironmentVariables']
             self.assertEqual(environment['CLAUDE_MEMORY_DB'], str(root / 'fixtures/app-memory.sqlite'))
@@ -92,6 +93,30 @@ class HostPreparationTests(unittest.TestCase):
             self.assertFalse((root / 'fixtures/app-memory.sqlite').exists(), 'preparation must never launch a host')
             with self.assertRaisesRegex(ValueError, 'path outside'):
                 M.owned(root, root.parent)
+
+    def test_frame_lookup_controls_are_mirrored_and_selected_in_exact_app_census(self):
+        repo = Path(__file__).parents[1]
+        package = (repo / 'Tests/EngramRealityKitTests/FrameLookupInvalidationTests.swift').read_text()
+        mirrored = package.replace('import Testing', 'import XCTest')
+        mirrored = re.sub(r'^@Suite\([^\n]*\)\n', '', mirrored, flags=re.M)
+        mirrored = re.sub(r'^    @Test\([^\n]*\)\n', '', mirrored, flags=re.M)
+        mirrored = mirrored.replace('struct FrameLookupInvalidationTests {',
+                                    'final class FrameLookupInvalidationTests: XCTestCase {')
+        mirrored = re.sub(r'^    func ([a-z])(\w*)\(',
+                          lambda match: '    func test' + match[1].upper() + match[2] + '(',
+                          mirrored, flags=re.M)
+        mirrored = mirrored.replace('    func testTick(dt: Float) {}', '    func tick(dt: Float) {}')
+        mirrored = mirrored.replace('#expect(', 'XCTAssertTrue(')
+        self.assertEqual((repo / 'EngramUnitTests/FrameLookupInvalidationTests.swift').read_text(), mirrored)
+        expected = ['FrameLookupInvalidationTests/' + name for name in (
+            'testLightColorsRemainLive', 'testLightNodeInvalidation', 'testSelectedEdgeDeletion',
+            'testSelectedEdgeReorderAndReplacement', 'testStableFlowAndSelectionChange',
+            'testFlowProviderCountAndCap')]
+        inventory = M.inventory(repo)
+        self.assertEqual(len(inventory), 54)
+        self.assertEqual([name for name in inventory if name.startswith('FrameLookupInvalidationTests/')],
+                         sorted(expected))
+        self.assertEqual(M.CLASSES.count('FrameLookupInvalidationTests'), 1)
 
 class DependencyPreparationTests(unittest.TestCase):
     def setUp(self):
