@@ -150,7 +150,7 @@ def _settlement(context,driver,recoveries,verify_locks):
     proof,proof_sha=D.read(context.paths.run_dir/f'residual-reconciliation-{index:03d}.json')
     driver._checkpoint(proof,generations)
     require(proof['heads']==driver._heads() and all(v['kind']=='committed' and v['receipt']['outcome']=='applied'
-        and len(v['receipt']['memoryIDs'])==1 and v['receipt']['edgeIDs']==[] for v in proof['statuses'].values()),
+        and len(v['receipt']['memoryIDs'])==1 for v in proof['statuses'].values()),
         'final_status_not_qualified')
     value={'version':1,'kind':'reviewed_residual_settlement',**_pin(context),
         'authorization_sha256':_authorization(context)[1],'generation_sha256s':[v[1] for v in generations],
@@ -476,7 +476,7 @@ def generation_directory(run_dir,index):
     return run_dir if index==0 else run_dir/'residual-writers'/f'{index:03d}'
 
 
-def recover_locked(paths,*,session_id,verify_locks,allow_continuation=False):
+def recover_locked(paths,*,session_id,verify_locks,allow_continuation=False,runtime_profile=None):
     """Recover the selected held residual under caller worker -> enqueue locks.
 
     Default only revokes writers, queries exact status and completes qualified
@@ -502,7 +502,8 @@ def recover_locked(paths,*,session_id,verify_locks,allow_continuation=False):
                 and same(J._json(PJ._raw(done['publication']['records']['state']['new']))['last_residual_reconciliation'],
                     state['last_residual_reconciliation']),'completed_reference_changed')
             _guard(verify_locks);return None
-    context=R.load_context(paths,manifest_sha256=ref['manifest_sha256'],context_sha256=ref['context_sha256'])
+    context=R.load_context(paths,manifest_sha256=ref['manifest_sha256'],context_sha256=ref['context_sha256'],
+                           runtime_profile=runtime_profile)
     require(context.plan['session_id']==session_id and context.review_sha256==ref['review_sha256']
             and _authorization(context)[1]==ref['authorization_sha256'],'selected_context_changed')
     _recover_marker(context,verify_locks)

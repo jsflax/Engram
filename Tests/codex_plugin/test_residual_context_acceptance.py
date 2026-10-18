@@ -69,6 +69,37 @@ class ResidualContextAcceptanceTests(unittest.TestCase):
                 with self.no_processes(),self.assertRaises(ValueError):f.context.validate_marker()
                 self.assertEqual(f.current(),before)
 
+    def test_repeated_context_checks_reuse_only_identical_history_and_source_semantics(self):
+        f=self.fixture(prepared=False);context=f.context
+        with self.no_processes(),f.locks() as verify:
+            f.begin(verify)
+        context._source_cache.clear();context._projection_cache.clear();context._history_cache.clear()
+        with self.no_processes(), mock.patch.object(RC,'validate_history',wraps=RC.validate_history) as history, \
+             mock.patch.object(RC.transcript,'read_excerpt',wraps=RC.transcript.read_excerpt) as source, \
+             mock.patch.object(context,'_pinned',wraps=context._pinned) as pinned:
+            for _ in range(4):
+                self.assertIs(context.validate_inputs(context.manifest,context.plan,'before_native_forward'),True)
+            self.assertEqual(history.call_count,1)
+            self.assertEqual(source.call_count,2)  # General and residual projection once each.
+            self.assertEqual(pinned.call_count,4)
+            path=f.historical_run_dir/'provider.jsonl'
+            path.write_bytes(path.read_bytes()+b' ')
+            with self.assertRaisesRegex(ValueError,'history_changed'):
+                context.validate_inputs(context.manifest,context.plan,'before_native_forward')
+            self.assertEqual(history.call_count,1)
+
+    def test_cached_residual_validation_keeps_fresh_preserved_row_check(self):
+        f=self.fixture(prepared=False);context=f.context
+        with self.no_processes(),f.locks() as verify:
+            f.begin(verify)
+        self.assertIs(context.validate_inputs(context.manifest,context.plan,'before_native_forward'),True)
+        with contextlib.closing(sqlite3.connect(f.store)) as db:
+            db.execute('UPDATE Memory SET content=? WHERE globalId=?',('changed after preflight',SUCCESS_ID));db.commit()
+        before=f.current()
+        with self.no_processes(),self.assertRaises(ValueError):
+            context.validate_inputs(context.manifest,context.plan,'before_native_forward')
+        self.assertEqual(f.current(),before)
+
     def test_selected_old_update_semantics_must_remain_exact(self):
         f=self.fixture();before=f.current()
         for column,value in (('content','changed'),('project','changed'),('source','changed'),
@@ -271,6 +302,51 @@ class ResidualContextAcceptanceTests(unittest.TestCase):
             self.assertEqual(f.current(),completed)
         self.assertFalse(RP.needs_recovery(f.root,SID))
         self.assertEqual(f.rows(),rows);self.assertEqual(f.history_snapshot(),history)
+
+    def test_auto_connected_commit_recovers_by_status_and_publishes_without_replay(self):
+        f=self.fixture(prepared=False);history=f.history_snapshot();old_rows=f.rows()
+        native_execute=f.execute;calls=[];expected={}
+        def auto_connected(raw,writer,check):
+            request=J._json(raw);operation=request['operationID'];calls.append(operation)
+            message=native_execute(raw,writer,check)
+            receipt=message['result']['structuredContent']['engram_operation']['receipt']
+            receipt['edgeIDs']=[str(uuid.uuid5(uuid.UUID(operation),'edge-'+str(i))) for i in range(3)]
+            expected[operation]=copy.deepcopy(receipt)
+            write_json(f.receipt_path(operation),receipt)
+            message['result']['content'][0]['text']=json.dumps(message['result']['structuredContent'])
+            if len(calls)==5:raise OSError('synthetic lost acknowledgment after commit')
+            return message
+        with self.no_processes(),f.locks() as verify:
+            f.begin(verify)
+            for label in f.driver.operations:
+                f.driver.dispatch(label,writer=f.writer,recoveries=f.recoveries,execute=auto_connected)
+            self.assertEqual(f.driver.summary()['applied'],['R1','R2','R3','R4'])
+            self.assertEqual(f.driver.summary()['unsettled'],['R5'])
+            self.assertEqual(J._json(f.state_path.read_bytes())['offset'],f.start)
+        f.release_fences();before=f.current();rows=f.rows()
+        # Recovery may read status, but must never invoke an apply/provider path.
+        with self.no_processes(),f.locks() as verify,f.synthetic_probe(), \
+             mock.patch.object(RP.N,'executor',side_effect=AssertionError('recovery must not apply')):
+            receipt=RP.recover_locked(f.paths,session_id=SID,verify_locks=verify)
+            completed=f.current()
+            self.assertEqual(J._json(completed[0])['offset'],f.end)
+            self.assertEqual(completed[2],before[2])
+            self.assertIsNone(RP.recover_locked(f.paths,session_id=SID,verify_locks=verify))
+            self.assertEqual(f.current(),completed)
+        self.assertEqual(len(calls),5);self.assertEqual(len(set(calls)),5)
+        self.assertEqual(f.rows(),rows);self.assertEqual(len(rows),len(old_rows)+5)
+        self.assertEqual(f.history_snapshot(),history)
+        self.assertEqual([row for row in rows if row['globalId'] in {old['globalId'] for old in old_rows}],old_rows)
+        memories={value['memoryIDs'][0] for value in expected.values()}
+        edges={edge for value in expected.values() for edge in value['edgeIDs']}
+        self.assertEqual(set(receipt['reference']['new_memory_ids']),memories)
+        self.assertTrue(memories.isdisjoint(edges))
+        self.assertEqual(receipt['reference']['preserved_memory_ids'],[SUCCESS_ID])
+        self.assertEqual(receipt['applied_write_count'],5)
+        for operation,value in expected.items():
+            self.assertEqual(J.read_evidence(f.run_dir,operation)[-1]['evidence']['receipt'],value)
+        self.assertFalse(RP.needs_recovery(f.root,SID))
+        self.assertFalse((f.run_dir/'successful-coverage.json').exists())
 
     def test_missing_or_malformed_processing_reference_remains_discoverable(self):
         for mutation in ('missing','malformed'):

@@ -24,7 +24,7 @@ MODULES = (
     "test_operation_recovery_probe", "test_execution_context", "test_parser_context",
     "test_publication_coordinator", "test_settlement", "test_proxy_execution",
     "test_runner_publication", "test_runner_reconnect", "test_runner_planning", "test_runner_durable", "test_plan_publication", "test_learner_plan", "test_runner_legacy_entry", "test_runner_legacy_dispatch",
-    "test_legacy_acceptance", "test_legacy_expired_update", "test_legacy_report_dates", "test_legacy_cli",
+    "test_legacy_acceptance", "test_legacy_expired_update", "test_legacy_completed_remember", "test_legacy_report_dates", "test_legacy_cli",
     'test_runner_residual_dispatch',
     'test_residual_driver',
     'test_residual_cache',
@@ -33,13 +33,14 @@ MODULES = (
     'test_residual_status_retention',
     'test_residual_independent',
     'test_residual_context_acceptance',
+    'test_residual_runtime_compatibility',
     'test_residual_policy',
     'test_residual_publication_contract',
     'test_learner_residual',
 )
 FSYNC_MODULES = {"test_host", "test_migration", "test_execution_context", "test_parser_context",
                  "test_publication_coordinator", "test_settlement", "test_runner_publication", "test_runner_reconnect", "test_runner_planning", "test_plan_publication",
-                 "test_legacy_acceptance", "test_legacy_expired_update", "test_residual_context_acceptance", "test_learner_residual",
+                 "test_legacy_acceptance", "test_legacy_expired_update", "test_legacy_completed_remember", "test_residual_context_acceptance", "test_residual_runtime_compatibility", "test_learner_residual",
                  "test_residual_driver", "test_residual_independent", "test_residual_crashes"}
 
 def run_module(name):

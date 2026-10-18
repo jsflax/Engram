@@ -50,6 +50,23 @@ class StatusTests(unittest.TestCase):
     def report(self):
         return STATUS.report(environ={"CODEX_HOME": str(self.home), "CODEX_THREAD_ID": SID})
 
+    def test_startup_failure_fixed_codes_surface_without_changing_hold_or_replay(self):
+        root = self.learner_fixture(session={"status": "reconciliation_required", "last_run": RUN,
+            "reconciliation_required": {"run_id": RUN, "reason": "unverified_completion"}})
+        diagnostic = {"stage": "execution_context", "reason": "execution_context_backend_changed"}
+        self.write(root / "runs" / RUN / "run.json", {"session_id": SID, "status": "failed",
+            "reason": "unverified_completion", "gateway_startup_failure": diagnostic})
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["failure"]["gateway_startup_failure"], diagnostic)
+        self.assertEqual(health["headline"], "reconciliation_required")
+        self.assertFalse(health["recovery"]["automatic_replay_authorized"])
+        for changed in ({"stage": "private-path", "reason": "execution_context_backend_changed"},
+                        {"stage": "execution_context", "reason": "secret value"},
+                        {**diagnostic, "exception": "private payload"},
+                        {"stage": [], "reason": {}}):
+            with self.subTest(fields=list(changed)):
+                self.assertNotIn("gateway_startup_failure", STATUS.metadata({"gateway_startup_failure": changed}))
+
     def learner_fixture(self, *, enabled=True, session=None, pending=None, admission=DEFAULT_ADMISSION):
         root = self.modern / "learner"
         self.write(root / "admission.json", {"enabled": enabled, "mode": "host_sessions_v2"})

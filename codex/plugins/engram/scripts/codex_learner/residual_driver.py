@@ -63,8 +63,10 @@ def _response(value, request):
     J._response(value,request,None)
     if value.get('kind')=='committed':
         receipt=value['receipt']
-        require(receipt['edgeIDs']==[] and (len(receipt['memoryIDs'])==1
-                if receipt['outcome']=='applied' else bool(receipt['memoryIDs'])),
+        # Applied remembers can create automatic edges alongside the new memory.
+        # The shared receipt validator above checks every effect ID and its bounds.
+        require(len(receipt['memoryIDs'])==1 if receipt['outcome']=='applied'
+                else bool(receipt['memoryIDs']) and receipt['edgeIDs']==[],
                 'invalid_remember_effect_ids')
     return value
 

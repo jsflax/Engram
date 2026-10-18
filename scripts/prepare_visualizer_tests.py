@@ -128,7 +128,7 @@ def dependency_checkouts(repo, pins, dependencies):
         else:
             # The only additional package is this exact, already hash-checked repo.
             require(local is None and reference['kind'] in ('root', 'fileSystem')
-                    and reference['name'] == 'Engram'
+                    and reference['name'] in ('Engram', repo.name)
                     and identity in ('engram', repo.name.lower())
                     and reference['location'] == str(repo)
                     and entry['state'] == {'name': 'fileSystem', 'path': str(repo)}

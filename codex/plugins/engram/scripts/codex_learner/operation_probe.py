@@ -145,7 +145,7 @@ def _exchange(transport, *, fence, expected_binding, limits=None,
     selector = selectors.DefaultSelector()
     old_signals = {}
     interrupted = False
-    deadline = time.monotonic() + limits.deadline_seconds
+    deadline = None
     buffer = bytearray()
     output_bytes = 0
     result = None
@@ -229,6 +229,10 @@ def _exchange(transport, *, fence, expected_binding, limits=None,
         if threading.current_thread() is threading.main_thread():
             for sig in (signal.SIGTERM, signal.SIGINT):
                 old_signals[sig] = signal.signal(sig, interrupt)
+        # Validation may reconstruct a sizeable sealed source/history graph.
+        # The single native exchange budget starts after that preflight, before
+        # launch, and is never reset by a response or an intermediate check.
+        deadline = time.monotonic() + limits.deadline_seconds
         check()
         child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.DEVNULL, env=env, cwd=cwd, pass_fds=pass_fds,

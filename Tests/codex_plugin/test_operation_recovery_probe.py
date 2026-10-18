@@ -208,6 +208,49 @@ class RecoveryProbeTests(unittest.TestCase):
         self.assertLess(time.monotonic()-start,2)
         self.assertEqual(self.kinds(),['dispatch'])
 
+    def test_costly_full_preflight_does_not_consume_single_native_exchange_budget(self):
+        for _ in range(4): self.prepare()
+        self.configure()
+        recovery=self.revoke();phases=[];preflight_done=[]
+        def validate(phase):
+            phases.append(phase)
+            if phase=='before_probe_launch':
+                # Measured production semantic validation took 7.657 + 4.944s.
+                # Use real elapsed cost, not a fake monotonic clock or fast mock.
+                time.sleep(12.65)
+                preflight_done.append(time.monotonic())
+            return True
+        started=time.monotonic()
+        result=P.probe_statuses(self.transport,recovery_fence=recovery,expected_binding=self.binding,
+            expected_scope=self.scope,requests=self.requests,validate_inputs=validate,limits=P.ProbeLimits())
+        self.assertGreaterEqual(time.monotonic()-started,12.65)
+        self.assertLess(time.monotonic()-preflight_done[0],10)
+        self.assertEqual(len(result),5)
+        self.assertEqual(phases.count('before_probe_launch'),1)
+        self.assertEqual(phases.count('before_probe_send'),8)
+        self.assertEqual(phases.count('after_probe_status'),5)
+        self.assertEqual(phases[-1],'after_probe_cleanup')
+        calls=[json.loads(line) for line in (self.run/'calls.jsonl').read_text().splitlines()]
+        self.assertEqual(calls[0]['method'],'initialize')
+        self.assertEqual(sum(v.get('params',{}).get('name')=='operation_status' for v in calls),5)
+        self.assertTrue(all(child.poll() is not None for child in self.children))
+        self.assertTrue(recovery.verify(self.binding))
+
+    def test_default_native_deadline_still_bounds_a_stalled_child_after_preflight(self):
+        self.configure(mode='delay');recovery=self.revoke();preflight_done=[]
+        def validate(phase):
+            if phase=='before_probe_launch':
+                time.sleep(0.15);preflight_done.append(time.monotonic())
+            return True
+        with self.assertRaisesRegex(P.ProbeError,'deadline'):
+            P.probe_statuses(self.transport,recovery_fence=recovery,expected_binding=self.binding,
+                expected_scope=self.scope,requests=self.requests,validate_inputs=validate,limits=P.ProbeLimits())
+        elapsed=time.monotonic()-preflight_done[0]
+        self.assertGreaterEqual(elapsed,9.9)
+        self.assertLess(elapsed,12)
+        self.assertTrue(all(child.poll() is not None for child in self.children))
+        self.assertEqual(self.kinds(),['dispatch'])
+
     def test_cleanup_failure_refuses_all_observations(self):
         # Keep normal probe time for this independent failure injection. The
         # deadline test's 0.2s limit can mask cleanup on a loaded host.

@@ -100,7 +100,7 @@ class DependencyPreparationTests(unittest.TestCase):
         self.remote = [{'packageRef': {'identity': pin['identity'], 'kind': 'remoteSourceControl'},
                         'subpath': pin['identity']} for pin in self.pins]
         self.local = {'packageRef': {'identity': 'repo', 'kind': 'fileSystem',
-                                     'name': 'Engram', 'location': str(self.repo)},
+                                     'name': 'repo', 'location': str(self.repo)},
                       'state': {'name': 'fileSystem', 'path': str(self.repo)},
                       'basedOn': None, 'subpath': 'repo'}
 
