@@ -385,10 +385,26 @@ def _held(paths,request,state_raw,record_before,plan,*,processing,execution):
     names=A.state_paths(paths.root,request['session_id'])
     current,state,_=record(names['sessions']);_,admitted,_=record(names['admissions'])
     original=J._json(state_raw)
+    gate=state.get('reconciliation_required')
+    expected_gate={'run_id':plan['legacy_run_id'],'reason':'successful_or_unverified_write',
+                   'memory_ids':plan['preserve_without_replay']['memory_ids']}
+    if reviewed(plan):
+        require(type(gate) is dict and set(gate)==set(expected_gate),'held_state_changed')
+        # The legacy runner sorted this inventory; reviewed attempt order is
+        # independently bound by history. Preserve both original serializations.
+        inventories=(gate['memory_ids'],expected_gate['memory_ids'])
+        for ids in inventories:
+            require(type(ids) is list and len(ids)<=32,'held_state_changed')
+            normalized=[J._uuid(value) for value in ids]
+            require(normalized==ids and len(set(normalized))==len(ids),'held_state_changed')
+        gate_matches=(gate['run_id']==expected_gate['run_id']
+                      and gate['reason']==expected_gate['reason']
+                      and set(inventories[0])==set(inventories[1]))
+    else:
+        gate_matches=same(gate,expected_gate)
     require(current==state_raw and state['session_id']==plan['session_id']==request['session_id']
             and state['last_run']==plan['legacy_run_id'] and state['status']=='reconciliation_required'
-            and same(state['reconciliation_required'],{'run_id':plan['legacy_run_id'],
-                'reason':'successful_or_unverified_write','memory_ids':plan['preserve_without_replay']['memory_ids']})
+            and gate_matches
             and state['identity']==request['identity']==binding['identity']
             and same(state['admission'],binding) and state['transcript_path']==request['transcript_path']
             and state['offset']>=binding['frontier_offset'],'held_state_changed')

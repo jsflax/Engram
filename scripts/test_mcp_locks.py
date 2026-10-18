@@ -107,7 +107,7 @@ class PersistenceHarnessTests(unittest.TestCase):
                                 result = {"isError": True, "content": [{"type": "text", "text": str(exc)}]}
                         if SEED_FAILURE:
                             # A returned error does not prove that no write occurred.
-                            log_dir = Path(os.environ["HOME"]) / ".claude/memory-logs"
+                            log_dir = Path(os.environ["CFFIXED_USER_HOME"]) / ".claude/memory-logs"
                             log_dir.mkdir(parents=True)
                             (log_dir / "lattice-mcp-fixture.log").write_text("old" * 10000 + "\\nfixture backend transaction detail\\n")
                             sys.stderr.write("old" * 10000 + "\\nfixture stderr transaction detail\\npartial final detail")
@@ -168,9 +168,130 @@ class PersistenceHarnessTests(unittest.TestCase):
         client.stderr, client.buffers = ["older"], {"stderr": b"\xff" * 20000}
         self.assertLessEqual(len(client.stderr_tail().encode()), 16 * 1024)
 
+    def fake_migrator(self, directory, mode="success"):
+        program = textwrap.dedent('''\
+            import json, os, sqlite3, sys, time
+            from pathlib import Path
+            mode = MODE
+            assert sys.argv[1] == "migrate-embeddings" and sys.argv[2] == "--db"
+            assert sys.argv[4:] == ["--force"]
+            path = Path(sys.argv[3])
+            assert path.is_file() and path.stat().st_size == 0
+            (path.parent / "migration-invocation.json").write_text(json.dumps({
+                "argv": sys.argv[1:], "pid": os.getpid(),
+                "account_environment": {key: os.environ.get(key) for key in ("HOME", "CODEX_HOME")},
+                "fixture_home": os.environ.get("CFFIXED_USER_HOME")}))
+            if mode == "timeout":
+                time.sleep(30)
+            if mode == "overflow":
+                sys.stdout.write("x" * (2 * 1024**2))
+                sys.stdout.flush()
+            db = sqlite3.connect(path)
+            db.execute("CREATE TABLE Memory(globalId TEXT PRIMARY KEY, content TEXT)")
+            db.execute("CREATE TABLE HookState(key TEXT, value TEXT)")
+            if mode != "missing_marker":
+                db.execute("INSERT INTO HookState VALUES ('embedding.spaceVersion', ?)",
+                           ("1" if mode == "stale_marker" else "2",))
+            if mode == "nonempty":
+                db.execute("INSERT INTO Memory VALUES ('kept', 'unexpected row')")
+            db.commit()
+            db.close()
+            if mode != "missing_completion":
+                print("Embedding migration: complete — " + ("1" if mode == "nonzero_completion" else "0")
+                      + " re-embedded, vec index rebuilt")
+            if mode != "missing_done":
+                print("Done: 0 re-embedded, 0 failed.")
+            sys.exit(7 if mode == "failed_exit" else 0)
+        ''').replace("MODE", repr(mode))
+        binary = Path(directory) / "fake-migrator"
+        binary.write_text("#!" + sys.executable + "\n" + program)
+        binary.chmod(0o700)
+        return binary
+
+    def test_explicit_migration_joins_exact_command_and_checks_persisted_empty_marker(self):
+        with self.temporary_directory() as directory:
+            root = Path(directory).resolve()
+            binary = self.fake_migrator(directory)
+            env = dict(os.environ, CFFIXED_USER_HOME=str(root / "fixture-home"))
+            result = HARNESS.prepare_empty_seed(binary, root / "memory.sqlite", environment=env,
+                                               cwd=root, deadline=time.monotonic() + 5)
+            invocation = json.loads((root / "migration-invocation.json").read_text())
+            self.assertEqual(invocation["argv"], ["migrate-embeddings", "--db", str(root / "memory.sqlite"), "--force"])
+            self.assertEqual(invocation["account_environment"], {key: os.environ.get(key) for key in ("HOME", "CODEX_HOME")})
+            self.assertEqual(invocation["fixture_home"], str(root / "fixture-home"))
+            self.assertEqual(result, {"pid": invocation["pid"], "clean_exit": 0, "reembedded": 0,
+                                      "failed": 0, "stored_embedding_version": 2})
+            with self.assertRaises(ProcessLookupError):
+                os.kill(result["pid"], 0)
+
+    def test_explicit_migration_refuses_failed_or_incomplete_output_and_wrong_database_state(self):
+        for mode, reason in (("failed_exit", "exited 7"), ("missing_completion", "zero-row sweep"),
+                             ("nonzero_completion", "zero-row sweep"), ("missing_done", "incomplete/failed"),
+                             ("missing_marker", "embedding marker"), ("stale_marker", "embedding marker"),
+                             ("nonempty", "not empty")):
+            with self.subTest(mode=mode), self.temporary_directory() as directory:
+                root = Path(directory).resolve()
+                binary = self.fake_migrator(directory, mode)
+                with contextlib.redirect_stderr(io.StringIO()) as diagnostic:
+                    with self.assertRaisesRegex(AssertionError, reason):
+                        HARNESS.prepare_empty_seed(binary, root / "memory.sqlite", environment=dict(os.environ),
+                                                   cwd=root, deadline=time.monotonic() + 5)
+                self.assertTrue(json.loads(diagnostic.getvalue())["fixture_migration_failed"])
+                pid = json.loads((root / "migration-invocation.json").read_text())["pid"]
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+
+    def test_explicit_migration_deadline_and_output_limit_reap_owned_child(self):
+        for mode, seconds, reason in (("timeout", 0.5, "original seed deadline"),
+                                      ("overflow", 5, "output exceeded")):
+            with self.subTest(mode=mode), self.temporary_directory() as directory:
+                root = Path(directory).resolve()
+                binary = self.fake_migrator(directory, mode)
+                started = time.monotonic()
+                with contextlib.redirect_stderr(io.StringIO()) as diagnostic:
+                    with self.assertRaisesRegex(AssertionError, reason):
+                        HARNESS.prepare_empty_seed(binary, root / "memory.sqlite", environment=dict(os.environ),
+                                                   cwd=root, deadline=started + seconds)
+                self.assertLess(time.monotonic() - started, seconds + 4)
+                self.assertLessEqual(len(json.loads(diagnostic.getvalue())["output_tail"].encode()), 16 * 1024)
+                pid = json.loads((root / "migration-invocation.json").read_text())["pid"]
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+
+    def test_explicit_migration_requires_binding_new_file_and_remaining_setup_budget(self):
+        with self.temporary_directory() as directory:
+            root = Path(directory).resolve()
+            binary = self.fake_migrator(directory)
+            db = root / "memory.sqlite"
+            with patch.object(HARNESS.subprocess, "Popen") as launch:
+                with self.assertRaisesRegex(AssertionError, "migration-binary"):
+                    HARNESS.prepare_empty_seed(None, db, environment={}, cwd=root, deadline=time.monotonic() + 5)
+                with self.assertRaisesRegex(AssertionError, "before launch"):
+                    HARNESS.prepare_empty_seed(binary, db, environment={}, cwd=root, deadline=time.monotonic() - 1)
+                self.assertFalse(db.exists())
+                db.write_bytes(b"existing fixture must not be rewritten")
+                with self.assertRaises(FileExistsError):
+                    HARNESS.prepare_empty_seed(binary, db, environment={}, cwd=root, deadline=time.monotonic() + 5)
+                self.assertEqual(db.read_bytes(), b"existing fixture must not be rewritten")
+                launch.assert_not_called()
+
+    def test_warm_migration_failure_stops_before_mcp_and_removes_fixture(self):
+        with self.temporary_directory() as directory:
+            binary = self.fake_migrator(directory, "failed_exit")
+            with patch.dict(os.environ, {"TMPDIR": directory}), patch.object(HARNESS, "Client") as client, \
+                    contextlib.redirect_stderr(io.StringIO()) as output:
+                with self.assertRaisesRegex(AssertionError, "exited 7"):
+                    HARNESS.run_warm_startup(Path("unused-mcp"), binary)
+            client.assert_not_called()
+            records = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual(records[-1]["phase"], "seed_embedding_migration")
+            self.assertIsNone(records[-1]["cleanup_error"])
+            self.assertEqual(list(Path(directory).glob("engram-mcp-warm-startup-*")), [])
+
     def test_warm_seed_failure_retains_diagnostics_after_reaping_before_temp_removal(self):
         with self.temporary_directory() as directory:
             binary = self.fake_binary(directory, seed_failure=True)
+            migrator = self.fake_migrator(directory)
             clients, roots = [], []
             original_client = HARNESS.Client
             def capture(*args, **kwargs):
@@ -182,7 +303,7 @@ class PersistenceHarnessTests(unittest.TestCase):
                     patch.object(HARNESS, "Client", side_effect=capture), \
                     contextlib.redirect_stderr(io.StringIO()) as output:
                 with self.assertRaisesRegex(AssertionError, "fixture stderr transaction detail"):
-                    HARNESS.run_warm_startup(binary)
+                    HARNESS.run_warm_startup(binary, migrator)
             record = json.loads(output.getvalue())
             self.assertEqual(record["phase"], "seed_remember")
             self.assertEqual(record["native_exit_code"], 0)

@@ -162,7 +162,8 @@ def publications(root: Path):
         Path(__file__).resolve().parents[2], legacy_paths=lambda: legacy_paths(root),
         legacy_verify_locks=lambda: publication_locks_owned(root),
         residual_paths=lambda run_id: residual_paths(root, run_id),
-        residual_verify_locks=lambda: publication_locks_owned(root))
+        residual_verify_locks=lambda: publication_locks_owned(root),
+        native_diagnostic=lambda value: event_log(root, "native_plan_diagnostic", **value))
 
 
 def publication_locks_owned(root: Path) -> bool:
@@ -1440,7 +1441,10 @@ def worker(root: Path) -> int:
             try:
                 outcome = process_request(root, request, config)
             except Exception as exc:
-                event_log(root, "worker_error", session_id=request.get("session_id"), reason=type(exc).__name__)
+                from .native_executor import failure_fields
+                details = failure_fields(exc)
+                event_log(root, "worker_error", session_id=request.get("session_id"),
+                          reason=details.pop('exception_type'), **details)
                 outcome = "blocked"
                 if has_recoverable_transition(root, request["session_id"]):
                     recovery_failures.add(request["session_id"])

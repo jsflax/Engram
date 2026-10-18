@@ -2,6 +2,58 @@ import Foundation
 import simd
 import AppKit
 import EngramRealityKit
+import EngramSceneKit
+
+/// Maps a validated render-node prefix to the simulation's authoritative
+/// indices. Append-only loading visits only new or previously missing nodes.
+@MainActor
+struct SimulationIndexCache {
+    private(set) var indices: [Int] = []
+    private var unresolved: [Int] = []
+    private weak var indexedSimulation: ForceSimulation3D?
+    private var indexGeneration: UInt64 = .max
+    private var nodeOrderVersion: UInt64 = .max
+
+    mutating func refresh(nodeCount: Int, preservingPrefix: Bool,
+                          simulation: ForceSimulation3D,
+                          nodeID: (Int) -> UUID) -> Bool {
+        let reset = !preservingPrefix || indices.count > nodeCount
+            || indexedSimulation !== simulation
+            || indexGeneration != simulation.nodeIndexGeneration
+        var changed = reset
+        if reset {
+            indices.removeAll(keepingCapacity: true)
+            unresolved.removeAll(keepingCapacity: true)
+        } else if nodeOrderVersion != simulation.nodeOrderVersion, !unresolved.isEmpty {
+            // Valid indices survive append. Only earlier misses can change.
+            var remaining: [Int] = []
+            for index in unresolved {
+                if let resolved = simulation.index(for: nodeID(index)) {
+                    indices[index] = resolved
+                    changed = true
+                } else {
+                    remaining.append(index)
+                }
+            }
+            unresolved = remaining
+        }
+        if indices.count < nodeCount {
+            if indices.capacity < nodeCount {
+                indices.reserveCapacity(max(nodeCount, max(64, indices.capacity * 2)))
+            }
+            for index in indices.count..<nodeCount {
+                let resolved = simulation.index(for: nodeID(index)) ?? -1
+                indices.append(resolved)
+                if resolved < 0 { unresolved.append(index) }
+            }
+            changed = true
+        }
+        indexedSimulation = simulation
+        indexGeneration = simulation.nodeIndexGeneration
+        nodeOrderVersion = simulation.nodeOrderVersion
+        return changed
+    }
+}
 
 /// Bridges GalaxyRegistry data to SceneDataProvider for EngramRealityKit.
 ///
@@ -31,8 +83,8 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     private var frameGlowing: [UUID: Float] = [:]
     private var frameNewGlows: [UUID: Float] = [:]
     private var frameCentroids: [String: SIMD3<Float>] = [:]
-    private var simIndexByNodeIndex: [Int] = []
-    private var simIndexTopologyVersion: UInt64 = .max
+    private var simulationIndices = SimulationIndexCache()
+    private var preservesIndexPrefix = true
     private var cachedPositionVersion: UInt64 = .max
     private var centroidPositionVersion: UInt64 = .max
 
@@ -134,21 +186,20 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         guard let registry else { return }
         let sim = registry.unifiedSimulation
 
-        // positionArray via flat sim arrays + a topology-cached index map.
+        // Reuse indices for the validated render prefix. The simulation owns
+        // the UUID lookup; no duplicate full-graph dictionary is needed here.
         let n = cachedNodes.count
-        let indicesChanged = simIndexByNodeIndex.count != n || simIndexTopologyVersion != lastTopologyVersion
-        if indicesChanged {
-            var idToSim = [UUID: Int](minimumCapacity: sim.nodeIds.count)
-            for (si, id) in sim.nodeIds.enumerated() { idToSim[id] = si }
-            simIndexByNodeIndex = cachedNodes.map { idToSim[$0.id] ?? -1 }
-            simIndexTopologyVersion = lastTopologyVersion
-        }
+        let nodes = cachedNodes
+        let indicesChanged = simulationIndices.refresh(
+            nodeCount: n, preservingPrefix: preservesIndexPrefix, simulation: sim
+        ) { nodes[$0].id }
+        preservesIndexPrefix = true
         if framePositionArray.count != n {
             framePositionArray = [SIMD3<Float>](repeating: .zero, count: n)
         }
         if indicesChanged || cachedPositionVersion != sim.positionVersion {
             let px = sim.posX, py = sim.posY, pz = sim.posZ
-            simIndexByNodeIndex.withUnsafeBufferPointer { simIdx in
+            simulationIndices.indices.withUnsafeBufferPointer { simIdx in
                 for i in 0..<n {
                     let si = simIdx[i]
                     framePositionArray[i] = si >= 0 && si < px.count ?
@@ -187,7 +238,7 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
             // (galaxyId|project) → accumulator; galaxyId → extent accumulator.
             var clusterSums: [String: (galaxy: String, project: String, sum: SIMD3<Float>, count: Int)] = [:]
             for (index, node) in cachedNodes.enumerated() {
-                guard simIndexByNodeIndex[index] >= 0 else { continue }
+                guard simulationIndices.indices[index] >= 0 else { continue }
                 let pos = framePositionArray[index]
                 let entry = sums[node.project] ?? (.zero, 0)
                 sums[node.project] = (entry.sum + pos, entry.count + 1)
@@ -209,7 +260,7 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
             var galaxyProjectCounts: [String: [String: Int]] = [:]
             let galaxyCenters = registry.galaxies.mapValues { $0.worldCenter }
             for (index, node) in cachedNodes.enumerated() {
-                guard simIndexByNodeIndex[index] >= 0 else { continue }
+                guard simulationIndices.indices[index] >= 0 else { continue }
                 let pos = framePositionArray[index]
                 let galaxy = nodeToGalaxy[node.id] ?? "personal"
                 let key = "\(galaxy)|\(node.project)"
@@ -274,7 +325,10 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
                     && old.createdAt == node.createdAt && old.lastAccessedAt == node.lastAccessedAt
                     && old.isHub == mergedHubs.contains(node.id)
             }
-        if !canAppendNodes { cachedNodes.removeAll(keepingCapacity: true) }
+        if !canAppendNodes {
+            preservesIndexPrefix = false
+            cachedNodes.removeAll(keepingCapacity: true)
+        }
         if cachedNodes.capacity < nodes.count {
             cachedNodes.reserveCapacity(max(nodes.count, max(64, cachedNodes.capacity * 2)))
         }

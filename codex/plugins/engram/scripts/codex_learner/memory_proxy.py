@@ -787,6 +787,14 @@ def durable_execution(config, cleanup, *, diagnostic=None):
             or config["provenance"] != "codex-session:" + manifest["session_id"]
             or config.get("allowed_tools") != allowed):
         raise ProxyError("Durable execution policy changed")
+    if mode == PLANNING_MODE:
+        # Only the deterministic plan executor projects sealed implicit TMPDIR.
+        # The read-only planning relay still launches its ordinary environment,
+        # so retain its exact pre-launch environment check instead of accepting
+        # a value the relay would not actually pass to the child.
+        environment = contexts.stdio_bridge._transport(context.transport)[1]
+        if contexts.normal_plan_environment(manifest, context.transport, environment) != environment:
+            raise contexts.ContextError("execution_context_backend_changed")
     operations = None
     if mode is None:
         if diagnostic is not None:

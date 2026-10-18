@@ -4,6 +4,22 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.4] - 2026-10-18
+
+### Fixed
+- Give normal learner writes their own thirty-second execution budget and
+  retain precise failure codes, phases and cleanup diagnostics.
+- Continue unfinished plans after a plugin upgrade using authenticated retained
+  inputs and current policy, preserving the original operation IDs and receipts.
+- Retain a plan's original implicit temporary directory when resuming it, so a
+  different worker launch environment does not falsely change its memory backend.
+  Explicit environment settings and other backend identity checks remain exact.
+- Accept the same complete, unique preserved-memory inventory in a different
+  order without changing the original held records or replaying saved writes.
+- Reuse simulation node indices while the visualizer loads appended nodes instead
+  of rebuilding the full lookup each time. Refresh indices after deletion,
+  reordering or simulation replacement, and resolve nodes that arrive later.
+
 ## [0.15.3] - 2026-10-18
 
 ### Fixed

@@ -230,6 +230,96 @@ def _backend(paths, *, stable_path=False):
     return configuration, route
 
 
+@_safe
+def normal_plan_environment(manifest, transport, environment):
+    """Retain the sealed implicit temp directory for normal native execution.
+
+    TMPDIR chosen by the launching worker is operational context, not a new
+    user configuration. Reuse its exact sealed value (or absence); never mutate
+    process-wide environment or reinterpret explicit env/env_vars. All other
+    launch fields still undergo the original exact route comparison.
+    """
+    if manifest.get("provider_mode") != "read_only_plan":
+        return environment
+    route = journal._json(journal._unseal(manifest["inputs"]["backend_route"]))
+    _require(_same(transport, route["transport"]), "backend_changed")
+    if "TMPDIR" in transport.get("env", {}) or "TMPDIR" in transport.get("env_vars", []):
+        return environment
+    original = route["launch"]["env"]
+    _require(type(environment) is dict and type(original) is dict, "invalid_launch_environment")
+    value = copy.deepcopy(environment)
+    if "TMPDIR" in original:
+        temporary = original["TMPDIR"]
+        _require(type(temporary) is str and len(temporary) <= 4096 and "\0" not in temporary,
+                 "invalid_launch_environment")
+        value["TMPDIR"] = temporary
+    else:
+        value.pop("TMPDIR", None)
+    return value
+
+
+def _normal_plan_paths(paths, manifest, decoded):
+    """Keep a sealed normal plan on its original retained native route.
+
+    Only sibling versions of the same currently enabled installed plugin may
+    differ. Current code validates/executes; no Python is loaded from the old
+    package. Legacy and explicitly reviewed residual contracts stay exact.
+    """
+    sealed = decoded["backend_route"]["paths"]
+    if (manifest.get("provider_mode") != "read_only_plan"
+            or sealed.get("plugin_root") == str(paths.plugin_root)):
+        return paths, None
+    journal._keys(sealed, set(ContextPaths.__dataclass_fields__))
+    _require(all(sealed[key] == str(getattr(paths, key))
+                 for key in ("root", "run_dir", "config_path")), "retained_paths_changed")
+    retained_root = Path(sealed["plugin_root"])
+    retained = ContextPaths(paths.root, paths.run_dir, paths.config_path, retained_root)
+    retained.check()
+    current_root = paths.plugin_root
+    _require(len(current_root.parents) > 3
+             and retained_root.parent == current_root.parent
+             and current_root.parents[3].name == "plugins"
+             and current_root.parents[2].name == "cache", "retained_plugin_namespace_changed")
+    snapshots = {}
+    for root in (retained_root, current_root):
+        for relative in (".codex-plugin/plugin.json", ".mcp.json"):
+            path = root / relative
+            raw, identity = durable._read(path, private=False, maximum=memory_config.MAX_PLUGIN)
+            _require(not path.stat().st_mode & 0o022, "unsafe_plugin")
+            snapshots[path] = (raw, identity)
+    config_raw, _ = durable._read(paths.config_path, private=False, maximum=memory_config.MAX_CONFIG)
+    user, current_memory = memory_config.resolve(paths.config_path, current_root, config_bytes=config_raw)
+    _, retained_memory = memory_config.resolve(paths.config_path, retained_root, config_bytes=config_raw)
+    plugins = memory_config._object(user.get("plugins", {}))
+    identity = memory_config._plugin_identity(plugins, current_root)
+    _require(memory_config._plugin_identity(plugins, retained_root) == identity
+             and memory_config._enabled(memory_config._object(user.get("features", {})).get("plugins", True))
+             and memory_config._enabled(memory_config._object(plugins[identity]).get("enabled", True)),
+             "retained_plugin_disabled_or_changed")
+    # Package defaults may relocate command/cwd to the sibling version. All
+    # other effective settings, including explicit env and tool policy, match.
+    def package_relative(memory, root):
+        value = copy.deepcopy(memory)
+        for key in ("command", "cwd"):
+            if key in value:
+                path = Path(value[key])
+                if path.is_relative_to(root):
+                    value[key] = {"package_relative": str(path.relative_to(root))}
+        return value
+    explicit = "memory" in memory_config._object(user.get("mcp_servers", {}))
+    _require(_same(current_memory, retained_memory) if explicit else
+             _same(package_relative(current_memory, current_root),
+                   package_relative(retained_memory, retained_root)), "retained_policy_changed")
+    parser_relative = Path("scripts/codex_learner/transcript.py")
+    _require(_parser_runtime()["path"] == str(current_root / parser_relative)
+             and decoded["parser_state"]["runtime"]["path"] == str(retained_root / parser_relative),
+             "retained_parser_path_changed")
+    for path, before in snapshots.items():
+        _require(durable._read(path, private=False, maximum=memory_config.MAX_PLUGIN) == before,
+                 "plugin_changed")
+    return retained, retained_root
+
+
 def _parser_runtime():
     path = Path(transcript.__file__)
     raw, _ = durable._read(path, private=False, maximum=1048576)
@@ -237,8 +327,16 @@ def _parser_runtime():
     return {"path": str(path), "sha256": journal.sha256(raw)}
 
 
-def _parser_matches(expected, runtime_admission=None):
+def _parser_matches(expected, runtime_admission=None, retained_plugin=None):
     current = _parser_runtime()
+    if retained_plugin is not None:
+        _require(runtime_admission is None, "invalid_runtime_admission")
+        journal._keys(expected, {"path", "sha256"})
+        path = retained_plugin / "scripts/codex_learner/transcript.py"
+        raw, _ = durable._read(path, private=False, maximum=1048576)
+        _require(not path.stat().st_mode & 0o022, "unsafe_parser")
+        return (expected["path"] == str(path)
+                and expected["sha256"] == journal.sha256(raw) == current["sha256"])
     if runtime_admission is None:
         return _same(current, expected)
     from .residual_runtime_compatibility import RuntimeAdmission
@@ -273,7 +371,8 @@ def _interval(path, identity, start, end):
         os.close(fd)
 
 
-def _source(request, parser, source, expected_next, *, verified=None, runtime_admission=None):
+def _source(request, parser, source, expected_next, *, verified=None, runtime_admission=None,
+            retained_plugin=None):
     journal._keys(parser, {"version", "input", "limits", "runtime", "interval_sha256"})
     journal._version(parser["version"])
     journal._keys(parser["input"], {"offset", "recent_messages", "current_turn_id"})
@@ -284,7 +383,7 @@ def _source(request, parser, source, expected_next, *, verified=None, runtime_ad
              and source["start_offset"] == parser["input"]["offset"]
              and source["end_offset"] - source["start_offset"] <= scan, "invalid_parser_limits")
     _require(source["identity"] == request["identity"]
-             and _parser_matches(parser["runtime"], runtime_admission), "parser_or_source_changed")
+             and _parser_matches(parser["runtime"], runtime_admission, retained_plugin), "parser_or_source_changed")
     path, start, end = request["transcript_path"], source["start_offset"], source["end_offset"]
     expected_hash = parser["interval_sha256"]
     _require(_interval(path, source["identity"], start, end) == expected_hash, "source_bytes_changed")
@@ -301,7 +400,7 @@ def _source(request, parser, source, expected_next, *, verified=None, runtime_ad
                  and journal.sha256(excerpt.text.encode("utf-8")) == source["excerpt_sha256"]
                  and _same(_next_parser(excerpt), expected_next), "excerpt_or_parser_changed")
     _require(_interval(path, source["identity"], start, end) == expected_hash
-             and _parser_matches(parser["runtime"], runtime_admission), "source_or_parser_changed")
+             and _parser_matches(parser["runtime"], runtime_admission, retained_plugin), "source_or_parser_changed")
     if verified is not None:
         verified.clear()
         verified["key"] = key
@@ -324,15 +423,18 @@ def _source_backend_inputs(paths, manifest, decoded, *, source_cache=None, runti
     # Only an already-sealed explicit default selects stable PATH validation.
     # Older seals without it retain exact ambient-PATH semantics unchanged.
     stable_path = decoded["backend_route"]["transport"].get("env", {}).get("PATH") == DEFAULT_NATIVE_PATH
-    configuration, route = _backend(paths, stable_path=stable_path)
+    selected, retained_plugin = _normal_plan_paths(paths, manifest, decoded)
+    configuration, route = _backend(selected, stable_path=stable_path)
+    route["launch"]["env"] = normal_plan_environment(manifest, route["transport"], route["launch"]["env"])
     _require(_same(configuration, decoded["backend_config"])
              and _same(route, decoded["backend_route"])
              and route["runtime"]["sha256"] == manifest["backend"]["runtime_sha256"], "backend_changed")
     arguments = (request, decoded["parser_state"], manifest["source"], decoded["next_parser_state"])
-    if source_cache is None and runtime_admission is None:
+    if source_cache is None and runtime_admission is None and retained_plugin is None:
         _source(*arguments)
     else:
-        _source(*arguments, verified=source_cache, runtime_admission=runtime_admission)
+        _source(*arguments, verified=source_cache, runtime_admission=runtime_admission,
+                retained_plugin=retained_plugin)
     _require(_same(admission.check(paths.root, request), request["admission"]), "binding_changed")
     return True
 

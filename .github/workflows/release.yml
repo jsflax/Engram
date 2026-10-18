@@ -245,11 +245,11 @@ jobs:
         run: |
           mkdir -p build/mcp-test-home build/mcp-test-tmp
           for regression in smoke startup warm-startup warm-multistore-startup recall idle persistence; do
-            env HOME="$PWD/build/mcp-test-home" \
-              CFFIXED_USER_HOME="$PWD/build/mcp-test-home" \
+            env CFFIXED_USER_HOME="$PWD/build/mcp-test-home" \
               TMPDIR="$PWD/build/mcp-test-tmp" \
               python3 -B scripts/verify-mcp-locks.py \
-                --binary .build/release/Engram --case "$regression"
+                --binary .build/release/Engram \
+                --migration-binary .build/release/EngramDaemon --case "$regression"
           done
 
       - name: Import signing certificate
