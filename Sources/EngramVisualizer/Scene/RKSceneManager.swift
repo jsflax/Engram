@@ -66,7 +66,13 @@ final class RKSceneManager {
     init?(registry: GalaxyRegistry) {
         self.camera = CameraController()
         self.dataAdapter = GalaxyRegistryAdapter(registry: registry)
-        self.rkScene = EngramRealityScene()
+        // Hosted isolation supplies an explicit owned directory; Foundation's
+        // default temporary directory need not follow the TMPDIR environment.
+        let audioDirectory = PerformanceLaunch.isIsolated
+            ? ProcessInfo.processInfo.environment["TMPDIR"].map { URL(fileURLWithPath: $0, isDirectory: true) }
+            : nil
+        self.rkScene = EngramRealityScene(
+            audioTemporaryDirectory: audioDirectory ?? FileManager.default.temporaryDirectory)
 
         // Wire scene to data/camera providers
         self.rkScene.dataProvider = dataAdapter
