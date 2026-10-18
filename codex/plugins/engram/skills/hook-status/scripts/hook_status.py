@@ -1101,15 +1101,53 @@ def report(session_id=None, environ=None):
     return out
 
 
+def render_report(value):
+    """Fit serialized metadata, including its newline, without hiding omission."""
+    pretty = json.dumps(value, ensure_ascii=True, indent=2)
+    if len(pretty.encode()) + 1 <= MAX_OUTPUT_BYTES:
+        return pretty
+    compact = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+    if len(compact.encode()) + 1 <= MAX_OUTPUT_BYTES:
+        return compact
+    # report() has already performed all selection, validation and sanitization.
+    # Keep its health classification exact; never infer health from a subset.
+    retained = {key: value[key] for key in
+                ("session_id", "session_sha256_prefix", "state_root") if key in value}
+    learner = value.get("learner", {})
+    health = learner.get("health") if isinstance(learner, dict) else None
+    omitted = [key for key in value if key not in retained and key not in ("status", "learner")]
+    if isinstance(learner, dict):
+        omitted += ["learner." + key for key in learner if key != "health"]
+    elif "learner" in value:
+        omitted.append("learner")
+    limited = {"status": "output_limit", "report_status": value.get("status"), **retained,
+               "output": {"complete": False, "maximum_bytes": MAX_OUTPUT_BYTES,
+                          "full_pretty_bytes": len(pretty.encode()) + 1,
+                          "full_compact_bytes": len(compact.encode()) + 1,
+                          "omitted_sections": sorted(omitted)}}
+    if health is not None:
+        limited["learner"] = {"health": health}
+    output = json.dumps(limited, ensure_ascii=True, separators=(",", ":"))
+    if len(output.encode()) + 1 <= MAX_OUTPUT_BYTES:
+        return output
+    # Defensive bound if the health schema grows: explicitly refuse to expose a
+    # partial classification, including one whose hold fields were dropped.
+    limited.pop("learner", None)
+    limited["output"]["omitted_sections"] = sorted(set(omitted + ["learner.health"]))
+    limited["output"]["health"] = "unavailable_within_output_budget"
+    output = json.dumps(limited, ensure_ascii=True, separators=(",", ":"))
+    if len(output.encode()) + 1 > MAX_OUTPUT_BYTES:
+        raise ValueError("output_envelope_exceeds_budget")
+    return output
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session-id", help="Selected task UUID; defaults to CODEX_THREAD_ID")
     args = parser.parse_args(argv)
     try:
         value = report(args.session_id)
-        output = json.dumps(value, ensure_ascii=True, indent=2)
-        if len(output.encode()) > MAX_OUTPUT_BYTES:
-            output = '{"status":"output_limit"}'
+        output = render_report(value)
     except (OSError, ValueError, TypeError, KeyError, RecursionError):
         output = '{"status":"metadata_unavailable"}'
     print(output)
