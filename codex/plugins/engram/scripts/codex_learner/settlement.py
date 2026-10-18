@@ -11,6 +11,8 @@ from __future__ import annotations
 import copy
 import os
 from pathlib import Path
+import re
+import stat
 
 from . import execution_manifest as journal, migration as durable
 from . import operation_gateway as gateway, operation_probe, writer_fence
@@ -407,6 +409,7 @@ def _result(raw, memory_ids):
 PINNED_DURABLE_0151 = {'runner.py': '5023d137ba790c8979417ca63c5a181fe4323d1bc6b9e489c135bd26928a379c', 'memory_proxy.py': '2c8670ca9591f649e5abcacec20ae865381fc295c516fa9e2969945947d263bd', 'operation_gateway.py': '333eabc06b20ff6a7c0b4dda05b70fad2b80c91b07faf40778edcedb602205e6', 'execution_manifest.py': 'ca886dbbb7a6f15e83ebac253fa6137665282996b548523d0a27267666df3a50', 'stdio_bridge.py': '737089019694cc0fdde0cfed724d28e31d96bda9addf303d53268f6c9815fb05', 'writer_fence.py': 'e55e1c6a993cdf84ea0ff5acab01b84ef72495f58f7f78ff6648fc57a9ca44e3'}
 ZERO_RETRY = "zero-intent-retry.json"
 ZERO_KIND = "zero_intent_retry"
+INSTALL_AUTHORITY = "gateway-install-continuity.json"
 
 
 def _gateway_contract(plugin_root):
@@ -426,7 +429,110 @@ def _gateway_contract(plugin_root):
     return evidence
 
 
-def zero_intent_proof(run_dir, manifest, digest):
+def _install_inventory(value):
+    """Read the existing install inventory schema, never a source hash override."""
+    journal._keys(value, {"root", "files", "directories", "total_bytes"})
+    _require(type(value["root"]) is str and Path(value["root"]).is_absolute()
+             and type(value["files"]) is list and 0 < len(value["files"]) <= 4096
+             and type(value["directories"]) is list and len(value["directories"]) <= 4096
+             and type(value["total_bytes"]) is int, "invalid_install_inventory")
+    files = {}
+    for row in value["files"]:
+        journal._keys(row, {"path", "sha256", "bytes", "identity"})
+        path = row["path"]
+        _require(type(path) is str and path and not Path(path).is_absolute()
+                 and str(Path(path)) == path and ".." not in Path(path).parts
+                 and path not in files and type(row["bytes"]) is int and row["bytes"] >= 0,
+                 "invalid_install_inventory")
+        journal._digest(row["sha256"])
+        files[path] = row
+    _require(sum(row["bytes"] for row in files.values()) == value["total_bytes"],
+             "invalid_install_inventory")
+    return files
+
+
+def _install_identity(row):
+    # The deployment inventory separates file type and octal permission mode.
+    value = row["identity"]
+    journal._keys(value, {"device", "inode", "uid", "gid", "mode", "type", "size",
+                          "mtime_ns", "ctime_ns", "nlink"})
+    _require(all(type(value[key]) is int and value[key] >= 0 for key in value if key != "mode")
+             and type(value["mode"]) is str
+             and re.fullmatch(r"0o[0-7]{3,4}", value["mode"]) is not None,
+             "invalid_install_identity")
+    mode = int(value["mode"], 8)
+    _require(value["type"] == stat.S_IFREG and not mode & 0o022
+             and mode <= 0o7777 and value["uid"] == os.getuid() and value["nlink"] == 1
+             and value["size"] == row["bytes"] and value["device"] > 0 and value["inode"] > 0,
+             "unsafe_install_identity")
+    return {**{key: item for key, item in value.items() if key not in ("mode", "type")},
+            "mode": value["type"] | mode}
+
+
+def _reviewed_install_continuity(authority_path, plugin_root, contract, dispatched):
+    """Explicit host approval of retained install evidence, not runtime authority.
+
+    No evidence discovery or approval is performed here. The operator supplies a
+    private reference after reviewing the immutable before/backup/restore chain.
+    This alternative admits only the fixed known write-ahead contract and only
+    proves its historical bytes; it cannot authorize any old operation replay.
+    """
+    authority_raw, authority_identity = durable._read(authority_path, absent=True, maximum=65536)
+    if authority_raw is None:
+        return None
+    authority = journal._json(authority_raw)
+    journal._keys(authority, {"version", "kind", "approved", "plugin_root", "before", "backup", "restored"})
+    journal._version(authority["version"])
+    _require(authority["kind"] == "reviewed_gateway_install_continuity"
+             and authority["approved"] is True and authority["plugin_root"] == plugin_root
+             and {name: item["sha256"] for name, item in contract.items()} == PINNED_DURABLE_0151,
+             "unapproved_install_continuity")
+    values, evidence = {}, {}
+    for role in ("before", "backup", "restored"):
+        ref = authority[role]
+        journal._keys(ref, {"path", "sha256"}); journal._digest(ref["sha256"])
+        _require(type(ref["path"]) is str, "invalid_install_reference")
+        path = Path(ref["path"])
+        _require(path.is_absolute() and str(path.resolve(strict=True)) == str(path),
+                 "invalid_install_reference")
+        raw, identity = durable._read(path, maximum=journal.MAX_INPUT)
+        _require(journal.sha256(raw) == ref["sha256"], "install_evidence_changed")
+        values[role] = journal._json(raw, journal.MAX_INPUT)
+        evidence[role] = {**ref, "identity": identity}
+    before, backup, restored = (values[role] for role in ("before", "backup", "restored"))
+    _require(type(before) is dict and type(backup) is dict and type(restored) is dict,
+             "invalid_install_evidence")
+    _require(backup.get("status") == "verified" and backup.get("source_stable_before_after") is True
+             and backup.get("backup_new_inodes_not_source_identity") is True
+             and backup.get("before_manifest_sha256") == authority["before"]["sha256"]
+             and restored.get("disposition") == "restored_only_absent_old_cache"
+             and restored.get("original_contents_preserved") is True
+             and restored.get("uninterrupted_availability_claim") is False,
+             "unverified_install_evidence")
+    inventories = [before["inventory"], backup["source_after"], backup["backup_inventory"], restored["inventory"]]
+    rows = [_install_inventory(value) for value in inventories]
+    _require(all(inventories[i]["root"] == plugin_root for i in (0, 1, 3))
+             and inventories[2]["root"] != plugin_root, "install_root_changed")
+    contents = lambda items: {path: (row["sha256"], row["bytes"]) for path, row in items.items()}
+    _require(all(contents(items) == contents(rows[0]) for items in rows[1:]),
+             "install_contents_changed")
+    for name, digest in PINNED_DURABLE_0151.items():
+        relative = "scripts/codex_learner/" + name
+        selected = [items.get(relative) for items in rows]
+        _require(all(type(row) is dict and row["sha256"] == digest for row in selected),
+                 "install_contract_changed")
+        original, stable, saved, current = [_install_identity(row) for row in selected]
+        _require(original == stable and max(original["mtime_ns"], original["ctime_ns"]) <= dispatched
+                 and saved["ctime_ns"] <= current["ctime_ns"]
+                 and current == contract[name]["identity"], "install_identity_changed")
+    _require(durable._read(authority_path, maximum=65536) == (authority_raw, authority_identity),
+             "install_authority_changed")
+    return {"version": 1, "kind": "reviewed_gateway_install_continuity", "plugin_root": plugin_root,
+            "authority": {"path": str(authority_path), "sha256": journal.sha256(authority_raw),
+                          "identity": authority_identity}, "evidence": evidence}
+
+
+def zero_intent_proof(run_dir, manifest, digest, *, reviewed_install=False):
     """Prove no learner mutation, not provider success or zero DB housekeeping.
 
     Only the known durable launcher/gateway qualifies. That gateway fsyncs an
@@ -476,14 +582,20 @@ def zero_intent_proof(run_dir, manifest, digest):
     dispatched = files["provider-dispatch.json"]["identity"]["mtime_ns"]
     _require(max(identity["mtime_ns"], identity["ctime_ns"]) <= dispatched,
              "gateway_configuration_installed_after_dispatch")
-    _require(all(max(item["identity"]["mtime_ns"], item["identity"]["ctime_ns"]) <= dispatched
-                 for item in contract.values()), "gateway_installed_after_dispatch")
+    continuity = None
+    if not all(max(item["identity"]["mtime_ns"], item["identity"]["ctime_ns"]) <= dispatched
+               for item in contract.values()):
+        if reviewed_install:
+            continuity = _reviewed_install_continuity(run_dir.parent.parent / INSTALL_AUTHORITY,
+                expected_paths["plugin_root"], contract, dispatched)
+        _require(continuity is not None, "gateway_installed_after_dispatch")
     revocation = _revocation_evidence(run_dir, manifest)
     _require(_same(_snapshot(run_dir)[0], files), "evidence_changed")
     return {"version": 1, "kind": "durable_zero_intent", "manifest_sha256": digest,
             "fencing": manifest["fencing"], "revocation": revocation, "files": files,
             "transport": {"sha256": journal.sha256(transport_raw), "identity": identity},
-            "gateway_contract": contract}
+            "gateway_contract": contract,
+            **({"install_continuity": continuity} if continuity is not None else {})}
 
 
 def original_zero_intent_hold(run_dir, expected_sha256):
@@ -499,7 +611,7 @@ def original_zero_intent_hold(run_dir, expected_sha256):
              and value["operations"] == [] and value["memory_ids"] == []
              and all(value[name] == 0 for name in ("attempted_write_calls", "applied_write_calls",
                                                    "unchanged_write_calls")), "not_original_zero_intent_hold")
-    proof = zero_intent_proof(run_dir, manifest, digest)
+    proof = zero_intent_proof(run_dir, manifest, digest, reviewed_install=True)
     _require(durable._read(run_dir / "settlement.json", maximum=journal.MAX_RECORD) == (raw, identity),
              "settlement_changed")
     return value, {"sha256": expected_sha256, "identity": identity}, proof

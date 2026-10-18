@@ -41,6 +41,162 @@ ARTIFACTS = {"legacy-reconciliation-assessment.json", "legacy-coverage-capture.j
              "legacy-write-intents.private.json"}
 ROW_FIELDS = ("globalId", "content", "project", "topic", "source", "isPrivate",
               "createdAt", "modifiedAt", "expiresAt", "deletedAt")
+REVIEWED_ACCOUNTING = "reviewed_legacy_accounting"
+
+
+def accounting_review(value):
+    """A complete retrospective decision, never a recovered provider seal.
+
+    The caller pins the entire reviewed document. Counts and projects are data;
+    every eligible message and every historical mutation must have a disposition.
+    Only permanent private remembers can enter the executable residual plan.
+    """
+    from . import operation_gateway as gateway
+    import math
+    codec._keys(value, {"schema_version", "kind", "status", "session_id", "legacy_run_id",
+        "previous_run_id", "historical_request_id", "source", "parser", "history", "rows",
+        "row_content", "store_identity", "preserve_without_replay", "message_dispositions",
+        "attempts", "operations", "qualifications"})
+    _require(type(value["schema_version"]) is int and value["schema_version"] == 1
+             and value["kind"] == REVIEWED_ACCOUNTING
+             and value["status"] == "reviewed_candidate_not_live_dispatch_authority", "invalid_accounting")
+    admission._uuid(value["session_id"], 7)
+    for name in ("legacy_run_id", "previous_run_id"):
+        _identifier(value[name])
+    _require(value["legacy_run_id"] != value["previous_run_id"], "invalid_previous_run")
+    if value["historical_request_id"] is not None:
+        _identifier(value["historical_request_id"])
+    _require(value["qualifications"] == {"origin": "explicit_retrospective_full_review",
+        "historical_run_status": "failed", "historical_execution_sealed": False,
+        "source_binding_grade": "current_bounded_reconstruction",
+        "current_cross_provider_capability": "unverified"}, "qualification_changed")
+    source = value["source"]
+    codec._keys(source, {"identity", "start", "end", "interval_sha256", "excerpt_sha256", "parser_sha256"})
+    file_identity.validate(source["identity"])
+    codec._integer(source["start"]); codec._integer(source["end"], source["start"] + 1)
+    _require(source["end"] - source["start"] <= context.MAX_SCAN, "invalid_interval")
+    for key in ("interval_sha256", "excerpt_sha256", "parser_sha256"):
+        codec._digest(source[key])
+    parser = value["parser"]
+    codec._keys(parser, {"input", "next", "max_chars", "record_count", "diagnostics"})
+    context._parser_state(parser["input"]); context._parser_state(parser["next"])
+    _require(parser["input"]["offset"] == source["start"] and parser["next"]["offset"] == source["end"],
+             "parser_interval_changed")
+    codec._integer(parser["max_chars"], 1, 48000); codec._integer(parser["record_count"], 1, context.MAX_SCAN)
+    codec._keys(value["history"], {"run", "result", "audit", "provider", "transport", "previous_run"})
+    for digest in value["history"].values(): codec._digest(digest)
+    codec._keys(value["store_identity"], {"device", "inode", "uid"})
+    for number in value["store_identity"].values(): codec._integer(number)
+    rows = value["rows"]
+    _require(type(rows) is list and len(rows) <= 64, "invalid_rows")
+    ids = []
+    for row in rows:
+        codec._keys(row, (set(ROW_FIELDS) - {"content"}) | {"content_sha256"})
+        _require(codec._uuid(row["globalId"]) == row["globalId"], "noncanonical_row_id")
+        ids.append(row["globalId"]); codec._digest(row["content_sha256"])
+        for key in ("project", "topic", "source"): codec._string(row[key], 4096, nonempty=False)
+        _require(type(row["isPrivate"]) is int and row["isPrivate"] in (0, 1) and row["deletedAt"] is None,
+                 "invalid_row_privacy")
+        for key in ("createdAt", "modifiedAt", "expiresAt"):
+            _require(type(row[key]) in (int, float) and math.isfinite(row[key]), "invalid_row_date")
+    _require(len(ids) == len(set(ids)), "duplicate_row_id")
+    codec._keys(value["row_content"], set(ids))
+    for row in rows:
+        text = value["row_content"][row["globalId"]]; codec._string(text, 65536)
+        _require(durable.digest(text.encode()) == row["content_sha256"], "row_content_changed")
+    codec._keys(value["preserve_without_replay"], {"memory_ids"})
+    preserved = value["preserve_without_replay"]["memory_ids"]
+    _require(type(preserved) is list and len(preserved) <= 32
+             and len(preserved) == len(set(preserved)) and set(preserved) <= set(ids), "preserved_ids_changed")
+    attempts, operations, messages = value["attempts"], value["operations"], value["message_dispositions"]
+    _require(type(attempts) is list and len(attempts) <= 32 and type(operations) is list
+             and len(operations) <= 5 and type(messages) is list and 1 <= len(messages) <= 128,
+             "accounting_limit")
+    labels = ["op_" + str(i) for i in range(1, len(operations) + 1)]
+    _require([op.get("id") for op in operations] == labels, "operation_inventory")
+    attempt_ids = []
+    for attempt in attempts:
+        codec._keys(attempt, {"item_id", "audit_id", "tool", "arguments", "native_result_sha256",
+                             "disposition", "memory_ids", "operations", "rationale"})
+        _identifier(attempt["item_id"]); attempt_ids.append(attempt["item_id"])
+        codec._integer(attempt["audit_id"], 0, (1 << 31) - 1)
+        codec._digest(attempt["native_result_sha256"]); codec._string(attempt["rationale"], 4096)
+        _require(attempt["tool"] in {"remember", "update"}, "unsupported_historical_mutation")
+        gateway.mutation(attempt["tool"], attempt["arguments"])
+        _require(attempt["disposition"] in {"preserved_success", "affirmative_no_write", "expired_no_write"},
+                 "unknown_historical_outcome")
+        _require(type(attempt["memory_ids"]) is list and type(attempt["operations"]) is list
+                 and len(attempt["operations"]) <= 1 and set(attempt["operations"]) <= set(labels), "attempt_changed")
+        if attempt["disposition"] == "preserved_success":
+            _require(len(attempt["memory_ids"]) == 1 and set(attempt["memory_ids"]) <= set(preserved)
+                     and attempt["operations"] == [], "preserved_write_is_executable")
+        else:
+            _require(attempt["memory_ids"] == [] and (attempt["disposition"] != "expired_no_write"
+                     or attempt["operations"] == []), "expired_or_unknown_write_is_executable")
+    _require(len(attempt_ids) == len(set(attempt_ids)) and set(preserved) == {
+        mid for a in attempts if a["disposition"] == "preserved_success" for mid in a["memory_ids"]},
+        "preserved_attempt_coverage")
+    for index, message in enumerate(messages, 1):
+        codec._keys(message, {"index", "role", "sha256", "record", "body", "disposition",
+                             "memory_ids", "operations", "attempt_ids", "rationale"})
+        _require(message["index"] == index and type(message["index"]) is int and message["role"] == "assistant"
+                 and message["disposition"] in {"preserved", "covered", "expired", "dated_progress", "residual"},
+                 "message_disposition_changed")
+        codec._digest(message["sha256"]); codec._string(message["rationale"], 4096)
+        _require(type(message["memory_ids"]) is list and set(message["memory_ids"]) <= set(ids)
+                 and type(message["operations"]) is list and set(message["operations"]) <= set(labels)
+                 and type(message["attempt_ids"]) is list and set(message["attempt_ids"]) <= set(attempt_ids), "message_unbound")
+        _require(bool(message["operations"]) == (message["disposition"] == "residual"), "message_operation_changed")
+        if message["disposition"] in {"preserved", "covered"}:
+            _require(bool(message["memory_ids"]), "coverage_row_missing")
+        linked=[a for a in attempts if a['item_id'] in message['attempt_ids']]
+        if message['disposition']=='expired':
+            _require(bool(message['memory_ids']) or any(a['disposition']=='expired_no_write' for a in linked),
+                     'expired_coverage_missing')
+        if message['disposition']=='residual':
+            _require(not any(a['disposition']=='expired_no_write' for a in linked),'temporary_intent_not_executable')
+        if message["disposition"] == "preserved":
+            _require(set(message["memory_ids"]) <= set(preserved), "preserved_message_changed")
+        for mid in message["memory_ids"]:
+            row = rows[ids.index(mid)]
+            if message["disposition"] == "expired": _require(row["expiresAt"] < time.time(), "row_not_expired")
+            if message["disposition"] == "covered": _require(row["expiresAt"] > time.time(), "coverage_expired")
+    _require({a for message in messages for a in message['attempt_ids']}==set(attempt_ids),
+             'historical_message_coverage_changed')
+    for op in operations:
+        codec._keys(op, {"id", "tool", "arguments", "arguments_canonical_sha256", "messages", "attempt_ids",
+                        "duplicate_review"})
+        args = op["arguments"]
+        codec._keys(args, {"content", "project", "topic", "source", "is_private", "force"}, {"parent_id"})
+        _require(op["tool"] == "remember" and args["is_private"] is True and args["force"] is False
+                 and args["source"] == "codex-session:" + value["session_id"], "unsupported_residual_policy")
+        gateway.mutation("remember", args)
+        _require(durable.digest(codec.encode(args)) == op["arguments_canonical_sha256"], "review_payload_changed")
+        expected_messages = [m["index"] for m in messages if op["id"] in m["operations"]]
+        _require(op["messages"] == expected_messages and bool(expected_messages), "residual_source_unbound")
+        _require(op["attempt_ids"] == [a["item_id"] for a in attempts if op["id"] in a["operations"]],
+                 "residual_attempt_unbound")
+        _require(set(op['attempt_ids']) <= {a for m in messages if op['id'] in m['operations'] for a in m['attempt_ids']},
+                 'residual_attempt_source_unbound')
+        for attempt in attempts:
+            if op["id"] in attempt["operations"]:
+                _require(attempt["disposition"] == "affirmative_no_write" and attempt["tool"] == "remember"
+                         and _same(attempt["arguments"], args), "historical_intent_changed_or_renewed")
+            if "expires_in_days" in attempt["arguments"]:
+                _require(not all(args.get(k)==attempt["arguments"].get(k) for k in ("content","project","topic")),
+                         "temporary_intent_not_executable")
+        duplicate = op["duplicate_review"]
+        codec._keys(duplicate, {"decision", "compared_memory_ids", "rationale"})
+        codec._string(duplicate["rationale"], 4096)
+        _require(duplicate["decision"] == "distinct_reviewed_fact" and type(duplicate["compared_memory_ids"]) is list
+                 and len(duplicate['compared_memory_ids'])==len(ids)
+                 and set(duplicate["compared_memory_ids"]) == set(ids), "duplicate_review_unbound")
+        _require(all(args['content'] != body for body in value['row_content'].values()), 'residual_already_present')
+        if "parent_id" in args:
+            parent = codec._uuid(args["parent_id"])
+            _require(parent in ids and rows[ids.index(parent)]["isPrivate"] == 1
+                     and rows[ids.index(parent)]["expiresAt"] > time.time(), "parent_unavailable_or_shared")
+    return value
 
 
 def _require(value, reason):
@@ -277,6 +433,200 @@ def _serial_history(review, history, write_tools, *, strict_projection=False):
         _require(len({item["id"] for item in started}) == len(started), "duplicate_provider_id")
     mutations = [(a, b, c) for a, b, c in zip(started, completed, results) if a["tool"] in write_tools]
     return began, ended, mutations
+
+
+def accounting_history(review, history):
+    """Account exact acknowledgements even when the old relay omitted its tail.
+
+    Missing terminal relay telemetry is disclosed, not turned into a successful
+    historical execution. Every serial provider call still needs its matching
+    gateway result; every mutation needs native success or affirmative no-write.
+    An unmatched call, unknown tool or ambiguous result keeps the original hold.
+    """
+    accounting_review(review)
+    codec._keys(history, set(review["history"]))
+    for role, digest in review["history"].items():
+        _require(durable.digest(_raw(history[role])) == digest, "history_changed")
+    run, previous = (_json(_raw(history[key])) for key in ("run", "previous_run"))
+    _require(run.get("session_id") == review["session_id"] and run.get("status") == "failed"
+             and type(run.get("returncode")) is int and run.get("unexpected_tool", False) is False
+             and run.get("end_offset") == review["source"]["end"]
+             and run.get("request_id") == review["historical_request_id"], "history_not_terminal")
+    began, ended = _time(run["started_at"]), _time(run["ended_at"])
+    _require(began <= ended and ended - began < dt.timedelta(hours=1), "invalid_run_window")
+    _require(previous.get("session_id") == review["session_id"] and previous.get("status") == "succeeded"
+             and previous.get("end_offset") == review["source"]["start"], "start_uncorroborated")
+    gateway = _json(_raw(history['transport']))
+    codec._keys(gateway, {'transport','audit_path','provenance','allowed_tools','max_tool_calls','max_writes'})
+    _require(gateway['provenance']=='codex-session:'+review['session_id']
+             and type(gateway['allowed_tools']) is list and len(gateway['allowed_tools'])==len(set(gateway['allowed_tools']))
+             and set(gateway['allowed_tools'])<=READ_TOOLS|{'remember','update','connect'},'historical_gateway_changed')
+    codec._integer(gateway['max_tool_calls'],1,1000);codec._integer(gateway['max_writes'],0,1000)
+    audit_path=Path(gateway['audit_path'])
+    _require(audit_path.is_absolute() and audit_path.parts[-3:]==('runs',review['legacy_run_id'],'mcp-audit.jsonl'),
+             'historical_gateway_changed')
+    transport=gateway['transport']
+    codec._keys(transport,{'command'},{'type','args','env','env_vars','cwd'})
+    codec._string(transport['command'],4096)
+    _require(transport.get('type','stdio')=='stdio' and type(transport.get('args',[])) is list
+             and all(type(arg) is str for arg in transport.get('args',[]))
+             and type(transport.get('env',{})) is dict and all(type(k) is str and type(v) is str
+                 for k,v in transport.get('env',{}).items())
+             and type(transport.get('env_vars',[])) is list and all(type(v) is str for v in transport.get('env_vars',[]))
+             and (transport.get('cwd') is None or type(transport['cwd']) is str and Path(transport['cwd']).is_absolute()),
+             'historical_transport_changed')
+    retained_result=_json(_raw(history['result']))
+    codec._keys(retained_result,{'outcome','summary','memory_ids'})
+    codec._string(retained_result['summary'],65536,nonempty=False)
+    _require(retained_result['outcome'] in {'stored','no_new_memories','failed'}
+             and type(retained_result['memory_ids']) is list and len(retained_result['memory_ids'])<=32,
+             'historical_result_changed')
+    for mid in retained_result['memory_ids']:codec._uuid(mid)
+    provider, audit = (_lines(_raw(history[key])) for key in ("provider", "audit"))
+    _require(len(provider) >= 3 and provider[0].get("type") == "thread.started"
+             and provider[1] == {"type": "turn.started"}
+             and provider[-1].get("type") in {"turn.completed", "turn.failed"}, "provider_not_terminal")
+    calls, pending = [], None
+    for event in provider[2:-1]:
+        kind, item = event.get("type"), event.get("item")
+        if kind == "error":
+            codec._keys(event, {"type", "message"}); codec._string(event["message"], 4096)
+            continue
+        _require(type(item) is dict, "unknown_provider_event")
+        if item.get("type") in {"agent_message", "reasoning"}:
+            # Completed prose may interleave with a pending call; it supplies no
+            # write evidence and must not consume or replace that call's pairing.
+            _require(kind == "item.completed", "unaccounted_provider_item")
+            codec._keys(item, {"id", "type", "text"}); codec._string(item["text"], 65536)
+            continue
+        _require(item.get("type") == "mcp_tool_call" and item.get("server") == "memory"
+                 and item.get("tool") in READ_TOOLS | {"remember", "update"}, "unaccounted_provider_tool")
+        _identifier(item.get("id"))
+        if kind == "item.started":
+            _require(pending is None and item.get("result") is None, "provider_overlap")
+            pending = item
+        else:
+            _require(kind == "item.completed" and pending is not None and all(
+                _same(item.get(key), pending.get(key)) for key in ("id", "tool", "server", "type", "arguments")),
+                "provider_result_changed")
+            calls.append((pending, item)); pending = None
+    _require(pending is None and len(calls) <= 64 and len({a["id"] for a, _ in calls}) == len(calls), "unfinished_call")
+    _require(len(calls)<=gateway['max_tool_calls'] and all(a['tool'] in gateway['allowed_tools'] for a,_ in calls),
+             'historical_gateway_changed')
+    _require(audit[0] == {"event": "relay_started"}, "relay_start_changed")
+    ended_relay = audit[-1].get("event") == "relay_finished"
+    if ended_relay:
+        _require(audit[-1].get("child_reaped") is True and audit[-1].get("cleanup_overrun") is False,
+                 "relay_cleanup_failed")
+    results, active, seen, interrupted = [], None, set(), False
+    for event in audit[1:-1] if ended_relay else audit[1:]:
+        kind = event.get("event")
+        if kind == "initialize_compat":
+            _require(active is None and not results and not interrupted, "unknown_audit_event")
+        elif kind == "relay_interrupted":
+            _require(active is None and not interrupted, "unknown_audit_event"); interrupted = True
+        elif kind == "tool_call":
+            codec._keys(event, {"event", "id", "tool"}); codec._integer(event["id"], 0, (1 << 31) - 1)
+            _require(not interrupted and active is None and event["id"] not in seen
+                     and len(results) < len(calls) and event["tool"] == calls[len(results)][0]["tool"], "unaccounted_call")
+            seen.add(event["id"]); active = event
+        else:
+            codec._keys(event, {"event", "id", "tool", "ok", "memory_ids", "forwarded"},
+                        {"write_outcome", "write_outcome_version"})
+            _require(kind == "tool_result" and active is not None and event.get("id") == active["id"]
+                     and event.get("tool") == active["tool"] and event.get("forwarded") is True,
+                     "unmatched_result")
+            results.append(event); active = None
+    _require(active is None and len(calls) == len(results), "unfinished_call")
+    mutations = [(a, b, event) for (a, b), event in zip(calls, results) if a["tool"] not in READ_TOOLS]
+    _require(len(mutations) == len(review["attempts"]), "attempt_coverage_changed")
+    _require(len(mutations)<=gateway['max_writes'],'historical_gateway_changed')
+    _require(type(run.get('tool_calls')) is int and run['tool_calls']==len(calls)
+             and type(run.get('write_calls')) is int and run['write_calls']==sum(
+                 attempt['disposition']=='preserved_success' for attempt in review['attempts'])
+             and _same(run.get('writes'),[{'tool':a['tool'],'memory_ids':a['memory_ids']}
+                 for a in review['attempts'] if a['disposition']=='preserved_success']), 'historical_inventory_changed')
+    rows = {row["globalId"]: row for row in review["rows"]}
+    for (start, finish, event), attempt in zip(mutations, review["attempts"]):
+        args = start["arguments"]
+        _require(start["id"] == attempt["item_id"] and event["id"] == attempt["audit_id"]
+                 and start["tool"] == attempt["tool"] and _same(args, attempt["arguments"])
+                 and durable.digest(codec.encode(finish.get("result"))) == attempt["native_result_sha256"],
+                 "attempt_changed")
+        _require(args.get("source", gateway['provenance']) == gateway['provenance'],
+                 "historical_source_changed")
+        if attempt["disposition"] == "preserved_success":
+            mid = attempt["memory_ids"][0]; row = rows[mid]; body = review["row_content"][mid]
+            native, text = expired_update._envelope(finish, error=False)
+            _require(event.get("ok") is True and [codec._uuid(v) for v in event.get("memory_ids", [])] == [mid]
+                     and native["structured_content"] is None and row["isPrivate"] == 1
+                     and args.get("is_private",True) is True and args.get("force",False) is False
+                     and "write_outcome" not in event and "write_outcome_version" not in event, "success_changed")
+            prefix = r"^Stored memory \(id: ([0-9A-Fa-f-]{36})," if start["tool"] == "remember" else r"^Updated memory \(id: ([0-9A-Fa-f-]{36}),"
+            match = re.match(prefix, text)
+            _require(match is not None and codec._uuid(match[1]) == mid, "native_ack_changed")
+            if start["tool"] == "remember":
+                _require(body == args["content"] and all(row[k] == args.get(k, "") for k in ("project", "topic"))
+                         and ', private: true' in text and began.timestamp() <= row["createdAt"] <= ended.timestamp(),
+                         "success_readback_mismatch")
+            else:
+                _require(codec._uuid(args["id"]) == mid and (body == args["content"] if "content" in args else
+                         "append" in args and body.endswith(args["append"]) and body.count(args['append'])==1)
+                         and began.timestamp() <= row["modifiedAt"] <= ended.timestamp(), "success_readback_mismatch")
+            if "source" in args: _require(row["source"] == args["source"], "success_source_changed")
+            if "expires_in_days" in args:
+                ttl=args["expires_in_days"]
+                _require(type(ttl) is int and ttl>0 and began.timestamp()+ttl*86400<=row["expiresAt"]<=ended.timestamp()+ttl*86400,
+                         "historical_expiry_changed")
+        else:
+            native, text = expired_update._envelope(finish, error=True)
+            receipt = native["structured_content"]
+            receipt = receipt.get("engram_write_receipt") if type(receipt) is dict else None
+            _require(start["tool"] == "remember" and text == expired_update.BEGIN_BUSY_TEXT and event.get("ok") is False
+                     and event.get("memory_ids") == [] and event.get("write_outcome_version") == 1
+                     and type(event.get("write_outcome_version")) is int
+                     and event.get("write_outcome") == expired_update.NO_WRITE
+                     and type(receipt) is dict and type(receipt.get("schema_version")) is int
+                     and receipt == {"schema_version": 1, "tool": "remember", "memory_ids": [],
+                         "reason": "database_busy", "write_outcome": expired_update.NO_WRITE}, "native_no_write_missing")
+            ttl = args.get("expires_in_days")
+            if attempt["disposition"] == "expired_no_write":
+                _require(type(ttl) is int and ttl > 0 and time.time() > ended.timestamp() + ttl * 86400,
+                         "intent_not_expired")
+            elif attempt["operations"]:
+                _require(ttl is None and "expires_in_days" not in args, "temporary_intent_not_executable")
+    return {"attempts": len(mutations), "relay_terminal_retained": ended_relay,
+            "historical_execution_sealed": False}
+
+
+def accounting_source(request, review):
+    accounting_review(review)
+    source, parser = review["source"], review["parser"]
+    _require(request["identity"] == source["identity"] and context._parser_runtime()["sha256"] == source["parser_sha256"]
+             and context._interval(request["transcript_path"], source["identity"], source["start"], source["end"])
+                == source["interval_sha256"], "source_changed")
+    excerpt = transcript.read_excerpt(request["transcript_path"], source["start"], max_chars=parser["max_chars"],
+        max_scan_bytes=source["end"] - source["start"], recent_messages=parser["input"]["recent_messages"],
+        current_turn_id=parser["input"]["current_turn_id"], stable_identity=True)
+    _require(excerpt.metadata.identity == source["identity"] and excerpt.metadata.session_id == review["session_id"]
+             and excerpt.blocked_reason is None and _same(context._next_parser(excerpt), parser["next"])
+             and durable.digest(excerpt.text.encode()) == source["excerpt_sha256"]
+             and _same(excerpt.diagnostics, parser["diagnostics"]), "parser_output_changed")
+    chunks = excerpt.text.split("\n\n[ASSISTANT]\n")
+    _require(chunks[0].startswith("[ASSISTANT]\n"), "unsupported_message_role")
+    chunks = [chunks[0]] + ["[ASSISTANT]\n" + item for item in chunks[1:]]
+    _require(len(chunks) == excerpt.message_count == len(review["message_dispositions"])
+             and all(durable.digest(text.encode()) == item["sha256"] for text, item in zip(chunks, review["message_dispositions"])),
+             "message_coverage_changed")
+    # Reuse the existing complete record projection: no malformed, truncated,
+    # oversized, redacted or duplicate eligible record may silently disappear.
+    adapted = {"source": {"start_offset": source["start"], "end_offset": source["end"]},
+               "parser": parser, "messages": review["message_dispositions"]}
+    projection = completed_remember.validate_source(request, adapted, excerpt, chunks)
+    _require(projection["record_count"] == parser["record_count"], "record_coverage_changed")
+    _require(context._interval(request["transcript_path"], source["identity"], source["start"], source["end"])
+             == source["interval_sha256"] and context._parser_runtime()["sha256"] == source["parser_sha256"], "source_changed")
+    return excerpt
 
 
 def _history(review, history):
@@ -556,11 +906,14 @@ def _active_if_present(selected, session_id):
 
 
 def _pending_pause(request, *, completed=False):
+    # Structural queue validation, not authority to accept a held interval.
+    # Every historical profile separately authenticates its state/gate, source,
+    # history and readback. Keep the keyword for existing residual callers.
     _identifier(request.get("request_id"))
     if "paused_request_id" in request or "pause_reason" in request:
         _require(request.get("paused_request_id") == request["request_id"]
-                 and request.get("pause_reason") in ({"batch_limit", "failed", "backoff", "blocked"}
-                     | ({"reconciliation_required"} if completed else set())),
+                 and request.get("pause_reason") in {"batch_limit", "failed", "backoff", "blocked",
+                                                      "reconciliation_required"},
                  "unsupported_pending_pause")
 
 
@@ -591,7 +944,7 @@ def _validate(paths, plan):
     codec._keys(plan["inputs"], {"state", "admission", "pending"})
     values = {key: _json(publication._raw(image, old=True)) for key, image in plan["inputs"].items()}
     request, state, record = values["pending"], values["state"], values["admission"]
-    _pending_pause(request, completed=review["kind"] == completed_remember.KIND)
+    _pending_pause(request)
     binding = admission.check(paths.root, request)
     _require(binding.get("mode") == host_admission.MODE_V2 and _same(request["admission"], binding)
              and _same(state.get("admission"), binding) and _same(record.get("binding"), binding)
@@ -734,7 +1087,7 @@ def _validator(paths, plan, plan_sha256, locks):
                            {k: v for k, v in expected.items() if k != "last_event"}), "published_admission_changed")
         pending_raw, pending_identity = durable._read(selected.pending)
         current_pending = _json(pending_raw)
-        _pending_pause(current_pending, completed=review["kind"] == completed_remember.KIND)
+        _pending_pause(current_pending)
         _require(_same(admission.check(paths.root, current_pending), values["pending"]["admission"]), "pending_not_admitted")
         if current_pending["request_id"] == values["pending"]["request_id"]:
             original_pending = plan["inputs"]["pending"]

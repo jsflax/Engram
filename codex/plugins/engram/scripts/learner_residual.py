@@ -131,7 +131,7 @@ def _prepare(args, locks):
     J._digest(args.review_sha256)
     raw, _ = J.durable._read(args.review, maximum=J.MAX_INPUT)
     require(J.sha256(raw) == args.review_sha256, "review_changed")
-    plan = D._plan(J._json(raw))
+    plan = R.review_plan(J._json(raw))
     require(plan["session_id"] == args.session_id, "session_changed")
     R.capture_reports(plan, args.evidence_directory)
     run_id = args.run_id or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex
@@ -189,6 +189,8 @@ def _recover(args, locks, *, continuation):
 
 def _execute(args, locks):
     context = _load(args)
+    if R.reviewed(context.plan):
+        return _execute_reviewed(context,args,locks)
     with locks.enqueue():
         require(P.recovery_reference(args.root, args.session_id) is None, "use_recover")
         # A pre-marker interrupted begin is inert evidence, never retry authority.
@@ -217,10 +219,38 @@ def _execute(args, locks):
     return _recover(args, locks, continuation=False)
 
 
+def _execute_reviewed(context,args,locks):
+    """Resume only the pinned complete plan; preserved old writes never enter it."""
+    from codex_learner import planned_execution as E
+    with locks.enqueue():
+        ref=P.recovery_reference(args.root,args.session_id)
+        if ref is not None:
+            require(all(ref[key]==value for key,value in P._pin(context).items()),'selected_plan_changed')
+            P._authorization(context);P._recover_marker(context,locks.verify)
+        writer=F.drain_and_acquire_shared(context.paths.run_dir,context.manifest['fencing'],
+            validate=lambda *_:locks.verify() and context.validate_marker())
+        try:
+            if ref is None:P.begin(context,writer=writer,verify_locks=locks.verify)
+        except BaseException:
+            writer.close();raise
+    try:
+        def validate(manifest,phase):
+            locks.verify(enqueue=False)
+            return context.validate_inputs(manifest,context.plan,phase)
+        E.execute_plan(context.paths.run_dir,writer=writer,validate_inputs=validate,
+                       execute=E.native_executor(context.paths.run_dir,context.transport))
+    finally:writer.close()
+    return _recover(args,locks,continuation=False)
+
+
 def _retained_summary(args):
     """Report known receipt IDs after failure; never dispatch or grant authority."""
     try:
         context = _load(args)
+        if R.reviewed(context.plan):
+            from codex_learner import planned_execution as E
+            value=E.inspect_plan(context.paths.run_dir)
+            return {key:value[key] for key in ('memory_ids','status','applied_write_calls','unchanged_write_calls')}
         driver = D.ResidualDriver(context.paths.run_dir, manifest_sha256=context.manifest_sha256,
             review_sha256=context.review_sha256, validate_inputs=lambda *_: False)
         value = driver.summary()
@@ -242,7 +272,7 @@ def main(argv=None):
     parser.add_argument("--evidence-directory", type=Path)
     parser.add_argument("--manifest-sha256")
     parser.add_argument("--context-sha256")
-    parser.add_argument("--runtime-compatibility", choices=("engram-0.15.1-validation-budget-v1",))
+    parser.add_argument("--runtime-compatibility", choices=("engram-0.15.1-validation-budget-v1", "engram-0.15.2-reviewed-accounting-v1"))
     args = parser.parse_args(argv)
     try:
         require(args.runtime_compatibility is None or args.command in ("recover", "continue-absent"),

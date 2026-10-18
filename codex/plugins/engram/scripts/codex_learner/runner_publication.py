@@ -662,6 +662,14 @@ class Publications:
             _require(self._residual_verify_locks() is True, "residual_caller_locks_changed")
             resolved = residual_publication.recover_locked(paths, session_id=session_id,
                 verify_locks=self._residual_verify_locks, allow_continuation=False)
+            if resolved is not None and resolved.get("status") == "reviewed_plan_pending":
+                _require(resolved["run_id"] == reference["run_id"] and resolved["provider_invoked"] is False
+                         and resolved["successful_coverage"] is False and resolved["cursor_changed"] is False,
+                         "residual_pending_changed")
+                publication._identifier(resolved["request_id"])
+                # Defer this SID for the worker invocation. Only explicit
+                # reviewed execution may resume its original exact plan.
+                return Continuation(resolved["request_id"])
             if resolved is not None:
                 completed = coordinator.read_completed(selected, session_id=session_id, **resolved["publication"])
                 _require(resolved["request_id"] == completed["ticket"]["request_id"], "residual_request_changed")

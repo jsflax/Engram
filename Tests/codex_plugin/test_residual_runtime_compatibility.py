@@ -22,7 +22,7 @@ K = runtime('residual_runtime_compatibility')
 
 
 class ResidualRuntimeCompatibilityTests(unittest.TestCase):
-    def fixture(self, *, begun=False):
+    def fixture(self, *, begun=False, profile=K.PROFILE):
         f = ResidualContextFixture(); self.addCleanup(f.close)
         old = f.base / 'old-plugin'; directory = old / 'scripts/codex_learner'
         directory.mkdir(parents=True, mode=0o700)
@@ -33,14 +33,15 @@ class ResidualRuntimeCompatibilityTests(unittest.TestCase):
             hashes[name] = J.sha256(raw)
         parser = directory / 'transcript.py'
         parser.write_bytes(Path(C.transcript.__file__).read_bytes()); parser.chmod(0o600)
-        patch = mock.patch.object(K, 'OLD_HASHES', hashes); patch.start(); self.addCleanup(patch.stop)
+        patch = mock.patch.object(K, 'OLD_HASHES' if profile==K.PROFILE else 'RELEASED_HASHES', hashes)
+        patch.start(); self.addCleanup(patch.stop)
         f.plugin = old; f.paths = dataclasses.replace(f.paths, plugin_root=old)
         sealed_runtime = {n:{'path':str(directory/n), 'sha256':h} for n,h in hashes.items()}
         old_parser = {'path':str(parser), 'sha256':K.PARSER_SHA256}
         with mock.patch.object(RC, '_runtime', return_value=sealed_runtime), \
              mock.patch.object(C, '_parser_runtime', return_value=old_parser):
             f.seal(prepare_driver=False)
-        f.context = self.load(f)
+        f.context = self.load(f,profile=profile)
         if begun:
             with f.locks() as verify: f.begin(verify)
         return f
@@ -185,3 +186,19 @@ class ResidualRuntimeCompatibilityTests(unittest.TestCase):
             code,result=self.invoke(self.arguments(f,'continue-absent'))
         self.assertEqual(code,2);self.assertEqual(f.current(),before)
         self.assertFalse((f.run_dir/'residual-writers/001').exists())
+
+    def test_closed_0152_predecessor_keeps_existing_seals_and_checks_all_bytes(self):
+        f=self.fixture(profile=K.RELEASED_PROFILE)
+        before={name:(f.run_dir/name).read_bytes() for name in ('execution-manifest.json','residual-context.json')}
+        original=f.current()
+        with self.no_processes():
+            with self.assertRaises(ValueError):self.load(f,profile=None)
+            context=self.load(f,profile=K.RELEASED_PROFILE)
+            self.assertTrue(context.validate_marker())
+            for name in K.RELEASED_HASHES:
+                path=f.plugin/'scripts/codex_learner'/name;raw=path.read_bytes();path.write_bytes(raw+b'# changed\n')
+                with self.assertRaises(ValueError):context.validate_marker()
+                path.write_bytes(raw)
+            self.assertTrue(context.validate_marker())
+        self.assertEqual(original,f.current())
+        self.assertEqual(before,{name:(f.run_dir/name).read_bytes() for name in before})
