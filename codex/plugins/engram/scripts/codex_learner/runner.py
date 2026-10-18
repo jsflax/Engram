@@ -29,7 +29,7 @@ import uuid
 from .transcript import inspect_rollout, read_excerpt
 from .memory_proxy import verified_no_write_receipt, audit_planning_tools, PLANNING_MODE, read_startup_failure
 from . import admission, memory_config, host_admission, operation_gateway, learner_settings
-from . import runner_publication, settlement, worker_schedule
+from . import runner_publication, settlement, worker_schedule, runtime_routing
 
 EVENTS = {"Stop", "SubagentStop", "PreCompact", "SessionEnd"}
 GUARD = "ENGRAM_CODEX_LEARNER"
@@ -583,8 +583,11 @@ def spawn_worker(root: Path) -> None:
     log = root / "worker.log"
     with log.open("ab") as out:
         os.chmod(log, 0o600)
-        subprocess.Popen([sys.executable, str(entry), "worker", "--state-dir", str(root)],
-                         stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+        env = dict(os.environ, CLAUDE_PLUGIN_ROOT=str(entry.parent.parent))
+        env.pop(runtime_routing.HOP, None)  # New independent batch, not an exec hop.
+        env.pop(runtime_routing.HOOK_DEADLINE, None)
+        subprocess.Popen([sys.executable, "-B", str(entry), "worker", "--state-dir", str(root)],
+                         env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
                          start_new_session=True, close_fds=True)
 
 
@@ -657,26 +660,7 @@ def learner_command(root: Path, run_dir: Path, request: dict, config: dict, *, p
               "tools": tool_policies,
               "startup_timeout_sec": memory.get("startup_timeout_sec", 30),
               "tool_timeout_sec": memory.get("tool_timeout_sec", 120)}
-    binary = config.get("codex_bin")
-    if not binary:
-        # Desktop's bundled CLI supports the same hook/runtime generation; a
-        # separately installed ~/.local/bin/codex may be an older release.
-        for applications in (Path("/Applications"), Path.home() / "Applications"):
-            for app in ("ChatGPT.app", "Codex.app"):
-                candidate = applications / app / "Contents/Resources/codex"
-                if candidate.is_file() and os.access(candidate, os.X_OK):
-                    binary = str(candidate)
-                    break
-            if binary:
-                break
-    if not binary:
-        binary = shutil.which("codex")
-    if not binary:
-        candidate = Path.home() / ".local/bin/codex"
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            binary = str(candidate)
-    if not binary:
-        raise ValueError("codex_binary_not_found")
+    binary = runtime_routing.codex_binary(config)
     argv = [binary, "exec", "--ignore-user-config", "--ephemeral", "--skip-git-repo-check",
             "--sandbox", "read-only", "--json", "--color", "never", "--cd", str(run_dir / "workspace"),
             "--output-schema", str(run_dir / "schema.json"),
@@ -1320,6 +1304,13 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=None,
 
 
 def worker(root: Path) -> int:
+    try:
+        runtime_routing.maybe_exec(Path(__file__).absolute().parents[2], "codex_learner.py",
+                                   ["worker", "--state-dir", str(root)], state_root=root)
+    except runtime_routing.Refused as exc:
+        # Refusal is not leadership or progress; preserve every queued plan.
+        print("Engram: " + str(exc), file=sys.stderr)
+        return 0
     # A missing/inactive policy must not even inspect or pause an old queue.
     active_policy = admission.check_activation(root)
     invalid_pending = set()

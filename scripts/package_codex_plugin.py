@@ -51,7 +51,7 @@ RUNTIME_SCRIPTS = (
     "learner_router.py", "codex_learner.py", "codex_learner/__init__.py",
     "codex_learner/admission.py", "codex_learner/host_admission.py",
     "codex_learner/learner_prompt.md", "codex_learner/learner_prompt_legacy.md", "codex_learner/runner.py",
-    "codex_learner/worker_schedule.py",
+    "codex_learner/worker_schedule.py", "codex_learner/runtime_routing.py",
     "codex_learner/learner_plan.py", "codex_learner/planned_execution.py",
     "codex_learner/memory_proxy.py", "codex_learner/memory_config.py",
     "codex_learner/runtime_identity.py", "codex_learner/stdio_bridge.py",

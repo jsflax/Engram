@@ -19,6 +19,8 @@ import sys
 import time
 import uuid
 
+from codex_learner import runtime_routing
+
 EVENTS = {"SessionStart", "UserPromptSubmit", "SubagentStart", "PreToolUse",
           "PostToolUse", "Stop", "SubagentStop", "PreCompact", "SessionEnd"}
 MAX_INPUT = 65536
@@ -152,6 +154,9 @@ def main(argv=None) -> int:
         import recall_hook
         if any(key in os.environ for key in recall_hook.RECURSION_ENV):
             return 0
+        deadline = runtime_routing.hook_deadline(start)
+        start = deadline - 2.8
+        runtime_routing.maybe_exec(Path(__file__).absolute().parents[1], "engram_hook.py", args, deadline=deadline)
         codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser().resolve(strict=True)
         root = initialize(codex_home)
         if args == ["--initialize"]:
@@ -162,7 +167,7 @@ def main(argv=None) -> int:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 previous[sig] = signal.signal(sig, recall_hook.cancel_hook)
             try:
-                payload = recall_hook.read_input(start + 2.8)
+                payload = recall_hook.read_input(deadline)
             except recall_hook.Failure:
                 raise ValueError("invalid_hook_input") from None
             if not isinstance(payload, dict):
@@ -173,6 +178,8 @@ def main(argv=None) -> int:
                 raise ValueError("hook_adapter_unavailable") from None
         else:
             raise ValueError("invalid_arguments")
+    except runtime_routing.Refused as exc:
+        print("Engram: " + str(exc), file=sys.stderr)
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, RecursionError):
         # Fixed diagnostic only: hook input, exception text and secrets stay out.
         print("Engram: hook unavailable; inspect Engram hook-status.", file=sys.stderr)
