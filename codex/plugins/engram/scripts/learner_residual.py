@@ -54,8 +54,11 @@ and provider guards remain owned while enqueue may be released for execution.
             info = os.fstat(fd)
             require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
                     and info.st_nlink == 1 and not info.st_mode & 0o077, "unsafe_coordination_lock")
-            identity = J.durable._identity(info)
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            identity = J.durable._lock_identity(info)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError("residual_cli_coordination_busy") from None
             acquired = True
             self.held.append((path, fd, identity))
             self.verify(enqueue=False)
@@ -87,7 +90,7 @@ and provider guards remain owned while enqueue may be released for execution.
             require(bool(self.held) and [p for p, _, _ in self.held] ==
                     (expected + [self.root / "enqueue.lock"])[:len(self.held)], "lock_order_changed")
         for path, fd, identity in self.held:
-            require(J.durable._identity(path.lstat()) == J.durable._identity(os.fstat(fd)) == identity,
+            require(J.durable._lock_identity(path.lstat()) == J.durable._lock_identity(os.fstat(fd)) == identity,
                     "coordination_lock_changed")
         return True
 

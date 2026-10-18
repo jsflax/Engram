@@ -170,5 +170,179 @@ class ResidualCLITests(unittest.TestCase):
         self.assertEqual(f.current(), before)
 
 
+
+class CoordinationLockTests(unittest.TestCase):
+    """Real overlapping flock owners, isolated from providers and live stores."""
+    def setUp(self):
+        from pathlib import Path
+        import tempfile
+        from residual_test_support import TEMP_ROOT, PLUGIN_ROOT, runtime
+        self.runtime = runtime('runner')
+        self.scripts = PLUGIN_ROOT / 'scripts'
+        TEMP_ROOT.mkdir(mode=0o700, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(prefix='coordination-', dir=TEMP_ROOT)
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name).resolve()
+        self.root = self.base / 'learner'
+        self.root.mkdir(mode=0o700)
+        self.paths = [self.root / 'worker.lock', self.base / 'learner-provider.lock',
+                      self.root / 'enqueue.lock']
+        for path in self.paths:
+            path.touch(mode=0o600)
+
+    @contextlib.contextmanager
+    def owner(self, kind):
+        with contextlib.ExitStack() as stack:
+            if kind == 'residual':
+                locks = stack.enter_context(CLI.Coordination(self.root).worker())
+                stack.enter_context(locks.enqueue())
+                verify = locks.verify
+            elif kind == 'migration':
+                locks = stack.enter_context(J.durable.Locks(self.root))
+                verify = locks.verify
+            else:
+                stack.enter_context(self.runtime.lock_file(self.paths[0]))
+                stack.enter_context(self.runtime.lock_file(self.paths[1]))
+                stack.enter_context(self.runtime.lock_file(self.paths[2]))
+                verify = lambda: self.assertTrue(self.runtime.publication_locks_owned(self.root))
+            yield verify
+
+    def contender(self, path, *, legacy, standalone=False):
+        import sys
+        if legacy:
+            # Released runners fchmod before trying flock, including on failure.
+            script = '''import fcntl,json,os,sys
+fd=os.open(sys.argv[2],os.O_RDWR|os.O_NOFOLLOW|os.O_CLOEXEC)
+try:
+ os.fchmod(fd,0o600)
+ try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB); acquired=True
+ except BlockingIOError: acquired=False
+ print(json.dumps({'acquired':acquired}))
+finally: os.close(fd)
+'''
+        else:
+            script = '''import json,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from codex_learner import runner
+with runner.lock_file(Path(sys.argv[2]),blocking=False) as acquired:
+ print(json.dumps({'acquired':acquired}))
+'''
+        child = subprocess.run([sys.executable, '-B', '-c', script,
+            str(self.scripts.parents[3] / 'scripts' if standalone else self.scripts),
+            str(path)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual(json.loads(child.stdout), {'acquired': False})
+
+    def test_legacy_losing_contenders_do_not_invalidate_existing_owners(self):
+        for kind in ('residual', 'migration', 'normal'):
+            with self.subTest(owner=kind), self.owner(kind) as verify:
+                for path in self.paths:
+                    before = J.durable._identity(path.lstat())
+                    self.contender(path, legacy=True)
+                    after = J.durable._identity(path.lstat())
+                    self.assertEqual({k for k in before if before[k] != after[k]}, {'ctime_ns'})
+                    verify()
+
+    def test_current_losing_contenders_leave_all_file_metadata_unchanged(self):
+        for kind in ('residual', 'migration', 'normal'):
+            with self.subTest(owner=kind), self.owner(kind) as verify:
+                before = [J.durable._identity(p.lstat()) for p in self.paths]
+                for path in self.paths:
+                    self.contender(path, legacy=False)
+                self.assertEqual([J.durable._identity(p.lstat()) for p in self.paths], before)
+                verify()
+
+    def test_standalone_losing_contenders_leave_existing_locks_unchanged(self):
+        for kind in ('residual', 'migration', 'normal'):
+            with self.subTest(owner=kind), self.owner(kind) as verify:
+                before = J.durable._identity(self.paths[0].lstat())
+                self.contender(self.paths[0], legacy=False, standalone=True)
+                self.assertEqual(J.durable._identity(self.paths[0].lstat()), before)
+                verify()
+
+    def test_immutable_identity_still_detects_ctime_and_lock_identity_keeps_other_fields(self):
+        from types import SimpleNamespace
+        fields = ('st_dev', 'st_ino', 'st_uid', 'st_gid', 'st_mode', 'st_size',
+                  'st_mtime_ns', 'st_ctime_ns', 'st_nlink')
+        values = {k: getattr(self.paths[0].lstat(), k) for k in fields}
+        before = SimpleNamespace(**values)
+        for key in fields:
+            with self.subTest(field=key):
+                after = SimpleNamespace(**{**values, key: values[key] + 1})
+                self.assertNotEqual(J.durable._identity(before), J.durable._identity(after))
+                if key == 'st_ctime_ns':
+                    self.assertEqual(J.durable._lock_identity(before), J.durable._lock_identity(after))
+                else:
+                    self.assertNotEqual(J.durable._lock_identity(before), J.durable._lock_identity(after))
+
+    def test_path_and_safety_changes_still_invalidate_coordination(self):
+        for kind in ('residual', 'migration'):
+            for change in ('replace', 'symlink', 'mode', 'hardlink', 'size', 'mtime'):
+                with self.subTest(owner=kind, change=change):
+                    path = self.paths[0]
+                    with self.owner(kind) as verify:
+                        if change == 'replace':
+                            path.unlink(); path.touch(mode=0o600)
+                        elif change == 'symlink':
+                            target = self.base / 'saved-worker'
+                            path.rename(target); path.symlink_to(target)
+                        elif change == 'mode':
+                            path.chmod(0o640)
+                        elif change == 'hardlink':
+                            os.link(path, self.base / 'extra-link')
+                        elif change == 'size':
+                            path.write_bytes(b'changed')
+                        else:
+                            info = path.stat()
+                            os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+                        with self.assertRaisesRegex(ValueError, 'lock_changed'):
+                            verify()
+                    path.unlink()
+                    for extra in (self.base / 'saved-worker', self.base / 'extra-link'):
+                        extra.unlink(missing_ok=True)
+                    path.touch(mode=0o600)
+
+    def test_unsafe_locks_are_refused_before_acquisition(self):
+        for kind in ('residual', 'migration'):
+            for change in ('symlink', 'mode', 'hardlink'):
+                with self.subTest(owner=kind, change=change):
+                    path = self.paths[0]
+                    extra = self.base / 'extra'
+                    if change == 'symlink':
+                        path.rename(extra); path.symlink_to(extra)
+                    elif change == 'mode':
+                        path.chmod(0o644)
+                    else:
+                        os.link(path, extra)
+                    with self.assertRaises((OSError, ValueError)):
+                        with self.owner(kind):
+                            self.fail('Unsafe coordination lock admitted')
+                    path.unlink(); extra.unlink(missing_ok=True); path.touch(mode=0o600)
+
+    def test_current_winner_still_normalizes_owned_lock_permissions(self):
+        path = self.paths[0]
+        path.chmod(0o640)
+        with self.runtime.lock_file(path, blocking=False) as acquired:
+            self.assertIs(acquired, True)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_busy_cli_reports_specific_reason_without_recovery_dispatch(self):
+        output = io.StringIO()
+        arguments = ['recover', '--root', str(self.root), '--config', str(self.base),
+            '--package-root', str(self.base), '--candidate-store', str(self.base), '--session-id', SID]
+        with self.runtime.lock_file(self.paths[0]), contextlib.redirect_stdout(output), \
+                mock.patch.object(CLI, '_base_paths'), \
+                mock.patch.object(CLI, '_retained_summary', return_value={}), \
+                mock.patch.object(CLI, '_recover', side_effect=AssertionError('Busy lock dispatched recovery')):
+            code = CLI.main(arguments)
+        result = json.loads(output.getvalue())
+        self.assertEqual(code, 2)
+        self.assertEqual(result['reason'], 'residual_cli_coordination_busy')
+        self.assertEqual(result['status'], 'held')
+        self.assertFalse(result['provider_invoked'])
+        self.assertFalse(result['successful_coverage'])
+
+
 if __name__ == '__main__':
     unittest.main()
