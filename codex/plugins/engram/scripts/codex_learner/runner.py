@@ -1241,13 +1241,25 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=None,
     offset = state["offset"]  # Durable admission requires a cursor at/after the sealed frontier.
     if meta.size_bytes < offset:
         raise ValueError("transcript_truncated")
-    excerpt = read_excerpt(str(path), offset, max_chars=config["max_chars"], max_scan_bytes=config["max_scan_bytes"],
-                           recent_messages=state.get("recent_messages"), current_turn_id=state.get("current_turn_id"),
-                           **stable_kwargs)
-    if (excerpt.metadata.session_id, excerpt.metadata.device, excerpt.metadata.inode) != (sid, meta.device, meta.inode):
-        raise ValueError("transcript_replaced_during_read")
-    if stable and excerpt.metadata.identity != meta.identity:
-        raise ValueError("transcript_replaced_during_read")
+    def select_excerpt(max_chars):
+        selected = read_excerpt(str(path), offset, max_chars=max_chars, max_scan_bytes=config["max_scan_bytes"],
+                                recent_messages=state.get("recent_messages"), current_turn_id=state.get("current_turn_id"),
+                                **stable_kwargs)
+        if (selected.metadata.session_id, selected.metadata.device, selected.metadata.inode) != (sid, meta.device, meta.inode):
+            raise ValueError("transcript_replaced_during_read")
+        if stable and selected.metadata.identity != meta.identity:
+            raise ValueError("transcript_replaced_during_read")
+        return selected
+
+    excerpt = select_excerpt(config["max_chars"])
+    if (provider_mode == "read_only_plan" and not excerpt.text
+            and excerpt.blocked_reason == "message_exceeds_char_limit" and config["max_chars"] < 48000):
+        # The configured target normally bounds batches. One whole first message
+        # may use the existing ceiling; retry from the ORIGINAL cursor/parser
+        # state, never the refused excerpt's partially scanned state. This copied
+        # effective limit is sealed below; shared settings and old plans stay exact.
+        config = {**config, "max_chars": 48000}
+        excerpt = select_excerpt(config["max_chars"])
     next_state = {"session_id": sid, "hook_session_id": request.get("hook_session_id", sid),
                   "transcript_path": str(path), "offset": excerpt.next_offset,
                   "recent_messages": excerpt.recent_messages, "current_turn_id": excerpt.current_turn_id,

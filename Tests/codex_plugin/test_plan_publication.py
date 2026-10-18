@@ -321,5 +321,173 @@ class PlanPublicationTests(unittest.TestCase):
         self.assertEqual(json.loads(self.f.pending.read_bytes())['turn_id'], 'during-probe')
 
 
+class OversizedMessageTests(unittest.TestCase):
+    """Prospective selection uses whole records and the existing sealed limit."""
+
+    def setUp(self):
+        self.p = PlanPublicationTests(methodName='runTest')
+        self.addCleanup(self.p.doCleanups)
+        self.p.setUp()
+        self.f = self.p.f
+        self.f.config['max_scan_bytes'] = 128 * 1024
+        fixtures.write(self.f.root / 'settings.json', self.f.config)
+
+    @staticmethod
+    def message(text):
+        return {'type': 'event_msg', 'payload': {'type': 'user_message', 'message': text}}
+
+    def replace_records(self, *records, partial=b''):
+        with self.f.path.open('r+b') as stream:
+            stream.truncate(self.f.frontier)
+            stream.seek(self.f.frontier)
+            for record in records:
+                stream.write(J.encode(record) + b'\n')
+            stream.write(partial)
+
+    def preimages(self):
+        return [path.read_bytes() for path in
+                (self.f.state_path, self.f.admission_path, self.f.pending, self.f.root / 'settings.json')]
+
+    def select(self):
+        class Selected(Exception):
+            pass
+        before = self.preimages()
+        with mock.patch.object(self.f.service, 'prepare', side_effect=Selected) as prepare, \
+             mock.patch.object(R, 'read_excerpt', wraps=R.read_excerpt) as reads:
+            with self.assertRaises(Selected):
+                self.p.process()
+        self.assertEqual(self.preimages(), before)
+        self.assertEqual(self.p.provider_runs, [])
+        self.assertEqual(self.p.calls, [])
+        return prepare.call_args.args[2:4], reads.call_args_list
+
+    def test_small_message_keeps_configured_target_and_single_read(self):
+        (excerpt, config), reads = self.select()
+        self.assertIs(config, self.f.config)
+        self.assertEqual(config['max_chars'], 2000)
+        self.assertEqual(excerpt.text, '[USER]\nSynthetic first visible fact.')
+        self.assertEqual(len(reads), 1)
+
+    def test_fallback_restarts_original_parser_and_preserves_whole_mirrored_text(self):
+        secret = 'sk-proj-' + 'x' * 32
+        body = 'é界' * 1500 + ' ' + secret
+        self.replace_records(
+            {'type': 'turn_context', 'payload': {'turn_id': 'oversized-turn'}},
+            self.message(body),
+            {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
+                'id': 'mirror', 'content': [{'type': 'input_text', 'text': body}]}},
+            self.message('yes'), self.message('yes'))
+        (excerpt, config), reads = self.select()
+        self.assertEqual(len(reads), 2)
+        for call in reads:
+            self.assertEqual(call.args, (str(self.f.path), self.f.frontier))
+            self.assertEqual(call.kwargs['recent_messages'], [])
+            self.assertIsNone(call.kwargs['current_turn_id'])
+            self.assertEqual(call.kwargs['max_scan_bytes'], 128 * 1024)
+        self.assertEqual([call.kwargs['max_chars'] for call in reads], [2000, 48000])
+        self.assertEqual(excerpt.text, '[USER]\n' + 'é界' * 1500
+                         + ' [REDACTED]\n\n[USER]\nyes\n\n[USER]\nyes')
+        self.assertEqual(excerpt.message_count, 3)
+        self.assertEqual(excerpt.diagnostics['duplicate_messages'], 1)
+        self.assertEqual(excerpt.diagnostics['redacted_messages'], 1)
+        self.assertEqual(excerpt.current_turn_id, 'oversized-turn')
+        self.assertEqual(excerpt.next_offset, self.f.path.stat().st_size)
+        self.assertFalse(excerpt.has_more)
+        self.assertIsNone(excerpt.blocked_reason)
+        self.assertIsNot(config, self.f.config)
+        self.assertEqual(config, {**self.f.config, 'max_chars': 48000})
+        self.assertEqual(self.f.config['max_chars'], 2000)
+
+    def test_fallback_does_not_consume_a_following_record_beyond_ceiling(self):
+        self.replace_records(self.message('a' * 30000))
+        first_end = self.f.path.stat().st_size
+        self.f.append('b' * 25000)
+        (excerpt, _), _ = self.select()
+        self.assertEqual(excerpt.text, '[USER]\n' + 'a' * 30000)
+        self.assertEqual(excerpt.next_offset, first_end)
+        self.assertTrue(excerpt.has_more)
+        self.assertIsNone(excerpt.blocked_reason)
+        following = fixtures.T.read_excerpt(self.f.path, excerpt.next_offset, max_chars=48000,
+            max_scan_bytes=self.f.config['max_scan_bytes'], recent_messages=excerpt.recent_messages,
+            current_turn_id=excerpt.current_turn_id, stable_identity=True)
+        self.assertEqual(following.text, '[USER]\n' + 'b' * 25000)
+        self.assertEqual(following.next_offset, self.f.path.stat().st_size)
+
+    def test_refusals_keep_cursor_settings_and_scan_bound_without_preparing(self):
+        cases = ((48001, 128 * 1024, 2000, False, 'read_only_plan', 2),
+                 (48001, 128 * 1024, 48000, False, 'read_only_plan', 1),
+                 (5000, 4096, 2000, False, 'read_only_plan', 1),
+                 (3000, 128 * 1024, 2000, True, 'read_only_plan', 1),
+                 (3000, 128 * 1024, 2000, False, None, 1))
+        for chars, scan, limit, partial, mode, expected_reads in cases:
+            with self.subTest(chars=chars, scan=scan, limit=limit, partial=partial, mode=mode):
+                self.f.config.update(max_scan_bytes=scan, max_chars=limit)
+                fixtures.write(self.f.root / 'settings.json', self.f.config)
+                record = self.message('z' * chars)
+                self.replace_records(partial=J.encode(record)) if partial else self.replace_records(record)
+                before = self.preimages()
+                with mock.patch.object(self.f.service, 'prepare') as prepare, \
+                     mock.patch.object(R, 'read_excerpt', wraps=R.read_excerpt) as reads:
+                    result = R.process_request(self.f.root, self.f.request, self.f.config,
+                                               invoke=self.p.planning, provider_mode=mode)
+                self.assertEqual(result, 'blocked')
+                prepare.assert_not_called()
+                self.assertEqual(reads.call_count, expected_reads)
+                self.assertTrue(all(call.kwargs['max_scan_bytes'] == scan for call in reads.call_args_list))
+                self.assertEqual(self.preimages(), before)
+                self.assertEqual(self.p.provider_runs, [])
+                self.assertEqual(self.p.calls, [])
+                self.assertFalse((self.f.root / 'runs').exists())
+
+    def resume(self):
+        class Future(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.datetime.now(tz) + datetime.timedelta(hours=1)
+        with mock.patch.object(P, 'dt', SimpleNamespace(datetime=Future, timezone=datetime.timezone)), \
+             mock.patch.object(R, 'read_excerpt', side_effect=AssertionError('old plan must recover first')):
+            return self.p.process()
+
+    def test_effective_limit_is_sealed_and_lost_ack_resumes_exact_plan(self):
+        self.replace_records(self.message('a' * 3000))
+        before = self.preimages()
+        self.assertIsInstance(self.p.process(), P.Continuation)
+        run = self.p.provider_runs[0]
+        manifest, _ = J.read_manifest(run)
+        parser = J._json(J._unseal(manifest['inputs']['parser_state']))
+        configuration = J._json(J._unseal(manifest['inputs']['backend_config']))
+        self.assertEqual(parser['limits'], {'max_chars': 48000, 'max_scan_bytes': 128 * 1024})
+        self.assertEqual(parser['input'], {'offset': self.f.frontier, 'recent_messages': [], 'current_turn_id': None})
+        self.assertEqual(configuration['settings']['sha256'], J.sha256(before[3]))
+        self.assertEqual(configuration['settings']['value']['max_chars'], 2000)
+        self.assertEqual(parser['runtime']['sha256'], J.sha256(Path(fixtures.T.__file__).read_bytes()))
+        self.assertEqual(self.f.state_path.read_bytes(), before[0])
+        self.assertEqual((self.f.root / 'settings.json').read_bytes(), before[3])
+        sealed = [(run / name).read_bytes() for name in ('execution-manifest.json', L.PLAN_NAME)]
+        self.assertEqual(self.resume(), 'succeeded')
+        self.assertEqual([(run / name).read_bytes() for name in ('execution-manifest.json', L.PLAN_NAME)], sealed)
+        self.assertEqual(len(self.p.provider_runs), 1)
+        self.assertEqual(len(self.p.ledger), 2)
+        self.assertEqual(self.p.calls[1], self.p.calls[2])
+        self.assertEqual(json.loads(self.f.state_path.read_bytes())['offset'], self.f.path.stat().st_size)
+        self.assertTrue((run / 'successful-coverage.json').exists())
+        self.assertEqual((self.f.root / 'settings.json').read_bytes(), before[3])
+
+    def test_existing_smaller_sealed_plan_recovers_before_new_oversized_suffix(self):
+        self.assertIsInstance(self.p.process(), P.Continuation)
+        run = self.p.provider_runs[0]
+        sealed = [(run / name).read_bytes() for name in ('execution-manifest.json', L.PLAN_NAME)]
+        manifest, _ = J.read_manifest(run)
+        self.assertEqual(J._json(J._unseal(manifest['inputs']['parser_state']))['limits']['max_chars'], 2000)
+        end = manifest['source']['end_offset']
+        self.f.append('new complete suffix ' + 'x' * 49000)
+        self.assertEqual(self.resume(), 'succeeded')
+        self.assertEqual([(run / name).read_bytes() for name in ('execution-manifest.json', L.PLAN_NAME)], sealed)
+        self.assertEqual(len(self.p.provider_runs), 1)
+        self.assertEqual(len(self.p.ledger), 2)
+        self.assertEqual(self.p.calls[1], self.p.calls[2])
+        self.assertEqual(json.loads(self.f.state_path.read_bytes())['offset'], end)
+
+
 if __name__ == '__main__':
     unittest.main()
