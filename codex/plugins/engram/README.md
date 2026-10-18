@@ -69,6 +69,10 @@ advance saved progress. Interactive memory calls and another laptop remain indep
 New plugin runs first read memory and propose a complete bounded plan. The
 provider cannot write memory. Only a clean completed proposal can authorize the
 native executor. A failed planning turn preserves progress and uses retry backoff.
+For a new plan, `max_chars` is the normal batch target. If the first complete
+message exceeds that target, the learner can use up to 48,000 characters and
+records that effective limit in the sealed plan. Larger messages stay pending;
+the learner never truncates or skips them. Existing plans retain their limits.
 If execution is interrupted, a later lifecycle event resumes the same saved
 plan and operation IDs; it does not ask the provider to recreate completed writes.
 
@@ -250,6 +254,12 @@ normal worker lock; an active batch finishes with its existing code and sealed
 plans before respawn. The selected worker resumes unfinished plans through the
 existing checks, retaining their operation IDs, native route and input seals.
 No cache files are rewritten and no Codex restart is requested.
+
+MCP servers use Codex's separate connection lifecycle. After an upgrade, an open
+task can retain an MCP process from the previous plugin version even while its
+hooks and learner use the current version. Refresh the MCP connection through
+the host's supported controls, or restart the desktop app when convenient, and
+verify the loaded executable before reporting that the task is fully updated.
 
 An already-running package that predates this selector cannot redirect itself.
 Its first transition still requires the supported new worker invocation after
