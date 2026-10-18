@@ -320,6 +320,66 @@ class ReviewedAccountingTests(unittest.TestCase):
                 with self.no_external(),self.assertRaises(ValueError):f.seal()
                 self.assertEqual(f.current(),before);self.assertEqual(f.calls,[])
 
+    def test_reversed_preserved_inventory_prepares_and_publishes_without_replay(self):
+        for residuals in (0,1):
+            with self.subTest(residuals=residuals):
+                f=self.fixture(residuals=residuals,successes=2,missing_tail=True)
+                f.plan['preserve_without_replay']['memory_ids']=list(reversed(
+                    f.plan['preserve_without_replay']['memory_ids']));f.refresh()
+                before=f.current();history=f.history_snapshot();review=f.reviewed_raw
+                self.assertNotEqual(J._json(before[0])['reconciliation_required']['memory_ids'],
+                                    f.plan['preserve_without_replay']['memory_ids'])
+                review_path=f.base/'reversed-review.json';review_path.write_bytes(review);review_path.chmod(0o600)
+                f.writer.close()
+                args=types.SimpleNamespace(root=f.root,session_id=SID,
+                    run_id='20260103T084600Z-'+uuid.uuid4().hex,config=f.config,package_root=f.plugin,
+                    candidate_store=f.store,review=review_path,review_sha256=f.reviewed_sha256,
+                    evidence_directory=f.evidence,runtime_compatibility=None)
+                with self.no_external(),CLI.Coordination(f.root).worker() as locks, \
+                     mock.patch.object(CLI.operation_probe,'probe_scope',return_value=f.scope) as scope:
+                    prepared=CLI._prepare(args,locks)
+                self.assertEqual(scope.call_count,1)
+                self.assertEqual(prepared['status'],'prepared')
+                self.assertEqual(prepared['memory_mutations_requested'],0)
+                self.assertEqual(f.current(),before);self.assertEqual(review_path.read_bytes(),review)
+                args.manifest_sha256=prepared['manifest_sha256'];args.context_sha256=prepared['context_sha256']
+                f.run_dir=f.root/'runs'/args.run_id;f.paths=CLI._paths(args,args.run_id);f.context=CLI._load(args)
+                self.assertEqual(f.context.manifest['inputs']['cursor']['sha256'],J.sha256(before[0]))
+                result=self.complete(f)
+                self.assertEqual(result['applied_write_count'],residuals)
+                self.assertEqual(len(f.calls),residuals);self.assertEqual(len(f.effects),residuals)
+                self.assertEqual(f.history_snapshot(),history);self.assertEqual(review_path.read_bytes(),review)
+                self.assertEqual(f.pending_path.read_bytes(),before[2])
+                state=J._json(f.state_path.read_bytes())
+                self.assertEqual(state['offset'],f.end);self.assertNotIn('reconciliation_required',state)
+                self.assertEqual(state['last_residual_reconciliation']['preserved_memory_ids'],
+                                 f.plan['preserve_without_replay']['memory_ids'])
+                for name in ('provider-dispatch.json','provider-observation.json','successful-coverage.json'):
+                    self.assertFalse((f.run_dir/name).exists())
+
+    def test_preserved_inventory_set_matching_rejects_invalid_or_changed_gate(self):
+        f=self.fixture(residuals=0,successes=2)
+        original=copy.deepcopy(f.state);record=copy.deepcopy(f.record)
+        for change in ('missing','extra','duplicate','uppercase','malformed','not_list','run','reason','extra_key'):
+            with self.subTest(change=change):
+                state=copy.deepcopy(original);gate=state['reconciliation_required'];ids=gate['memory_ids']
+                if change=='missing':ids.pop()
+                elif change=='extra':ids.append(str(uuid.uuid4()))
+                elif change=='duplicate':ids.append(ids[0])
+                elif change=='uppercase':
+                    upper=ids[1].upper();self.assertNotEqual(upper,ids[1]);ids[1]=upper
+                elif change=='malformed':ids[0]='not-a-uuid'
+                elif change=='not_list':gate['memory_ids']={str(i):v for i,v in enumerate(ids)}
+                elif change=='run':gate['run_id']=PREVIOUS_RUN
+                elif change=='reason':gate['reason']='different_reason'
+                else:gate['unreviewed']=True
+                write_json(f.state_path,state)
+                write_json(f.record_path,{**record,'state_sha256':J.durable.object_digest(state)})
+                before=f.current()
+                with self.no_external(),self.assertRaises(ValueError):f.seal()
+                self.assertEqual(f.current(),before);self.assertEqual(f.calls,[])
+                self.assertFalse((f.run_dir/'execution-manifest.json').exists())
+
     def test_lost_response_resumes_same_plan_once_and_keeps_hold_until_complete(self):
         f=self.fixture(residuals=2,parent=True);f.seal()
         with f.locks() as verify:Q.begin(f.context,writer=f.writer,verify_locks=verify)

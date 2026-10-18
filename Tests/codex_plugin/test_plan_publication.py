@@ -2,6 +2,8 @@
 import copy
 import datetime
 import json
+import shutil
+from pathlib import Path
 import threading
 import unittest
 from types import SimpleNamespace
@@ -131,6 +133,158 @@ class PlanPublicationTests(unittest.TestCase):
         self.assertFalse(R.requires_reconciliation(state))
         self.assertEqual(json.loads(self.f.pending.read_bytes())['turn_id'], 'later-turn')
         self.assertTrue((run / 'successful-coverage.json').exists())
+
+    def prepare_upgrade(self, *, explicit=False):
+        C = fixtures.C
+        parent = self.f.base / 'plugins/cache/personal/engram'
+        roots = [parent / version for version in ('0.15.3', '0.15.4')]
+        parser_bytes = Path(C.transcript.__file__).read_bytes()
+        for index, root in enumerate(roots):
+            root.mkdir(parents=True, mode=0o700)
+            fixtures.write(root / '.codex-plugin/plugin.json',
+                           {'name': 'engram', 'version': root.name})
+            fixtures.write(root / '.mcp.json', {'mcpServers': {'memory': {
+                'command': './memory', 'cwd': '.', 'args': [],
+                'default_tools_approval_mode': 'approve'}}})
+            native = root / 'memory'
+            native.write_bytes(b'\xcf\xfa\xed\xfe' + bytes([index]) * 128)
+            native.chmod(0o700)
+            parser = root / 'scripts/codex_learner/transcript.py'
+            parser.parent.mkdir(parents=True, mode=0o700)
+            parser.write_bytes(parser_bytes); parser.chmod(0o600)
+        self.old_plugin, self.new_plugin = roots
+        self.f.service.plugin_root = self.old_plugin
+        self.config_path = self.f.service.config_path
+        self.plugin_config = '[plugins."engram@personal"]\nenabled = true\n'
+        if explicit:
+            self.plugin_config += ('[mcp_servers.memory]\ncommand = ' + json.dumps(str(self.old_plugin / 'memory'))
+                + '\nargs = []\ndefault_tools_approval_mode = "approve"\n')
+        self.config_path.write_text(self.plugin_config)
+        self.upgraded = P.Publications(self.f.root, self.config_path, self.new_plugin)
+        with mock.patch.object(C.transcript, '__file__', str(self.old_plugin / 'scripts/codex_learner/transcript.py')):
+            self.assertIsInstance(self.process(), P.Continuation)
+        run = self.provider_runs[0]
+        self.assertEqual(len(self.ledger), 2)
+        self.assertFalse((run / F.REVOCATION_NAME).exists())
+        self.manifest_before = (run / 'execution-manifest.json').read_bytes()
+        self.plan_before = (run / L.PLAN_NAME).read_bytes()
+        self.state_before = self.f.state_path.read_bytes()
+        return run
+
+    def resume_upgrade(self):
+        class Future(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.datetime.now(tz) + datetime.timedelta(hours=1)
+        with mock.patch.object(fixtures.C.transcript, '__file__',
+                               str(self.new_plugin / 'scripts/codex_learner/transcript.py')), \
+             mock.patch.object(P, 'dt', SimpleNamespace(datetime=Future, timezone=datetime.timezone)), \
+             R.lock_file(self.f.root / 'worker.lock'):
+            with R.lock_file(self.f.root / 'enqueue.lock'):
+                ready = self.upgraded.recover(SID, self.f.config)
+            return R.complete_ready_plan(self.f.root, self.upgraded, ready, self.f.config)
+
+    def test_upgrade_resumes_exact_original_native_plan_with_current_executor(self):
+        run = self.prepare_upgrade()
+        self.assertEqual(self.resume_upgrade(), 'succeeded')
+        self.assertEqual(len(self.provider_runs), 1)
+        self.assertEqual(len(self.ledger), 2)
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(self.calls[1], self.calls[2])
+        self.assertEqual(self.factory.call_args.args[1]['command'], str(self.old_plugin / 'memory'))
+        self.assertEqual(self.factory.call_args.kwargs['limits'].deadline_seconds, 30.0)
+        self.assertEqual((run / 'execution-manifest.json').read_bytes(), self.manifest_before)
+        self.assertEqual((run / L.PLAN_NAME).read_bytes(), self.plan_before)
+        self.assertGreater(json.loads(self.f.state_path.read_bytes())['offset'], self.f.frontier)
+        self.assertTrue((run / 'successful-coverage.json').exists())
+        # New plans still resolve the active package. No global route rewrites.
+        paths = self.upgraded.context_paths(run.name)
+        _, current = fixtures.C._backend(paths, stable_path=True)
+        self.assertEqual(current['runtime']['path'], str(self.new_plugin / 'memory'))
+
+    def test_upgrade_refuses_policy_settings_parser_and_foreign_namespace_changes(self):
+        run = self.prepare_upgrade()
+        protected = [self.f.state_path, self.f.admission_path, self.f.pending,
+                     run / 'execution-manifest.json', run / L.PLAN_NAME]
+        before = {path: path.read_bytes() for path in protected}
+        def refused():
+            with self.assertRaises(ValueError): self.resume_upgrade()
+            self.assertEqual(len(self.calls), 2)
+            self.assertFalse((run / F.REVOCATION_NAME).exists())
+            for path, raw in before.items(): self.assertEqual(path.read_bytes(), raw)
+        changes = [
+            (self.config_path, self.plugin_config.replace('true', 'false').encode()),
+            (self.config_path, (self.plugin_config + '[plugins."engram@personal".mcp_servers.memory]\ndisabled_tools = ["remember"]\n').encode()),
+            (self.config_path, (self.plugin_config + '[mcp_servers.memory]\ncommand = ' + json.dumps(str(self.new_plugin / 'memory')) + '\ndefault_tools_approval_mode = "approve"\n').encode()),
+            (self.f.root / 'settings.json', J.encode({**self.f.config, 'max_tool_calls': 1})),
+            (self.new_plugin / 'scripts/codex_learner/transcript.py', b'# changed current parser\n'),
+            (self.old_plugin / 'scripts/codex_learner/transcript.py', b'# changed retained parser\n'),
+            (self.new_plugin / '.codex-plugin/plugin.json', J.encode({'name': 'foreign', 'version': '0.15.4'})),
+            (self.old_plugin / '.codex-plugin/plugin.json', J.encode({'name': 'foreign', 'version': '0.15.3'})),
+        ]
+        for path, changed in changes:
+            with self.subTest(path=path.name, changed=changed[:40]):
+                old = path.read_bytes()
+                try: path.write_bytes(changed); refused()
+                finally: path.write_bytes(old)
+        self.assertEqual(self.resume_upgrade(), 'succeeded')
+
+    def test_upgrade_refuses_replaced_retained_native_even_with_identical_bytes(self):
+        run = self.prepare_upgrade()
+        native = self.old_plugin / 'memory'
+        other = native.with_name('replacement')
+        other.write_bytes(native.read_bytes()); other.chmod(0o700); other.replace(native)
+        with self.assertRaisesRegex(ValueError, 'backend_changed'): self.resume_upgrade()
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.f.state_path.read_bytes(), self.state_before)
+        self.assertFalse((run / F.REVOCATION_NAME).exists())
+
+    def test_upgrade_keeps_explicit_native_route_and_rejects_env_or_other_marketplace(self):
+        run = self.prepare_upgrade(explicit=True)
+        self.config_path.write_text(self.plugin_config + 'env = { PRIVATE_ROUTE_FLAG = "changed" }\n')
+        with self.assertRaisesRegex(ValueError, 'backend_changed'): self.resume_upgrade()
+        self.assertEqual(len(self.calls), 2)
+        self.config_path.write_text(self.plugin_config)
+        original_root = self.new_plugin
+        foreign = original_root.parents[2] / 'other-market/engram/0.15.4'
+        foreign.parent.mkdir(parents=True, mode=0o700)
+        shutil.copytree(original_root, foreign)
+        self.config_path.write_text(self.plugin_config + '[plugins."engram@other-market"]\nenabled = true\n')
+        self.new_plugin = foreign; self.upgraded.plugin_root = foreign
+        with self.assertRaisesRegex(ValueError, 'retained_plugin_namespace_changed'): self.resume_upgrade()
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.f.state_path.read_bytes(), self.state_before)
+        self.assertFalse((run / F.REVOCATION_NAME).exists())
+        self.new_plugin = original_root; self.upgraded.plugin_root = original_root
+        self.config_path.write_text(self.plugin_config)
+        self.assertEqual(self.resume_upgrade(), 'succeeded')
+        self.assertEqual(self.factory.call_args.args[1]['command'], str(self.old_plugin / 'memory'))
+        self.assertEqual(self.calls[1], self.calls[2])
+        self.assertEqual(len(self.ledger), 2)
+
+    def test_upgraded_publication_recovers_partial_pair_without_native_replay(self):
+        run = self.prepare_upgrade()
+        def crash(label):
+            if label == 'admission_replaced': raise RuntimeError('synthetic metadata interruption')
+        with mock.patch.object(P.publication, '_boundary', side_effect=crash):
+            with self.assertRaisesRegex(RuntimeError, 'synthetic metadata interruption'):
+                self.resume_upgrade()
+        self.assertTrue((run / F.REVOCATION_NAME).exists())
+        self.assertEqual(self.f.state_path.read_bytes(), self.state_before)
+        self.assertEqual(len(self.calls), 3)
+        settlement = (run / 'settlement.json').read_bytes()
+        with mock.patch.object(fixtures.C.transcript, '__file__',
+                               str(self.new_plugin / 'scripts/codex_learner/transcript.py')), \
+             R.lock_file(self.f.root / 'worker.lock'), R.lock_file(self.f.root / 'enqueue.lock'):
+            outcome = self.upgraded.recover(SID, self.f.config)
+        self.assertEqual(outcome, 'succeeded')
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(len(self.provider_runs), 1)
+        self.assertEqual((run / 'settlement.json').read_bytes(), settlement)
+        self.assertEqual((run / 'execution-manifest.json').read_bytes(), self.manifest_before)
+        self.assertEqual((run / L.PLAN_NAME).read_bytes(), self.plan_before)
+        self.assertGreater(json.loads(self.f.state_path.read_bytes())['offset'], self.f.frontier)
+        self.assertIsNone(json.loads(self.f.admission_path.read_bytes())['processing'])
 
     def test_failed_planning_turn_has_no_writes_and_uses_retry_backoff(self):
         self.failed = True

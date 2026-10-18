@@ -83,6 +83,9 @@ def executor(driver, transport, *, limits=None, diagnostic=None):
         check('before_native_launch')
         details.mark('resolve_transport')
         argv,env,cwd,pass_fds=P.bridge._fenced_transport(frozen,writer)
+        if driver.manifest.get("provider_mode") == "read_only_plan":
+            from .execution_context import normal_plan_environment
+            env = normal_plan_environment(driver.manifest, frozen, env)
         selector=selectors.DefaultSelector(); child=None; buffer=bytearray(); total=0
         deadline=time.monotonic()+limits.deadline_seconds
         interrupted=False; old_signals={}

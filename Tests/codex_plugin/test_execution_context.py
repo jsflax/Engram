@@ -252,6 +252,60 @@ class ExecutionContextTests(unittest.TestCase):
                 with self.assertRaisesRegex(C.ContextError, "backend_changed"):
                     self.validate(context)
 
+    def test_normal_plan_reuses_sealed_implicit_tmpdir_presence_or_absence(self):
+        for initial, resumed in (('sealed-fixture-temp', 'new-worker-temp'),
+                                 ('sealed-fixture-temp', None), (None, 'new-worker-temp'), (None, None)):
+            with self.subTest(initial=initial, resumed=resumed):
+                self.setUp()
+                with mock.patch.dict(os.environ, {}):
+                    if initial is None: os.environ.pop('TMPDIR', None)
+                    else: os.environ['TMPDIR'] = initial
+                    context = self.seal(provider_mode='read_only_plan',
+                                        plan_policy={'max_tool_calls': 12, 'max_writes': 5})
+                    self.assertTrue(self.validate(context))
+                    raw = (self.run_dir / 'execution-manifest.json').read_bytes()
+                    transport = copy.deepcopy(context.transport)
+                    if resumed is None: os.environ.pop('TMPDIR', None)
+                    else: os.environ['TMPDIR'] = resumed
+                    loaded = C.load_execution(self.paths, manifest_sha256=context.manifest_sha256,
+                                              writer_fence=self.fence)
+                    self.assertTrue(self.validate(loaded))
+                    self.assertTrue(C.validate_recovery_inputs(self.paths, manifest_sha256=context.manifest_sha256))
+                    actual = C.normal_plan_environment(self.manifest(), loaded.transport,
+                                                       C.stdio_bridge._transport(loaded.transport)[1])
+                    self.assertEqual(actual.get('TMPDIR'), initial)
+                    self.assertEqual('TMPDIR' in actual, initial is not None)
+                    self.assertEqual(loaded.transport, transport)
+                    self.assertEqual((self.run_dir / 'execution-manifest.json').read_bytes(), raw)
+
+    def test_normal_plan_explicit_and_requested_tmpdir_keep_live_config_authority(self):
+        for explicit in (True, False):
+            with self.subTest(explicit=explicit):
+                self.setUp()
+                suffix = '\nenv = { TMPDIR = "configured-fixture-temp" }\n' if explicit else '\nenv_vars = ["TMPDIR"]\n'
+                self.config_path.write_text(self.config_text + suffix)
+                self.memory = C.memory_config.resolve(self.config_path, self.plugin)[1]
+                self.transport = C.memory_config.transport(self.memory)
+                with mock.patch.dict(os.environ, {'TMPDIR': 'original-worker-temp'}):
+                    context = self.seal(provider_mode='read_only_plan',
+                                        plan_policy={'max_tool_calls': 12, 'max_writes': 5})
+                    before = (self.run_dir / 'execution-manifest.json').read_bytes()
+                    os.environ['TMPDIR'] = 'new-worker-temp'
+                    if explicit:
+                        self.assertTrue(self.validate(context))
+                        self.config_path.write_text((self.config_text + suffix).replace('configured-fixture-temp','changed-config'))
+                    with self.assertRaisesRegex(C.ContextError, 'backend_changed'):
+                        self.validate(context)
+                    self.assertEqual((self.run_dir / 'execution-manifest.json').read_bytes(), before)
+
+    def test_normal_plan_tmpdir_reuse_does_not_ignore_other_inherited_fields(self):
+        context = self.seal(provider_mode='read_only_plan',
+                            plan_policy={'max_tool_calls': 12, 'max_writes': 5})
+        for field in ('USER', 'LOGNAME', 'LANG', 'LC_ALL', 'SHELL'):
+            with self.subTest(field=field), mock.patch.dict(os.environ, {field: 'changed-fixture-value'}):
+                with self.assertRaisesRegex(C.ContextError, 'backend_changed'):
+                    self.validate(context)
+
     def test_later_append_pending_and_last_event_are_allowed_and_preserved(self):
         context = self.seal()
         self.append("Later private fact remains pending for the next Stop.")
@@ -607,6 +661,75 @@ class ExecutionContextTests(unittest.TestCase):
             with self.assertRaises(C.ContextError):
                 C.validate_recovery_inputs(self.paths, manifest_sha256=context.manifest_sha256)
 
+
+    def test_planning_proxy_remains_strict_when_executor_reuses_implicit_tmpdir(self):
+        proxy = importlib.import_module("codex_learner.memory_proxy")
+        cases = (("implicit", "same", "same", True),
+                 ("implicit", "first", "second", False),
+                 ("implicit", "first", None, False),
+                 ("implicit", None, "second", False),
+                 ("implicit", None, None, True),
+                 ("explicit", "first", "second", True),
+                 ("requested", "same", "same", True),
+                 ("requested", "first", "second", False))
+        for policy, initial, current, accepted in cases:
+            with self.subTest(policy=policy, initial=initial, current=current):
+                fixture = ExecutionContextTests(methodName="runTest")
+                try:
+                    fixture.setUp()
+                    if policy == "explicit":
+                        fixture.config_path.write_text(fixture.config_text +
+                            '[mcp_servers.memory.env]\nTMPDIR = "configured-temp"\n')
+                    elif policy == "requested":
+                        fixture.config_path.write_text(fixture.config_text + 'env_vars = ["TMPDIR"]\n')
+                    fixture.memory = C.memory_config.resolve(fixture.config_path, fixture.plugin)[1]
+                    fixture.transport = C.memory_config.transport(fixture.memory)
+                    with mock.patch.dict(os.environ):
+                        if initial is None:
+                            os.environ.pop("TMPDIR", None)
+                        else:
+                            os.environ["TMPDIR"] = str(fixture.base / initial)
+                        context = fixture.seal(provider_mode="read_only_plan",
+                            plan_policy={"max_tool_calls": 12, "max_writes": 5})
+                        manifest_raw = (fixture.run_dir / "execution-manifest.json").read_bytes()
+                        expected_env = C.stdio_bridge._transport(context.transport)[1]
+                    config = {"transport": context.transport,
+                        "audit_path": str(fixture.run_dir / "mcp-audit.jsonl"),
+                        "provenance": "codex-session:" + SID,
+                        "allowed_tools": sorted(set(C.memory_config.allowed_tools(
+                            fixture.memory, proxy.ALLOWED_TOOLS)).intersection(proxy.READ_TOOLS)),
+                        "max_tool_calls": 12, "max_writes": 5, "provider_mode": "read_only_plan",
+                        "execution": {**{name: str(getattr(fixture.paths, name))
+                            for name in fixture.paths.__dataclass_fields__},
+                            "manifest_sha256": context.manifest_sha256}}
+                    state_raw, admission_raw = fixture.state_path.read_bytes(), fixture.record_path.read_bytes()
+                    def relay(transport, client, server, **kwargs):
+                        self.assertEqual(transport, context.transport)
+                        self.assertIsNone(client.__self__.operations)
+                        actual = C.stdio_bridge._fenced_transport(transport, kwargs["writer_fence"])[1]
+                        self.assertEqual(actual.get("TMPDIR"), expected_env.get("TMPDIR"))
+                        self.assertEqual("TMPDIR" in actual, "TMPDIR" in expected_env)
+                        self.assertTrue(kwargs["writer_fence"].verify(fixture.binding))
+                        return 0
+                    with mock.patch.dict(os.environ), mock.patch.object(C.stdio_bridge, "run_relay", side_effect=relay) as launch:
+                        if current is None:
+                            os.environ.pop("TMPDIR", None)
+                        else:
+                            os.environ["TMPDIR"] = str(fixture.base / current)
+                        if accepted:
+                            self.assertEqual(proxy.run(config), 0)
+                            launch.assert_called_once()
+                        else:
+                            with self.assertRaisesRegex(C.ContextError, "backend_changed"):
+                                proxy.run(config)
+                            launch.assert_not_called()
+                            self.assertFalse((fixture.run_dir / "mcp-audit.jsonl").exists())
+                    self.assertEqual((fixture.run_dir / "execution-manifest.json").read_bytes(), manifest_raw)
+                    self.assertEqual(fixture.state_path.read_bytes(), state_raw)
+                    self.assertEqual(fixture.record_path.read_bytes(), admission_raw)
+                    self.assertTrue(fixture.fence.verify(fixture.binding))
+                finally:
+                    fixture.doCleanups()
 
 if __name__ == "__main__":
     unittest.main()

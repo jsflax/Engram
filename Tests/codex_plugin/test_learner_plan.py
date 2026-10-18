@@ -398,7 +398,8 @@ class LearnerPlanTests(unittest.TestCase):
 class NativeExecutorDiagnosticsTests(unittest.TestCase):
     """Actual transport state machine with in-memory IO, no child or store."""
     def exercise(self, *, timeout_at=None, invalid_at=None, check_error=None,
-                 cleanup_failed=False, observer_error=False, normal=False, apply_delay=.01):
+                 cleanup_failed=False, observer_error=False, normal=False, apply_delay=.01,
+                 ambient_env=None, sealed_env=None, transport_override=None, provider_mode=P.MODE):
         scope = {'version': 1, 'storeID': STORE, 'principal': {'kind': 'agent', 'groupIds': [], 'scopes': []}}
         request = {'operationID': MEMORY, 'expectedScope': scope, 'mutation': {'kind': 'remember'}}
         scope_value = {'engram_operation': {'version': 1, 'kind': 'scope',
@@ -433,21 +434,23 @@ class NativeExecutorDiagnosticsTests(unittest.TestCase):
             if observer_error: raise ValueError('/private/observer-failure')
         def check(phase):
             if check_error is not None and phase == 'before_native_forward': raise check_error
-        transport = {'command': '/fixture/native'}
-        driver = SimpleNamespace(manifest={'inputs': {'backend_route': J.seal_json(J.encode({'transport': transport}))}})
-        driver.manifest.update(provider_mode=P.MODE, session_id=SID,
+        transport = transport_override or {'command': '/fixture/native'}
+        driver = SimpleNamespace(manifest={'inputs': {'backend_route': J.seal_json(J.encode({
+            'transport': transport, 'launch': {'argv': ['/fixture/native'], 'cwd': None, 'env': sealed_env or {}}}))}})
+        driver.manifest.update(provider_mode=provider_mode, session_id=SID,
                                plan_policy={'max_tool_calls': 12, 'max_writes': 5})
         driver.manifest['inputs']['backend_config'] = J.seal_json(J.encode({'memory': {
             'enabled': True, 'disabled_tools': [], 'default_tools_approval_mode': 'approve', 'tools': {}}}))
         writer = mock.Mock()
         result = error = None
+        popen = mock.Mock(return_value=child)
         with contextlib.ExitStack() as stack:
             for target, name, value in [
                 (N.time, 'monotonic', lambda: clock[0]), (N.selectors, 'DefaultSelector', lambda: selector),
                 (N.threading, 'current_thread', lambda: None), (N.J, '_request', lambda *_: request),
                 (N.J, 'read_manifest', lambda *_: (driver.manifest, 'a' * 64)),
-                (N.P.bridge, '_fenced_transport', lambda *_: (['/fixture/native'], {}, None, ())),
-                (N.subprocess, 'Popen', mock.Mock(return_value=child)),
+                (N.P.bridge, '_fenced_transport', lambda *_: (['/fixture/native'], dict(ambient_env or {}), None, ())),
+                (N.subprocess, 'Popen', popen),
                 (N.os, 'set_blocking', lambda *_: None), (N.os, 'write', write), (N.os, 'read', read)]:
                 stack.enter_context(mock.patch.object(target, name, value))
             clean = stack.enter_context(mock.patch.object(N.P.bridge, '_cleanup', return_value=cleanup))
@@ -458,9 +461,35 @@ class NativeExecutorDiagnosticsTests(unittest.TestCase):
             except Exception as caught:
                 error = caught
             clean.assert_called_once_with(child, .25)
+        self.spawn_environment = copy.deepcopy(popen.call_args.kwargs['env']) if popen.called else None
         self.assertEqual(len(reports), 1)
         self.assertTrue(reports[0]['cleanup']['child_reaped'])
         return result, error, reports[0], sent
+
+    def test_actual_normal_popen_preserves_sealed_implicit_tmpdir_only(self):
+        for original in ({'TMPDIR': 'sealed-temp'}, {}):
+            with self.subTest(original=original):
+                ambient = {'TMPDIR': 'new-worker-temp', 'USER': 'fixture-user', 'FENCE_FIXTURE': 'preserved'}
+                sealed = {**original, 'USER': 'fixture-user'}
+                result, error, _, sent = self.exercise(normal=True, ambient_env=ambient, sealed_env=sealed)
+                self.assertIsNone(error)
+                self.assertEqual(result['id'], MEMORY)
+                self.assertEqual(self.spawn_environment.get('TMPDIR'), original.get('TMPDIR'))
+                self.assertEqual('TMPDIR' in self.spawn_environment, 'TMPDIR' in original)
+                self.assertEqual(self.spawn_environment['USER'], 'fixture-user')
+                self.assertEqual(self.spawn_environment['FENCE_FIXTURE'], 'preserved')
+                self.assertEqual(sent[-1]['params']['arguments']['operationID'], MEMORY)
+                self.assertEqual(ambient['TMPDIR'], 'new-worker-temp')
+
+    def test_native_tmpdir_projection_does_not_apply_to_explicit_or_legacy_routes(self):
+        for mode, transport in ((P.MODE, {'command': '/fixture/native', 'env': {'TMPDIR': 'configured'}}),
+                                (P.MODE, {'command': '/fixture/native', 'env_vars': ['TMPDIR']}),
+                                (None, {'command': '/fixture/native'})):
+            with self.subTest(mode=mode, transport=transport):
+                _, error, _, _ = self.exercise(transport_override=transport, provider_mode=mode,
+                    ambient_env={'TMPDIR': 'actual-resolved'}, sealed_env={'TMPDIR': 'sealed-old'})
+                self.assertIsNone(error)
+                self.assertEqual(self.spawn_environment['TMPDIR'], 'actual-resolved')
 
     def test_success_has_bounded_phases_and_cleaned_child(self):
         result, error, report, sent = self.exercise()
