@@ -536,6 +536,9 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=run_codex
     if digest == state.get("last_excerpt_sha256"):
         atomic_json(state_path, {**state, **next_state, "status": "duplicate", "last_excerpt_sha256": digest})
         return "more" if excerpt.has_more else "no_change"
+    # parents=True only applies the requested mode to the final directory.
+    # Create runs explicitly; leave any existing parent's permissions unchanged.
+    (root / "runs").mkdir(parents=True, exist_ok=True, mode=0o700)
     run_dir = private_dir(root / "runs" / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex))
     try:
         result = invoke(root, run_dir, request, excerpt, config)
