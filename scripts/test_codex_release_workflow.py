@@ -230,6 +230,58 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
                         self.assertEqual(call['fixture'], str(expected_fixture))
                         self.assertEqual(call['tmp'], str(expected_fixture / 'tmp') if release else str(validation / 'tmp'))
 
+    def test_force_preparation_requires_exact_runtime_passes_and_propagates_failure(self):
+        names = ['testPreparationCentroidsUseFirstEncodePositionsAndCadence',
+                 'testPreparationRegroupAndCapacityGrowth', 'testPreparationAsyncDirtyDispatch']
+        selected = 'ForceEngineTests/(' + '|'.join(names) + r')(\(\))?$'
+        name = 'Run force preparation regressions (serial)'
+        source = (ROOT / 'Tests/EngramVisualizerTests/ForceEngineTests.swift').read_text()
+        for method in names:
+            self.assertRegex(source, r'@Test\s+@MainActor\s+func ' + method + r'\(\)')
+            self.assertIsNotNone(re.search(selected, 'EngramVisualizerTests.ForceEngineTests/' + method + '()'))
+        self.assertIsNone(re.search(selected, 'EngramVisualizerTests.ForceEngineTests/testHistoricalGPUCase()'))
+        for workflow in ('native-validation.yml', 'release.yml'):
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory(prefix='engram force gate ') as temporary:
+                root = Path(temporary).resolve()
+                validation = root / 'validation'
+                (validation / 'repo').mkdir(parents=True)
+                bin_dir = root / 'bin'; bin_dir.mkdir()
+                log = root / 'call.json'
+                fake = bin_dir / 'python3'
+                fake.write_text('#!' + sys.executable + '\nimport json,os,sys\nfrom pathlib import Path\n'
+                    'Path(os.environ["CALL_LOG"]).write_text(json.dumps(sys.argv[1:]))\n'
+                    'raise SystemExit(int(os.environ["FAKE_GATE_EXIT"]))\n')
+                fake.chmod(0o700)
+                env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
+                           VALIDATION_ROOT=str(validation), GITHUB_RUN_ID='987654321', GITHUB_RUN_ATTEMPT='2')
+                release = workflow == 'release.yml'
+                diagnostics = (Path(env['HOME']) / 'localdev/engram-force-preparation-987654321-2/diagnostics'
+                               if release else validation / 'evidence/force-preparation')
+                command = ['swift' if release else str(validation / 'bin/swift-validation'),
+                           'test', '--force-resolved-versions']
+                if not release:
+                    command += ['--disable-index-store']
+                command += ['--skip-build', '--no-parallel', '--filter', selected]
+                expected = ['-B', 'scripts/run_native_tests.py', '--diagnostics-dir', str(diagnostics),
+                            '--timeout-seconds', '120', '--silence-seconds', '60']
+                for method in names:
+                    expected += ['--require-swift-test', method]
+                expected += ['--', *command]
+                section = step_section(workflow, name)
+                self.assertIn('timeout-minutes: 4', section)
+                self.assertNotIn('continue-on-error', section)
+                self.assertNotIn('|| true', section)
+                for code in (0, 29):
+                    # Intercept mkdir so release-path checks never write under the real HOME.
+                    result = subprocess.run(['/bin/bash', '-e', '-c', 'mkdir() { :; };\n' + run_block(workflow, name)],
+                        cwd=root, env=dict(env, FAKE_GATE_EXIT=str(code)), capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                    self.assertEqual(json.loads(log.read_text()), expected)
+        upload = step_section('release.yml', 'Upload force preparation diagnostics')
+        self.assertIn('if: ${{ always() }}', upload)
+        self.assertIn('~/localdev/engram-force-preparation-${{ github.run_id }}-${{ github.run_attempt }}/diagnostics/', upload)
+        self.assertIn('${{ env.VALIDATION_ROOT }}/evidence/', step_section('native-validation.yml', 'Upload explicit validation evidence'))
+
     def test_native_validation_uses_only_explicit_independent_prerequisites(self):
         workflow = 'native-validation.yml'
         text = (ROOT / '.github/workflows' / workflow).read_text()
@@ -244,6 +296,7 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
             self.assertEqual(re.findall(r'^        id: (.*)$', step_section(workflow, name), re.M), [step_id])
         prerequisites = {
             'Run full native release filter': 'native_build',
+            'Run force preparation regressions (serial)': 'native_build',
             'Run ledger BEGIN timing regression (serial)': 'native_build',
             'Collect ledger BEGIN contention diagnostics (serial)': 'native_build',
             'Run both statement budgets in separate serial processes': 'native_build',
