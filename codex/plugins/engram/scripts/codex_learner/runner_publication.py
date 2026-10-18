@@ -121,7 +121,7 @@ class Execution:
 
 class Publications:
     def __init__(self, root, config_path, plugin_root, *, legacy_paths=None, legacy_verify_locks=None,
-                 residual_paths=None, residual_verify_locks=None):
+                 residual_paths=None, residual_verify_locks=None, native_diagnostic=None):
         for path in (root, plugin_root):
             _require(isinstance(path, Path) and path.is_absolute()
                      and path.resolve(strict=True) == path, "untrusted_paths")
@@ -132,6 +132,7 @@ class Publications:
         self.root, self.config_path, self.plugin_root = root, config_path, plugin_root
         self._legacy_paths, self._legacy_verify_locks = legacy_paths, legacy_verify_locks
         self._residual_paths, self._residual_verify_locks = residual_paths, residual_verify_locks
+        self._native_diagnostic = native_diagnostic
 
     def paths(self, session_id):
         selected = admission.state_paths(self.root, session_id)
@@ -437,9 +438,13 @@ class Publications:
                          "retry_plan_changed")
                 if retry["retry_after"] > dt.datetime.now(dt.timezone.utc).timestamp():
                     return Continuation(request["request_id"])
-            execute = native_executor.executor(SimpleNamespace(manifest=manifest), context.transport)
+            def diagnostic(value):
+                if self._native_diagnostic is not None:
+                    self._native_diagnostic({'session_id': manifest['session_id'],
+                        'run_id': paths.run_dir.name, 'diagnostic': value})
+            execute = planned_execution.native_executor(paths.run_dir, context.transport, diagnostic=diagnostic)
             result = planned_execution.execute_plan(paths.run_dir, writer=writer,
-                validate_inputs=context.validate_inputs, execute=execute)
+                validate_inputs=context.validate_inputs, execute=execute, diagnostic=diagnostic)
             _require(result["plan_sha256"] == plan_digest and result["status"] in {"complete", "pending"},
                      "invalid_plan_result")
             if result["status"] == "complete":

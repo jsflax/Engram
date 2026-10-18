@@ -22,7 +22,7 @@ class PlanPublicationTests(unittest.TestCase):
         self.provider_runs, self.calls, self.ledger = [], [], {}
         self.failed = False
         self.patch = mock.patch.object(N, 'executor', return_value=self.apply)
-        self.patch.start()
+        self.factory = self.patch.start()
         self.addCleanup(self.patch.stop)
 
     def planning(self, root, run_dir, request, excerpt, config):
@@ -73,6 +73,9 @@ class PlanPublicationTests(unittest.TestCase):
     def test_partial_commit_resumes_without_provider_replay_or_enqueue_lock(self):
         old_state = self.f.state_path.read_bytes()
         outcome = self.process()
+        self.assertEqual(self.factory.call_args.kwargs['limits'].deadline_seconds, 30.0)
+        self.assertTrue(callable(self.factory.call_args.kwargs['diagnostic']))
+        self.assertEqual(N.P.ProbeLimits().deadline_seconds, 10.0)
         self.assertIsInstance(outcome, P.Continuation)
         self.assertEqual(len(self.ledger), 2)
         self.assertEqual(self.f.state_path.read_bytes(), old_state)

@@ -361,7 +361,70 @@ def reopen_registered_fixture(binary, db, expected_scope, *, environment, cwd, d
             client.close()
 
 
-def run_warm_startup(binary):
+def prepare_empty_seed(migration_binary, db, *, environment, cwd, deadline):
+    # The MCP's background backstop is optional, not a readiness protocol.
+    # Await the existing explicit native command on a new empty fixture first.
+    assert migration_binary is not None and migration_binary.is_file(), "Warm fixtures require --migration-binary"
+    assert db.parent.resolve() == Path(cwd).resolve(), "Migration database escaped fixture"
+    assert time.monotonic() < deadline, "Migration exceeded the original seed deadline before launch"
+    descriptor = os.open(db, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    os.close(descriptor)
+    command = [str(migration_binary), "migrate-embeddings", "--db", str(db), "--force"]
+    child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, env=environment, cwd=cwd)
+    output = bytearray()
+    selector = selectors.DefaultSelector()
+    try:
+        os.set_blocking(child.stdout.fileno(), False)
+        selector.register(child.stdout, selectors.EVENT_READ)
+        while selector.get_map() or child.poll() is None:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, "Migration exceeded the original seed deadline"
+            for key, _ in selector.select(min(0.1, remaining)):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                else:
+                    output.extend(chunk)
+                    assert len(output) <= 1024**2, "Migration output exceeded 1 MiB"
+        child.wait(timeout=max(0.01, deadline - time.monotonic()))
+        assert child.returncode == 0, f"Migration exited {child.returncode}"
+        lines = output.decode(errors="replace").splitlines()
+        assert lines.count("Embedding migration: complete — 0 re-embedded, vec index rebuilt") == 1, \
+            "Migration did not report one complete zero-row sweep"
+        assert lines.count("Done: 0 re-embedded, 0 failed.") == 1, "Migration reported incomplete/failed work"
+        assert time.monotonic() < deadline, "Migration exceeded the original seed deadline"
+        with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True,
+                                     timeout=min(1, deadline - time.monotonic()))) as reader:
+            assert reader.execute("SELECT COUNT(*) FROM Memory").fetchone()[0] == 0, "Migration fixture is not empty"
+            marker = reader.execute("SELECT value FROM HookState WHERE key = ?", ("embedding.spaceVersion",)).fetchall()
+            assert marker == [("2",)], "Migration did not persist the current embedding marker"
+        assert time.monotonic() < deadline, "Migration exceeded the original seed deadline"
+        return {"pid": child.pid, "clean_exit": child.returncode, "reembedded": 0, "failed": 0,
+                "stored_embedding_version": 2}
+    except BaseException:
+        print(json.dumps({"fixture_migration_failed": True, "output_tail": bounded_text_tail(bytes(output))}),
+              file=sys.stderr, flush=True)
+        raise
+    finally:
+        # Join only this owned child; the outer supervisor owns descendants.
+        for stop in (child.terminate, child.kill):
+            if child.poll() is not None:
+                break
+            try:
+                stop()
+            except ProcessLookupError:
+                break
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        child.wait(timeout=2)
+        selector.close()
+        child.stdout.close()
+
+
+def run_warm_startup(binary, migration_binary=None):
     configured_tmp = os.environ.get("TMPDIR")
     assert configured_tmp and Path(configured_tmp).is_dir(), "warm-startup requires an existing owned TMPDIR"
     started = time.monotonic()
@@ -371,17 +434,24 @@ def run_warm_startup(binary):
         for path in (root / "home", root / "home/.codex", root / "tmp"):
             path.mkdir(parents=True, exist_ok=True)
         env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C",
-               "HOME": str(root / "home"), "CFFIXED_USER_HOME": str(root / "home"),
-               "CODEX_HOME": str(root / "home/.codex"), "TMPDIR": str(root / "tmp") + "/"}
+               "CFFIXED_USER_HOME": str(root / "home"), "TMPDIR": str(root / "tmp") + "/"}
+        # Preserve account environment; Foundation and the explicit database
+        # select this disposable fixture's paths.
+        for name in ("HOME", "CODEX_HOME"):
+            if name in os.environ:
+                env[name] = os.environ[name]
         client = None
         cases = []
         token = uuid.uuid4().hex
         content = f"Warm startup keeper {token}: retain this exact identity and content under an independent writer."
-        phase = "seed_initialize"
+        phase = "seed_embedding_migration"
         try:
+            migration = prepare_empty_seed(migration_binary, db, environment=env, cwd=root,
+                                           deadline=started + 60)
             # A real initial process registers the complete production schema
             # and initializes the store. The remember also exercises normal
             # model readiness before any lock is acquired.
+            phase = "seed_initialize"
             client = Client(binary, db, environment=env, cwd=root, deadline=started + 60)
             client.initialize(protocol_version="2025-11-25")
             phase = "seed_remember"
@@ -452,6 +522,7 @@ def run_warm_startup(binary):
                               "seconds": round(time.monotonic() - started, 3),
                               "full_model_registry": True, "scope_unchanged": True,
                               "store_and_fingerprints_unchanged": True,
+                              "migration": migration,
                               "warmup_pid": warm_pid, "schema_reopen_pid": reopen_pid,
                               "cases": cases}), flush=True)
         finally:
@@ -483,7 +554,7 @@ def require_optional_open_logs(client, synced, groups):
         assert any(line.endswith(message) for line in client.stderr), f"Missing optional-open receipt: {message}"
 
 
-def run_warm_multistore_startup(binary):
+def run_warm_multistore_startup(binary, migration_binary=None):
     configured_tmp = os.environ.get("TMPDIR")
     assert configured_tmp and Path(configured_tmp).is_dir(), "warm-multistore-startup requires an existing owned TMPDIR"
     started = time.monotonic()
@@ -504,14 +575,19 @@ def run_warm_multistore_startup(binary):
             os.close(descriptor)
             assert path.stat().st_size == 0
         env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C",
-               "HOME": str(root / "home"), "CFFIXED_USER_HOME": str(root / "home"),
-               "CODEX_HOME": str(root / "home/.codex"), "TMPDIR": str(root / "tmp") + "/"}
+               "CFFIXED_USER_HOME": str(root / "home"), "TMPDIR": str(root / "tmp") + "/"}
+        for name in ("HOME", "CODEX_HOME"):
+            if name in os.environ:
+                env[name] = os.environ[name]
         token = uuid.uuid4().hex
         content = f"Multi-store startup keeper {token}: retain this local identity under independent writers on every store."
         stores = [db, synced, *(path for _, path in groups)]
         client = None
-        phase = "seed_initialize"
+        phase = "seed_embedding_migration"
         try:
+            migration = prepare_empty_seed(migration_binary, db, environment=env, cwd=root,
+                                           deadline=started + 60)
+            phase = "seed_initialize"
             client = Client(binary, db, environment=env, cwd=root, deadline=started + 60)
             client.initialize(protocol_version="2025-11-25")
             phase = "seed_remember"
@@ -603,6 +679,7 @@ def run_warm_multistore_startup(binary):
                               "protocol_seconds": round(protocol_seconds, 3),
                               "warmup_pid": warm_pid, "schema_reopen_pid": reopen_pid,
                               "locked_pid": locked_pid,
+                              "migration": migration,
                               "clean_exit": clean_exit}), flush=True)
         finally:
             close_warm_fixture(client, root, "warm-multistore-startup", phase)
@@ -723,13 +800,13 @@ def read_lock_holders(db):
         return holders
 
 
-def run(binary, case):
+def run(binary, case, migration_binary=None):
     if case == "persistence":
         return run_persistence(binary)
     if case == "warm-startup":
-        return run_warm_startup(binary)
+        return run_warm_startup(binary, migration_binary)
     if case == "warm-multistore-startup":
-        return run_warm_multistore_startup(binary)
+        return run_warm_multistore_startup(binary, migration_binary)
     with tempfile.TemporaryDirectory(prefix="engram-mcp-locks-") as directory:
         db = Path(directory) / "memory.sqlite"
         client = Client(binary, db)
@@ -794,6 +871,9 @@ def run(binary, case):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--migration-binary", type=Path,
+                        help="Explicit memory-sync/EngramDaemon executable; required by the two warm fixtures")
     parser.add_argument("--case", choices=["smoke", "idle", "recall", "startup", "warm-startup", "warm-multistore-startup", "persistence"], default="smoke")
     args = parser.parse_args()
-    run(args.binary.resolve(), args.case)
+    run(args.binary.resolve(), args.case,
+        args.migration_binary.resolve() if args.migration_binary is not None else None)

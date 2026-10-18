@@ -19,8 +19,12 @@ from types import SimpleNamespace
 
 from . import execution_manifest as J, learner_plan as P, migration as durable
 from . import operation_gateway as G, writer_fence as F
+from . import native_executor as N, operation_probe
 
 MAX_ATTEMPTS = 1024
+# A mutation also performs embedding/vector/transaction work after scope. Keep
+# read-only probes and reviewed-residual executor defaults at their own 10s.
+MUTATION_DEADLINE_SECONDS = 30.0
 
 
 class PlanRefused(ValueError):
@@ -93,12 +97,13 @@ def inspect_plan(run_dir):
             'memory_ids': sorted(memory_ids)}
 
 
-def native_executor(run_dir, transport, *, limits=None):
+def native_executor(run_dir, transport, *, limits=None, diagnostic=None):
     """Use the existing bounded exact-route native transport/cleanup contract."""
     from . import native_executor as N
     manifest, _ = J.read_manifest(run_dir)
     P.manifest_policy(manifest)
-    return N.executor(SimpleNamespace(manifest=manifest), transport, limits=limits)
+    limits = limits or operation_probe.ProbeLimits(deadline_seconds=MUTATION_DEADLINE_SECONDS)
+    return N.executor(SimpleNamespace(manifest=manifest), transport, limits=limits, diagnostic=diagnostic)
 
 
 def _durable_progress(run_dir):
@@ -120,7 +125,7 @@ def _durable_progress(run_dir):
     _require(inspect_plan(run_dir) == before, 'progress_changed')
 
 
-def execute_plan(run_dir, *, writer, validate_inputs, execute):
+def execute_plan(run_dir, *, writer, validate_inputs, execute, diagnostic=None):
     run_dir = J._private(Path(run_dir))
     manifest, manifest_sha = J.read_manifest(run_dir)
     _require(type(writer) is F.HeldFence and writer.mode == 'shared', 'shared_original_fence_required')
@@ -168,29 +173,40 @@ def execute_plan(run_dir, *, writer, validate_inputs, execute):
         J._publish_atomic(directory / f'{len(attempts):06d}.json', J.encode(attempt))
         check('before_plan_forward')
         reason = None
+        response_reason = 'transport_error'
+        detail = {}
         try:
             message = execute(native, writer, check)
-        except PlanRefused:
+        except (PlanRefused, operation_probe.ProbeError) as error:
+            N.observe(diagnostic, {'kind': 'native_plan_failure', 'operation_id': operation,
+                'reason': 'native_execution_refused', **N.failure_fields(error)})
             raise
-        except (OSError, ValueError, TimeoutError):
+        except (OSError, ValueError, TimeoutError) as error:
             reason = 'native_reply_unavailable'
+            detail = N.failure_fields(error)
         else:
             try:
                 _require(type(message) is dict and 'error' not in message, 'invalid_native_reply')
                 value = G.envelope(message.get('result'))
                 if value['kind'] == 'error':
                     reason = 'native_operation_unavailable'
+                    response_reason = 'backend_error'
+                    detail = {'native_error_code': value['code']}  # G.envelope checked the closed allowlist.
                 else:
                     J._keys(value, {'version', 'kind', 'receipt'})
                     _require(value['kind'] == 'committed', 'invalid_native_reply')
                     J._receipt(value['receipt'], J._json(native))
                     _require(value['receipt']['outcome'] != 'applied' or bool(value['receipt']['memoryIDs']),
                              'applied_without_memory_ids')
-            except (ValueError, TypeError, KeyError):
+            except (ValueError, TypeError, KeyError) as error:
                 reason = 'native_reply_invalid'
+                response_reason = 'invalid_response'
+                detail = N.failure_fields(error)
         if reason is not None:
             # Do not infer absence, success or fresh authority from uncertainty.
-            J.record_response(run_dir, operation, {'kind': 'unavailable', 'reason': 'transport_error'}, verify_fence=verify, atomic=True)
+            N.observe(diagnostic, {'kind': 'native_plan_failure', 'operation_id': operation,
+                'reason': reason, 'response_reason': response_reason, **detail})
+            J.record_response(run_dir, operation, {'kind': 'unavailable', 'reason': response_reason}, verify_fence=verify, atomic=True)
             check('after_plan_response')
             return dict(inspect_plan(run_dir), reason=reason)
         # Retain known commits before rechecking mutable source/admission. A

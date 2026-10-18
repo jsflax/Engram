@@ -1,16 +1,19 @@
 """In-process plan/fence/ledger fixtures; no provider, native or store access."""
 import copy
+import contextlib
 import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'codex/plugins/engram/scripts'))
 from codex_learner import learner_plan as P, planned_execution as E
 from codex_learner import execution_manifest as J, settlement as S, writer_fence as F
+from codex_learner import native_executor as N, operation_probe as Probe, execution_context as C
 
 SID = '01900000-0000-7000-8000-000000000001'
 STORE = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
@@ -342,6 +345,181 @@ class LearnerPlanTests(unittest.TestCase):
             self.assertEqual(self.execute()['status'], 'pending')
             with self.assertRaisesRegex(ValueError, 'attempt_limit'): self.execute()
         self.assertEqual(len(self.ledger.calls), 1)
+
+    def test_native_backend_error_is_distinct_and_keeps_exact_retry(self):
+        plan = self.seal(self.operations[:1]); observed = []
+        value = {'engram_operation': {'version': 1, 'kind': 'error', 'code': 'storage_unavailable'}}
+        message = {'result': {'isError': True, 'structuredContent': value,
+            'content': [{'type': 'text', 'text': J.encode(value).decode()}]}}
+        result = E.execute_plan(self.run, writer=self.writer, validate_inputs=lambda *_: True,
+                                execute=lambda *_: message, diagnostic=observed.append)
+        operation = plan['operations'][0]['operation_id']
+        self.assertEqual(result['status'], 'pending')
+        self.assertEqual(result['memory_ids'], [])
+        self.assertEqual(J.read_evidence(self.run, operation)[-1]['evidence'],
+                         {'kind': 'unavailable', 'reason': 'backend_error'})
+        self.assertEqual(observed[0]['native_error_code'], 'storage_unavailable')
+        self.assertEqual(self.execute()['status'], 'complete')
+        self.assertEqual(self.ledger.calls[0], (operation, J._unseal(plan['operations'][0]['request'])))
+
+    def test_invalid_native_envelope_does_not_log_payload_or_backend_code(self):
+        plan = self.seal(self.operations[:1]); observed = []
+        value = {'engram_operation': {'version': 1, 'kind': 'error', 'code': '/private/fixture-secret'}}
+        message = {'result': {'isError': True, 'structuredContent': value,
+            'content': [{'type': 'text', 'text': J.encode(value).decode()}]}}
+        result = E.execute_plan(self.run, writer=self.writer, validate_inputs=lambda *_: True,
+                                execute=lambda *_: message, diagnostic=observed.append)
+        self.assertEqual((result['status'], result['reason']), ('pending', 'native_reply_invalid'))
+        self.assertEqual(J.read_evidence(self.run, plan['operations'][0]['operation_id'])[-1]['evidence']['reason'],
+                         'invalid_response')
+        self.assertEqual(observed[0]['error_code'], 'operation_gateway_invalid_response')
+        self.assertNotIn('native_error_code', observed[0])
+        self.assertNotIn('fixture-secret', str(observed))
+
+    def test_context_error_code_and_probe_error_propagation_are_preserved(self):
+        plan = self.seal(self.operations[:1]); observed = []
+        def reject(*_): raise C.ContextError('execution_context_source_changed')
+        result = E.execute_plan(self.run, writer=self.writer, validate_inputs=lambda *_: True,
+                                execute=reject, diagnostic=observed.append)
+        operation = plan['operations'][0]['operation_id']
+        self.assertEqual((result['status'], observed[-1]['error_code']), ('pending', 'execution_context_source_changed'))
+        self.assertEqual(J.read_evidence(self.run, operation)[-1]['evidence']['reason'], 'transport_error')
+        before = J.read_evidence(self.run, operation)
+        def deadline(*_): raise Probe.ProbeError('residual_native_deadline')
+        with self.assertRaisesRegex(Probe.ProbeError, '^residual_native_deadline$'):
+            E.execute_plan(self.run, writer=self.writer, validate_inputs=lambda *_: True,
+                           execute=deadline, diagnostic=observed.append)
+        self.assertEqual(observed[-1]['error_code'], 'residual_native_deadline')
+        self.assertEqual(J.read_evidence(self.run, operation), before)
+        self.assertEqual(E.inspect_plan(self.run)['status'], 'pending')
+        self.assertEqual(self.ledger.effects, {})
+
+
+class NativeExecutorDiagnosticsTests(unittest.TestCase):
+    """Actual transport state machine with in-memory IO, no child or store."""
+    def exercise(self, *, timeout_at=None, invalid_at=None, check_error=None,
+                 cleanup_failed=False, observer_error=False, normal=False, apply_delay=.01):
+        scope = {'version': 1, 'storeID': STORE, 'principal': {'kind': 'agent', 'groupIds': [], 'scopes': []}}
+        request = {'operationID': MEMORY, 'expectedScope': scope, 'mutation': {'kind': 'remember'}}
+        scope_value = {'engram_operation': {'version': 1, 'kind': 'scope',
+                       'capability': Probe.CAPABILITY, 'scope': scope}}
+        messages = [
+            {'jsonrpc': '2.0', 'id': 1, 'result': {'protocolVersion': Probe.PROTOCOL_VERSION,
+                'capabilities': {'tools': {}}, 'serverInfo': {'name': 'fixture', 'version': '1'}}},
+            {'jsonrpc': '2.0', 'id': 2, 'result': {'isError': False, 'structuredContent': scope_value,
+                'content': [{'type': 'text', 'text': J.encode(scope_value).decode()}]}},
+            dict(receipt_envelope(request), id=MEMORY)]
+        if invalid_at is not None:
+            messages[invalid_at]['id'] = 'wrong-id'
+        clock, consumed, reports, sent = [0.0], [0], [], []
+        cleanup = {'child_reaped': True, 'cleanup_failed': cleanup_failed, 'cleanup_overrun': False}
+        child = SimpleNamespace(stdin=SimpleNamespace(fileno=lambda: 101), stdout=SimpleNamespace(fileno=lambda: 102))
+        selector = mock.Mock()
+        def select(timeout):
+            delay = apply_delay if consumed[0] == 2 else .01
+            if timeout_at == consumed[0] or delay >= timeout:
+                clock[0] += timeout
+                return []
+            clock[0] += delay
+            return [object()]
+        selector.select.side_effect = select
+        def read(*_):
+            value = messages[consumed[0]]; consumed[0] += 1
+            return J.encode(value) + b'\n'
+        def write(fd, raw):
+            sent.append(J._json(raw)); return len(raw)
+        def observer(value):
+            reports.append(value)
+            if observer_error: raise ValueError('/private/observer-failure')
+        def check(phase):
+            if check_error is not None and phase == 'before_native_forward': raise check_error
+        transport = {'command': '/fixture/native'}
+        driver = SimpleNamespace(manifest={'inputs': {'backend_route': J.seal_json(J.encode({'transport': transport}))}})
+        driver.manifest.update(provider_mode=P.MODE, session_id=SID,
+                               plan_policy={'max_tool_calls': 12, 'max_writes': 5})
+        driver.manifest['inputs']['backend_config'] = J.seal_json(J.encode({'memory': {
+            'enabled': True, 'disabled_tools': [], 'default_tools_approval_mode': 'approve', 'tools': {}}}))
+        writer = mock.Mock()
+        result = error = None
+        with contextlib.ExitStack() as stack:
+            for target, name, value in [
+                (N.time, 'monotonic', lambda: clock[0]), (N.selectors, 'DefaultSelector', lambda: selector),
+                (N.threading, 'current_thread', lambda: None), (N.J, '_request', lambda *_: request),
+                (N.J, 'read_manifest', lambda *_: (driver.manifest, 'a' * 64)),
+                (N.P.bridge, '_fenced_transport', lambda *_: (['/fixture/native'], {}, None, ())),
+                (N.subprocess, 'Popen', mock.Mock(return_value=child)),
+                (N.os, 'set_blocking', lambda *_: None), (N.os, 'write', write), (N.os, 'read', read)]:
+                stack.enter_context(mock.patch.object(target, name, value))
+            clean = stack.enter_context(mock.patch.object(N.P.bridge, '_cleanup', return_value=cleanup))
+            try:
+                execute = (E.native_executor(Path('/fixture'), transport, diagnostic=observer) if normal
+                           else N.executor(driver, transport, diagnostic=observer))
+                result = execute(J.encode(request), writer, check)
+            except Exception as caught:
+                error = caught
+            clean.assert_called_once_with(child, .25)
+        self.assertEqual(len(reports), 1)
+        self.assertTrue(reports[0]['cleanup']['child_reaped'])
+        return result, error, reports[0], sent
+
+    def test_success_has_bounded_phases_and_cleaned_child(self):
+        result, error, report, sent = self.exercise()
+        self.assertIsNone(error)
+        self.assertEqual(result['id'], MEMORY)
+        self.assertEqual(report['status'], 'response_received')
+        self.assertIsNone(report['failure'])
+        self.assertLessEqual(len(report['phases']), 14)
+        self.assertEqual([v['method'] for v in sent], ['initialize', 'notifications/initialized', 'tools/call', 'tools/call'])
+        self.assertNotIn('Fixture', str(report))
+
+    def test_scope_deadline_keeps_fixed_code_phase_and_original_bound(self):
+        result, error, report, sent = self.exercise(timeout_at=1)
+        self.assertIsNone(result)
+        self.assertIsInstance(error, Probe.ProbeError)
+        self.assertEqual(report['failure'], {'phase': 'waiting_scope', 'exception_type': 'ProbeError',
+                                            'error_code': 'residual_native_deadline'})
+        self.assertEqual(report['elapsed_seconds'], 10.0)
+        self.assertFalse(any(v.get('params', {}).get('name') == 'operation_apply' for v in sent))
+
+    def test_forward_validation_failure_prevents_apply_and_retains_code(self):
+        _, error, report, sent = self.exercise(check_error=C.ContextError('execution_context_backend_changed'))
+        self.assertIsInstance(error, C.ContextError)
+        self.assertEqual(report['failure']['phase'], 'validate_forward')
+        self.assertEqual(report['failure']['error_code'], 'execution_context_backend_changed')
+        self.assertFalse(any(v.get('params', {}).get('name') == 'operation_apply' for v in sent))
+
+    def test_cleanup_failure_keeps_preceding_protocol_failure(self):
+        _, error, report, _ = self.exercise(invalid_at=1, cleanup_failed=True)
+        self.assertEqual(str(error), 'residual_cleanup_failed')
+        self.assertEqual(report['failure']['phase'], 'cleanup')
+        self.assertEqual(report['failure']['preceding_failure']['error_code'], 'residual_invalid_response')
+
+    def test_observer_failure_cannot_change_return_or_mask_deadline(self):
+        result, error, _, _ = self.exercise(observer_error=True)
+        self.assertIsNotNone(result); self.assertIsNone(error)
+        _, error, report, _ = self.exercise(timeout_at=2, observer_error=True)
+        self.assertEqual(str(error), 'residual_native_deadline')
+        self.assertEqual(report['failure']['phase'], 'waiting_apply')
+
+    def test_arbitrary_exception_text_is_never_reported(self):
+        for text in ('/private/secret-path', 'secret payload text', 'secret_token'):
+            with self.subTest(text=text):
+                fields = N.failure_fields(ValueError(text))
+                self.assertEqual(fields, {'exception_type': 'ValueError'})
+
+    def test_normal_mutation_budget_accepts_delayed_reply_and_stops_at_thirty(self):
+        self.assertEqual(Probe.ProbeLimits().deadline_seconds, 10.0)
+        result, error, report, _ = self.exercise(normal=True, apply_delay=12)
+        self.assertIsNotNone(result); self.assertIsNone(error)
+        self.assertEqual(report['elapsed_seconds'], 12.02)
+        _, error, report, _ = self.exercise(normal=True, apply_delay=31)
+        self.assertEqual(str(error), 'residual_native_deadline')
+        self.assertEqual(report['failure']['phase'], 'waiting_apply')
+        self.assertEqual(report['elapsed_seconds'], 30.0)
+        # Existing reviewed-residual/default callers retain the former bound.
+        _, error, report, _ = self.exercise(apply_delay=12)
+        self.assertEqual(str(error), 'residual_native_deadline')
+        self.assertEqual(report['elapsed_seconds'], 10.0)
 
 
 if __name__ == '__main__':

@@ -222,7 +222,9 @@ jobs:
         id: release_build
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         timeout-minutes: 75
-        run: '"$VALIDATION_ROOT/bin/swift-validation" build --force-resolved-versions --disable-index-store -c release --product Engram'
+        run: |
+          "$VALIDATION_ROOT/bin/swift-validation" build --force-resolved-versions --disable-index-store -c release --product Engram
+          "$VALIDATION_ROOT/bin/swift-validation" build --force-resolved-versions --disable-index-store -c release --product EngramDaemon
 
       - name: Verify actual native MCP lifecycle and contention cases
         if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
@@ -233,11 +235,14 @@ jobs:
           cd "$VALIDATION_ROOT/repo"
           native_binary="$VALIDATION_ROOT/scratch/release/Engram"
           test -x "$native_binary"
+          migration_binary="$VALIDATION_ROOT/scratch/release/EngramDaemon"
+          test -x "$migration_binary"
           status=0
           for regression in smoke startup warm-startup warm-multistore-startup recall idle persistence; do
             python3 -B scripts/run_native_tests.py --diagnostics-dir "$VALIDATION_ROOT/evidence/mcp-$regression" \
               --timeout-seconds 180 --silence-seconds 90 -- \
-              python3 -B scripts/verify-mcp-locks.py --binary "$native_binary" --case "$regression" || status=1
+              python3 -B scripts/verify-mcp-locks.py --binary "$native_binary" \
+                --migration-binary "$migration_binary" --case "$regression" || status=1
           done
           exit "$status"
 
