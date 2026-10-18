@@ -549,6 +549,27 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(learner["health"]["progress"]["last_completed_interval"]["evidence"],"not_available_in_window")
         self.assertFalse(learner["health"]["recovery"]["automatic_replay_authorized"])
 
+    def test_verified_no_effect_failure_remains_failed_without_coverage(self):
+        self.durable_fixture(status="failed", reason="verified_no_effect_failure",
+                             attempted_write_calls=1, applied_write_calls=0, unchanged_write_calls=0)
+        learner = self.report()["learner"]
+        recorded = learner["latest_run"]["recorded_settlement"]
+        self.assertEqual(recorded["binding"], "session_hash_match")
+        self.assertEqual(recorded["metadata"]["reason"], "verified_no_effect_failure")
+        self.assertEqual(recorded["metadata"]["status"], "failed")
+        self.assertEqual(learner["health"]["progress"]["last_completed_interval"]["evidence"],
+                         "not_available_in_window")
+        self.assertNotEqual(learner["health"]["headline"], "reconciliation_required")
+        for change in ({"status": "succeeded"}, {"applied_write_calls": 1},
+                       {"unchanged_write_calls": 1}, {"attempted_write_calls": 0}):
+            with self.subTest(change=change):
+                values = {"status": "failed", "reason": "verified_no_effect_failure",
+                          "attempted_write_calls": 1, "applied_write_calls": 0,
+                          "unchanged_write_calls": 0, **change}
+                self.durable_fixture(**values)
+                recorded = self.report()["learner"]["latest_run"]["recorded_settlement"]
+                self.assertEqual(recorded["read"]["read_status"], "invalid_json")
+
     def test_settlement_schema_is_typed_scoped_bounded_and_never_reads_private_evidence(self):
         for change in ({"session_id":OTHER,"hook_session_id":SID},{"run_id":"../private"},
                        {"version":True},{"reason":"private reason"},{"attempted_write_calls":True},

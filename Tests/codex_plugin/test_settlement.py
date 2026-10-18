@@ -36,6 +36,8 @@ class SettlementTests(unittest.TestCase):
         values["parser_state"] = {"version": 1, "input": {"offset": 10, "recent_messages": [], "current_turn_id": None},
             "limits": {"max_chars": 24000, "max_scan_bytes": 8388608},
             "runtime": {"path": "/fixture/parser.py", "sha256": "b" * 64}, "interval_sha256": "c" * 64}
+        self.transport = {"command": "/fixture/not-executed"}
+        values["backend_route"] = {"transport": self.transport}
         values["next_parser_state"] = {"offset": 20, "recent_messages": [], "current_turn_id": None}
         inputs = {name: J.seal_json(J.encode(value)) for name, value in values.items()}
         self.scope = {"version": 1, "storeID": STORE, "principal": {"kind": "agent", "groupIds": [], "scopes": []}}
@@ -97,6 +99,168 @@ class SettlementTests(unittest.TestCase):
     def verify(self, digest, **overrides):
         return S.verify_settlement(self.run, expected_sha256=digest, recovery_fence=self.revoke(),
                                     validate_inputs=overrides.get("validate", lambda *_: True))
+
+    def failed_write(self, call=1):
+        operation, _ = self.gateway.prepare(call, "remember", {
+            "content": "private fixture", "source": "fixture", "is_private": True})
+        self.gateway.unavailable(operation, "backend_error")
+        self.audit.extend([{"event": "tool_call", "id": call, "tool": "remember"},
+            {"event": "tool_result", "id": call, "tool": "remember", "ok": False,
+             "forwarded": True, "memory_ids": []}])
+        self.observation.update(returncode=1, turn_completed=False, provider_error=True, tool_errors=1)
+        return operation
+
+    def prove_absence(self, *, response=None, validate=None):
+        if not (self.run / "provider-observation.json").exists():
+            S.persist_observation(self.run, self.observation)
+        def probe(transport, **kwargs):
+            self.assertEqual(transport, self.transport)
+            self.assertEqual(kwargs["recovery_fence"].mode, "exclusive")
+            self.assertTrue(kwargs["recovery_fence"].verify(self.binding))
+            self.assertTrue(kwargs["validate_inputs"]("after_probe_cleanup"))
+            return [{"kind": "absent", "operationID": item["operationID"], "scope": self.scope}
+                    if response is None else response for item in kwargs["requests"]]
+        with mock.patch.object(S.operation_probe, "probe_statuses", side_effect=probe) as observed:
+            result = S.reconcile_statuses(self.run, manifest_sha256=self.digest,
+                recovery_fence=self.revoke(), transport=self.transport,
+                validate_inputs=validate or (lambda *_: True))
+        return result, observed.call_count
+
+    def test_absence_proof_is_retryable_failure_never_coverage_or_replay(self):
+        self.dispatch(); self.failed_write(); self.finish_files()
+        counts, calls = self.prove_absence()
+        self.assertEqual((counts["absent"], calls), (1, 1))
+        first = (self.run / S.ABSENCE_CHECKPOINT).read_bytes()
+        # Crash/re-entry reuses the exact proof without another native query.
+        self.assertEqual(self.prove_absence()[1], 0)
+        self.assertEqual((self.run / S.ABSENCE_CHECKPOINT).read_bytes(), first)
+        result = self.settle(observation=False)
+        self.assertEqual((result["status"], result["reason"]), ("failed", "verified_no_effect_failure"))
+        self.assertEqual(result["memory_ids"], [])
+        self.assertEqual(result["audit"]["tool_errors"], 1)
+        self.assertEqual(result["source"], {"start_offset": 10, "end_offset": 20})
+        self.assertFalse((self.run / "successful-coverage.json").exists())
+        self.assertEqual(self.verify(result["settlement_sha256"])["status"], "failed")
+        with self.assertRaisesRegex(ValueError, "redispatch"):
+            J.record_dispatch(self.run, result["operations"][0]["operation_id"],
+                              verify_fence=self.recovery.verify)
+
+    def test_absence_clean_interruption_is_failed_but_bad_interruption_stays_held(self):
+        self.dispatch(); operation = self.failed_write(); self.finish_files(interrupt=True)
+        self.prove_absence()
+        result = self.settle(observation=False)
+        self.assertEqual((result["status"], result["reason"]), ("failed", "verified_no_effect_failure"))
+        self.assertFalse((self.run / "successful-coverage.json").exists())
+        rows = [J._json(line) for line in (self.run / "mcp-audit.jsonl").read_bytes().splitlines()]
+        for change in ("missing_result", "after_finish", "second_interrupt", "unreaped", "overrun",
+                       "owner_not_started", "owner_not_terminated", "unexpected_tool", "unpaired_write"):
+            with self.subTest(change=change):
+                entries, observation = copy.deepcopy(rows), copy.deepcopy(self.observation)
+                if change == "missing_result": del entries[2]
+                elif change == "after_finish": entries.append({"event": "relay_started"})
+                elif change == "second_interrupt": entries.insert(-1, {"event": "relay_interrupted"})
+                elif change == "unreaped": entries[-1]["child_reaped"] = False
+                elif change == "overrun": entries[-1]["cleanup_overrun"] = True
+                elif change == "owner_not_started": observation["started"] = False
+                elif change == "owner_not_terminated": observation["terminated"] = False
+                elif change == "unexpected_tool": observation["unexpected_tool"] = True
+                else: entries[1]["id"] = entries[2]["id"] = "unpaired"
+                with self.assertRaises(ValueError):
+                    S._audit(b"".join(J.encode(row) + b"\n" for row in entries), self.run,
+                             observation, {operation})
+        with self.assertRaises(ValueError):
+            S._audit(b"".join(J.encode(row) + b"\n" for row in rows), self.run, self.observation)
+
+    def test_absence_before_revocation_without_checkpoint_stays_held(self):
+        self.dispatch(); operation = self.failed_write(); self.finish_files()
+        J.record_response(self.run, operation, {"kind": "absent", "operationID": operation,
+            "scope": self.scope}, verify_fence=self.writer.verify)
+        self.assertEqual(self.settle()["status"], "reconciliation_required")
+
+    def test_absence_checkpoint_missing_partial_changed_or_later_unknown_stays_held(self):
+        for change in ("missing", "partial", "inventory", "scope", "later_unknown"):
+            with self.subTest(change=change):
+                self.setUp(); self.dispatch(); operation = self.failed_write(); self.finish_files()
+                self.prove_absence()
+                path = self.run / S.ABSENCE_CHECKPOINT
+                if change == "missing": path.unlink()
+                elif change == "partial": path.write_bytes(b'{"partial":')
+                elif change in ("inventory", "scope"):
+                    value = J._json(path.read_bytes())
+                    if change == "inventory": value["inventory_sha256"] = "0" * 64
+                    else: value["manifest_sha256"] = "0" * 64
+                    path.write_bytes(J.encode(value))
+                else:
+                    J.record_response(self.run, operation, {"kind": "unavailable", "reason": "transport_error"},
+                                      verify_fence=self.recovery.verify)
+                self.assertEqual(self.settle(observation=False)["status"], "reconciliation_required")
+                self.assertFalse((self.run / "successful-coverage.json").exists())
+
+    def test_absence_error_wrong_scope_or_lost_status_never_creates_proof(self):
+        for response in ({"kind": "unavailable", "reason": "backend_error"},
+                         {"kind": "absent", "operationID": MEMORY, "scope": self.scope},
+                         {"kind": "absent", "operationID": MEMORY,
+                          "scope": {**self.scope, "storeID": MEMORY}}):
+            with self.subTest(response=response["kind"]):
+                self.setUp(); self.dispatch(); self.failed_write(); self.finish_files()
+                with self.assertRaises(ValueError): self.prove_absence(response=response)
+                self.assertFalse((self.run / S.ABSENCE_CHECKPOINT).exists())
+                self.assertEqual(self.settle(observation=False)["status"], "reconciliation_required")
+        self.setUp(); self.dispatch(); self.failed_write(); self.finish_files(); self.revoke()
+        with mock.patch.object(S.operation_probe, "probe_statuses", side_effect=S.operation_probe.ProbeError("operation_probe_deadline")):
+            with self.assertRaises(S.operation_probe.ProbeError):
+                S.reconcile_statuses(self.run, manifest_sha256=self.digest, recovery_fence=self.recovery,
+                                     transport=self.transport, validate_inputs=lambda *_: True)
+        self.assertFalse((self.run / S.ABSENCE_CHECKPOINT).exists())
+        self.assertEqual(self.settle()["status"], "reconciliation_required")
+
+    def test_absence_mixed_with_any_commit_cannot_create_retry_proof(self):
+        for outcome in ("applied", "unchanged"):
+            with self.subTest(outcome=outcome):
+                self.setUp(); self.dispatch(); self.write(1, outcome=outcome); self.failed_write(2); self.finish_files()
+                self.assertEqual(self.prove_absence()[0]["absent"], 1)
+                self.assertFalse((self.run / S.ABSENCE_CHECKPOINT).exists())
+                result = self.settle(observation=False)
+                self.assertEqual(result["status"], "reconciliation_required")
+                self.assertEqual(result["memory_ids"], [MEMORY] if outcome == "applied" else [])
+
+    def test_absence_requires_whole_cohort_and_correlated_clean_audit(self):
+        for invalid in ("orphan_intent", "missing_call", "wrong_tool", "cleanup", "missing_result", "unexpected_tool"):
+            with self.subTest(invalid=invalid):
+                self.setUp(); self.dispatch(); self.failed_write()
+                if invalid == "orphan_intent":
+                    self.gateway.prepare("extra", "remember", {"content": "other", "source": "fixture", "is_private": True})
+                elif invalid == "missing_call": del self.audit[1]
+                elif invalid == "wrong_tool": self.audit[1]["tool"] = self.audit[2]["tool"] = "update"
+                elif invalid == "missing_result": self.audit.pop()
+                elif invalid == "unexpected_tool": self.observation["unexpected_tool"] = True
+                self.finish_files()
+                if invalid == "cleanup":
+                    path = self.run / "mcp-audit.jsonl"
+                    rows = [J._json(line) for line in path.read_bytes().splitlines()]
+                    rows[-1]["child_reaped"] = False
+                    path.write_bytes(b"".join(J.encode(row) + b"\n" for row in rows))
+                self.prove_absence()
+                self.assertEqual(self.settle(observation=False)["status"], "reconciliation_required")
+
+    def test_absence_source_or_fence_change_refuses_publication(self):
+        for phase in ("before_status_probe", "before_absence_checkpoint", "after_absence_checkpoint"):
+            with self.subTest(phase=phase):
+                self.setUp(); self.dispatch(); self.failed_write(); self.finish_files()
+                with self.assertRaises(ValueError):
+                    self.prove_absence(validate=lambda _manifest, at: at != phase)
+                self.assertFalse((self.run / "settlement.json").exists())
+        self.setUp(); self.dispatch(); self.failed_write(); self.finish_files()
+        with self.assertRaisesRegex(ValueError, "exclusive_fence_required"):
+            S.reconcile_statuses(self.run, manifest_sha256=self.digest, recovery_fence=self.writer,
+                                 transport=self.transport, validate_inputs=lambda *_: True)
+        self.revoke().close()
+        with self.assertRaises(ValueError): self.prove_absence()
+
+    def test_absence_proof_does_not_invent_missing_provider_outcome(self):
+        self.dispatch(); self.failed_write(); self.finish_files(); self.prove_absence()
+        (self.run / "provider-observation.json").unlink()
+        self.assertEqual(self.settle(observation=False)["status"], "reconciliation_required")
 
     def test_applied_receipt_audit_and_provider_completion_create_exact_coverage(self):
         self.dispatch(); self.write(); self.finish_files()

@@ -20,6 +20,7 @@ WRITE_TOOLS = {"remember", "update", "connect"}
 FIXED = ("provider-dispatch.json", "provider-observation.json", "mcp-audit.jsonl", "result.json")
 MAX_FILES = 4096
 MAX_TOTAL = 32 * 1024 * 1024
+ABSENCE_CHECKPOINT = "absent-status-reconciliation.json"
 
 
 def _require(ok, reason):
@@ -105,6 +106,10 @@ def _snapshot(run_dir):
         return raw
     for name in FIXED:
         raw_fixed[name] = read(run_dir / name, name, True)
+    # Keep old settlement snapshots byte-compatible when no new checkpoint exists.
+    checkpoint = run_dir / ABSENCE_CHECKPOINT
+    raw_fixed[ABSENCE_CHECKPOINT] = (read(checkpoint, ABSENCE_CHECKPOINT)
+                                        if os.path.lexists(checkpoint) else None)
     operation_ids, evidence_ids = set(), set()
     with os.scandir(run_dir) as entries:
         for count, entry in enumerate(entries):
@@ -130,6 +135,42 @@ def _snapshot(run_dir):
     return files, raw_fixed, sorted(operation_ids)
 
 
+def _revocation_evidence(run_dir, manifest):
+    raw, identity = durable._read(run_dir / writer_fence.REVOCATION_NAME)
+    _require(_same(journal._json(raw), {"version": 1, "status": "revoked",
+                                       "binding": manifest["fencing"]}), "revocation_changed")
+    return {"sha256": journal.sha256(raw), "identity": identity}
+
+
+def _absence_checkpoint(run_dir, manifest, digest, files, raw, operations):
+    """Validate post-revocation proof, never interpret a bare absent event as safe.
+
+    This proof can only make a clean failed run retryable with its cursor intact.
+    It cannot authorize replay, clear an old hold, or create successful coverage.
+    """
+    if raw is None:
+        return set()
+    value = journal._json(raw)
+    journal._keys(value, {"version", "kind", "manifest_sha256", "fencing", "revocation",
+                          "inventory_sha256", "operation_ids"})
+    journal._version(value["version"])
+    inventory = {key: item for key, item in files.items() if key != ABSENCE_CHECKPOINT}
+    _require(value["kind"] == "revoked_all_operations_absent"
+             and value["manifest_sha256"] == digest
+             and _same(value["fencing"], manifest["fencing"])
+             and _same(value["revocation"], _revocation_evidence(run_dir, manifest))
+             and value["inventory_sha256"] == journal.sha256(journal.encode(inventory))
+             and type(value["operation_ids"]) is list
+             and value["operation_ids"] == operations and 0 < len(operations) <= 32,
+             "absence_checkpoint_changed")
+    for operation in operations:
+        events = journal.read_evidence(run_dir, operation)
+        kinds = [event["evidence"]["kind"] for event in events]
+        _require(bool(kinds) and kinds[0] == "dispatch" and kinds[-1] == "absent"
+                 and "committed" not in kinds, "absence_checkpoint_unsettled")
+    return set(operations)
+
+
 def reconcile_statuses(run_dir, *, manifest_sha256, recovery_fence, transport,
                        validate_inputs, limits=None):
     """Recover observations for unresolved dispatches; never replay a mutation.
@@ -146,7 +187,13 @@ def reconcile_statuses(run_dir, *, manifest_sha256, recovery_fence, transport,
              and _same(selected_transport, route["transport"]), "backend_route_changed")
     _validate(manifest, recovery_fence, validate_inputs, "before_status_reconciliation")
     _require(not os.path.lexists(run_dir / "settlement.json"), "already_settled")
-    baseline, _, operations = _snapshot(run_dir)
+    baseline, fixed, operations = _snapshot(run_dir)
+    if fixed[ABSENCE_CHECKPOINT] is not None:
+        absent = _absence_checkpoint(run_dir, manifest, digest, baseline,
+                                     fixed[ABSENCE_CHECKPOINT], operations)
+        _validate(manifest, recovery_fence, validate_inputs, "after_absence_checkpoint_read")
+        _require(_same(_snapshot(run_dir)[0], baseline), "evidence_changed")
+        return {"requested": len(absent), "committed": 0, "absent": len(absent), "already_committed": 0}
     requests, event_counts, already_committed = [], {}, 0
     for operation in operations:
         _, request = journal.read_intent(run_dir, operation)
@@ -200,10 +247,29 @@ def reconcile_statuses(run_dir, *, manifest_sha256, recovery_fence, transport,
         counts[response["kind"]] += 1
         validate("after_status_evidence")
     validate("after_status_reconciliation")
+    if requests and counts["absent"] == len(operations) == len(requests) and not already_committed:
+        # The exact native probe completed, cleaned up, and revalidated the held
+        # EX fence before any evidence was appended. Publish only after ALL
+        # selected operations were freshly observed absent on the sealed route.
+        validate("before_absence_checkpoint")
+        checkpoint = {"version": 1, "kind": "revoked_all_operations_absent",
+            "manifest_sha256": digest, "fencing": manifest["fencing"],
+            "revocation": _revocation_evidence(run_dir, manifest),
+            "inventory_sha256": journal.sha256(journal.encode(baseline)), "operation_ids": operations}
+        checkpoint_raw = journal.encode(checkpoint)
+        journal._publish(run_dir / ABSENCE_CHECKPOINT, checkpoint_raw)
+        current, fixed, selected = _snapshot(run_dir)
+        _require(ABSENCE_CHECKPOINT not in baseline
+                 and current[ABSENCE_CHECKPOINT]["sha256"] == journal.sha256(checkpoint_raw)
+                 and _same({key: item for key, item in current.items() if key != ABSENCE_CHECKPOINT}, baseline),
+                 "evidence_changed")
+        baseline = current
+        validate("after_absence_checkpoint")
+        _absence_checkpoint(run_dir, manifest, digest, current, fixed[ABSENCE_CHECKPOINT], selected)
     return counts
 
 
-def _operations(run_dir, operation_ids):
+def _operations(run_dir, operation_ids, verified_absent=frozenset()):
     records, applied, unchanged, uncertain = [], [], [], False
     for operation in operation_ids:
         mutation = None
@@ -216,7 +282,8 @@ def _operations(run_dir, operation_ids):
             receipt = receipts[-1] if receipts else None
             dispatched = "dispatch" in kinds
             settled = dispatched and kinds[0] == "dispatch" and kinds[-1] == "committed" and receipt is not None
-            uncertain |= dispatched and not settled or receipt is not None and not settled
+            absent = operation in verified_absent and dispatched and kinds[-1] == "absent" and receipt is None
+            uncertain |= dispatched and not settled and not absent or receipt is not None and not settled
             # A later unavailable observation cannot erase an already validated
             # commit. Keep its effect IDs while retaining the uncertainty hold.
             if receipt is not None:
@@ -232,7 +299,7 @@ def _operations(run_dir, operation_ids):
     return records, applied, unchanged, uncertain
 
 
-def _audit(raw, run_dir, observation):
+def _audit(raw, run_dir, observation, verified_absent=frozenset()):
     _require(raw is not None and raw.endswith(b"\n") and len(raw) <= 4 * 1024 * 1024, "audit_missing_or_partial")
     calls, results, started, finished, interrupted = {}, {}, False, False, False
     for index, line in enumerate(raw.splitlines()):
@@ -255,9 +322,14 @@ def _audit(raw, run_dir, observation):
             continue
         _require(not interrupted, "audit_after_interrupt")
         if event == "relay_interrupted":
-            _require(value == {"event": event} and observation is not None and _provider_clean(observation)
+            failed_no_effect = (bool(verified_absent) and observation is not None
+                                and observation["started"] and observation["terminated"]
+                                and not observation["unexpected_tool"])
+            _require(value == {"event": event} and observation is not None
+                     and (_provider_clean(observation) or failed_no_effect)
                      and bool(calls) and set(calls) == set(results)
-                     and all(v["ok"] is True for v in results.values()), "audit_unclean_interrupt")
+                     and (all(v["ok"] is True for v in results.values()) or failed_no_effect),
+                     "audit_unclean_interrupt")
             interrupted = True
             continue
         if event == "initialize_compat":
@@ -283,7 +355,15 @@ def _audit(raw, run_dir, observation):
     for key, call in calls.items():
         result = results[key]
         if call["tool"] in WRITE_TOOLS and result["forwarded"]:
-            gateway.verify_audit_receipt(run_dir, call["id"], call["tool"], result)
+            if result["ok"]:
+                gateway.verify_audit_receipt(run_dir, call["id"], call["tool"], result)
+            else:
+                operation = journal.operation_id(run_dir, gateway.call_key(call["id"]))
+                _require(operation in verified_absent and result["memory_ids"] == []
+                         and not any(name.startswith("operation_") for name in result),
+                         "audit_failed_write_unverified")
+                _, request = journal.read_intent(run_dir, operation)
+                _require(request["mutation"]["kind"] == call["tool"], "audit_tool_changed")
             forwarded.append(call["id"])
         else:
             _require(not any(name.startswith("operation_") for name in result)
@@ -313,7 +393,14 @@ def _result(raw, memory_ids):
 def _compute(run_dir, manifest, digest):
     files, raw, operation_ids = _snapshot(run_dir)
     issues = []
-    records, applied, unchanged, uncertain = _operations(run_dir, operation_ids)
+    verified_absent = set()
+    try:
+        verified_absent = _absence_checkpoint(run_dir, manifest, digest, files,
+                                              raw[ABSENCE_CHECKPOINT], operation_ids)
+    except (ValueError, TypeError, KeyError, OSError):
+        issues.append("invalid_absence_reconciliation")
+    records, applied, unchanged, uncertain = _operations(run_dir, operation_ids, verified_absent)
+    uncertain |= bool(issues)
     if any(record.get("evidence_valid") is False for record in records):
         issues.append("invalid_operation_evidence")
     observation, dispatch = None, raw["provider-dispatch.json"]
@@ -339,7 +426,7 @@ def _compute(run_dir, manifest, digest):
     audit = None
     if not (never_dispatched or positive_no_start):
         try:
-            audit = _audit(raw["mcp-audit.jsonl"], run_dir, observation)
+            audit = _audit(raw["mcp-audit.jsonl"], run_dir, observation, verified_absent)
         except (ValueError, TypeError, KeyError, OSError):
             issues.append("audit_unsettled")
             uncertain = True
@@ -348,6 +435,9 @@ def _compute(run_dir, manifest, digest):
         uncertain = True
     elif observation is not None and not observation["terminated"]:
         issues.append("provider_not_terminated")
+        uncertain = True
+    if verified_absent and observation is not None and observation["unexpected_tool"]:
+        issues.append("unexpected_provider_effect")
         uncertain = True
     memory_ids = sorted({journal._uuid(value) for receipt in applied for value in receipt["memoryIDs"]})
     result_valid = False
@@ -362,7 +452,9 @@ def _compute(run_dir, manifest, digest):
                and len(records) == len(applied) + len(unchanged))
     status = "succeeded" if success else ("reconciliation_required" if uncertain or applied else "failed")
     reason = "verified_completion" if success else ("never_dispatched" if never_dispatched else
-             "provider_not_started" if positive_no_start else "unverified_completion")
+             "provider_not_started" if positive_no_start else
+             "verified_no_effect_failure" if verified_absent and not uncertain and not issues and not applied else
+             "unverified_completion")
     return {"version": 1, "kind": "learner_settlement", "manifest_sha256": digest,
             "session_id": manifest["session_id"], "run_id": manifest["run_id"], "fencing": manifest["fencing"],
             "source": {key: manifest["source"][key] for key in ("start_offset", "end_offset")},

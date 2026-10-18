@@ -181,7 +181,7 @@ class RunnerTests(unittest.TestCase):
                     raise errors[0]
 
     def fake_codex(self, *, events=None, result=None, exit_code=0, delay=0, read_stdin=True, audit_events=None, write_audit=True, audit_rows=None):
-        events = events if events is not None else [mcp_event(), {"type": "turn.completed"}]
+        events = [{"type": "turn.started"}] + (events if events is not None else [mcp_event(), {"type": "turn.completed"}])
         audit_events = events if audit_events is None else audit_events
         result = result if result is not None else {"outcome": "no_new_memories", "summary": "Already represented.", "memory_ids": []}
         script = self.base / "fake-codex"
@@ -700,7 +700,7 @@ class RunnerTests(unittest.TestCase):
         self.assertGreaterEqual(result["tool_errors"], 1)
 
     def test_provider_error_or_nonzero_exit_rejects_claimed_success(self):
-        result = self.provider_run(events=[mcp_event(), {"type": "error", "message": "fixture failure"}, {"type": "turn.completed"}])
+        result = self.provider_run(events=[mcp_event(), {"type": "turn.failed", "error": {"message": "fixture failure"}}, {"type": "turn.completed"}])
         self.assertEqual(result["status"], "failed")
         result = self.provider_run(exit_code=1)
         self.assertEqual(result["status"], "failed")

@@ -145,7 +145,7 @@ class BudgetGuidanceTests(unittest.TestCase):
 
                     def __init__(self, argv, **kwargs):
                         captured.append(kwargs["stdin"].read().decode())
-                        kwargs["stdout"].write(b'{"type":"turn.completed"}\n')
+                        kwargs["stdout"].write(b'{"type":"turn.started"}\n{"type":"turn.completed"}\n')
                         kwargs["stdout"].flush()
 
                     def poll(self):

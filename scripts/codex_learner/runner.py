@@ -290,12 +290,30 @@ RESULT_SCHEMA = {"type": "object", "additionalProperties": False,
 
 def observe_event(event: dict, observed: dict) -> None:
     kind = event.get("type")
-    if kind in {"error", "turn.failed"}:
+    if kind == "turn.started":
+        observed["provider_turn_starts"] = observed.get("provider_turn_starts", 0) + 1
+        if observed["provider_turn_starts"] != 1 or observed["turn_completed"]:
+            observed["provider_error"] = True
+    if kind == "error":
+        # Codex emits nonterminal error notices while reconnecting a stream.
+        # A later completed turn still needs every independent receipt/result
+        # check. Terminal failures, malformed notices and post-completion errors
+        # remain sticky; notice prose never grants completion authority.
+        observed["provider_notices"] = observed.get("provider_notices", 0) + 1
+        if (set(event) != {"type", "message"} or type(event.get("message")) is not str
+                or not event["message"] or observed["turn_completed"]
+                or observed.get("provider_turn_starts") != 1):
+            observed["provider_error"] = True
+    if kind == "turn.failed":
         observed["provider_error"] = True
     if kind == "turn.completed":
+        if observed["turn_completed"] or observed.get("provider_turn_starts") != 1:
+            observed["provider_error"] = True
         observed["turn_completed"] = True
     if kind not in {"item.started", "item.completed"}:
         return
+    if observed["turn_completed"]:
+        observed["provider_error"] = True
     item = event.get("item", {})
     if item.get("type") in {"command_execution", "file_change", "web_search", "collab_tool_call", "image_generation"}:
         observed["unexpected_tool"] = True
@@ -372,7 +390,8 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict) -
     env[GUARD] = "1"
     env["CLAUDE_MEMORY_LEARNER"] = "1"
     observed = {"seen": set(), "tool_calls": 0, "write_calls": 0, "writes": [],
-                "tool_errors": 0, "provider_error": False, "unexpected_tool": False, "turn_completed": False}
+                "tool_errors": 0, "provider_error": False, "provider_notices": 0, "provider_turn_starts": 0,
+                "unexpected_tool": False, "turn_completed": False}
     initial = {"status": "running", "started_at": utc(), "session_id": request["session_id"],
                "event": request["event"], "end_offset": excerpt.next_offset}
     atomic_json(run_dir / "run.json", initial)
