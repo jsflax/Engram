@@ -110,6 +110,33 @@ def prepare(root):
     }, indent=2) + '\n')
     return {'prepared': str(target), 'expected_tests': len(expected)}
 
+def dependency_checkouts(repo, pins, dependencies):
+    """Xcode adds the local package itself to SwiftPM's managed dependencies."""
+    expected = {pin['identity'] for pin in pins}
+    require(len(pins) == len(expected) == 46, 'dependency pins changed')
+    checkouts = {}
+    seen = set()
+    local = None
+    for entry in dependencies:
+        reference = entry['packageRef']
+        identity = reference['identity']
+        require(identity not in seen, 'duplicate dependency identity')
+        seen.add(identity)
+        if identity in expected:
+            require(reference['kind'] == 'remoteSourceControl', 'pinned dependency is not remote')
+            checkouts[identity] = entry['subpath']
+        else:
+            # The only additional package is this exact, already hash-checked repo.
+            require(local is None and reference['kind'] in ('root', 'fileSystem')
+                    and reference['name'] == 'Engram'
+                    and identity in ('engram', repo.name.lower())
+                    and reference['location'] == str(repo)
+                    and entry['state'] == {'name': 'fileSystem', 'path': str(repo)}
+                    and entry.get('basedOn') is None, 'unexpected local dependency')
+            local = reference
+    require(set(checkouts) == expected, 'dependency set changed')
+    return checkouts, local
+
 def verify_inputs(root):
     repo = root / 'repo'
     identity = json.loads((root / 'evidence/source-identity.json').read_text())
@@ -129,9 +156,12 @@ def verify_inputs(root):
     for path in ('Package.resolved', 'Engram.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved'):
         require((repo / path).read_bytes() == original_lock, 'dependency lock changed')
     pins = json.loads(original_lock)['pins']
-    state = json.loads((root / 'scratch/workspace-state.json').read_text())['object']['dependencies']
-    checkouts = {entry['packageRef']['identity']: entry['subpath'] for entry in state}
-    require(len(pins) == 46 and set(checkouts) == {pin['identity'] for pin in pins}, 'dependency set changed')
+    suffix = 'final' if (root / 'evidence/inputs-initial.json').exists() else 'initial'
+    state_bytes = (root / 'scratch/workspace-state.json').read_bytes()
+    with (root / 'evidence' / ('workspace-state-' + suffix + '.json')).open('xb') as output:
+        output.write(state_bytes)
+    state = json.loads(state_bytes)['object']['dependencies']
+    checkouts, local = dependency_checkouts(repo, pins, state)
     heads = {}
     for pin in pins:
         checkout = owned(root, root / 'scratch/checkouts' / checkouts[pin['identity']])
@@ -140,8 +170,9 @@ def verify_inputs(root):
         heads[pin['identity']] = head
     result = {'source_sha': identity['source_sha'], 'source_files': len(identity['files_sha256']),
               'lock_sha256': hashlib.sha256(original_lock).hexdigest(), 'pins': pins,
-              'actual_checkout_heads': heads, 'sdk_mirrors_preserved': True}
-    destination = root / 'evidence' / ('inputs-final.json' if (root / 'evidence/inputs-initial.json').exists() else 'inputs-initial.json')
+              'actual_checkout_heads': heads, 'sdk_mirrors_preserved': True,
+              'local_package_reference': local, 'workspace_state_sha256': hashlib.sha256(state_bytes).hexdigest()}
+    destination = root / 'evidence' / ('inputs-' + suffix + '.json')
     require(not destination.exists(), 'input verification receipt already exists')
     destination.write_text(json.dumps(result, indent=2) + '\n')
     return {'input_receipt': str(destination), 'source_files': result['source_files'], 'pins': len(pins)}

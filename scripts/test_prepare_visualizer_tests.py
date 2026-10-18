@@ -2,6 +2,7 @@
 """Pure launch-description checks; never invokes Xcode, a host, or a store."""
 import copy
 import importlib.util
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -91,5 +92,44 @@ class HostPreparationTests(unittest.TestCase):
             self.assertFalse((root / 'fixtures/app-memory.sqlite').exists(), 'preparation must never launch a host')
             with self.assertRaisesRegex(ValueError, 'path outside'):
                 M.owned(root, root.parent)
+
+class DependencyPreparationTests(unittest.TestCase):
+    def setUp(self):
+        self.repo = Path('/owned/repo')
+        self.pins = json.loads((Path(__file__).parents[1] / 'Package.resolved').read_text())['pins']
+        self.remote = [{'packageRef': {'identity': pin['identity'], 'kind': 'remoteSourceControl'},
+                        'subpath': pin['identity']} for pin in self.pins]
+        self.local = {'packageRef': {'identity': 'repo', 'kind': 'fileSystem',
+                                     'name': 'Engram', 'location': str(self.repo)},
+                      'state': {'name': 'fileSystem', 'path': str(self.repo)},
+                      'basedOn': None, 'subpath': 'repo'}
+
+    def test_exact_local_self_preserves_all_remote_checkouts(self):
+        before, local = M.dependency_checkouts(self.repo, self.pins, self.remote)
+        self.assertIsNone(local)
+        after, local = M.dependency_checkouts(self.repo, self.pins, self.remote + [self.local])
+        self.assertEqual(before, after)
+        self.assertEqual(len(after), 46)
+        self.assertEqual(local, self.local['packageRef'])
+
+    def test_unknown_or_wrong_path_local_package_refuses(self):
+        for part, key, value in [('packageRef', 'identity', 'unexpected'),
+                                 ('packageRef', 'kind', 'remoteSourceControl'),
+                                 ('packageRef', 'name', 'AnotherPackage'),
+                                 ('packageRef', 'location', '/owned/other'),
+                                 ('state', 'path', '/owned/other'),
+                                 ('state', 'name', 'edited')]:
+            local = copy.deepcopy(self.local); local[part][key] = value
+            with self.subTest(part=part, key=key), self.assertRaisesRegex(ValueError, 'unexpected local'):
+                M.dependency_checkouts(self.repo, self.pins, self.remote + [local])
+
+    def test_local_self_cannot_hide_missing_duplicate_or_replaced_remote(self):
+        for state in (self.remote[:-1] + [self.local], self.remote + [self.remote[0]],
+                      self.remote + [self.local, self.local]):
+            with self.subTest(count=len(state)), self.assertRaises(ValueError):
+                M.dependency_checkouts(self.repo, self.pins, state)
+        state = copy.deepcopy(self.remote); state[0]['packageRef']['kind'] = 'fileSystem'
+        with self.assertRaisesRegex(ValueError, 'pinned dependency is not remote'):
+            M.dependency_checkouts(self.repo, self.pins, state + [self.local])
 
 if __name__ == '__main__': unittest.main()
