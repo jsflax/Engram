@@ -6,12 +6,15 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import signal
 import stat
 import subprocess
 import time
 
 LIMIT = 16 * 1024
+SAMPLE_LIMIT = 256 * 1024
+SAMPLE_TIMEOUT = 10
 
 
 def read_owned(path, limit):
@@ -71,6 +74,68 @@ def inspect(root):
         return {'status': 'invalid_pid_file'}
 
 
+def sockets(root, expected):
+    before = process(expected['pid'], root)
+    if before != expected:
+        return {'status': 'identity_changed', 'before': before, 'qualified': False}
+    result = command(['/usr/sbin/lsof', '-nP', '-a', '-p', str(expected['pid']),
+                      '-iTCP:8765', '-FpcnT'])
+    after = process(expected['pid'], root)
+    return {'result': result, 'before': before, 'after': after,
+            'qualified': after == expected and result.get('exit_code') in (0, 1),
+            'scope': 'Exact owned PID and port; all TCP states, not only LISTEN.'}
+
+
+def sample_limit():
+    # Applies only in the sample child; never changes the workflow process.
+    _, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+    limit = SAMPLE_LIMIT if hard == resource.RLIM_INFINITY else min(SAMPLE_LIMIT, hard)
+    resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+
+
+def sample_mirror(root, expected):
+    before = process(expected['pid'], root)
+    if before != expected:
+        return {'status': 'identity_changed', 'before': before, 'qualified': False}
+    path = root / 'evidence/mirror-sample.txt'
+    receipt = {'before': before, 'qualified': False, 'seconds_requested': 1,
+               'helper_timeout_seconds': SAMPLE_TIMEOUT, 'output_limit': SAMPLE_LIMIT}
+    try:
+        # Refuse an existing destination rather than overwrite prior evidence.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        receipt['status'] = 'output_unavailable_or_exists'
+        return receipt
+    os.close(fd)
+    began = time.monotonic()
+    try:
+        result = subprocess.run(['/usr/bin/sample', str(expected['pid']), '1', '10',
+                                 '-file', str(path)], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=SAMPLE_TIMEOUT, preexec_fn=sample_limit)
+        receipt.update(status='complete', exit_code=result.returncode)
+    except subprocess.TimeoutExpired:
+        # subprocess.run kills and joins only its own helper on timeout.
+        receipt['status'] = 'timeout'
+    except (OSError, subprocess.SubprocessError):
+        receipt['status'] = 'unavailable'
+    finally:
+        receipt['elapsed_seconds'] = time.monotonic() - began
+        receipt['after'] = process(expected['pid'], root)
+    try:
+        raw, truncated = read_owned(path, SAMPLE_LIMIT)
+        # Reaching the child file limit can leave a partial sample at exactly
+        # the cap; preserve it, but never call it a complete stack report.
+        truncated = truncated or len(raw) == SAMPLE_LIMIT
+        receipt.update(path=path.name, retained_bytes=len(raw), truncated=truncated,
+                       sha256=hashlib.sha256(raw).hexdigest())
+        receipt['qualified'] = (receipt['status'] == 'complete' and receipt.get('exit_code') == 0
+                                and receipt['after'] == expected and bool(raw) and not truncated)
+    except (OSError, ValueError):
+        receipt['output_status'] = 'unavailable_or_unsafe'
+    return receipt
+
+
 def diagnose(root, curl_status):
     current = inspect(root)
     receipt = {'curl_exit_code': curl_status, 'process': current}
@@ -82,8 +147,8 @@ def diagnose(root, curl_status):
     except (OSError, ValueError):
         receipt['stderr'] = {'status': 'unavailable_or_unsafe'}
     if current['status'] == 'owned':
-        receipt['listener'] = command(['/usr/sbin/lsof', '-nP', '-a', '-p', str(current['pid']),
-                                       '-iTCP:8765', '-sTCP:LISTEN', '-FpcnT'])
+        receipt['sockets'] = sockets(root, current)
+        receipt['sample'] = sample_mirror(root, current)
     (root / 'evidence/mirror-failure.json').write_text(json.dumps(receipt, indent=2) + '\n')
     return receipt
 

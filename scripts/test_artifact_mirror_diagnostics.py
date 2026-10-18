@@ -29,17 +29,19 @@ class MirrorDiagnosticsTests(unittest.TestCase):
                     'command': self.command, 'command_sha256': 'test-command-hash'}
         self.absent = {'status': 'absent', 'pid': 12345}
 
-    def test_failure_retains_bounded_server_stderr_and_exact_listener_only(self):
+    def test_failure_retains_bounded_server_stderr_and_exact_owned_sockets(self):
         (self.root / 'private/mirror.log').write_bytes(b'x' * (M.LIMIT + 100))
         listener = {'status': 'complete', 'exit_code': 0, 'stdout': 'p12345\nn127.0.0.1:8765\n'}
-        with patch.object(M, 'process', return_value=self.row), patch.object(M, 'command', return_value=listener) as command:
+        with patch.object(M, 'process', return_value=self.row), patch.object(M, 'command', return_value=listener) as command, patch.object(M, 'sample_mirror', return_value={'status': 'unavailable', 'qualified': False}) as sample:
             receipt = M.diagnose(self.root, 28)
         self.assertEqual(receipt['curl_exit_code'], 28)
         self.assertEqual(receipt['stderr']['retained_bytes'], M.LIMIT)
         self.assertTrue(receipt['stderr']['truncated'])
         self.assertEqual((self.root / 'evidence/mirror-stderr.log').read_bytes(), b'x' * M.LIMIT)
-        self.assertEqual(receipt['listener'], listener)
-        command.assert_called_once_with(['/usr/sbin/lsof', '-nP', '-a', '-p', '12345', '-iTCP:8765', '-sTCP:LISTEN', '-FpcnT'])
+        self.assertEqual(receipt['sockets']['result'], listener)
+        self.assertTrue(receipt['sockets']['qualified'])
+        sample.assert_called_once_with(self.root, self.row)
+        command.assert_called_once_with(['/usr/sbin/lsof', '-nP', '-a', '-p', '12345', '-iTCP:8765', '-FpcnT'])
 
     def test_exited_server_keeps_stderr_without_broad_listener_scan(self):
         (self.root / 'private/mirror.log').write_text('startup fixture error\n')
@@ -103,6 +105,93 @@ class MirrorDiagnosticsTests(unittest.TestCase):
             self.assertEqual(M.command(['ps']), {'status': 'output_limit'})
         with patch.object(M.subprocess, 'run', return_value=subprocess.CompletedProcess('ps', 1, b'', b'secret')):
             self.assertEqual(M.command(['ps']), {'status': 'complete', 'exit_code': 1, 'stdout': ''})
+
+    def test_sample_success_uses_owned_pid_private_output_and_child_only_limit(self):
+        data = b'Call graph: fixture stack\n'
+        def sampled(argv, **kwargs):
+            self.assertEqual(argv, ['/usr/bin/sample', '12345', '1', '10', '-file', str(self.root / 'evidence/mirror-sample.txt')])
+            self.assertEqual(kwargs, dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL, timeout=10, preexec_fn=M.sample_limit))
+            path = Path(argv[-1])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            path.write_bytes(data)
+            return subprocess.CompletedProcess(argv, 0)
+        with patch.object(M, 'process', return_value=self.row), patch.object(M.subprocess, 'run', side_effect=sampled) as run:
+            receipt = M.sample_mirror(self.root, self.row)
+        self.assertTrue(receipt['qualified'])
+        self.assertEqual(receipt['retained_bytes'], len(data))
+        self.assertEqual(receipt['sha256'], M.hashlib.sha256(data).hexdigest())
+        run.assert_called_once()
+
+    def test_sample_timeout_failure_and_output_cap_retain_partial_unqualified_evidence(self):
+        path = self.root / 'evidence/mirror-sample.txt'
+        for status in ('timeout', 'failed', 'capped', 'unavailable'):
+            with self.subTest(status=status):
+                data = b'x' * (M.SAMPLE_LIMIT if status == 'capped' else 19)
+                def sampled(argv, **kwargs):
+                    path.write_bytes(data)
+                    if status == 'timeout': raise subprocess.TimeoutExpired(argv, 10)
+                    if status == 'unavailable': raise FileNotFoundError('sample unavailable')
+                    return subprocess.CompletedProcess(argv, 0 if status == 'capped' else 1)
+                with patch.object(M, 'process', return_value=self.row), patch.object(M.subprocess, 'run', side_effect=sampled):
+                    receipt = M.sample_mirror(self.root, self.row)
+                self.assertFalse(receipt['qualified'])
+                self.assertEqual(receipt['status'], status if status in ('timeout', 'unavailable') else 'complete')
+                self.assertEqual(receipt['retained_bytes'], len(data))
+                self.assertEqual(receipt['truncated'], status == 'capped')
+                self.assertEqual(path.read_bytes(), data)
+                path.unlink()
+
+    def test_sample_requires_same_owner_before_and_after(self):
+        changed = dict(self.row, started='changed birth')
+        with patch.object(M, 'process', return_value=changed), patch.object(M.subprocess, 'run') as run:
+            receipt = M.sample_mirror(self.root, self.row)
+        self.assertFalse(receipt['qualified'])
+        self.assertEqual(receipt['status'], 'identity_changed')
+        run.assert_not_called()
+        def sampled(argv, **kwargs):
+            Path(argv[-1]).write_bytes(b'partial evidence')
+            return subprocess.CompletedProcess(argv, 0)
+        with patch.object(M, 'process', side_effect=[self.row, changed]), patch.object(M.subprocess, 'run', side_effect=sampled):
+            receipt = M.sample_mirror(self.root, self.row)
+        self.assertFalse(receipt['qualified'])
+        self.assertEqual(receipt['after'], changed)
+        self.assertEqual(receipt['retained_bytes'], 16)
+
+    def test_sample_refuses_existing_or_symlink_destination(self):
+        path = self.root / 'evidence/mirror-sample.txt'
+        outside = self.root / 'original'; outside.write_bytes(b'preserve')
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink):
+                if symlink: path.symlink_to(outside)
+                else: path.write_bytes(b'preserve')
+                with patch.object(M, 'process', return_value=self.row), patch.object(M.subprocess, 'run') as run:
+                    receipt = M.sample_mirror(self.root, self.row)
+                self.assertEqual(receipt['status'], 'output_unavailable_or_exists')
+                self.assertFalse(receipt['qualified'])
+                run.assert_not_called()
+                self.assertEqual(path.read_bytes(), b'preserve')
+                self.assertEqual(outside.read_bytes(), b'preserve')
+                path.unlink()
+
+    def test_sample_limit_does_not_raise_existing_child_hard_limit(self):
+        for hard, expected in ((M.resource.RLIM_INFINITY, M.SAMPLE_LIMIT), (M.SAMPLE_LIMIT * 2, M.SAMPLE_LIMIT), (4096, 4096)):
+            with self.subTest(hard=hard), patch.object(M.resource, 'getrlimit', return_value=(hard, hard)), patch.object(M.resource, 'setrlimit') as setlimit:
+                M.sample_limit()
+                setlimit.assert_called_once_with(M.resource.RLIMIT_FSIZE, (expected, expected))
+
+    def test_sockets_identity_changes_never_qualify_or_query_other_pid(self):
+        changed = dict(self.row, command_sha256='changed')
+        with patch.object(M, 'process', return_value=changed), patch.object(M, 'command') as command:
+            receipt = M.sockets(self.root, self.row)
+        self.assertFalse(receipt['qualified'])
+        command.assert_not_called()
+        result = {'status': 'complete', 'exit_code': 1, 'stdout': ''}
+        with patch.object(M, 'process', side_effect=[self.row, changed]), patch.object(M, 'command', return_value=result) as command:
+            receipt = M.sockets(self.root, self.row)
+        self.assertFalse(receipt['qualified'])
+        self.assertEqual(receipt['after'], changed)
+        command.assert_called_once_with(['/usr/sbin/lsof', '-nP', '-a', '-p', '12345', '-iTCP:8765', '-FpcnT'])
 
     def test_workflow_preserves_curl_failure_even_when_diagnostics_fail(self):
         repo = Path(__file__).parents[1]
