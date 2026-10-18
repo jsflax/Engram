@@ -405,7 +405,7 @@ class RunnerPublicationTests(unittest.TestCase):
             ("read", True, False, "failed"),
             ("applied", True, False, "reconciliation_required"),
             ("applied", False, True, "reconciliation_required"),
-            ("unresolved", True, True, "reconciliation_required"),
+            ("unresolved", True, True, "failed"),
         ):
             with self.subTest(kind=kind, observation=observation, success=success):
                 self.setUp()
@@ -424,6 +424,34 @@ class RunnerPublicationTests(unittest.TestCase):
                     self.assertEqual(state["reconciliation_required"]["memory_ids"], memories)
                 self.assertEqual(self.probe_mock.call_count, 1)
                 self.assertEqual(self.status_probe_mock.call_count, int(kind == "unresolved"))
+
+    def test_proven_absent_failure_keeps_cursor_and_accepts_next_natural_event(self):
+        runner = importlib.import_module("codex_learner.runner")
+        execution = self.begin()
+        self.addCleanup(execution.close)
+        self.provider_files(execution, kind="unresolved", success=False)
+        self.assertEqual(self.finish(execution), "failed")
+        state = json.loads(self.f.state_path.read_bytes())
+        self.assertEqual(C._parser_state(state), C._parser_state(self.f.state))
+        self.assertNotIn("reconciliation_required", state)
+        self.assertFalse((execution.paths.run_dir / "successful-coverage.json").exists())
+        self.assertEqual(json.loads(self.pending.read_bytes())["pause_reason"], "failed")
+        self.f.append("PRIVATE next natural turn remains eligible.")
+        payload = {"session_id": SID, "transcript_path": str(self.f.path), "cwd": str(self.f.project),
+                   "hook_event_name": "Stop", "turn_id": "next-natural-turn"}
+        with mock.patch.object(runner, "event_log"):
+            self.assertTrue(runner.enqueue(self.f.root, payload, spawn=False))
+        pending = json.loads(self.pending.read_bytes())
+        self.assertNotIn("pause_reason", pending)
+        self.assertNotEqual(pending["request_id"], self.f.request["request_id"])
+        self.assertEqual(C._parser_state(json.loads(self.f.state_path.read_bytes())), C._parser_state(state))
+        # Actual process_request enforces the existing backoff before launching.
+        with mock.patch.object(runner, "publications", return_value=self.service):
+            with runner.lock_file(self.f.root / "worker.lock"):
+                outcome = runner.process_request(self.f.root, pending,
+                    {**runner.DEFAULTS, **self.config, "min_chars": 0},
+                    invoke=mock.Mock(side_effect=AssertionError("backoff must not invoke provider")))
+        self.assertEqual(outcome, "backoff")
 
     def test_finish_sigkill_public_recovery_preserves_exact_settlement_and_never_redispatches(self):
         for phase in ("ticket_directory_fsynced", "index_directory_fsynced", "admission_replaced",

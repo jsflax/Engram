@@ -272,6 +272,12 @@ class RecoveryProbeTests(unittest.TestCase):
         self.assertEqual(self.kinds(),['dispatch','absent'])
         with self.assertRaisesRegex(ValueError,'redispatch'):
             J.record_dispatch(self.run,operation,verify_fence=self.recovery.verify)
+        # A durable all-absent checkpoint is immutable; a different operation
+        # outcome belongs to a separate fixture, never a rewrite of that proof.
+        result = S.settle(self.run,manifest_sha256=self.digest,recovery_fence=self.recovery,validate_inputs=lambda *_:True)
+        self.assertEqual(result['status'],'reconciliation_required')  # provider outcome absent
+        self.setUp()
+        operation = self.requests[0]['operationID']
         self.responses[operation] = {'kind':'committed','receipt':{'version':1,'operationID':operation,
             'scope':self.scope,'payloadDigest':'d'*64,'mutation':'remember','outcome':'unchanged',
             'memoryIDs':[MEMORY],'edgeIDs':[],'committedAt':800000000.25}}
