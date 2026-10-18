@@ -383,6 +383,15 @@ def _queue_position(paths, ticket, intent, *, intent_exists):
     current = _pending(raw, ticket["session_id"])
     if current["request_id"] != ticket["request_id"]:
         return "newer", raw, identity
+    # A zero-intent correction authenticates the old immutable hold and its
+    # processing marker. Its original queue slot was already paused by that
+    # hold; accept exactly those two pause fields, using the ACTUAL identity.
+    # A newer request still follows the branch above and remains byte-identical.
+    if (ticket["input_evidence"].get("kind") == "zero_intent_retry"
+            and ticket["outcome"] == {"result": "failed", "queue_action": "pause", "pause_reason": "failed"}
+            and raw == durable.encode({**_json(old), "paused_request_id": ticket["request_id"],
+                                       "pause_reason": "reconciliation_required"})):
+        return "original", raw, identity
     if intent_exists and intent["action"] == "pause" and raw == publication._raw(intent["target"]):
         return "target", raw, identity
     raise ValueError("publication_coordinator_pending_changed")

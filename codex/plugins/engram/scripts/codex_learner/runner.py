@@ -236,7 +236,19 @@ def has_recoverable_transition(root: Path, session_id: str) -> bool:
     if os.path.lexists(root / "publications" / session_id / "active.json"):
         return True
     try:
-        record = load_json(admission.state_paths(root, session_id)["admissions"])
+        selected = admission.state_paths(root, session_id)
+        state = load_json(selected["sessions"])
+        if runner_publication.zero_intent_candidate(state):
+            return True
+        pending = load_pending(selected["pending"])
+        if (state.get("status") == "failed" and type(state.get("zero_intent_retry")) is dict
+                and state["zero_intent_retry"].get("run_id") == state.get("last_run")
+                and pending.get("paused_request_id") == pending.get("request_id")
+                and pending.get("pause_reason") == "failed"
+                and type(state.get("retry_after", 0)) in (int, float)
+                and 0 <= state.get("retry_after", 0) <= time.time()):
+            return True
+        record = load_json(selected["admissions"])
         if isinstance(record, dict) and record.get("processing_execution") is not None:
             return True
     except (OSError, ValueError):
@@ -425,6 +437,8 @@ def enqueue(root: Path, payload: dict, *, spawn: bool = True, expected_admission
                 gate = gate if isinstance(gate, dict) else {}
                 event_log(root, "reconciliation_required", session_id=sid,
                           run_id=state.get("last_run"), reason=gate.get("reason"), memory_ids=gate.get("memory_ids", []))
+                if spawn and runner_publication.zero_intent_candidate(state):
+                    spawn_worker(root)
                 return False
             event_key = event_digest(request)
             if record["last_event"] == event_key or legacy_event_matches(record, request):
@@ -457,6 +471,48 @@ def enqueue(root: Path, payload: dict, *, spawn: bool = True, expected_admission
     return True
 
 
+def _resume_request_locked(root, session_id, request, state):
+    """Existing ordinary retry checks; caller owns worker -> enqueue locks."""
+    paths = admission.state_paths(root, session_id)
+    record = admitted_record(root, request)
+    if record["processing"] is not None:
+        raise ValueError("admission_interrupted_processing")
+    if requires_reconciliation(state):
+        raise ValueError("reconciliation_required")
+    if (request.get("paused_request_id") != request["request_id"]
+            or request.get("pause_reason") not in {"failed", "backoff", "blocked", "batch_limit"}):
+        raise ValueError("resume_request_not_safely_paused")
+    retry_after = state.get("retry_after", 0)
+    if type(retry_after) not in (int, float) or not 0 <= retry_after <= time.time():
+        raise ValueError("resume_backoff")
+    stable = request["admission"].get("mode") == host_admission.MODE_V2
+    meta = inspect_rollout(request["transcript_path"], **({"stable_identity": True} if stable else {}))
+    identity = {"identity": meta.identity} if stable else {"device": meta.device, "inode": meta.inode}
+    if (meta.session_id != session_id
+            or any(request.get(k) != v or state.get(k) != v for k, v in identity.items())):
+        raise ValueError("resume_transcript_identity_changed")
+    size = request.get("size_bytes")
+    if type(size) is not int or size < 0 or meta.size_bytes < max(state["offset"], size):
+        raise ValueError("resume_transcript_truncated")
+    resumed = dict(request)
+    resumed.pop("paused_request_id")
+    resumed.pop("pause_reason")
+    atomic_json(paths["pending"], resumed)
+    return record
+
+
+def _resume_zero_intent_locked(root, session_id):
+    paths = admission.state_paths(root, session_id)
+    state, request = load_json(paths["sessions"]), load_pending(paths["pending"])
+    if (state.get("status") == "failed" and type(state.get("zero_intent_retry")) is dict
+            and state["zero_intent_retry"].get("run_id") == state.get("last_run")
+            and request.get("paused_request_id") == request.get("request_id")
+            and request.get("pause_reason") == "failed"):
+        _resume_request_locked(root, session_id, request, state)
+        return True
+    return False
+
+
 def resume_pending(root: Path, session_id: str, *, spawn: bool = True) -> bool:
     """Resume the same paused request without treating it as a new hook event.
 
@@ -480,36 +536,33 @@ def resume_pending(root: Path, session_id: str, *, spawn: bool = True) -> bool:
         with lock_file(root / "worker.lock", blocking=False) as acquired:
             if not acquired:
                 raise ValueError("resume_worker_active")
+            ready = None
+            if (runner_publication.zero_intent_candidate(expected_state)
+                    or (type(expected_state.get("zero_intent_retry")) is dict
+                        and os.path.lexists(root / "publications" / session_id / "active.json"))):
+                publisher = publications(root)
+                ready = publisher.prepare_zero_intent_retry(session_id, settings(root))
+            if ready is not None:
+                try:
+                    with lock_file(root / "enqueue.lock"):
+                        publisher.finish_zero_intent_retry(ready)
+                        expected_request = load_pending(pending_path)
+                        expected_state = load_json(state_path)
+                finally:
+                    ready.close()
             with lock_file(root / "enqueue.lock"):
                 admission.state_paths(root, session_id)
                 request = load_pending(pending_path)
                 state = load_json(state_path)
                 if request != expected_request or state != expected_state:
                     raise ValueError("resume_request_or_state_changed")
-                record = admitted_record(root, request)
-                if record["processing"] is not None:
-                    raise ValueError("admission_interrupted_processing")
-                if requires_reconciliation(state):
-                    raise ValueError("reconciliation_required")
-                if (request.get("paused_request_id") != request["request_id"]
-                        or request.get("pause_reason") not in {"failed", "backoff", "blocked", "batch_limit"}):
-                    raise ValueError("resume_request_not_safely_paused")
-                retry_after = state.get("retry_after", 0)
-                if type(retry_after) not in (int, float) or not 0 <= retry_after <= time.time():
-                    raise ValueError("resume_backoff")
-                stable = request["admission"].get("mode") == host_admission.MODE_V2
-                meta = inspect_rollout(request["transcript_path"], **({"stable_identity": True} if stable else {}))
-                identity = {"identity": meta.identity} if stable else {"device": meta.device, "inode": meta.inode}
-                if (meta.session_id != session_id
-                        or any(request.get(k) != v or state.get(k) != v for k, v in identity.items())):
-                    raise ValueError("resume_transcript_identity_changed")
-                size = request.get("size_bytes")
-                if type(size) is not int or size < 0 or meta.size_bytes < max(state["offset"], size):
-                    raise ValueError("resume_transcript_truncated")
-                resumed = dict(request)
-                resumed.pop("paused_request_id")
-                resumed.pop("pause_reason")
-                atomic_json(pending_path, resumed)
+                if (ready is not None and request.get("paused_request_id") != request.get("request_id")
+                        and request["request_id"] != runner_publication.journal._json(runner_publication.journal._unseal(ready.manifest["inputs"]["request"]))["request_id"]):
+                    # The authenticated correction preserved a newer admitted
+                    # request. Wake it without inventing/removing pause fields.
+                    record = admitted_record(root, request)
+                else:
+                    record = _resume_request_locked(root, session_id, request, state)
     except (ValueError, OSError, KeyError, TypeError) as exc:
         event_log(root, "resume_refused", session_id=session_id, reason=str(exc)[:160])
         return False
@@ -517,7 +570,7 @@ def resume_pending(root: Path, session_id: str, *, spawn: bool = True) -> bool:
     # describe this as a refused/no-change resume nor suppress its wakeup.
     try:
         event_log(root, "resumed", session_id=session_id, request_id=request["request_id"],
-                  previous_pause_reason=request["pause_reason"], state_sha256=record["state_sha256"])
+                  previous_pause_reason=request.get("pause_reason"), state_sha256=record["state_sha256"])
     finally:
         if spawn:
             spawn_worker(root)
@@ -1312,9 +1365,22 @@ def worker(root: Path) -> int:
             if sid is not None:
                 try:
                     publisher = publications(root)
-                    with lock_file(root / "enqueue.lock"):
-                        recovered = publisher.recover(sid, config)
+                    ready = publisher.prepare_zero_intent_retry(sid, config)
+                    try:
+                        with lock_file(root / "enqueue.lock"):
+                            recovered = (publisher.finish_zero_intent_retry(ready) if ready is not None
+                                         else publisher.recover(sid, config))
+                    finally:
+                        if ready is not None:
+                            ready.close()
                     recovered = complete_ready_plan(root, publisher, recovered, config)
+                    with lock_file(root / "enqueue.lock"):
+                        try:
+                            _resume_zero_intent_locked(root, sid)
+                        except (ValueError, OSError, KeyError, TypeError):
+                            # Preserve a future backoff/changed admission. A new
+                            # lifecycle event can retry; never spin this worker.
+                            deferred_plans.add(sid)
                     if isinstance(recovered, runner_publication.Continuation):
                         deferred_plans.add(sid)
                     if recovered == "more":
