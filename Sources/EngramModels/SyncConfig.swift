@@ -21,13 +21,13 @@ public final class SyncConfig {
 
     @LatticeEnum
     public enum Policy: String, Codable, Sendable {
-        /// Memories stay in memory.db (device-local).
+        /// Disables personal device sync; explicit group exposure can still share non-private memories.
         case local
         /// Non-private memories go to personal.db (synced across devices).
         case sync
     }
 
-    /// Whether this project's memories should sync.
+    /// Whether this project's non-private memories should sync across personal devices.
     public var policy: Policy = .local
 
     /// Group IDs this project is exposed to (the Groups feature).

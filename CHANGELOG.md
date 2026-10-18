@@ -14,6 +14,8 @@ All notable changes to Engram are documented in this file.
   preserving the first preview, immediate node updates, and the final refresh.
 - Clarify that existing Codex MCP connections have a separate refresh lifecycle
   from plugin hooks and learner workers.
+- Correct project-policy comments to distinguish personal device sync from
+  explicit group sharing. Private memories remain device-local.
 
 ## [0.15.5] - 2026-10-18
 
