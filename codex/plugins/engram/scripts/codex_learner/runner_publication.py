@@ -1,8 +1,9 @@
 """Runner-owned authority for journaled cursor and queue transitions.
 
 All entry points require the caller's worker -> enqueue locks. Paths come from
-the executing runner, never a retained ticket. This module does not run a
-provider or replay a memory operation. It keeps the active ticket reachable
+the executing runner, never a retained ticket. This module never runs a provider.
+New planning runs can continue their exact sealed native operations before
+final settlement. It keeps the active ticket reachable
 until publication and queue acknowledgment are both durable.
 """
 from __future__ import annotations
@@ -12,6 +13,7 @@ import datetime as dt
 from dataclasses import dataclass
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import uuid
 
 from . import admission, execution_context as contexts, execution_manifest as journal
@@ -26,6 +28,22 @@ class Outcome(str):
         value = super().__new__(cls, result)
         value.request_id = request_id
         return value
+
+
+class Continuation(str):
+    """The sealed plan is still processing; no queue/cursor was acknowledged."""
+    def __new__(cls, request_id):
+        value = super().__new__(cls, "backoff")
+        value.request_id = request_id
+        return value
+
+
+@dataclass(frozen=True)
+class PlanReady:
+    """Worker-owned continuation to execute after releasing enqueue.lock."""
+    session_id: str
+    run_id: str
+    manifest_sha256: str
 
 
 def _require(ok, reason):
@@ -67,7 +85,7 @@ class Execution:
     paths: contexts.ContextPaths
     context: contexts.ExecutionContext
     fence: writer_fence.HeldFence
-    marker: dict
+    marker: dict | None
 
     def close(self):
         self.fence.close()
@@ -165,8 +183,8 @@ class Publications:
         coordinator._immutable(run_dir / "processing-publication.json", reference, "processing_publication")
         return reference
 
-    def begin(self, request, state, excerpt, config):
-        """Probe and seal before journaled processing; no provider is invoked."""
+    def prepare(self, request, state, excerpt, config, *, provider_mode=None):
+        """Probe and seal under worker ownership, outside enqueue.lock."""
         _require(request["admission"].get("mode") == host_admission.MODE_V2, "v2_required")
         runs = self.root / "runs"
         durable._mkdir(runs)
@@ -183,15 +201,33 @@ class Publications:
             context = contexts.seal_execution(paths, host="codex", request=request, state=state, excerpt=excerpt,
                 expected_next_parser=contexts._next_parser(excerpt), memory=memory, transport=transport,
                 scope=scope, writer_fence=fence, max_chars=config["max_chars"],
-                max_scan_bytes=config["max_scan_bytes"])
+                max_scan_bytes=config["max_scan_bytes"], provider_mode=provider_mode,
+                plan_policy=None if provider_mode is None else {
+                    "max_tool_calls": config["max_tool_calls"], "max_writes": config["max_writes"]})
+            return Execution(paths, context, fence, None)
+        except BaseException:
+            fence.close()
+            raise
+
+    def begin(self, request, state, excerpt, config, *, provider_mode=None):
+        """Compatibility composition; production prepares before enqueue.lock."""
+        execution = self.prepare(request, state, excerpt, config, provider_mode=provider_mode)
+        return self.begin_prepared(execution, request, state, excerpt)
+
+    def begin_prepared(self, execution, request, state, excerpt):
+        """Revalidate and publish the processing marker under enqueue.lock."""
+        paths, context, fence = execution.paths, execution.context, execution.fence
+        try:
             manifest, digest = journal.read_manifest(paths.run_dir)
+            _require(execution.marker is None and digest == context.manifest_sha256,
+                     "prepared_execution_changed")
             selected = self.paths(request["session_id"])
             state_raw, current_state, _ = _record(selected.state)
             admission_raw, record, _ = _record(selected.admission)
             pending_raw, pending, _ = _record(selected.pending)
             _require(_same(current_state, state) and _same(pending, request),
                      "request_changed_before_marker")
-            execution_reference = {"run_id": run_id, "manifest_sha256": digest}
+            execution_reference = {"run_id": paths.run_dir.name, "manifest_sha256": digest}
             run_evidence = {**execution_reference, "has_more": excerpt.has_more}
             def validate(view, phase):
                 _require(_same(view["run_evidence"], run_evidence)
@@ -316,13 +352,91 @@ class Publications:
         execution.close()
         paths = execution.paths
         manifest, digest = journal.read_manifest(paths.run_dir)
+        if manifest.get("provider_mode") == "read_only_plan":
+            return PlanReady(manifest["session_id"], paths.run_dir.name, digest)
         with self._revoke(paths, manifest, digest) as fence:
             return self._finish_revoked(paths, manifest, digest, fence, config)
+
+    def continue_plan(self, ready, config):
+        """Run under worker.lock only, so lifecycle hooks can still enqueue."""
+        _require(type(ready) is PlanReady, "invalid_plan_reference")
+        paths = self.context_paths(ready.run_id)
+        manifest, digest = journal.read_manifest(paths.run_dir)
+        _require(digest == ready.manifest_sha256 and manifest["session_id"] == ready.session_id
+                 and manifest.get("provider_mode") == "read_only_plan", "plan_reference_changed")
+        self._marker(paths, manifest)
+        return self._continue_plan(paths, manifest, digest, config)
+
+    def _continue_plan(self, paths, manifest, digest, config):
+        """Finish the immutable plan before revoking its writer generation."""
+        from . import learner_plan, planned_execution, native_executor
+        if os.path.lexists(paths.run_dir / writer_fence.REVOCATION_NAME):
+            # The final publication can have crashed after revocation. No
+            # writer is revived; settlement must verify the terminal evidence.
+            return None
+        request = journal._json(journal._unseal(manifest["inputs"]["request"]))
+        def validate(binding, phase):
+            _require(_same(binding, manifest["fencing"]), "fence_changed")
+            contexts.validate_recovery_inputs(paths, manifest_sha256=digest)
+            selected = self.paths(manifest["session_id"])
+            state_raw, _, _ = _record(selected.state)
+            _, record, _ = _record(selected.admission)
+            original = journal._json(journal._unseal(manifest["inputs"]["admission"]))
+            expected = {**_authority(original), "processing": request["request_id"],
+                        "processing_execution": {"run_id": paths.run_dir.name, "manifest_sha256": digest}}
+            _require(state_raw == journal._unseal(manifest["inputs"]["cursor"])
+                     and _same(_authority(record), expected), "processing_changed")
+            return True
+        with writer_fence.drain_and_acquire_shared(paths.run_dir, manifest["fencing"],
+                                                  validate=validate) as writer:
+            context = contexts.load_execution(paths, manifest_sha256=digest, writer_fence=writer)
+            if not os.path.lexists(paths.run_dir / learner_plan.PLAN_NAME):
+                try:
+                    learner_plan.seal_plan(paths.run_dir, verify_fence=writer.verify,
+                                           validate_inputs=context.validate_inputs)
+                except (ValueError, OSError):
+                    if os.path.lexists(paths.run_dir / learner_plan.PLAN_NAME):
+                        raise
+                    # No accepted plan means no executor dispatch. Settlement
+                    # independently verifies the absence of any write evidence.
+                    return None
+            _, plan_digest = learner_plan.read_plan(paths.run_dir)
+            retry_path = paths.run_dir / "plan-retry.json"
+            retry_raw, _ = durable._read(retry_path, absent=True)
+            if retry_raw is not None:
+                retry = journal._json(retry_raw)
+                journal._keys(retry, {"version", "manifest_sha256", "plan_sha256", "retry_after"})
+                journal._version(retry["version"])
+                journal._integer(retry["retry_after"])
+                _require(retry["manifest_sha256"] == digest and retry["plan_sha256"] == plan_digest,
+                         "retry_plan_changed")
+                if retry["retry_after"] > dt.datetime.now(dt.timezone.utc).timestamp():
+                    return Continuation(request["request_id"])
+            execute = native_executor.executor(SimpleNamespace(manifest=manifest), context.transport)
+            result = planned_execution.execute_plan(paths.run_dir, writer=writer,
+                validate_inputs=context.validate_inputs, execute=execute)
+            _require(result["plan_sha256"] == plan_digest and result["status"] in {"complete", "pending"},
+                     "invalid_plan_result")
+            if result["status"] == "complete":
+                return None
+            retry_seconds = config["retry_seconds"]
+            journal._integer(retry_seconds, 10, 3600)
+            value = {"version": 1, "manifest_sha256": digest, "plan_sha256": plan_digest,
+                     "retry_after": int(dt.datetime.now(dt.timezone.utc).timestamp()) + retry_seconds}
+            temporary = retry_path.with_name(".plan-retry-" + uuid.uuid4().hex + ".tmp")
+            try:
+                durable._new(temporary, journal.encode(value))
+                os.replace(temporary, retry_path)
+                durable._fsync(retry_path.parent)
+            finally:
+                temporary.unlink(missing_ok=True)
+            return Continuation(request["request_id"])
 
     def _finish_revoked(self, paths, manifest, digest, fence, config):
         context = contexts.load_execution(paths, manifest_sha256=digest, writer_fence=fence,
                                           source_backend_only=True)
-        if not os.path.lexists(paths.run_dir / "settlement.json"):
+        if (manifest.get("provider_mode") != "read_only_plan"
+                and not os.path.lexists(paths.run_dir / "settlement.json")):
             settlement.reconcile_statuses(paths.run_dir, manifest_sha256=digest, recovery_fence=fence,
                 transport=context.transport,
                 validate_inputs=lambda value, _: context.validate_source_backend(value))
@@ -370,7 +484,7 @@ class Publications:
         coordinator.acknowledge(selected, session_id=manifest["session_id"], validate=validate)
         return Outcome(result, request["request_id"])
 
-    def recover(self, session_id, config):
+    def recover(self, session_id, config, *, plan_finished=None):
         """Complete the exact active transition before ordinary pair validation.
 
         An interrupted processing marker leads to fenced settlement, never a
@@ -472,5 +586,9 @@ class Publications:
         _require(digest == reference["manifest_sha256"] and manifest["session_id"] == session_id,
                  "processing_manifest_changed")
         self._marker(paths, manifest)
+        if (manifest.get("provider_mode") == "read_only_plan"
+                and plan_finished != paths.run_dir.name
+                and not os.path.lexists(paths.run_dir / writer_fence.REVOCATION_NAME)):
+            return PlanReady(session_id, paths.run_dir.name, digest)
         with self._revoke(paths, manifest, digest) as fence:
             return self._finish_revoked(paths, manifest, digest, fence, config)

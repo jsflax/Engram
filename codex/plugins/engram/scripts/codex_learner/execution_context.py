@@ -32,7 +32,11 @@ MAX_SCAN = 32 * 1024 * 1024
 MAX_RUNTIME = 512 * 1024 * 1024
 READ_TOOLS = {"recall", "graph", "list_topics", "stats", "timeline"}
 WRITE_TOOLS = {"remember", "update", "connect"}
-PHASES = {"before_intent", "before_dispatch_record", "before_forward"}
+PHASES = {"before_intent", "before_dispatch_record", "before_forward",
+          "before_plan_seal", "before_plan_publication", "after_plan_publication",
+          "before_plan_execution", "before_plan_intent", "before_plan_dispatch",
+          "before_plan_forward", "after_plan_response", "after_plan_execution",
+          "before_native_launch", "before_native_forward", "before_native_write"}
 NATIVE_MAGIC = {b"\x7fELF", b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
                 b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
                 b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
@@ -402,7 +406,8 @@ class ExecutionContext:
 
 @_safe
 def seal_execution(paths, *, host, request, state, excerpt, expected_next_parser,
-                   memory, transport, scope, writer_fence, max_chars, max_scan_bytes):
+                   memory, transport, scope, writer_fence, max_chars, max_scan_bytes,
+                   provider_mode=None, plan_policy=None):
     """Before processing marker/provider: admit, freeze and fsync manifest."""
     _require(type(paths) is ContextPaths and type(writer_fence) is HeldFence
              and writer_fence.mode == "shared", "invalid_context")
@@ -433,6 +438,11 @@ def seal_execution(paths, *, host, request, state, excerpt, expected_next_parser
                          "runtime_sha256": route["runtime"]["sha256"],
                          "route_sha256": inputs["backend_route"]["sha256"],
                          "config_sha256": inputs["backend_config"]["sha256"]}, "fencing": writer_fence.binding()}
+    if provider_mode is not None:
+        value["provider_mode"] = provider_mode
+        value["plan_policy"] = copy.deepcopy(plan_policy)
+    else:
+        _require(plan_policy is None, "orphan_plan_policy")
     journal._manifest(value)
     context = ExecutionContext(paths, value, journal.sha256(journal.encode(value)), writer_fence)
 

@@ -570,6 +570,23 @@ class StatusTests(unittest.TestCase):
                 recorded = self.report()["learner"]["latest_run"]["recorded_settlement"]
                 self.assertEqual(recorded["read"]["read_status"], "invalid_json")
 
+    def test_failed_planning_settlement_has_zero_writes_and_no_coverage(self):
+        values = {"status": "failed", "reason": "planning_not_complete", "attempted_write_calls": 0,
+                  "applied_write_calls": 0, "unchanged_write_calls": 0}
+        self.durable_fixture(**values)
+        learner = self.report()["learner"]
+        recorded = learner["latest_run"]["recorded_settlement"]
+        self.assertEqual(recorded["binding"], "session_hash_match")
+        self.assertEqual(recorded["metadata"]["reason"], "planning_not_complete")
+        self.assertEqual(learner["health"]["progress"]["last_completed_interval"]["evidence"],
+                         "not_available_in_window")
+        for change in ({"status": "succeeded"}, {"attempted_write_calls": 1},
+                       {"attempted_write_calls": 1, "applied_write_calls": 1}):
+            with self.subTest(change=change):
+                self.durable_fixture(**{**values, **change})
+                recorded = self.report()["learner"]["latest_run"]["recorded_settlement"]
+                self.assertEqual(recorded["read"]["read_status"], "invalid_json")
+
     def test_settlement_schema_is_typed_scoped_bounded_and_never_reads_private_evidence(self):
         for change in ({"session_id":OTHER,"hook_session_id":SID},{"run_id":"../private"},
                        {"version":True},{"reason":"private reason"},{"attempted_write_calls":True},

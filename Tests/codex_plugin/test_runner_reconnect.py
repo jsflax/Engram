@@ -162,7 +162,7 @@ class RunnerReconnectTests(unittest.TestCase):
 
     def process(self):
         with R.lock_file(self.root / 'worker.lock'):
-            return R.process_request(self.root, self.request, self.config, invoke=R.run_codex)
+            return R.process_request(self.root, self.request, self.config, invoke=R.run_codex, provider_mode=None)
 
     def test_recovered_notices_publish_coverage_and_next_stop_learns_new_interval(self):
         self.assertEqual(self.process(), 'succeeded')

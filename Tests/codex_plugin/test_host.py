@@ -106,10 +106,12 @@ class HostTests(unittest.TestCase):
         self.durable.migrate()
 
     def process(self, sid):
+        # These injected providers emit historical v1 execution evidence.
+        # The separate planning integration suite exercises the production default.
         state = F.RUNNER.load_json(self.root / 'sessions' / (sid + '.json'))
         if not F.RUNNER.requires_reconciliation(state):
             self.enable_durable()
-        return F.RUNNER.process_request(self.root, self.request(sid), F.RUNNER.settings(self.root), invoke=self.invoke)
+        return F.RUNNER.process_request(self.root, self.request(sid), F.RUNNER.settings(self.root), invoke=self.invoke, provider_mode=None)
 
     def paused_for_resume(self, n=1, *, durable=False):
         sid, path, payload = self.task(n)
@@ -141,7 +143,7 @@ class HostTests(unittest.TestCase):
                          {k: v for k, v in before.items() if k != 'pending'})
         self.assertFalse(self.dispatch(payload))  # Ordinary hooks still deduplicate.
         original = F.RUNNER.process_request
-        with mock.patch.object(F.RUNNER, 'process_request', side_effect=lambda r,q,c: original(r,q,c,invoke=self.invoke)), \
+        with mock.patch.object(F.RUNNER, 'process_request', side_effect=lambda r,q,c: original(r,q,c,invoke=self.invoke, provider_mode=None)), \
                 mock.patch.object(F.RUNNER, 'spawn_worker', side_effect=F.forbidden):
             F.RUNNER.worker(self.root)
             F.RUNNER.worker(self.root)
@@ -344,7 +346,7 @@ class HostTests(unittest.TestCase):
             self.assertEqual(self.request(sid)['model'], 'fake-never-executed')
         self.enable_durable()
         original = F.RUNNER.process_request
-        with mock.patch.object(F.RUNNER, 'process_request', side_effect=lambda r,q,c: original(r,q,c,invoke=self.invoke)), mock.patch.object(F.RUNNER, 'spawn_worker') as spawn:
+        with mock.patch.object(F.RUNNER, 'process_request', side_effect=lambda r,q,c: original(r,q,c,invoke=self.invoke, provider_mode=None)), mock.patch.object(F.RUNNER, 'spawn_worker') as spawn:
             F.RUNNER.worker(self.root)
         self.assertEqual(len(self.invocations), 5)
         spawn.assert_not_called()
@@ -372,7 +374,7 @@ class HostTests(unittest.TestCase):
         before = self.resume_records(sid)
         self.assertEqual(F.ADMISSION.check(self.root, request), request['admission'])
         with self.assertRaisesRegex(ValueError, 'v2_required'):
-            F.RUNNER.process_request(self.root, request, F.RUNNER.settings(self.root), invoke=self.invoke)
+            F.RUNNER.process_request(self.root, request, F.RUNNER.settings(self.root), invoke=self.invoke, provider_mode=None)
         self.assertEqual(self.resume_records(sid), before)
         self.assertEqual(self.invocations, [])
 
@@ -439,7 +441,7 @@ class HostTests(unittest.TestCase):
         def fail(*args):
             self.durable.provider(success=False, missing_audit=True)
             return {'status': 'failed', 'write_calls': 1}
-        with mock.patch.object(F.RUNNER, 'process_request', side_effect=lambda r,q,c: original(r,q,c,invoke=fail)), mock.patch.object(F.RUNNER, 'spawn_worker'):
+        with mock.patch.object(F.RUNNER, 'process_request', side_effect=lambda r,q,c: original(r,q,c,invoke=fail, provider_mode=None)), mock.patch.object(F.RUNNER, 'spawn_worker'):
             F.RUNNER.worker(self.root)
         pending = self.root / 'pending' / (sid + '.json')
         state = self.root / 'sessions' / (sid + '.json')
@@ -534,7 +536,7 @@ class HostTests(unittest.TestCase):
             self.durable.provider(success=False, missing_audit=True)
             return {'status': 'failed', 'write_calls': 1}
         result = F.RUNNER.process_request(self.root, self.request(sid), F.RUNNER.settings(self.root),
-                                         invoke=failed)
+                                         invoke=failed, provider_mode=None)
         self.assertEqual(result, 'reconciliation_required')
         state = json.loads((self.root / 'sessions' / (sid + '.json')).read_text())
         self.assertEqual(state['offset'], before)
@@ -577,7 +579,7 @@ class HostTests(unittest.TestCase):
             self.durable.provider(rows=rows, success=False, started=provider_started,
                                   typed_success=typed_success, missing_audit=rows is None)
             return {'status': 'failed', 'write_calls': 0, 'reason': 'synthetic_failure'}
-        result = F.RUNNER.process_request(self.root, self.request(sid), F.RUNNER.settings(self.root), invoke=invoke)
+        result = F.RUNNER.process_request(self.root, self.request(sid), F.RUNNER.settings(self.root), invoke=invoke, provider_mode=None)
         state = json.loads((self.root / 'sessions' / (sid + '.json')).read_text())
         return sid, path, payload, result, state
 
@@ -631,7 +633,7 @@ class HostTests(unittest.TestCase):
             spawn.assert_called_once_with(self.root)
         self.assertFalse(self.dispatch(payload))
         with mock.patch.object(F.RUNNER.time, 'time', return_value=state['retry_after'] + 1), \
-                mock.patch.object(F.RUNNER, 'process_request', side_effect=lambda r,q,c: original(r,q,c,invoke=self.invoke)), \
+                mock.patch.object(F.RUNNER, 'process_request', side_effect=lambda r,q,c: original(r,q,c,invoke=self.invoke, provider_mode=None)), \
                 mock.patch.object(F.RUNNER, 'spawn_worker', side_effect=F.forbidden):
             F.RUNNER.worker(self.root)
             F.RUNNER.worker(self.root)
@@ -654,7 +656,7 @@ class HostTests(unittest.TestCase):
         self.assertGreater(state['retry_after'], time.time())
         original = F.RUNNER.process_request
         def process(root, request, config):
-            return original(root, request, config, invoke=self.invoke)
+            return original(root, request, config, invoke=self.invoke, provider_mode=None)
         with mock.patch.object(F.RUNNER, 'process_request', side_effect=process), \
                 mock.patch.object(F.RUNNER, 'spawn_worker', side_effect=F.forbidden):
             F.RUNNER.worker(self.root)  # Respect backoff without another provider.
@@ -732,7 +734,7 @@ class HostTests(unittest.TestCase):
             return {'status': 'succeeded', 'write_calls': 0}
         def run():
             try:
-                F.RUNNER.process_request(self.root, self.request(sid), F.RUNNER.settings(self.root), invoke=invoke)
+                F.RUNNER.process_request(self.root, self.request(sid), F.RUNNER.settings(self.root), invoke=invoke, provider_mode=None)
             except BaseException as error:
                 errors.append(error)
             finally:

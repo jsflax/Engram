@@ -63,7 +63,7 @@ def tearDownModule():
 
 class BudgetGuidanceTests(unittest.TestCase):
     def render(self, calls, writes):
-        return RUNNER.render_learner_prompt((SOURCE / "learner_prompt.md").read_text(),
+        return RUNNER.render_learner_prompt((SOURCE / "learner_prompt_legacy.md").read_text(),
                                             {"max_tool_calls": calls, "max_writes": writes})
 
     def test_operational_four_total_one_write_guidance(self):
@@ -156,7 +156,7 @@ class BudgetGuidanceTests(unittest.TestCase):
 
                 excerpt = types.SimpleNamespace(next_offset=123, text="SYNTHETIC {{RUN_TOOL_BUDGET}} EXCERPT")
                 request = {"session_id": "synthetic", "cwd": str(root), "event": "Stop"}
-                with mock.patch.dict(os.environ, {"CODEX_HOME": str(root)}), mock.patch.object(
+                with mock.patch.object(RUNNER, "codex_home", return_value=root), mock.patch.object(
                         RUNNER.subprocess, "Popen", CompletedSyntheticChild):
                     RUNNER.run_codex(root, run, request, excerpt, config)
                 transport = json.loads((run / "transport.json").read_text())

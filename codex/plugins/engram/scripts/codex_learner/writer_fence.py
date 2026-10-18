@@ -180,7 +180,7 @@ class HeldFence:
         _require(durable.encode(expected_binding) == durable.encode(self._binding), "generation_changed")
         _check_lock(self._directory, self._fd, self._binding)
         path = self._directory / REVOCATION_NAME
-        if self._mode == "shared":
+        if self._mode in ("shared", "quiescent"):
             _require(not os.path.lexists(path), "generation_revoked")
         else:
             actual, identity = durable._read(path, maximum=MAX_BYTES)
@@ -256,6 +256,36 @@ def acquire_shared(directory, binding, *, timeout_seconds=2.0):
     try:
         _boundary("shared_acquired")
         held.verify(binding)
+        return held
+    except BaseException:
+        held.close()
+        raise
+
+
+def drain_and_acquire_shared(directory, binding, *, validate, timeout_seconds=2.0):
+    """Drain the original generation, then resume its sealed idempotent plan.
+
+    The caller owns worker/enqueue coordination. Exclusive acquisition proves
+    no previous inherited writer descriptor remains. Unlike settlement, this
+    transition does not revoke the generation: its exact manifest and operation
+    IDs remain in use. The exclusive handle cannot launch a writer; it is
+    downgraded to a shared handle only after current inputs are revalidated.
+    """
+    binding = copy.deepcopy(binding)
+    _binding(binding)
+    _validator(validate, binding, "before_acquire")
+    held = _acquire(directory, binding, "quiescent", timeout_seconds)
+    try:
+        held.verify(binding)
+        _boundary("plan_generation_drained")
+        _validator(validate, binding, "after_acquire")
+        held.verify(binding)
+        # Keep conversion bounded too; flock conversion atomicity differs by
+        # platform. Worker coordination excludes a competing plan owner.
+        fcntl.flock(held._fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        held._mode = "shared"
+        held.verify(binding)
+        _validator(validate, binding, "after_downgrade")
         return held
     except BaseException:
         held.close()

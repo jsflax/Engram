@@ -69,7 +69,7 @@ jobs:
           root = pathlib.Path(os.environ['SOURCE_ROOT'])
           repo = root / 'repo'
           files = subprocess.check_output(['git', 'ls-files', '-z', 'Sources', 'Tests', 'scripts',
-              'Package.swift', 'Package.resolved', '.swiftpm/configuration/mirrors.json',
+              'Package.swift', 'Package.resolved', '.swiftpm/configuration/mirrors.json', 'codex/plugins/engram',
               '.github/workflows/native-validation.yml'], cwd=repo).decode().split('\0')
           hashes = {name: hashlib.sha256((repo / name).read_bytes()).hexdigest() for name in files if name}
           (root / 'evidence/source-identity.json').write_text(json.dumps({
@@ -77,6 +77,20 @@ jobs:
               'workflow': 'native-validation', 'run_id': os.environ['GITHUB_RUN_ID'],
               'run_attempt': os.environ['GITHUB_RUN_ATTEMPT']}, indent=2) + '\n')
           PY
+
+      - name: Run full Codex plugin regressions
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VALIDATION_ROOT/repo"
+          export ENGRAM_CI_TEST_ROOT="$VALIDATION_ROOT/fixtures"
+          suite_status=0
+          python3 -B Tests/codex_plugin/run_suite.py | tee "$VALIDATION_ROOT/evidence/codex-plugin-suite.log" || suite_status=$?
+          if [[ -f Tests/codex_plugin/results.json ]]; then
+            cp Tests/codex_plugin/results.json "$VALIDATION_ROOT/evidence/codex-plugin-suite.json"
+          fi
+          exit "$suite_status"
 
       - name: Mirror identical Sparkle artifact from localhost
         timeout-minutes: 5

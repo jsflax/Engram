@@ -32,13 +32,13 @@ class RunnerDurableTests(unittest.TestCase):
 
     def process(self):
         with R.lock_file(self.root / "worker.lock"):
-            return R.process_request(self.root, self.f.f.request, self.config, invoke=self.invoke)
+            return R.process_request(self.root, self.f.f.request, self.config, invoke=self.invoke, provider_mode=None)
 
     def worker(self):
         original = R.process_request
         with mock.patch.object(R, "settings", return_value=self.config), \
              mock.patch.object(R, "process_request", side_effect=lambda root, request, config:
-                               original(root, request, config, invoke=self.invoke)), \
+                               original(root, request, config, invoke=self.invoke, provider_mode=None)), \
              mock.patch.object(R, "spawn_worker") as spawn:
             result = R.worker(self.root)
         return result, spawn

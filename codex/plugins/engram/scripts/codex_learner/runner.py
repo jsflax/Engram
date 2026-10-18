@@ -27,7 +27,7 @@ import tomllib
 import uuid
 
 from .transcript import inspect_rollout, read_excerpt
-from .memory_proxy import verified_no_write_receipt
+from .memory_proxy import verified_no_write_receipt, audit_planning_tools, PLANNING_MODE
 from . import admission, memory_config, host_admission, operation_gateway, learner_settings
 from . import runner_publication, settlement
 
@@ -547,7 +547,7 @@ def toml_value(value) -> str:
     raise TypeError("unsupported TOML value")
 
 
-def learner_command(root: Path, run_dir: Path, request: dict, config: dict) -> list[str]:
+def learner_command(root: Path, run_dir: Path, request: dict, config: dict, *, planning=False) -> list[str]:
     plugin_root = Path(__file__).resolve().parents[2]  # Executing immutable package, never a stale cache pin.
     # During migration an already loaded runner may still require the legacy
     # whole-file pin. Honor it as well as any memory pin, parsing the exact bytes
@@ -568,18 +568,28 @@ def learner_command(root: Path, run_dir: Path, request: dict, config: dict) -> l
     allowed = memory_config.allowed_tools(memory, READ_TOOLS | WRITE_TOOLS)
     if "recall" not in allowed or not (allowed & WRITE_TOOLS):
         raise ValueError("memory_mcp_policy_disallows_learning")
+    if planning:
+        allowed = allowed.intersection(READ_TOOLS)
     tool_policies = {tool: {**memory["tools"].get(tool, {}), "approval_mode": "approve"}
                      for tool in sorted(allowed)}
     memory = memory_config.transport(memory)
     execution = _EXECUTION.get()
     execution_config = {}
+    if planning and execution is None:
+        raise ValueError("planning_requires_durable_execution")
     if execution is not None:
         if execution.paths.root != root or execution.paths.run_dir != run_dir:
             raise ValueError("execution_paths_changed")
         manifest, _ = runner_publication.journal.read_manifest(run_dir)
+        if manifest.get("provider_mode") != (PLANNING_MODE if planning else None):
+            raise ValueError("provider_mode_changed")
+        if planning and manifest["plan_policy"] != {name: config[name] for name in ("max_tool_calls", "max_writes")}:
+            raise ValueError("planning_budget_changed")
         execution.context.validate_inputs(manifest, "before_intent")
         memory = execution.context.transport
         execution_config = {"execution": execution.specification()}
+    if planning:
+        execution_config["provider_mode"] = PLANNING_MODE
     transport_path = run_dir / "transport.json"
     atomic_json(transport_path, {"transport": memory, "audit_path": str(run_dir / "mcp-audit.jsonl"),
                                "provenance": "codex-session:" + request["session_id"],
@@ -615,7 +625,7 @@ def learner_command(root: Path, run_dir: Path, request: dict, config: dict) -> l
     argv = [binary, "exec", "--ignore-user-config", "--ephemeral", "--skip-git-repo-check",
             "--sandbox", "read-only", "--json", "--color", "never", "--cd", str(run_dir / "workspace"),
             "--output-schema", str(run_dir / "schema.json"),
-            "--output-last-message", str(run_dir / "result.json")]
+            "--output-last-message", str(run_dir / ("proposal.json" if planning else "result.json"))]
     model = request.get("model") or user_config.get("model")
     if model:
         argv += ["--model", model]
@@ -639,7 +649,7 @@ RESULT_SCHEMA = {"type": "object", "additionalProperties": False,
                  "required": ["outcome", "summary", "memory_ids"]}
 
 
-def observe_event(event: dict, observed: dict) -> None:
+def observe_event(event: dict, observed: dict, *, planning=False) -> None:
     kind = event.get("type")
     if kind == "turn.started":
         observed["provider_turn_starts"] = observed.get("provider_turn_starts", 0) + 1
@@ -678,7 +688,7 @@ def observe_event(event: dict, observed: dict) -> None:
     observed["seen"].add(key)
     observed["tool_calls"] += 1
     server, tool = item.get("server"), item.get("tool")
-    if server != "memory" or tool not in READ_TOOLS | WRITE_TOOLS:
+    if server != "memory" or tool not in (READ_TOOLS if planning else READ_TOOLS | WRITE_TOOLS):
         observed["unexpected_tool"] = True
         return
     result = item.get("result") or {}
@@ -806,7 +816,7 @@ def audit_tools(path: Path, *, allow_clean_interrupt: bool = False) -> dict:
     return summary
 
 
-def render_learner_prompt(template: str, config: dict) -> str:
+def render_learner_prompt(template: str, config: dict, *, planning=False) -> str:
     """Use the same normalized numeric limits supplied to the enforcing proxy."""
     total, writes = config["max_tool_calls"], config["max_writes"]
     if (type(total) is not int or not 1 <= total <= 20
@@ -815,6 +825,15 @@ def render_learner_prompt(template: str, config: dict) -> str:
     marker = "{{RUN_TOOL_BUDGET}}"
     if template.count(marker) != 1:
         raise ValueError("missing_or_duplicate_prompt_budget_marker")
+    if planning:
+        budget = (f"Hard budget for this run: {total} total read tool attempts plus proposed operations. "
+                  f"At most {writes} proposed operations may appear in the complete plan. "
+                  "Every read attempt consumes one slot, including failed or denied attempts; each proposed "
+                  "operation also consumes one slot. A successful recall must precede the proposal. "
+                  "Reserve enough slots for your full plan before making more reads. "
+                  "If a needed operation cannot fit, report failed with no operations; do not silently omit "
+                  "unfinished work or claim no_new_memories. These are limits, not quotas.")
+        return template.replace(marker, budget)
     budget = (f"Hard budget for this run: {total} total memory tool-call attempts, including ALL reads and writes. "
               f"Within that total, at most {writes} write attempts (remember/update/connect) are permitted. "
               "Failed or denied attempts still consume the total budget. Track both counts before every call; "
@@ -831,15 +850,53 @@ def render_learner_prompt(template: str, config: dict) -> str:
     return template.replace(marker, budget)
 
 
-def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict) -> dict:
+def run_planner(root: Path, run_dir: Path, request: dict, excerpt, config: dict) -> dict:
+    """Collect a complete write-free proposal; no return value grants execution."""
+    if _EXECUTION.get() is None:
+        raise ValueError("planning_requires_durable_execution")
+    return run_codex(root, run_dir, request, excerpt, config, planning=True)
+
+
+def private_proposal(path: Path) -> bytes:
+    """Privatize only the completed provider's owned, bounded output inode.
+
+    The CLI controls creation permissions for --output-last-message. Tightening
+    them is preparation for sealing, never evidence that its proposal succeeded.
+    """
+    maximum = runner_publication.journal.MAX_INPUT
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        state = os.fstat(fd)
+        named = path.lstat()
+        if (not stat.S_ISREG(state.st_mode) or state.st_uid != os.getuid()
+                or state.st_nlink != 1 or state.st_size > maximum
+                or (state.st_dev, state.st_ino) != (named.st_dev, named.st_ino)):
+            raise ValueError("unsafe_provider_proposal")
+        os.fchmod(fd, 0o600)
+        normalized = runner_publication.durable._identity(os.fstat(fd))
+    finally:
+        os.close(fd)
+    raw, identity = runner_publication.durable._read(path, maximum=maximum)
+    if identity != normalized:
+        raise ValueError("provider_proposal_changed")
+    return raw
+
+
+def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict, *, planning=False) -> dict:
     _PROVIDER_STARTED.set(False)
     private_dir(run_dir / "workspace")
-    atomic_json(run_dir / "schema.json", RESULT_SCHEMA)
-    system = render_learner_prompt(Path(__file__).with_name("learner_prompt.md").read_text(), config)
-    provenance = "codex-session:" + request["session_id"] + "; transcript bytes " + str(excerpt.next_offset) + "; " + utc()
+    if planning:
+        from . import learner_plan
+    atomic_json(run_dir / "schema.json", learner_plan.PROPOSAL_SCHEMA if planning else RESULT_SCHEMA)
+    template_name = "learner_prompt.md" if planning else "learner_prompt_legacy.md"
+    system = render_learner_prompt(Path(__file__).with_name(template_name).read_text(), config, planning=planning)
+    provenance = "codex-session:" + request["session_id"]
+    if not planning:
+        provenance += "; transcript bytes " + str(excerpt.next_offset) + "; " + utc()
     prompt = system + "\n\nSource provenance: " + provenance + "\nWorking-directory context: " + str(request.get("cwd"))
     prompt += "\n\n<untrusted_visible_session_excerpt>\n" + excerpt.text + "\n</untrusted_visible_session_excerpt>\n"
-    argv = learner_command(root, run_dir, request, config)
+    argv = (learner_command(root, run_dir, request, config, planning=True) if planning
+            else learner_command(root, run_dir, request, config))
     env = dict(os.environ)
     env[GUARD] = "1"
     env["CLAUDE_MEMORY_LEARNER"] = "1"
@@ -890,7 +947,7 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict) -
                             batch_exhausted = False
                             break
                         try:
-                            observe_event(json.loads(line), observed)
+                            observe_event(json.loads(line), observed, planning=planning)
                         except (ValueError, TypeError, AttributeError, RecursionError):
                             observed["provider_error"] = True
                     finished = proc.poll() is not None
@@ -941,25 +998,43 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict) -
         reason is None and proc.returncode == 0 and observed["turn_completed"]
         and not observed["provider_error"] and not observed["unexpected_tool"]
         and provider_tool_errors == 0)
-    observed.update(audit_tools(run_dir / "mcp-audit.jsonl",
-                                allow_clean_interrupt=allow_clean_interrupt))
+    audit = audit_planning_tools if planning else audit_tools
+    observed.update(audit(run_dir / "mcp-audit.jsonl", allow_clean_interrupt=allow_clean_interrupt))
     observed["tool_errors"] += provider_tool_errors
     if observed["tool_calls"] > config["max_tool_calls"] or observed["write_calls"] > config["max_writes"]:
         reason = "tool_limit"
     if observed["unexpected_tool"]:
         reason = "unexpected_tool"
-    try:
-        result = load_json(run_dir / "result.json")
-    except (ValueError, OSError):
-        result = {}
+    result_path = run_dir / ("proposal.json" if planning else "result.json")
+    if planning:
+        try:
+            journal = runner_publication.journal
+            raw = private_proposal(result_path)
+            result = journal._json(raw, journal.MAX_INPUT)
+            manifest, _ = journal.read_manifest(run_dir)
+            backend = journal._json(journal._unseal(manifest["inputs"]["backend_config"]))
+            learner_plan.validate_proposal(result, provenance="codex-session:" + request["session_id"],
+                allowed_tools=memory_config.allowed_tools(backend["memory"], READ_TOOLS | WRITE_TOOLS),
+                max_tool_calls=config["max_tool_calls"], max_writes=config["max_writes"],
+                read_calls=observed["read_calls"])
+            valid_result = result["outcome"] in {"proposed", "no_new_memories"}
+            observed["proposal_sha256"] = hashlib.sha256(raw).hexdigest()
+        except (ValueError, OSError, TypeError, KeyError, UnicodeError, RecursionError):
+            result, valid_result = {}, False
+    else:
+        try:
+            result = load_json(result_path)
+        except (ValueError, OSError):
+            result = {}
     actual_ids = {i.lower() for write in observed["writes"] for i in write["memory_ids"]}
-    valid_result = (isinstance(result, dict) and set(result) == {"outcome", "summary", "memory_ids"}
+    if not planning:
+        valid_result = (isinstance(result, dict) and set(result) == {"outcome", "summary", "memory_ids"}
                     and isinstance(result.get("summary"), str) and isinstance(result.get("memory_ids"), list))
-    claimed_ids = result.get("memory_ids", []) if valid_result else []
-    valid_result = valid_result and all(isinstance(i, str) for i in claimed_ids)
-    if valid_result:
-        valid_result = ({i.lower() for i in claimed_ids} == actual_ids)
-        valid_result = valid_result and ((result["outcome"] == "stored" and bool(actual_ids))
+        claimed_ids = result.get("memory_ids", []) if valid_result else []
+        valid_result = valid_result and all(isinstance(i, str) for i in claimed_ids)
+        if valid_result:
+            valid_result = ({i.lower() for i in claimed_ids} == actual_ids)
+            valid_result = valid_result and ((result["outcome"] == "stored" and bool(actual_ids))
                                          or (result["outcome"] == "no_new_memories" and not actual_ids))
     if not isinstance(result, dict):
         result = {}
@@ -967,7 +1042,7 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict) -
                and not observed["provider_error"] and not observed["unexpected_tool"]
                and observed["tool_errors"] == 0 and observed["tool_calls"] > 0
                and valid_result)
-    summary = {**initial, "status": "succeeded" if success else "failed", "ended_at": utc(),
+    summary = {**initial, "status": ("planned" if planning else "succeeded") if success else "failed", "ended_at": utc(),
                "session_id": request["session_id"], "event": request["event"],
                "returncode": proc.returncode, "reason": reason or (None if success else "unverified_completion"),
                "outcome": result.get("outcome"), **observed}
@@ -1071,14 +1146,29 @@ def failure_reconciliation(run_dir: Path, provider_started: bool | None) -> dict
         return unknown
 
 
-def process_request(root: Path, request: dict, config: dict, *, invoke=run_codex) -> str:
+def complete_ready_plan(root, publisher, outcome, config):
+    """Keep the worker lock, but release enqueue while native I/O is pending."""
+    if not isinstance(outcome, runner_publication.PlanReady):
+        return outcome
+    pending = publisher.continue_plan(outcome, config)
+    if pending is not None:
+        return pending
+    with lock_file(root / "enqueue.lock"):
+        return publisher.recover(outcome.session_id, config, plan_finished=outcome.run_id)
+
+
+def process_request(root: Path, request: dict, config: dict, *, invoke=None,
+                    provider_mode="read_only_plan") -> str:
+    if invoke is None:
+        invoke = run_planner
     sid = request["session_id"]
     state_path = root / "sessions" / (sid + ".json")
     publisher = publications(root)
     with lock_file(root / "enqueue.lock"):
         recovered = publisher.recover(sid, config)
-        if recovered is not None:
-            return recovered
+    if recovered is not None:
+        return complete_ready_plan(root, publisher, recovered, config)
+    with lock_file(root / "enqueue.lock"):
         record = admitted_record(root, request)
         if record["processing"] is not None:
             raise ValueError("admission_interrupted_processing")
@@ -1139,8 +1229,16 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=run_codex
                 return "reconciliation_required"
             if admission_digest(current) != admission_digest(state):
                 raise ValueError("admission_cursor_changed_while_waiting")
-            execution = publisher.begin(request, state, excerpt, config)
-            run_dir = execution.paths.run_dir
+        # Native startup can wait on the store. Keep lifecycle hook enqueueing
+        # available while the worker probes and freezes this execution.
+        prepared = publisher.prepare(request, state, excerpt, config, provider_mode=provider_mode)
+        try:
+            with lock_file(root / "enqueue.lock"):
+                execution = publisher.begin_prepared(prepared, request, state, excerpt)
+                run_dir = execution.paths.run_dir
+        except BaseException:
+            prepared.close()
+            raise
         token = _PROVIDER_STARTED.set(None)
         execution_token = _EXECUTION.set(execution)
         try:
@@ -1157,6 +1255,7 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=run_codex
               status=result["status"], writes=result.get("write_calls", 0))
     with lock_file(root / "enqueue.lock"):
         outcome = publisher.finish(execution, config)
+    outcome = complete_ready_plan(root, publisher, outcome, config)
     event_log(root, "learner_settled", session_id=sid, run_id=run_dir.name, status=str(outcome))
     return outcome
 
@@ -1166,11 +1265,12 @@ def worker(root: Path) -> int:
     active_policy = admission.check_activation(root)
     invalid_pending = set()
     recovery_failures = set()
+    deferred_plans = set()
 
     def ready_pending():
         values = []
         for sid in admission.enrollment_ids(root, active_policy):
-            if sid in recovery_failures:
+            if sid in recovery_failures or sid in deferred_plans:
                 continue
             p = admission.state_paths(root, sid)["pending"]
             if not p.exists():
@@ -1188,7 +1288,7 @@ def worker(root: Path) -> int:
     def recovery_session():
         # A missing or paused queue slot cannot hide an active publication.
         for sid in admission.enrollment_ids(root, active_policy):
-            if sid in recovery_failures:
+            if sid in recovery_failures or sid in deferred_plans:
                 continue
             if has_recoverable_transition(root, sid):
                 return sid
@@ -1204,19 +1304,24 @@ def worker(root: Path) -> int:
         while handled < config["max_runs_per_worker"]:
             with lock_file(root / "enqueue.lock"):
                 sid = recovery_session()
-                if sid is not None:
-                    try:
-                        recovered = publications(root).recover(sid, config)
-                        if recovered == "more":
+            if sid is not None:
+                try:
+                    publisher = publications(root)
+                    with lock_file(root / "enqueue.lock"):
+                        recovered = publisher.recover(sid, config)
+                    recovered = complete_ready_plan(root, publisher, recovered, config)
+                    if isinstance(recovered, runner_publication.Continuation):
+                        deferred_plans.add(sid)
+                    if recovered == "more":
+                        with lock_file(root / "enqueue.lock"):
                             path = admission.state_paths(root, sid)["pending"]
                             if load_pending(path).get("request_id") == recovered.request_id:
                                 more[path] = recovered.request_id
-                    except Exception as exc:
-                        # Preserve an unfinished transition's pending preimage.
-                        recovery_failures.add(sid)
-                        event_log(root, "publication_recovery_held", session_id=sid, reason=type(exc).__name__)
-                    handled += 1
-            if sid is not None:
+                except Exception as exc:
+                    # Preserve an unfinished transition's pending preimage.
+                    recovery_failures.add(sid)
+                    event_log(root, "publication_recovery_held", session_id=sid, reason=type(exc).__name__)
+                handled += 1
                 continue
             candidates = ready_pending()
             if not candidates:
@@ -1230,6 +1335,11 @@ def worker(root: Path) -> int:
                 if has_recoverable_transition(root, request["session_id"]):
                     recovery_failures.add(request["session_id"])
             handled += 1
+            if isinstance(outcome, runner_publication.Continuation):
+                # Preserve the processing marker and exact pending preimage.
+                # A later hook resumes this plan after its bounded backoff.
+                deferred_plans.add(request["session_id"])
+                continue
             # Only the latest outcome for this queue slot may pause it for the
             # batch limit. An earlier successful batch must not mask a hold.
             more.pop(pending, None)

@@ -64,10 +64,17 @@ access. Its memory proxy enforces approved tools, private new memories, session
 provenance, bounded calls/writes, and exact write receipts. Failure does not
 advance saved progress. Interactive memory calls and another laptop remain independent.
 
-If a failed run has a successful, unresolved, or unknown write, its task is held
-as `reconciliation_required`. Later turns cannot replay that excerpt until the
-recorded run and memory IDs are reconciled. The hook-status skill exposes this
-condition; it does not clear it automatically.
+New plugin runs first read memory and propose a complete bounded plan. The
+provider cannot write memory. Only a clean completed proposal can authorize the
+native executor. A failed planning turn preserves progress and uses retry backoff.
+If execution is interrupted, a later lifecycle event resumes the same saved
+plan and operation IDs; it does not ask the provider to recreate completed writes.
+
+Older failed runs, or runs with changed or invalid execution evidence, can still
+be held as `reconciliation_required`. Their recorded writes must be accounted for
+before the excerpt can be retried. The hook-status skill exposes this condition;
+it does not clear it automatically. Installing the new pipeline does not clear
+historical holds.
 
 Receipts distinguish enrollment, queued work, provider completion, and reported
 memory UUIDs. Queueing is not completion; a saved UUID is not independent database
@@ -149,12 +156,21 @@ the required arguments and current state.
 ### Interrupted learning and historical reconciliation
 
 New V2 learner runs require the native `localMutationOperationsV1` capability.
-Each write has a durable operation identity, and the native server commits its
-receipt with the mutation. Recovery first waits for the old writer to finish,
-then checks recorded operations. It does not retry a provider run merely because
-a response was lost. Cursor and queue publication use a separate durable journal;
+The whole plan is validated and durably published before any mutation. Each
+write has a stable operation identity, and the native server commits its receipt
+with the mutation. Continuation drains the previous writer, then retries only
+unfinished operations with their original request bytes and IDs. A lost reply
+therefore returns the original receipt without applying the write again.
+Only receipts for the entire plan allow transcript progress to advance.
+Cursor and queue publication use a separate durable journal;
 a newer queued request survives completion of an older run. Upgrade the native
 MCP and plugin together. A capability mismatch remains an explicit hold.
+
+Plans use known memory UUIDs for updates, parents and connections. Relationships
+to newly created memories require a later recall. A stable native rejection,
+such as a deleted target, remains pending and requires diagnosis; repeated exact
+requests cannot repair that target. The legacy standalone adapter is unchanged
+and does not use this plugin's complete-plan executor.
 
 `hook-status` and the app distinguish native writes, provider completion,
 verified transcript coverage, interrupted publication and independent readback.

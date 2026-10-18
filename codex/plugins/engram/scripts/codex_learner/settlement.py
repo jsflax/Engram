@@ -106,6 +106,18 @@ def _snapshot(run_dir):
         return raw
     for name in FIXED:
         raw_fixed[name] = read(run_dir / name, name, True)
+    planning = journal.read_manifest(run_dir)[0].get('provider_mode') == 'read_only_plan'
+    if planning:
+        for name in ('proposal.json', 'learner-plan.json'):
+            raw_fixed[name] = read(run_dir / name, name, True)
+        directory = run_dir / 'plan-attempts'
+        if os.path.lexists(directory):
+            journal._private(directory)
+            children = journal._event_paths(directory, planning=True)
+            _require(len(children) <= journal.MAX_EVENTS, 'evidence_limit')
+            for index, child in enumerate(children):
+                _require(child.name == f'{index:06d}.json', 'invalid_plan_attempt_sequence')
+                read(child, 'plan-attempts/' + child.name)
     # Keep old settlement snapshots byte-compatible when no new checkpoint exists.
     checkpoint = run_dir / ABSENCE_CHECKPOINT
     raw_fixed[ABSENCE_CHECKPOINT] = (read(checkpoint, ABSENCE_CHECKPOINT)
@@ -126,7 +138,7 @@ def _snapshot(run_dir):
                 evidence_ids.add(operation)
                 directory = run_dir / entry.name
                 journal._private(directory)
-                children = sorted(directory.iterdir())
+                children = journal._event_paths(directory, planning=planning)
                 _require(len(children) <= journal.MAX_EVENTS, "evidence_limit")
                 for index, child in enumerate(children):
                     _require(child.name == f"{index:06d}.json", "invalid_evidence_sequence")
@@ -391,6 +403,8 @@ def _result(raw, memory_ids):
 
 
 def _compute(run_dir, manifest, digest):
+    if manifest.get('provider_mode') == 'read_only_plan':
+        return _compute_plan(run_dir, manifest, digest)
     files, raw, operation_ids = _snapshot(run_dir)
     issues = []
     verified_absent = set()
@@ -464,6 +478,48 @@ def _compute(run_dir, manifest, digest):
             "memory_ids": memory_ids, "audit": audit}
 
 
+def _compute_plan(run_dir, manifest, digest):
+    """Planning failure is zero-write; partial execution remains the SAME run.
+
+    Read-only mode is immutable in the execution manifest and enforced by the
+    proxy. Missing provider terminal/proposal evidence cannot strand a session
+    when no complete plan or execution artifacts ever existed. Once a plan is
+    sealed, only exact native receipts for its ENTIRE cohort grant coverage.
+    """
+    from . import learner_plan as P, planned_execution as E
+    P.manifest_policy(manifest)
+    files, raw, operation_ids = _snapshot(run_dir)
+    records, applied, unchanged, _ = _operations(run_dir, operation_ids)
+    memory_ids = sorted({journal._uuid(value) for receipt in applied for value in receipt['memoryIDs']})
+    status, reason, issues, audit = 'failed', 'planning_not_complete', [], None
+    if raw['learner-plan.json'] is None:
+        try:
+            P.operation_inventory(run_dir)
+            _require(not any(name.startswith('plan-attempts/') for name in files), 'unplanned_attempts')
+        except (ValueError, TypeError, KeyError, OSError):
+            status, reason, issues = 'reconciliation_required', 'unverified_completion', ['unplanned_execution_evidence']
+    else:
+        try:
+            plan, _ = P.read_plan(run_dir)
+            progress = E.inspect_plan(run_dir)
+            records, memory_ids, audit = progress['operations'], progress['memory_ids'], plan['audit']
+            applied = [record['receipt'] for record in records
+                       if record['receipt'] is not None and record['receipt']['outcome'] == 'applied']
+            unchanged = [record['receipt'] for record in records
+                         if record['receipt'] is not None and record['receipt']['outcome'] == 'unchanged']
+            status = 'succeeded' if progress['status'] == 'complete' else 'pending'
+            reason = 'verified_completion' if status == 'succeeded' else 'plan_pending'
+        except (ValueError, TypeError, KeyError, OSError):
+            status, reason, issues = 'reconciliation_required', 'unverified_completion', ['invalid_complete_plan']
+    return {'version': 1, 'kind': 'learner_settlement', 'manifest_sha256': digest,
+            'session_id': manifest['session_id'], 'run_id': manifest['run_id'], 'fencing': manifest['fencing'],
+            'source': {key: manifest['source'][key] for key in ('start_offset', 'end_offset')},
+            'status': status, 'reason': reason, 'issues': issues, 'files': files, 'operations': records,
+            'attempted_write_calls': sum(record['dispatched'] is True for record in records),
+            'applied_write_calls': len(applied), 'unchanged_write_calls': len(unchanged),
+            'memory_ids': memory_ids, 'audit': audit}
+
+
 def _coverage(manifest, manifest_sha, settlement_sha):
     parser = journal._json(journal._unseal(manifest["inputs"]["parser_state"]))
     journal._keys(parser, {"version", "input", "limits", "runtime", "interval_sha256"})
@@ -483,10 +539,12 @@ def settle(run_dir, *, manifest_sha256, recovery_fence, validate_inputs, provide
     if provider_observation is not None:
         persist_observation(run_dir, provider_observation)
     settlement = _compute(run_dir, manifest, digest)
+    _require(settlement['status'] != 'pending', 'plan_not_complete')
     _validate(manifest, recovery_fence, validate_inputs, "before_settlement_publication")
     _require(_same(settlement, _compute(run_dir, manifest, digest)), "evidence_changed")
     raw = journal.encode(settlement)
-    journal._publish(run_dir / "settlement.json", raw)
+    publish = journal._publish_atomic if manifest.get('provider_mode') == 'read_only_plan' else journal._publish
+    publish(run_dir / "settlement.json", raw)
     _validate(manifest, recovery_fence, validate_inputs, "after_settlement_publication")
     _require(_same(settlement, _compute(run_dir, manifest, digest)), "evidence_changed")
     result = {**copy.deepcopy(settlement), "settlement_sha256": journal.sha256(raw), "coverage_reference": None}
@@ -495,7 +553,7 @@ def settle(run_dir, *, manifest_sha256, recovery_fence, validate_inputs, provide
         _validate(manifest, recovery_fence, validate_inputs, "before_coverage_publication")
         _require(_same(settlement, _compute(run_dir, manifest, digest)), "evidence_changed")
         coverage_raw = journal.encode(coverage)
-        journal._publish(run_dir / "successful-coverage.json", coverage_raw)
+        publish(run_dir / "successful-coverage.json", coverage_raw)
         _validate(manifest, recovery_fence, validate_inputs, "after_coverage_publication")
         result["coverage_reference"] = {"version": 1, "run_id": manifest["run_id"],
                                         "receipt_sha256": journal.sha256(coverage_raw)}
