@@ -98,13 +98,11 @@ extension GraphView {
             Task {
                 if let filter = personalFilter { personal.setNodeFilter(filter) }
                 await personal.loadData()
-                await personal.startObservers()
             }
         }
         if let synced = galaxyRegistry.galaxies["synced"], syncedRef != nil {
             Task {
                 await synced.loadData()
-                await synced.startObservers()
             }
         }
         for spoke in groupSpokes {
@@ -118,10 +116,6 @@ extension GraphView {
                 // rows sync live from other members.
                 galaxy.setProjectResolver(Self.groupProjectResolver(for: spoke.ref))
                 await galaxy.loadData()
-                // Live animation comes free: the spoke is daemon-written, and
-                // startObservers watches its AuditLog cross-process — the same
-                // mechanism the synced galaxy already uses.
-                await galaxy.startObservers()
             }
         }
 
