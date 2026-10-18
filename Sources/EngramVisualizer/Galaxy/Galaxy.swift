@@ -459,8 +459,12 @@ actor Galaxy: Identifiable {
                 return result
             }
             if !Task.isCancelled { await self.publishClusters(clusters, generation: generation, revision: revision) }
-            self.clusterTask = nil
+            await self.finishClusterTask()
         }
+    }
+
+    private func finishClusterTask() {
+        clusterTask = nil
     }
 
     @MainActor private func loadedProjects() -> Set<String> { Set(renderStore.allNodes.values.map(\.project)) }
