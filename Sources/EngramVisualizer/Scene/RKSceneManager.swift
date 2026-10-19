@@ -56,7 +56,10 @@ final class RKSceneManager {
     private(set) var teleportCounter: Int = 0
 
     // Data pushed from SwiftUI
-    var showMascots: Bool = true
+    var showMascots: Bool {
+        get { rkScene.showMascots }
+        set { rkScene.showMascots = newValue }
+    }
     var layoutMode: LayoutMode = .forceDirected
     var semanticClusters3D: [SemanticCluster3D] = []
 

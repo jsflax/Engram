@@ -40,6 +40,11 @@ public final class EngramRealityScene {
     public let nebulaContainer: Entity
     public let galaxyTitleContainer: Entity
     public let mascotContainer: Entity
+    /// Hide the complete subtree and skip mascot frame updates while disabled.
+    /// Retain existing entities so showing them resumes their state.
+    public var showMascots: Bool = true {
+        didSet { mascotContainer.isEnabled = showMascots }
+    }
     public var flowParticleEntity: ModelEntity?
     public let lightContainer: Entity
 
@@ -464,12 +469,14 @@ public final class EngramRealityScene {
 
         // 9. Mascot update
 
-        mascotSystem.update(
-            container: mascotContainer,
-            dataProvider: dataProvider,
-            dt: dt,
-            scaleFactor: scaleFactor
-        )
+        if showMascots {
+            mascotSystem.update(
+                container: mascotContainer,
+                dataProvider: dataProvider,
+                dt: dt,
+                scaleFactor: scaleFactor
+            )
+        }
         phaseMark()
 
         // 10. Flow particles
