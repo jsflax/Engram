@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import EngramSceneKit
 @testable import EngramRealityKit
 
 @MainActor
@@ -32,6 +33,228 @@ private final class FrameLookupProvider: SceneDataProvider {
 @Suite("Frame lookup invalidation")
 @MainActor
 struct FrameLookupInvalidationTests {
+    @Test("Frame gaps distinguish startup, previous logger tail and drained work")
+    func frameGapIntervalsTailAndDrain() {
+        let diagnostics = FrameGapDiagnostics(enabled: true), owner = NSObject()
+        diagnostics.recordLoad(rows: 4, accepted: true, queuedAt: 50, startedAt: 60, endedAt: 70)
+        let first = diagnostics.beginCallback(owner: owner, at: 100)
+        #expect(first?.sequence == 1)
+        #expect(first?.previousSequence == 0)
+        #expect(first?.hasPreviousCallback == false)
+        #expect(first?.entryIntervalNanoseconds == 0)
+        #expect(first?.outsideCallbackNanoseconds == 0)
+        #expect(first?.previousLoggerTailNanoseconds == 0)
+        #expect(first?.load.rows == 4)
+        diagnostics.finishCallback(owner: owner, bodyEndedAt: 140, exitedAt: 155)
+        diagnostics.recordLoad(rows: 2, accepted: false, queuedAt: nil, startedAt: 170, endedAt: 180)
+        diagnostics.recordForce(outcome: .positionsApplied, queuedAt: 160, startedAt: 180, endedAt: 190)
+        let second = diagnostics.beginCallback(owner: owner, at: 200)
+        #expect(second?.sequence == 2)
+        #expect(second?.previousSequence == 1)
+        #expect(second?.hasPreviousCallback == true)
+        #expect(second?.entryIntervalNanoseconds == 100)
+        #expect(second?.outsideCallbackNanoseconds == 45)
+        #expect(second?.previousLoggerTailNanoseconds == 15)
+        #expect(second?.load.count == 1)
+        #expect(second?.load.rows == 2)
+        #expect(second?.load.rejectedCount == 1)
+        #expect(second?.force.acceptedCount == 1)
+        // A missing/invalid exit cannot manufacture a complete interval.
+        diagnostics.finishCallback(owner: owner, bodyEndedAt: 199, exitedAt: 220)
+        let incomplete = diagnostics.beginCallback(owner: owner, at: 250)
+        #expect(incomplete?.hasPreviousCallback == false)
+        #expect(incomplete?.previousSequence == 0)
+        #expect(incomplete?.entryIntervalNanoseconds == 0)
+        #expect(incomplete?.outsideCallbackNanoseconds == 0)
+        #expect(incomplete?.previousLoggerTailNanoseconds == 0)
+        #expect(incomplete?.load.count == 0)
+        #expect(incomplete?.load.durationNanoseconds == 0)
+        #expect(incomplete?.load.maximumDurationNanoseconds == 0)
+        #expect(incomplete?.force.count == 0)
+        #expect(incomplete?.force.queueSamples == 0)
+        // Earlier samples are values; subsequent draining does not erase them.
+        #expect(first?.load.rows == 4)
+        #expect(second?.force.acceptedCount == 1)
+    }
+
+    @Test("A second scene cannot steal counters and replacement loses prior timing")
+    func frameGapOwnershipDoesNotStealAndResetsAfterRelease() {
+        let diagnostics = FrameGapDiagnostics(enabled: true), other = NSObject()
+        var owner: NSObject? = NSObject()
+        weak var observedOwner: NSObject? = owner
+        _ = diagnostics.beginCallback(owner: owner!, at: 100)
+        diagnostics.finishCallback(owner: owner!, bodyEndedAt: 130, exitedAt: 140)
+        diagnostics.recordLoad(rows: 7, accepted: true, queuedAt: 150, startedAt: 160, endedAt: 170)
+        #expect(diagnostics.beginCallback(owner: other, at: 180) == nil)
+        diagnostics.finishCallback(owner: other, bodyEndedAt: 181, exitedAt: 190)
+        let retained = diagnostics.beginCallback(owner: owner!, at: 200)
+        #expect(retained?.sequence == 2)
+        #expect(retained?.previousSequence == 1)
+        #expect(retained?.outsideCallbackNanoseconds == 60)
+        #expect(retained?.previousLoggerTailNanoseconds == 10)
+        #expect(retained?.load.count == 1)
+        #expect(retained?.load.rows == 7)
+        diagnostics.finishCallback(owner: owner!, bodyEndedAt: 220, exitedAt: 230)
+        diagnostics.recordForce(outcome: .rejected, queuedAt: nil, startedAt: 240, endedAt: 245)
+        owner = nil
+        #expect(observedOwner == nil)
+        let replacement = diagnostics.beginCallback(owner: other, at: 300)
+        #expect(replacement?.sequence == 3)
+        #expect(replacement?.previousSequence == 0)
+        #expect(replacement?.hasPreviousCallback == false)
+        #expect(replacement?.entryIntervalNanoseconds == 0)
+        #expect(replacement?.outsideCallbackNanoseconds == 0)
+        #expect(replacement?.previousLoggerTailNanoseconds == 0)
+        #expect(replacement?.force.rejectedCount == 1)
+        #expect(replacement?.load.count == 0)
+    }
+
+    @Test("Gap work keeps exact outcomes, unknown queue stamps and saturating totals")
+    func frameGapWorkAggregatesAndSaturates() {
+        let diagnostics = FrameGapDiagnostics(enabled: true), owner = NSObject()
+        diagnostics.recordLoad(rows: 2, accepted: true, queuedAt: 10, startedAt: 20, endedAt: 50)
+        diagnostics.recordLoad(rows: 3, accepted: false, queuedAt: nil, startedAt: 40, endedAt: 45)
+        diagnostics.recordLoad(rows: 4, accepted: true, queuedAt: 100, startedAt: 60, endedAt: 70)
+        diagnostics.recordForce(outcome: .positionsApplied, queuedAt: 15, startedAt: 20, endedAt: 30)
+        diagnostics.recordForce(outcome: .rejected, queuedAt: nil, startedAt: 40, endedAt: 60)
+        diagnostics.recordForce(outcome: .rawFallback, queuedAt: 30, startedAt: 30, endedAt: 34)
+        let sample = diagnostics.beginCallback(owner: owner, at: 100)
+        #expect(sample?.load.count == 3)
+        #expect(sample?.load.acceptedCount == 2)
+        #expect(sample?.load.rejectedCount == 1)
+        #expect(sample?.load.rows == 9)
+        #expect(sample?.load.durationNanoseconds == 45)
+        #expect(sample?.load.maximumDurationNanoseconds == 30)
+        #expect(sample?.load.queueSamples == 1)
+        #expect(sample?.load.queueNanoseconds == 10)
+        #expect(sample?.load.maximumQueueNanoseconds == 10)
+        #expect(sample?.force.count == 3)
+        #expect(sample?.force.acceptedCount == 1)
+        #expect(sample?.force.rejectedCount == 1)
+        #expect(sample?.force.fallbackCount == 1)
+        #expect(sample?.force.durationNanoseconds == 34)
+        #expect(sample?.force.maximumDurationNanoseconds == 20)
+        #expect(sample?.force.queueSamples == 2)
+        #expect(sample?.force.queueNanoseconds == 5)
+        #expect(sample?.force.maximumQueueNanoseconds == 5)
+
+        // Exercise the emitted numeric contract with nonzero milliseconds,
+        // including queue availability and previous-callback attribution.
+        let csv = FrameGapDiagnostics(enabled: true)
+        csv.recordLoad(rows: 2, accepted: true, queuedAt: 1_000_000,
+                       startedAt: 3_000_000, endedAt: 8_000_000)
+        csv.recordForce(outcome: .rawFallback, queuedAt: nil,
+                        startedAt: 9_000_000, endedAt: 12_000_000)
+        let csvFirst = csv.beginCallback(owner: owner, at: 20_000_000)
+        let columns = FrameGapDiagnostics.csvHeader.components(separatedBy: ",")
+        let firstValues = FrameGapDiagnostics.csvValues(csvFirst).components(separatedBy: ",")
+        #expect(columns.count == 24)
+        #expect(Set(columns).count == columns.count)
+        #expect(firstValues.count == columns.count)
+        let firstFields = Dictionary(uniqueKeysWithValues: zip(columns, firstValues))
+        #expect(firstFields["gap_flags"] == "1")
+        #expect(firstFields["load_count"] == "1")
+        #expect(firstFields["load_accepted"] == "1")
+        #expect(firstFields["load_rows"] == "2")
+        #expect(firstFields["load_apply_ms"] == "5.000")
+        #expect(firstFields["load_apply_max_ms"] == "5.000")
+        #expect(firstFields["load_queue_samples"] == "1")
+        #expect(firstFields["load_queue_ms"] == "2.000")
+        #expect(firstFields["force_raw_fallback"] == "1")
+        #expect(firstFields["force_applied"] == "0")
+        #expect(firstFields["force_apply_ms"] == "3.000")
+        #expect(firstFields["force_queue_samples"] == "0")
+        csv.finishCallback(owner: owner, bodyEndedAt: 30_000_000, exitedAt: 32_000_000)
+        let csvSecond = csv.beginCallback(owner: owner, at: 50_000_000)
+        let nextValues = FrameGapDiagnostics.csvValues(csvSecond).components(separatedBy: ",")
+        #expect(nextValues.count == columns.count)
+        let nextFields = Dictionary(uniqueKeysWithValues: zip(columns, nextValues))
+        #expect(nextFields["gap_flags"] == "3")
+        #expect(nextFields["gap_callback"] == "2")
+        #expect(nextFields["gap_previous_callback"] == "1")
+        #expect(nextFields["callback_entry_dt_ms"] == "30.000")
+        #expect(nextFields["callback_outside_ms"] == "18.000")
+        #expect(nextFields["previous_logger_tail_ms"] == "2.000")
+        #expect(nextFields["load_count"] == "0")
+        #expect(nextFields["force_apply_count"] == "0")
+
+        diagnostics.recordLoad(rows: Int.max, accepted: true, queuedAt: nil, startedAt: 0, endedAt: .max)
+        diagnostics.recordLoad(rows: Int.max, accepted: true, queuedAt: nil, startedAt: 0, endedAt: .max)
+        diagnostics.recordLoad(rows: Int.max, accepted: false, queuedAt: 0, startedAt: .max, endedAt: .max)
+        diagnostics.recordLoad(rows: -1, accepted: false, queuedAt: 0, startedAt: .max, endedAt: .max)
+        let saturated = diagnostics.beginCallback(owner: owner, at: .max)
+        #expect(saturated?.load.count == 4)
+        #expect(saturated?.load.rows == UInt64.max)
+        #expect(saturated?.load.durationNanoseconds == UInt64.max)
+        #expect(saturated?.load.maximumDurationNanoseconds == UInt64.max)
+        #expect(saturated?.load.queueSamples == 2)
+        #expect(saturated?.load.queueNanoseconds == UInt64.max)
+        #expect(saturated?.load.maximumQueueNanoseconds == UInt64.max)
+        #expect(saturated?.force.count == 0)
+    }
+
+    @Test("Disabled gap diagnostics never invoke the supplied clock or emit a sample")
+    func frameGapDisabledPathDoesNotReadClock() {
+        #expect(FrameGapDiagnostics.enabled(forPath: nil) == false)
+        #expect(FrameGapDiagnostics.enabled(forPath: "") == false)
+        #expect(FrameGapDiagnostics.enabled(forPath: "/owned/frame.csv") == true)
+        var clockReads = 0
+        let disabledStamp = FrameGapDiagnostics.timestamp(enabled: false) { clockReads += 1; return 42 }
+        #expect(disabledStamp == nil)
+        #expect(clockReads == 0)
+        let enabledStamp = FrameGapDiagnostics.timestamp(enabled: true) { clockReads += 1; return 42 }
+        #expect(enabledStamp == 42)
+        #expect(clockReads == 1)
+        let diagnostics = FrameGapDiagnostics(enabled: false), owner = NSObject()
+        diagnostics.recordLoad(rows: 50, accepted: true, queuedAt: 1, startedAt: 2, endedAt: 3)
+        diagnostics.recordForce(outcome: .positionsApplied, queuedAt: 1, startedAt: 2, endedAt: 3)
+        #expect(diagnostics.beginCallback(owner: owner, at: 4) == nil)
+        diagnostics.finishCallback(owner: owner, bodyEndedAt: 5, exitedAt: 6)
+        #expect(diagnostics.beginCallback(owner: owner, at: 7) == nil)
+        let unavailable = FrameGapDiagnostics.csvValues(nil).components(separatedBy: ",")
+        #expect(unavailable.count == FrameGapDiagnostics.csvHeader.components(separatedBy: ",").count)
+        #expect(unavailable.allSatisfy { $0 == "0" })
+    }
+
+    @Test("Gap force outcomes preserve stale ordering, count guards and actual position writes")
+    func frameGapForceOutcomesPreserveAcceptanceGuards() {
+        let simulation = ForceSimulation3D()
+        let first = UUID(), second = UUID(), replacement = UUID()
+        simulation.addNode(first, project: "p", topic: "t")
+        simulation.addNode(second, project: "p", topic: "t")
+        let dispatchedOrder = simulation.nodeOrderVersion
+        simulation.removeNodes([first])
+        simulation.addNode(replacement, project: "p", topic: "t")
+        simulation.setPosition(second, to: SIMD3(1, 2, 3))
+        simulation.setPosition(replacement, to: SIMD3(4, 5, 6))
+        let before = simulation.positions, revision = simulation.positionVersion
+        let readback = ForceResult(positions: [SIMD3(10, 20, 30), SIMD3(40, 50, 60)])
+        let stale = simulation.applyGPUForces(readback, expectedNodeOrderVersion: dispatchedOrder)
+        if case .rejected = stale {} else { #expect(false) }
+        #expect(simulation.positions == before)
+        #expect(simulation.positionVersion == revision)
+        #expect(simulation.topologyDirtyForGPU)
+        let short = simulation.applyGPUForces(ForceResult(positions: [SIMD3(99, 99, 99)]),
+                                              expectedNodeOrderVersion: simulation.nodeOrderVersion)
+        if case .rejected = short {} else { #expect(false) }
+        #expect(simulation.positions == before)
+        #expect(simulation.positionVersion == revision)
+        let applied = simulation.applyGPUForces(readback, expectedNodeOrderVersion: simulation.nodeOrderVersion)
+        if case .positionsApplied = applied {} else { #expect(false) }
+        #expect(simulation.positions[second] == SIMD3<Float>(10, 20, 30))
+        #expect(simulation.positions[replacement] == SIMD3<Float>(40, 50, 60))
+        #expect(simulation.positionVersion > revision)
+        let acceptedPositions = simulation.positions, acceptedRevision = simulation.positionVersion
+        let fallback = simulation.applyGPUForces(ForceResult(fx: [1, 2], fy: [3, 4], fz: [5, 6]))
+        if case .rawFallback = fallback {} else { #expect(false) }
+        #expect(simulation.positions == acceptedPositions)
+        #expect(simulation.positionVersion == acceptedRevision)
+        let shortForces = simulation.applyGPUForces(ForceResult(fx: [1], fy: [2], fz: [3]))
+        if case .rejected = shortForces {} else { #expect(false) }
+        #expect(simulation.positions == acceptedPositions)
+        #expect(simulation.positionVersion == acceptedRevision)
+    }
+
     @Test("Optional timing fallback calls the ordinary provider exactly once")
     func optionalTickTimingFallbackCallsOrdinaryProviderExactlyOnce() {
         let provider = FrameLookupProvider()

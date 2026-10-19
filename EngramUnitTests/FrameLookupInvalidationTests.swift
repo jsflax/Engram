@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import EngramSceneKit
 @testable import EngramRealityKit
 
 @MainActor
@@ -31,6 +32,223 @@ private final class FrameLookupProvider: SceneDataProvider {
 
 @MainActor
 final class FrameLookupInvalidationTests: XCTestCase {
+    func testFrameGapIntervalsTailAndDrain() {
+        let diagnostics = FrameGapDiagnostics(enabled: true), owner = NSObject()
+        diagnostics.recordLoad(rows: 4, accepted: true, queuedAt: 50, startedAt: 60, endedAt: 70)
+        let first = diagnostics.beginCallback(owner: owner, at: 100)
+        XCTAssertTrue(first?.sequence == 1)
+        XCTAssertTrue(first?.previousSequence == 0)
+        XCTAssertTrue(first?.hasPreviousCallback == false)
+        XCTAssertTrue(first?.entryIntervalNanoseconds == 0)
+        XCTAssertTrue(first?.outsideCallbackNanoseconds == 0)
+        XCTAssertTrue(first?.previousLoggerTailNanoseconds == 0)
+        XCTAssertTrue(first?.load.rows == 4)
+        diagnostics.finishCallback(owner: owner, bodyEndedAt: 140, exitedAt: 155)
+        diagnostics.recordLoad(rows: 2, accepted: false, queuedAt: nil, startedAt: 170, endedAt: 180)
+        diagnostics.recordForce(outcome: .positionsApplied, queuedAt: 160, startedAt: 180, endedAt: 190)
+        let second = diagnostics.beginCallback(owner: owner, at: 200)
+        XCTAssertTrue(second?.sequence == 2)
+        XCTAssertTrue(second?.previousSequence == 1)
+        XCTAssertTrue(second?.hasPreviousCallback == true)
+        XCTAssertTrue(second?.entryIntervalNanoseconds == 100)
+        XCTAssertTrue(second?.outsideCallbackNanoseconds == 45)
+        XCTAssertTrue(second?.previousLoggerTailNanoseconds == 15)
+        XCTAssertTrue(second?.load.count == 1)
+        XCTAssertTrue(second?.load.rows == 2)
+        XCTAssertTrue(second?.load.rejectedCount == 1)
+        XCTAssertTrue(second?.force.acceptedCount == 1)
+        // A missing/invalid exit cannot manufacture a complete interval.
+        diagnostics.finishCallback(owner: owner, bodyEndedAt: 199, exitedAt: 220)
+        let incomplete = diagnostics.beginCallback(owner: owner, at: 250)
+        XCTAssertTrue(incomplete?.hasPreviousCallback == false)
+        XCTAssertTrue(incomplete?.previousSequence == 0)
+        XCTAssertTrue(incomplete?.entryIntervalNanoseconds == 0)
+        XCTAssertTrue(incomplete?.outsideCallbackNanoseconds == 0)
+        XCTAssertTrue(incomplete?.previousLoggerTailNanoseconds == 0)
+        XCTAssertTrue(incomplete?.load.count == 0)
+        XCTAssertTrue(incomplete?.load.durationNanoseconds == 0)
+        XCTAssertTrue(incomplete?.load.maximumDurationNanoseconds == 0)
+        XCTAssertTrue(incomplete?.force.count == 0)
+        XCTAssertTrue(incomplete?.force.queueSamples == 0)
+        // Earlier samples are values; subsequent draining does not erase them.
+        XCTAssertTrue(first?.load.rows == 4)
+        XCTAssertTrue(second?.force.acceptedCount == 1)
+    }
+
+    func testFrameGapOwnershipDoesNotStealAndResetsAfterRelease() {
+        let diagnostics = FrameGapDiagnostics(enabled: true), other = NSObject()
+        var owner: NSObject? = NSObject()
+        weak var observedOwner: NSObject? = owner
+        _ = diagnostics.beginCallback(owner: owner!, at: 100)
+        diagnostics.finishCallback(owner: owner!, bodyEndedAt: 130, exitedAt: 140)
+        diagnostics.recordLoad(rows: 7, accepted: true, queuedAt: 150, startedAt: 160, endedAt: 170)
+        XCTAssertTrue(diagnostics.beginCallback(owner: other, at: 180) == nil)
+        diagnostics.finishCallback(owner: other, bodyEndedAt: 181, exitedAt: 190)
+        let retained = diagnostics.beginCallback(owner: owner!, at: 200)
+        XCTAssertTrue(retained?.sequence == 2)
+        XCTAssertTrue(retained?.previousSequence == 1)
+        XCTAssertTrue(retained?.outsideCallbackNanoseconds == 60)
+        XCTAssertTrue(retained?.previousLoggerTailNanoseconds == 10)
+        XCTAssertTrue(retained?.load.count == 1)
+        XCTAssertTrue(retained?.load.rows == 7)
+        diagnostics.finishCallback(owner: owner!, bodyEndedAt: 220, exitedAt: 230)
+        diagnostics.recordForce(outcome: .rejected, queuedAt: nil, startedAt: 240, endedAt: 245)
+        owner = nil
+        XCTAssertTrue(observedOwner == nil)
+        let replacement = diagnostics.beginCallback(owner: other, at: 300)
+        XCTAssertTrue(replacement?.sequence == 3)
+        XCTAssertTrue(replacement?.previousSequence == 0)
+        XCTAssertTrue(replacement?.hasPreviousCallback == false)
+        XCTAssertTrue(replacement?.entryIntervalNanoseconds == 0)
+        XCTAssertTrue(replacement?.outsideCallbackNanoseconds == 0)
+        XCTAssertTrue(replacement?.previousLoggerTailNanoseconds == 0)
+        XCTAssertTrue(replacement?.force.rejectedCount == 1)
+        XCTAssertTrue(replacement?.load.count == 0)
+    }
+
+    func testFrameGapWorkAggregatesAndSaturates() {
+        let diagnostics = FrameGapDiagnostics(enabled: true), owner = NSObject()
+        diagnostics.recordLoad(rows: 2, accepted: true, queuedAt: 10, startedAt: 20, endedAt: 50)
+        diagnostics.recordLoad(rows: 3, accepted: false, queuedAt: nil, startedAt: 40, endedAt: 45)
+        diagnostics.recordLoad(rows: 4, accepted: true, queuedAt: 100, startedAt: 60, endedAt: 70)
+        diagnostics.recordForce(outcome: .positionsApplied, queuedAt: 15, startedAt: 20, endedAt: 30)
+        diagnostics.recordForce(outcome: .rejected, queuedAt: nil, startedAt: 40, endedAt: 60)
+        diagnostics.recordForce(outcome: .rawFallback, queuedAt: 30, startedAt: 30, endedAt: 34)
+        let sample = diagnostics.beginCallback(owner: owner, at: 100)
+        XCTAssertTrue(sample?.load.count == 3)
+        XCTAssertTrue(sample?.load.acceptedCount == 2)
+        XCTAssertTrue(sample?.load.rejectedCount == 1)
+        XCTAssertTrue(sample?.load.rows == 9)
+        XCTAssertTrue(sample?.load.durationNanoseconds == 45)
+        XCTAssertTrue(sample?.load.maximumDurationNanoseconds == 30)
+        XCTAssertTrue(sample?.load.queueSamples == 1)
+        XCTAssertTrue(sample?.load.queueNanoseconds == 10)
+        XCTAssertTrue(sample?.load.maximumQueueNanoseconds == 10)
+        XCTAssertTrue(sample?.force.count == 3)
+        XCTAssertTrue(sample?.force.acceptedCount == 1)
+        XCTAssertTrue(sample?.force.rejectedCount == 1)
+        XCTAssertTrue(sample?.force.fallbackCount == 1)
+        XCTAssertTrue(sample?.force.durationNanoseconds == 34)
+        XCTAssertTrue(sample?.force.maximumDurationNanoseconds == 20)
+        XCTAssertTrue(sample?.force.queueSamples == 2)
+        XCTAssertTrue(sample?.force.queueNanoseconds == 5)
+        XCTAssertTrue(sample?.force.maximumQueueNanoseconds == 5)
+
+        // Exercise the emitted numeric contract with nonzero milliseconds,
+        // including queue availability and previous-callback attribution.
+        let csv = FrameGapDiagnostics(enabled: true)
+        csv.recordLoad(rows: 2, accepted: true, queuedAt: 1_000_000,
+                       startedAt: 3_000_000, endedAt: 8_000_000)
+        csv.recordForce(outcome: .rawFallback, queuedAt: nil,
+                        startedAt: 9_000_000, endedAt: 12_000_000)
+        let csvFirst = csv.beginCallback(owner: owner, at: 20_000_000)
+        let columns = FrameGapDiagnostics.csvHeader.components(separatedBy: ",")
+        let firstValues = FrameGapDiagnostics.csvValues(csvFirst).components(separatedBy: ",")
+        XCTAssertTrue(columns.count == 24)
+        XCTAssertTrue(Set(columns).count == columns.count)
+        XCTAssertTrue(firstValues.count == columns.count)
+        let firstFields = Dictionary(uniqueKeysWithValues: zip(columns, firstValues))
+        XCTAssertTrue(firstFields["gap_flags"] == "1")
+        XCTAssertTrue(firstFields["load_count"] == "1")
+        XCTAssertTrue(firstFields["load_accepted"] == "1")
+        XCTAssertTrue(firstFields["load_rows"] == "2")
+        XCTAssertTrue(firstFields["load_apply_ms"] == "5.000")
+        XCTAssertTrue(firstFields["load_apply_max_ms"] == "5.000")
+        XCTAssertTrue(firstFields["load_queue_samples"] == "1")
+        XCTAssertTrue(firstFields["load_queue_ms"] == "2.000")
+        XCTAssertTrue(firstFields["force_raw_fallback"] == "1")
+        XCTAssertTrue(firstFields["force_applied"] == "0")
+        XCTAssertTrue(firstFields["force_apply_ms"] == "3.000")
+        XCTAssertTrue(firstFields["force_queue_samples"] == "0")
+        csv.finishCallback(owner: owner, bodyEndedAt: 30_000_000, exitedAt: 32_000_000)
+        let csvSecond = csv.beginCallback(owner: owner, at: 50_000_000)
+        let nextValues = FrameGapDiagnostics.csvValues(csvSecond).components(separatedBy: ",")
+        XCTAssertTrue(nextValues.count == columns.count)
+        let nextFields = Dictionary(uniqueKeysWithValues: zip(columns, nextValues))
+        XCTAssertTrue(nextFields["gap_flags"] == "3")
+        XCTAssertTrue(nextFields["gap_callback"] == "2")
+        XCTAssertTrue(nextFields["gap_previous_callback"] == "1")
+        XCTAssertTrue(nextFields["callback_entry_dt_ms"] == "30.000")
+        XCTAssertTrue(nextFields["callback_outside_ms"] == "18.000")
+        XCTAssertTrue(nextFields["previous_logger_tail_ms"] == "2.000")
+        XCTAssertTrue(nextFields["load_count"] == "0")
+        XCTAssertTrue(nextFields["force_apply_count"] == "0")
+
+        diagnostics.recordLoad(rows: Int.max, accepted: true, queuedAt: nil, startedAt: 0, endedAt: .max)
+        diagnostics.recordLoad(rows: Int.max, accepted: true, queuedAt: nil, startedAt: 0, endedAt: .max)
+        diagnostics.recordLoad(rows: Int.max, accepted: false, queuedAt: 0, startedAt: .max, endedAt: .max)
+        diagnostics.recordLoad(rows: -1, accepted: false, queuedAt: 0, startedAt: .max, endedAt: .max)
+        let saturated = diagnostics.beginCallback(owner: owner, at: .max)
+        XCTAssertTrue(saturated?.load.count == 4)
+        XCTAssertTrue(saturated?.load.rows == UInt64.max)
+        XCTAssertTrue(saturated?.load.durationNanoseconds == UInt64.max)
+        XCTAssertTrue(saturated?.load.maximumDurationNanoseconds == UInt64.max)
+        XCTAssertTrue(saturated?.load.queueSamples == 2)
+        XCTAssertTrue(saturated?.load.queueNanoseconds == UInt64.max)
+        XCTAssertTrue(saturated?.load.maximumQueueNanoseconds == UInt64.max)
+        XCTAssertTrue(saturated?.force.count == 0)
+    }
+
+    func testFrameGapDisabledPathDoesNotReadClock() {
+        XCTAssertTrue(FrameGapDiagnostics.enabled(forPath: nil) == false)
+        XCTAssertTrue(FrameGapDiagnostics.enabled(forPath: "") == false)
+        XCTAssertTrue(FrameGapDiagnostics.enabled(forPath: "/owned/frame.csv") == true)
+        var clockReads = 0
+        let disabledStamp = FrameGapDiagnostics.timestamp(enabled: false) { clockReads += 1; return 42 }
+        XCTAssertTrue(disabledStamp == nil)
+        XCTAssertTrue(clockReads == 0)
+        let enabledStamp = FrameGapDiagnostics.timestamp(enabled: true) { clockReads += 1; return 42 }
+        XCTAssertTrue(enabledStamp == 42)
+        XCTAssertTrue(clockReads == 1)
+        let diagnostics = FrameGapDiagnostics(enabled: false), owner = NSObject()
+        diagnostics.recordLoad(rows: 50, accepted: true, queuedAt: 1, startedAt: 2, endedAt: 3)
+        diagnostics.recordForce(outcome: .positionsApplied, queuedAt: 1, startedAt: 2, endedAt: 3)
+        XCTAssertTrue(diagnostics.beginCallback(owner: owner, at: 4) == nil)
+        diagnostics.finishCallback(owner: owner, bodyEndedAt: 5, exitedAt: 6)
+        XCTAssertTrue(diagnostics.beginCallback(owner: owner, at: 7) == nil)
+        let unavailable = FrameGapDiagnostics.csvValues(nil).components(separatedBy: ",")
+        XCTAssertTrue(unavailable.count == FrameGapDiagnostics.csvHeader.components(separatedBy: ",").count)
+        XCTAssertTrue(unavailable.allSatisfy { $0 == "0" })
+    }
+
+    func testFrameGapForceOutcomesPreserveAcceptanceGuards() {
+        let simulation = ForceSimulation3D()
+        let first = UUID(), second = UUID(), replacement = UUID()
+        simulation.addNode(first, project: "p", topic: "t")
+        simulation.addNode(second, project: "p", topic: "t")
+        let dispatchedOrder = simulation.nodeOrderVersion
+        simulation.removeNodes([first])
+        simulation.addNode(replacement, project: "p", topic: "t")
+        simulation.setPosition(second, to: SIMD3(1, 2, 3))
+        simulation.setPosition(replacement, to: SIMD3(4, 5, 6))
+        let before = simulation.positions, revision = simulation.positionVersion
+        let readback = ForceResult(positions: [SIMD3(10, 20, 30), SIMD3(40, 50, 60)])
+        let stale = simulation.applyGPUForces(readback, expectedNodeOrderVersion: dispatchedOrder)
+        if case .rejected = stale {} else { XCTAssertTrue(false) }
+        XCTAssertTrue(simulation.positions == before)
+        XCTAssertTrue(simulation.positionVersion == revision)
+        XCTAssertTrue(simulation.topologyDirtyForGPU)
+        let short = simulation.applyGPUForces(ForceResult(positions: [SIMD3(99, 99, 99)]),
+                                              expectedNodeOrderVersion: simulation.nodeOrderVersion)
+        if case .rejected = short {} else { XCTAssertTrue(false) }
+        XCTAssertTrue(simulation.positions == before)
+        XCTAssertTrue(simulation.positionVersion == revision)
+        let applied = simulation.applyGPUForces(readback, expectedNodeOrderVersion: simulation.nodeOrderVersion)
+        if case .positionsApplied = applied {} else { XCTAssertTrue(false) }
+        XCTAssertTrue(simulation.positions[second] == SIMD3<Float>(10, 20, 30))
+        XCTAssertTrue(simulation.positions[replacement] == SIMD3<Float>(40, 50, 60))
+        XCTAssertTrue(simulation.positionVersion > revision)
+        let acceptedPositions = simulation.positions, acceptedRevision = simulation.positionVersion
+        let fallback = simulation.applyGPUForces(ForceResult(fx: [1, 2], fy: [3, 4], fz: [5, 6]))
+        if case .rawFallback = fallback {} else { XCTAssertTrue(false) }
+        XCTAssertTrue(simulation.positions == acceptedPositions)
+        XCTAssertTrue(simulation.positionVersion == acceptedRevision)
+        let shortForces = simulation.applyGPUForces(ForceResult(fx: [1], fy: [2], fz: [3]))
+        if case .rejected = shortForces {} else { XCTAssertTrue(false) }
+        XCTAssertTrue(simulation.positions == acceptedPositions)
+        XCTAssertTrue(simulation.positionVersion == acceptedRevision)
+    }
+
     func testOptionalTickTimingFallbackCallsOrdinaryProviderExactlyOnce() {
         let provider = FrameLookupProvider()
         let erased: any SceneDataProvider = provider

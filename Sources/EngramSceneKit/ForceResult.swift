@@ -10,19 +10,25 @@ public struct ForceResult: Sendable {
     /// (with alpha scaling) and these positions should replace CPU arrays directly.
     public let positions: [SIMD3<Float>]?
 
+    /// Opt-in monotonic stamp immediately before the existing MainActor task.
+    /// Its queue interval excludes GPU execution and CPU readback; nil is unknown.
+    public let diagnosticEnqueuedAt: UInt64?
+
     /// Per-phase timing breakdown (milliseconds). Populated by encodeForcePassSync.
     public var cpuPrepMs: Double = 0
     public var gpuMs: Double = 0
     public var readbackMs: Double = 0
     public var algorithm: String = ""
 
-    public init(fx: [Float], fy: [Float], fz: [Float]) {
+    public init(fx: [Float], fy: [Float], fz: [Float], diagnosticEnqueuedAt: UInt64? = nil) {
         self.fx = fx; self.fy = fy; self.fz = fz
         self.positions = nil
+        self.diagnosticEnqueuedAt = diagnosticEnqueuedAt
     }
 
-    public init(positions: [SIMD3<Float>]) {
+    public init(positions: [SIMD3<Float>], diagnosticEnqueuedAt: UInt64? = nil) {
         self.fx = []; self.fy = []; self.fz = []
         self.positions = positions
+        self.diagnosticEnqueuedAt = diagnosticEnqueuedAt
     }
 }

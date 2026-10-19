@@ -549,15 +549,27 @@ public final class ForceSimulation3D {
     }
 
     /// Apply GPU force results delivered via @MainActor callback.
-    /// Called from MetalForceCompute's completion handler (dispatched to main actor).
-    public func applyGPUForces(_ result: ForceResult, expectedNodeOrderVersion: UInt64? = nil) {
+    /// Called from ForceEngine's completion callback on MainActor.
+    /// A validated raw-force fallback remains distinct from a position mutation.
+    @discardableResult
+    public func applyGPUForces(_ result: ForceResult, expectedNodeOrderVersion: UInt64? = nil)
+        -> FrameGapDiagnostics.ForceOutcome {
+        let diagnosticStart = FrameGapDiagnostics.timestamp()
+        var outcome = FrameGapDiagnostics.ForceOutcome.rejected
+        defer {
+            if let diagnosticStart {
+                FrameGapDiagnostics.shared.recordForce(outcome: outcome,
+                    queuedAt: result.diagnosticEnqueuedAt, startedAt: diagnosticStart,
+                    endedAt: DispatchTime.now().uptimeNanoseconds)
+            }
+        }
         // An insert/delete pair can restore count while changing every remaining
         // slot. Count equality alone must not authorize an old GPU readback.
-        if let expectedNodeOrderVersion, expectedNodeOrderVersion != nodeOrderVersion { return }
+        if let expectedNodeOrderVersion, expectedNodeOrderVersion != nodeOrderVersion { return outcome }
         // GPU-integrated positions: forces were already applied with alpha scaling on GPU.
         // Write positions directly into CPU arrays.
         if let gpuPositions = result.positions {
-            guard gpuPositions.count == ids.count else { return }
+            guard gpuPositions.count == ids.count else { return outcome }
             // Compute velocity from position delta (for settle detection).
             // GPU velocities live on GPU; this derives them from the position change.
             for i in 0..<ids.count {
@@ -569,12 +581,15 @@ public final class ForceSimulation3D {
                 z[i] = gpuPositions[i].z
             }
             syncPositions()
-            return
+            outcome = .positionsApplied
+            return outcome
         }
 
         // Raw forces fallback (unused in GPU-only path, but kept for test compatibility).
-        guard result.fx.count == ids.count else { return }
+        guard result.fx.count == ids.count else { return outcome }
         GPULog.log("APPLIED forces n=\(result.fx.count)")
+        outcome = .rawFallback
+        return outcome
     }
 
     // MARK: - Positioning helpers

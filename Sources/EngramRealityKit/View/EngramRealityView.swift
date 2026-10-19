@@ -17,7 +17,8 @@ public struct EngramRealityView: View {
             let root = scene.setup()
             content.add(root)
 
-            // Subscribe to per-frame update
+            // RealityKit supplies this delta. Opt-in scene diagnostics measure
+            // callback spacing separately; neither value proves presentation time.
             content.subscribe(to: SceneEvents.Update.self) { event in
                 let dt = Float(event.deltaTime)
                 scene.update(dt: dt)

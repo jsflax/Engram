@@ -248,12 +248,15 @@ public final class ForceEngine {
             if hasGPUIntegration, let ss {
                 ss.readBackPositions()
                 let positions = ss.cpuPositions
+                let result = ForceResult(positions: positions,
+                                         diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
                 Task { @MainActor in
                     fc.inFlight = false
-                    onComplete(ForceResult(positions: positions))
+                    onComplete(result)
                 }
             } else if let forces = fc.readBackForces() {
-                let result = ForceResult(fx: forces.fx, fy: forces.fy, fz: forces.fz)
+                let result = ForceResult(fx: forces.fx, fy: forces.fy, fz: forces.fz,
+                                         diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
                 Task { @MainActor in
                     fc.inFlight = false
                     onComplete(result)

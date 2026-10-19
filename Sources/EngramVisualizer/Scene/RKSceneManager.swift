@@ -190,7 +190,8 @@ final class RKSceneManager {
         let nodeOrderVersion = sim.nodeOrderVersion
 
         // Async dispatch — GPU runs force compute while CPU/renderer continue.
-        // Results applied next frame via completion handler. Never blocks main thread.
+        // Submission does not wait for the GPU. The later MainActor completion
+        // applies results outside this frame's synchronous preparation timing.
         engine.encodeForcePass(queue: rkScene.commandQueue, snapshot: snapshot) { result in
             sim.applyGPUForces(result, expectedNodeOrderVersion: nodeOrderVersion)
         }

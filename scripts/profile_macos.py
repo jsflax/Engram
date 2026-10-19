@@ -25,6 +25,14 @@ REQUIRED_COLUMNS = {
     "near", "mid", "far",
 }
 
+# Only these new interval diagnostics depend on gap_flags. Existing fields and
+# acceptance gates retain their original sample selection and definitions.
+GAP_TIMING_COLUMNS = {
+    "callback_entry_dt_ms", "callback_outside_ms", "previous_logger_tail_ms",
+    "load_apply_ms", "load_apply_max_ms", "load_queue_ms", "load_queue_max_ms",
+    "force_apply_ms", "force_apply_max_ms", "force_queue_ms", "force_queue_max_ms",
+}
+
 
 def distribution(values):
     ordered = sorted(values)
@@ -60,9 +68,26 @@ def analyze(path, warmup=120):
     active = [row for row in frames if row["nodes"] > 0 and row["dt_ms"] > 0][warmup:]
     if len(active) < 100:
         raise ValueError(f"Need at least 100 rendered samples after warmup; got {len(active)}")
-    phases = {key: distribution([row[key] for row in active])
-              for key in active[0] if key.endswith("_ms")}
-    return {
+    # dt_ms remains the RealityKit event delta; total_ms remains the measured
+    # scene body before CSV formatting/flush. Optional callback/work/queue
+    # columns are descriptive and may overlap; never add them to these gates.
+    # An unavailable zero must not be interpreted as a measured interval.
+    phases = {}
+    gap_samples = {}
+    for key in active[0]:
+        if not key.endswith("_ms"):
+            continue
+        selected = active
+        if key in GAP_TIMING_COLUMNS:
+            selected = [row for row in active if row.get("gap_flags") == 3]
+            if key.startswith("load_queue_"):
+                selected = [row for row in selected if row.get("load_queue_samples", 0) > 0]
+            elif key.startswith("force_queue_"):
+                selected = [row for row in selected if row.get("force_queue_samples", 0) > 0]
+            gap_samples[key] = len(selected)
+        if selected:
+            phases[key] = distribution([row[key] for row in selected])
+    report = {
         "frames": len(active), "recorded_frames": len(frames), "warmup_frames": warmup,
         "nodes": int(max(row["nodes"] for row in active)),
         "edges": int(max(row["edges"] for row in active)),
@@ -72,6 +97,9 @@ def analyze(path, warmup=120):
         "all_updates_under_100ms": max(row["total_ms"] for row in frames) <= 100,
         "startup_update_max_ms": max(row["total_ms"] for row in frames),
     }
+    if gap_samples:
+        report["gap_timing_samples"] = gap_samples
+    return report
 
 
 def profile(args):
