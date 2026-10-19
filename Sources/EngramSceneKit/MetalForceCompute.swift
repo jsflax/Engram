@@ -82,6 +82,10 @@ public final class MetalForceCompute: @unchecked Sendable {
     // CPU-side centroid state
     private var tickCount: Int = 0
 
+    // Internal diagnostics distinguish redundant preparation with identical output.
+    private(set) var centroidUpdateCount = 0
+    private(set) var groupUploadCount = 0
+
     // MARK: - Buffer Capacity Management
 
     private func ensureNodeCapacity(_ n: Int) {
@@ -185,6 +189,7 @@ public final class MetalForceCompute: @unchecked Sendable {
                 0
             )
         }
+        groupUploadCount &+= 1
 
         // Build centroid mapping and group metadata
         let numProjects = max((projectGroups.max() ?? 0) + 1, 1)
@@ -231,15 +236,14 @@ public final class MetalForceCompute: @unchecked Sendable {
             }
         }
 
-        // Compute initial centroids
-        updateCentroids(
-            x: x, y: y, z: z, n: n,
-            projectGroups: projectGroups, topicGroups: topicGroups,
-            galaxyCenters: galaxyCenters,
-            numProjects: numProjects, numTopics: numTopics
-        )
-
+        // Publish the groups prepared above only after the rebuild completes.
+        // The next encode must not upload them or rescan their counts again.
+        cachedNumProjects = numProjects
+        cachedNumTopics = numTopics
+        groupsDirty = false
         topologyDirtyForDispatch = false
+        // First encode computes centroids from its current positions. Computing
+        // them here too repeated the full scan/radius sort on every loading edit.
         tickCount = 0
     }
 
@@ -272,6 +276,7 @@ public final class MetalForceCompute: @unchecked Sendable {
         ensureCentroidCapacity(totalGroups)
 
         guard let cBuf = centroidBuffer, let rBuf = refRadiusBuffer else { return }
+        centroidUpdateCount &+= 1
         let cPtr = cBuf.contents().bindMemory(to: SIMD4<Float>.self, capacity: totalGroups)
         let rPtr = rBuf.contents().bindMemory(to: Float.self, capacity: numProjects)
 
@@ -394,6 +399,7 @@ public final class MetalForceCompute: @unchecked Sendable {
                     0
                 )
             }
+            groupUploadCount &+= 1
             groupsDirty = false
         }
         let numProjects = cachedNumProjects

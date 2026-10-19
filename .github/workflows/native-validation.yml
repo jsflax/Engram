@@ -172,6 +172,23 @@ jobs:
             --skip busyBeginDoesNotInvokeBodyOrPublishReceipt \
             --skip beginContentionTimingDiagnostics
 
+      # Require actual Metal execution of the three preparation regressions.
+      # The runner rejects zero matches, skipped tests and incomplete pass IDs.
+      - name: Run force preparation regressions (serial)
+        if: ${{ !cancelled() && steps.native_build.outcome == 'success' }}
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VALIDATION_ROOT/repo"
+          python3 -B scripts/run_native_tests.py --diagnostics-dir "$VALIDATION_ROOT/evidence/force-preparation" \
+            --timeout-seconds 120 --silence-seconds 60 \
+            --require-swift-test testPreparationCentroidsUseFirstEncodePositionsAndCadence \
+            --require-swift-test testPreparationRegroupAndCapacityGrowth \
+            --require-swift-test testPreparationAsyncDirtyDispatch -- \
+            "$VALIDATION_ROOT/bin/swift-validation" test --force-resolved-versions --disable-index-store --skip-build --no-parallel \
+            --filter 'testPreparationCentroidsUseFirstEncodePositionsAndCadence|testPreparationRegroupAndCapacityGrowth|testPreparationAsyncDirtyDispatch'
+
       # Keep the existing <2s held-writer assertion, but isolate its scheduling
       # window from the parallel suite. The matching skip above is not a waiver.
       - name: Run ledger BEGIN timing regression (serial)

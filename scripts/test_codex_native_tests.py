@@ -20,6 +20,52 @@ HARNESS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(HARNESS)
 
 
+class RequiredSwiftTestsTests(unittest.TestCase):
+    names = ('testPreparationCentroidsUseFirstEncodePositionsAndCadence',
+             'testPreparationRegroupAndCapacityGrowth', 'testPreparationAsyncDirtyDispatch')
+
+    @classmethod
+    def output(cls):
+        return '\n'.join(f'✔ Test {name}() passed after 0.003 seconds.' for name in cls.names) + \
+            '\n✔ Test run with 3 tests in 1 suite passed after 0.010 seconds.\n'
+
+    def test_exact_named_passes_accept_ansi_and_arbitrary_completion_order(self):
+        lines = self.output().splitlines()
+        output = '\n'.join('\x1b[32m' + line + '\x1b[0m' for line in reversed(lines[:-1])) + '\n' + lines[-1]
+        self.assertTrue(HARNESS.required_swift_tests(output, self.names)['matched'])
+
+    def test_zero_missing_duplicate_unexpected_and_ambiguous_totals_refuse(self):
+        good = self.output()
+        first = good.splitlines()[0] + '\n'
+        for output in ('', '✔ Test run with 0 tests passed after 0.001 seconds.\n',
+                       good.replace(first, ''), first + good,
+                       good.replace(self.names[0], 'testOther'),
+                       good.replace('with 3 tests', 'with 2 tests'), good + good.splitlines()[-1]):
+            with self.subTest(output=output):
+                self.assertFalse(HARNESS.required_swift_tests(output, self.names)['matched'])
+
+    def test_skip_failure_and_missing_metal_cannot_qualify(self):
+        for line in ('↷ Test ' + self.names[0] + '() skipped.',
+                     '✘ Test ' + self.names[0] + '() failed after 0.001 seconds with 1 issue.',
+                     '✘ Suite "ForceEngine" failed after 0.001 seconds with 1 issue.'):
+            with self.subTest(line=line):
+                self.assertFalse(HARNESS.required_swift_tests(self.output() + line, self.names)['matched'])
+        self.assertFalse(HARNESS.required_swift_tests(
+            '✘ Test ' + self.names[0] + '() recorded an issue: Expectation failed: (Self.device → nil)\n',
+            self.names)['matched'])
+
+    def test_cli_passes_required_identities_and_preserves_gate_exit(self):
+        args = ['runner', '--diagnostics-dir', '/fixture/diagnostics']
+        for name in self.names:
+            args += ['--require-swift-test', name]
+        args += ['--', 'swift', 'test', '--skip-build']
+        with patch.object(HARNESS.sys, 'argv', args), patch.object(HARNESS, 'Runner') as runner:
+            runner.return_value.run.return_value = 125
+            self.assertEqual(HARNESS.main(), 125)
+        self.assertEqual(runner.call_args.kwargs['required_tests'], list(self.names))
+        self.assertEqual(runner.call_args.args[0], ['swift', 'test', '--skip-build'])
+
+
 class NativeTestRunnerTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="native-test-supervisor-")
@@ -41,6 +87,23 @@ class NativeTestRunnerTests(unittest.TestCase):
 
     def receipt(self):
         return json.loads((self.root / "diagnostics/receipt.json").read_text())
+
+    def test_required_pass_gate_uses_actual_child_output_and_preserves_failure(self):
+        good = RequiredSwiftTestsTests.output()
+        scenarios = ((good, 0, 0, 65536),
+                     ('✔ Test run with 0 tests passed after 0.001 seconds.\n', 0, 125, 65536),
+                     (good, 7, 7, 65536), (good, 0, 125, 32))
+        for index, (output, child_exit, expected_exit, cap) in enumerate(scenarios):
+            with self.subTest(index=index):
+                runner = self.runner(f'import sys; print({output!r}, flush=True); sys.exit({child_exit})',
+                                     required_tests=RequiredSwiftTestsTests.names, log_limit=cap)
+                runner.directory = self.root / str(index)
+                self.assertEqual(runner.run(), expected_exit)
+                receipt = json.loads((runner.directory / 'receipt.json').read_text())
+                self.assertEqual(receipt['child_exit_code'], child_exit)
+                self.assertEqual(receipt['cleanup']['remaining'], [])
+                self.assertEqual(receipt['cleanup']['signals'], [])
+                self.assertEqual(receipt['required_swift_tests']['matched'], index in (0, 2))
 
     def test_cli_preserves_exact_arguments_output_and_failure_exit(self):
         command = [sys.executable, "-c",

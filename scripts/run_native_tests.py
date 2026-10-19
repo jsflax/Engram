@@ -5,11 +5,29 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
 import threading
 import time
+
+
+def required_swift_tests(output, expected):
+    """Require actual Swift Testing passes, not merely a successful launcher."""
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+    passed = re.findall(r"^✔ Test ([A-Za-z_]\w*)\(\) passed after [0-9.]+ seconds\.$",
+                        output, re.MULTILINE)
+    totals = [int(value) for value in re.findall(
+        r"^✔ Test run with (\d+) tests?(?: in \d+ suites?)? passed after [0-9.]+ seconds\.$",
+        output, re.MULTILINE)]
+    failed_or_skipped = bool(re.search(r"^.*(?:Test|Suite) .+ (?:failed|skipped)\b",
+                                      output, re.MULTILINE))
+    return {"expected": list(expected), "passed": passed, "summary_counts": totals,
+            "failed_or_skipped": failed_or_skipped,
+            "matched": bool(expected) and len(set(expected)) == len(expected)
+            and sorted(passed) == sorted(expected) and totals == [len(expected)]
+            and not failed_or_skipped}
 
 
 def processes():
@@ -41,7 +59,7 @@ class Runner:
     def __init__(self, command, directory, *, timeout=1800, silence=300,
                  log_limit=64 * 1024**2, sample_tool="/usr/bin/sample",
                  sample_timeout=10, sample_seconds=5, cleanup_grace=5,
-                 console=None):
+                 console=None, required_tests=()):
         self.command = command
         self.directory = Path(directory)
         self.timeout, self.silence = timeout, silence
@@ -55,6 +73,7 @@ class Runner:
         self.output_bytes = self.log_bytes = 0
         self.reader_error = None
         self.group_closed = False
+        self.required_tests = tuple(required_tests)
 
     def refresh(self):
         current = {pid: item for pid, item in processes().items() if "Z" not in item["state"]}
@@ -260,6 +279,17 @@ class Runner:
             if not code and (cleanup["remaining"] or cleanup["errors"] or
                              not reader_complete or self.reader_error):
                 code = 125
+            required = None
+            if self.required_tests:
+                try:
+                    required = required_swift_tests(
+                        (self.directory / "output.log").read_text(errors="replace"), self.required_tests)
+                except OSError as error:
+                    required = {"expected": list(self.required_tests), "matched": False,
+                                "read_error": type(error).__name__}
+                if not code and (not required["matched"] or cleanup["signals"] or
+                                 self.output_bytes > self.log_bytes):
+                    reason, code = "required_tests_unverified", 125
             receipt = {"command": self.command, "runtime_budget_seconds": self.timeout,
                        "silence_threshold_seconds": self.silence, "reason": reason,
                        "child_exit_code": self.child.returncode, "exit_code": code,
@@ -269,6 +299,8 @@ class Runner:
                        "reader_complete": reader_complete, "reader_error": self.reader_error,
                        "diagnostics": self.diagnostics, "cleanup": cleanup,
                        "signals_received": self.signals, "errors": self.errors}
+            if required is not None:
+                receipt["required_swift_tests"] = required
             (self.directory / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
         return code
 
@@ -278,13 +310,18 @@ def main():
     parser.add_argument("--diagnostics-dir", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, default=1800)
     parser.add_argument("--silence-seconds", type=float, default=300)
+    parser.add_argument("--require-swift-test", action="append", default=[],
+                        help="Require one exact bare Swift Testing method pass (repeatable)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command or args.timeout_seconds <= 0 or args.silence_seconds <= 0:
         parser.error("A command and positive runtime/silence budgets are required")
+    if (any(not re.fullmatch(r"[A-Za-z_]\w*", name) for name in args.require_swift_test)
+            or len(set(args.require_swift_test)) != len(args.require_swift_test)):
+        parser.error("Required Swift test names must be unique bare method identifiers")
     return Runner(command, args.diagnostics_dir, timeout=args.timeout_seconds,
-                  silence=args.silence_seconds).run()
+                  silence=args.silence_seconds, required_tests=args.require_swift_test).run()
 
 
 if __name__ == "__main__":

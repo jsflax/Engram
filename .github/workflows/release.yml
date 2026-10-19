@@ -119,8 +119,9 @@ jobs:
         timeout-minutes: 75
         run: swift build --force-resolved-versions --build-tests
       # Core correctness gate (the 0.13.0 release bar): sync/memory/organize/
-      # relay + RealityKit system tests. EngramVisualizerTests' GPU-internal
-      # suites are known debt (see CHANGELOG 0.13.0) and on-device
+      # relay + RealityKit system tests. The three ForceEngine preparation tests
+      # have a required Metal gate below; the remaining historical GPU-internal
+      # suites are still excluded debt (see CHANGELOG 0.13.0), and on-device
       # FoundationModels tests can't run on hosted runners.
       # Environment-sensitive tests are excluded on hosted runners (they
       # remain local gates): the ENTIRE PerfTests suite (idle-machine latency
@@ -149,6 +150,32 @@ jobs:
             --skip "recall_statementBudget" \
             --skip "clusters_statementBudget" \
             --skip "busyBeginDoesNotInvokeBodyOrPublishReceipt"
+
+      - name: Run force preparation regressions (serial)
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ENGRAM_ADOPTION_TEST_ROOT="$HOME/localdev/engram-force-preparation-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export ENGRAM_TEST_ROOT="$ENGRAM_ADOPTION_TEST_ROOT"
+          export TMPDIR="$ENGRAM_ADOPTION_TEST_ROOT/tmp"
+          mkdir -m 700 -p "$ENGRAM_ADOPTION_TEST_ROOT" "$TMPDIR"
+          python3 -B scripts/run_native_tests.py --diagnostics-dir "$ENGRAM_ADOPTION_TEST_ROOT/diagnostics" \
+            --timeout-seconds 120 --silence-seconds 60 \
+            --require-swift-test testPreparationCentroidsUseFirstEncodePositionsAndCadence \
+            --require-swift-test testPreparationRegroupAndCapacityGrowth \
+            --require-swift-test testPreparationAsyncDirtyDispatch -- \
+            swift test --force-resolved-versions --skip-build --no-parallel \
+            --filter 'testPreparationCentroidsUseFirstEncodePositionsAndCadence|testPreparationRegroupAndCapacityGrowth|testPreparationAsyncDirtyDispatch'
+
+      - name: Upload force preparation diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: force-preparation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ~/localdev/engram-force-preparation-${{ github.run_id }}-${{ github.run_attempt }}/diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
 
       # Keep the existing <2s held-writer assertion, but isolate its scheduling
       # window from the parallel suite. The matching skip above is not a waiver.
