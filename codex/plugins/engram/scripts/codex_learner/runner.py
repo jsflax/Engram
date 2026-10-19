@@ -1252,20 +1252,31 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=None,
         return selected
 
     excerpt = select_excerpt(config["max_chars"])
-    if (provider_mode == "read_only_plan" and not excerpt.text
-            and excerpt.blocked_reason == "message_exceeds_char_limit" and config["max_chars"] < 48000):
-        # The configured target normally bounds batches. One whole first message
-        # may use the existing ceiling; retry from the ORIGINAL cursor/parser
-        # state, never the refused excerpt's partially scanned state. This copied
-        # effective limit is sealed below; shared settings and old plans stay exact.
-        config = {**config, "max_chars": 48000}
-        excerpt = select_excerpt(config["max_chars"])
+    if provider_mode == "read_only_plan":
+        # Ordinary batches keep their configured target and the existing 48k
+        # fallback. A complete first message may then use a bounded planning
+        # allowance. Always retry ORIGINAL parser state; never consume a refused
+        # message or change shared settings/previously sealed plans.
+        ceiling = min(config["max_scan_bytes"], learner_settings.MAX_PLANNING_EXCERPT_CHARS)
+        previous_limit = config["max_chars"]
+        for limit in (48000, ceiling):
+            if excerpt.text or excerpt.blocked_reason != "message_exceeds_char_limit":
+                break
+            if limit <= previous_limit:
+                continue
+            excerpt = select_excerpt(limit)
+            previous_limit = limit
+            if excerpt.text:
+                # Only a visible planning excerpt can carry an expanded limit.
+                # Parser-only publication retains the original validated target.
+                config = {**config, "max_chars": limit}
     next_state = {"session_id": sid, "hook_session_id": request.get("hook_session_id", sid),
                   "transcript_path": str(path), "offset": excerpt.next_offset,
                   "recent_messages": excerpt.recent_messages, "current_turn_id": excerpt.current_turn_id,
                   **observed_identity, "updated_at": utc()}
     if excerpt.blocked_reason and not excerpt.text:
-        event_log(root, "blocked", session_id=sid, reason=excerpt.blocked_reason, offset=offset)
+        event_log(root, "blocked", session_id=sid, request_id=request["request_id"],
+                  reason=excerpt.blocked_reason, offset=offset)
         return "blocked"
     if not excerpt.text:
         with lock_file(root / "enqueue.lock"):

@@ -3,6 +3,47 @@ import Metal
 import simd
 import EngramSceneKit
 
+/// Project/topic membership follows node contents, not edges or load status.
+/// A certified append can extend the sets across several skipped frames;
+/// replacement, prefix edits and removals rebuild them from the current nodes.
+@MainActor
+struct LabelProjectTopicCache {
+    private weak var provider: (any SceneDataProvider)?
+    private var nodeVersion: UInt64?
+    private var appendGeneration: UInt64?
+    private var nodeCount = 0
+    private var projects: Set<String> = []
+    private var topics: Set<String> = []
+    private(set) var nodesVisited: UInt64 = 0
+    private(set) var revision: UInt64 = 0
+
+    mutating func update(_ dataProvider: SceneDataProvider) -> (projects: Set<String>, topics: Set<String>) {
+        let nodes = dataProvider.nodes
+        if provider === dataProvider, nodeVersion == dataProvider.nodeVersion,
+           appendGeneration == dataProvider.nodeAppendGeneration, nodeCount == nodes.count {
+            return (projects, topics)
+        }
+        let append = provider === dataProvider
+            && appendGeneration == dataProvider.nodeAppendGeneration && nodeCount <= nodes.count
+        if !append {
+            projects.removeAll(keepingCapacity: true)
+            topics.removeAll(keepingCapacity: true)
+            nodeCount = 0
+        }
+        for node in nodes.dropFirst(nodeCount) {
+            nodesVisited &+= 1
+            projects.insert(node.project)
+            topics.insert(node.topic)
+        }
+        provider = dataProvider
+        nodeVersion = dataProvider.nodeVersion
+        appendGeneration = dataProvider.nodeAppendGeneration
+        nodeCount = nodes.count
+        revision &+= 1
+        return (projects, topics)
+    }
+}
+
 /// Instanced billboard label rendering system.
 ///
 /// Labels are camera-facing quads with texture atlas UV coordinates.
@@ -15,13 +56,18 @@ public final class LabelBatchSystem {
     private var lastAtlasVersion: UInt64 = 0
     private var lastAtlasFrame: UInt64 = 0
     private var atlasInvalidation = LabelAtlasInvalidation()
+    private weak var atlasProvider: (any SceneDataProvider)?
+    private var atlasNodeVersion: UInt64?
+    private var atlasHubVersion: UInt64?
+    private var atlasInputRevision: UInt64 = 0
     private var labelStaging: [BatchVertex] = []
     private var lastFrameState: LabelFrameState?
 
     /// Labels have no clock-driven animation. Reuse their mesh until one of
     /// the actual geometry, visibility, or appearance inputs changes.
     private struct LabelFrameState: Equatable {
-        let topologyVersion: UInt64
+        let nodeRevision: UInt64
+        let hubVersion: UInt64
         let positionVersion: UInt64
         let atlasVersion: UInt64
         let visibleLabels: [Int]
@@ -42,29 +88,13 @@ public final class LabelBatchSystem {
     private var cachedTopicSums: [String: (sum: SIMD3<Float>, count: Int, project: String, maxY: Float)] = [:]
     private var lastClusterFrame: UInt64 = 0
     private var clusterPositionVersion: UInt64?
-    private var clusterTopologyVersion: UInt64?
+    private var clusterNodeRevision: UInt64?
     private let clusterRescanInterval: UInt64 = 10
 
-    // Project/topic sets cached on topologyVersion. Building
-    // Set(nodes.map(\.topic)) inline costs ~300ms/frame at 40k nodes —
-    // it was 70% of the total frame time in the V0 baseline.
-    private var cachedProjects: Set<String> = []
-    private var cachedTopics: Set<String> = []
-    private var cachedSetsTopologyVersion: UInt64 = .max
+    private var projectTopicCache = LabelProjectTopicCache()
 
     private func projectTopicSets(_ dataProvider: SceneDataProvider) -> (projects: Set<String>, topics: Set<String>) {
-        if dataProvider.topologyVersion != cachedSetsTopologyVersion {
-            var projects = Set<String>(minimumCapacity: 64)
-            var topics = Set<String>(minimumCapacity: 256)
-            for node in dataProvider.nodes {
-                projects.insert(node.project)
-                topics.insert(node.topic)
-            }
-            cachedProjects = projects
-            cachedTopics = topics
-            cachedSetsTopologyVersion = dataProvider.topologyVersion
-        }
-        return (cachedProjects, cachedTopics)
+        projectTopicCache.update(dataProvider)
     }
 
     public init() {}
@@ -97,7 +127,14 @@ public final class LabelBatchSystem {
         if sectionStats && frameCount % 120 == 0 {
             print("[labels] frame=\(frameCount) visibleNodes=\(visibleCount) projects=\(projCount) topics=\(topicCount) totalNodes=\(dataProvider.nodes.count) projRects=\(scene.labelAtlasGenerator.projectRects.count) topicRects=\(scene.labelAtlasGenerator.topicRects.count) atlasFrame=\(lastAtlasFrame)")
         }
-        if atlasInvalidation.observe(version: dataProvider.topologyVersion) {
+        if atlasProvider !== dataProvider || atlasNodeVersion != dataProvider.nodeVersion
+            || atlasHubVersion != dataProvider.hubVersion {
+            atlasProvider = dataProvider
+            atlasNodeVersion = dataProvider.nodeVersion
+            atlasHubVersion = dataProvider.hubVersion
+            atlasInputRevision &+= 1
+        }
+        if atlasInvalidation.observe(version: atlasInputRevision) {
             scene.labelAtlasGenerator.invalidatePendingAtlas()
         }
         if scene.labelAtlasGenerator.needsAtlasRetry {
@@ -148,11 +185,15 @@ public final class LabelBatchSystem {
             camUp = SIMD3<Float>(0, 1, 0)
         }
 
-        let needsClusterRescan = clusterTopologyVersion != dataProvider.topologyVersion
+        // Node metadata changes need fresh aggregates. Edge/status/hub-only
+        // changes do not. Append continuity never certifies stable positions:
+        // retain the position revision and existing bounded rescan cadence.
+        let needsClusterRescan = clusterNodeRevision != projectTopicCache.revision
             || (clusterPositionVersion != dataProvider.positionVersion
                 && frameCount &- lastClusterFrame >= clusterRescanInterval)
         var frameState = LabelFrameState(
-            topologyVersion: dataProvider.topologyVersion,
+            nodeRevision: projectTopicCache.revision,
+            hubVersion: dataProvider.hubVersion,
             positionVersion: dataProvider.positionVersion,
             atlasVersion: scene.labelAtlasGenerator.atlasVersion,
             visibleLabels: visibleSet.visibleLabelIndices,
@@ -237,7 +278,7 @@ public final class LabelBatchSystem {
         if needsClusterRescan {
             lastClusterFrame = frameCount
             clusterPositionVersion = dataProvider.positionVersion
-            clusterTopologyVersion = dataProvider.topologyVersion
+            clusterNodeRevision = projectTopicCache.revision
             cachedProjectMaxY.removeAll(keepingCapacity: true)
             cachedTopicSums.removeAll(keepingCapacity: true)
             for (index, node) in nodes.enumerated() {

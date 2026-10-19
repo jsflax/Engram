@@ -67,12 +67,43 @@ final class GalaxyRegistry {
     private struct RenderRevision: Equatable {
         let identity: ObjectIdentifier
         let topology: UInt64
+        let nodes: UInt64
+        let edges: UInt64
+        let hubs: UInt64
+        let lookup: UInt64
+        let allEdges: UInt64
+        let nodeAppendGeneration: UInt64
+        let lookupAppendGeneration: UInt64
+        let nodeCount: Int
         let colors: UInt64
         let worldCenter: SIMD3<Float>
     }
     @ObservationIgnored private var lastMergedRevisions: [String: RenderRevision] = [:]
+    @ObservationIgnored private var lastMergedOrder: [String] = []
+    @ObservationIgnored private var lastHiddenRelations: Set<String> = []
+    @ObservationIgnored private var mergedNodeEnds: [String: Int] = [:]
+    @ObservationIgnored private var lookupOwners: [UUID: Int] = [:]
+    @ObservationIgnored private var lastMergedNodeCount = 0
+    @ObservationIgnored private var previousNodeVersion: UInt64 = 0
+    @ObservationIgnored private var previousNodeCount = 0
+    @ObservationIgnored private var retainedNodePrefix: Int?
     @ObservationIgnored private(set) var mergedTopologyVersion: UInt64 = 0
+    @ObservationIgnored private(set) var mergedNodesVersion: UInt64 = 0
+    @ObservationIgnored private(set) var mergedEdgesVersion: UInt64 = 0
+    @ObservationIgnored private(set) var mergedHubsVersion: UInt64 = 0
+    @ObservationIgnored private(set) var mergedNodeAppendGeneration: UInt64 = 0
+    @ObservationIgnored private(set) var mergedColorMapVersion: UInt64 = 0
+    @ObservationIgnored private(set) var routingNodeVisitCount: UInt64 = 0
     @ObservationIgnored private var loadTasks: [String: Task<Void, Never>] = [:]
+
+    /// A certificate for this publication only. A consumer that missed a node
+    /// publication must validate its own full prefix rather than infer safety
+    /// from count growth or an unrelated topology revision.
+    func preservedNodePrefix(since version: UInt64, count: Int) -> Int? {
+        if version == mergedNodesVersion, count == lastMergedNodeCount { return count }
+        guard version == previousNodeVersion, count == previousNodeCount else { return nil }
+        return retainedNodePrefix
+    }
 
     // MARK: - Galaxy Management
 
@@ -267,109 +298,188 @@ final class GalaxyRegistry {
     }
 
     func mergeRenderData() {
-        // Contents, colors, instance identity, and layout all affect the merge.
+        let ordered = galaxiesInPrecedenceOrder()
+        let order = ordered.map(\.id)
         let revisions = galaxies.mapValues {
-            // Immutable metadata belongs to this Galaxy instance, not just
-            // its ID. A same-ID replacement can restart store revisions at
-            // the same values while changing its display name or hierarchy.
-            RenderRevision(identity: ObjectIdentifier($0),
-                           topology: $0.renderStore.topologyVersion,
-                           colors: $0.renderStore.colorMapVersion,
-                           worldCenter: $0.worldCenter)
+            let store = $0.renderStore
+            return RenderRevision(identity: ObjectIdentifier($0),
+                                  topology: store.topologyVersion,
+                                  nodes: store.nodesVersion, edges: store.edgesVersion,
+                                  hubs: store.hubsVersion, lookup: store.nodeLookupVersion,
+                                  allEdges: store.allEdgesVersion,
+                                  nodeAppendGeneration: store.nodeAppendGeneration,
+                                  lookupAppendGeneration: store.nodeLookupAppendGeneration,
+                                  nodeCount: store.nodes.count,
+                                  colors: store.colorMapVersion, worldCenter: $0.worldCenter)
         }
-        guard revisions != lastMergedRevisions else { return }
-        let previousRevisions = lastMergedRevisions
+        guard revisions != lastMergedRevisions || order != lastMergedOrder
+            || hiddenRelations != lastHiddenRelations else { return }
+        let previous = lastMergedRevisions
+        let identitiesChanged = order != lastMergedOrder || ordered.contains {
+            previous[$0.id]?.identity != ObjectIdentifier($0)
+        }
+        let nodesChanged = identitiesChanged || ordered.contains {
+            previous[$0.id]?.nodes != $0.renderStore.nodesVersion
+        }
+        let hubsChanged = identitiesChanged || ordered.contains {
+            previous[$0.id]?.hubs != $0.renderStore.hubsVersion
+        }
+        let colorsChanged = identitiesChanged || ordered.contains {
+            previous[$0.id]?.colors != $0.renderStore.colorMapVersion
+        }
+        let lookupChanged = identitiesChanged || ordered.contains {
+            previous[$0.id]?.lookup != $0.renderStore.nodeLookupVersion
+        }
+        // Cross-galaxy edges depend on ALL source edges and merged visibility,
+        // including endpoints in different galaxies and currently hidden rows.
+        let edgesChanged = identitiesChanged || hiddenRelations != lastHiddenRelations
+            || (ordered.count > 1 && nodesChanged) || ordered.contains {
+                let store = $0.renderStore
+                return ordered.count == 1 ? previous[$0.id]?.edges != store.edgesVersion
+                    : previous[$0.id]?.allEdges != store.allEdgesVersion
+            }
+        let appendOnly = !identitiesChanged && ordered.allSatisfy {
+            guard let old = previous[$0.id] else { return false }
+            let store = $0.renderStore
+            return old.nodeAppendGeneration == store.nodeAppendGeneration
+                && old.nodeCount <= store.nodes.count
+        }
+        // Access-only lookup changes and singleton hidden-edge bookkeeping do
+        // not publish new render inputs. Explicit topology/status and layout
+        // changes still refresh aggregates, as do cross-galaxy visible edges.
+        let publishesRenderChange = nodesChanged || edgesChanged || hubsChanged || colorsChanged
+            || ordered.contains {
+                previous[$0.id]?.topology != $0.renderStore.topologyVersion
+                    || previous[$0.id]?.worldCenter != $0.worldCenter
+            }
         lastMergedRevisions = revisions
-        mergedTopologyVersion &+= 1
+        lastMergedOrder = order
+        lastHiddenRelations = hiddenRelations
+        if publishesRenderChange { mergedTopologyVersion &+= 1 }
 
         #if ENGRAM_INSTRUMENTATION
         let mergeStart = CFAbsoluteTimeGetCurrent()
         #endif
 
-        let nodeCount: Int
-        let edgeCount: Int
+        if nodesChanged {
+            previousNodeVersion = mergedNodesVersion
+            previousNodeCount = lastMergedNodeCount
+            retainedNodePrefix = nil
+            if let only = ordered.first, ordered.count == 1 {
+                // The borrow below may have restored newer store arrays already;
+                // previous.nodeCount is the retained publication's count.
+                let start = appendOnly ? previous[only.id]!.nodeCount : 0
+                if !appendOnly { nodeToGalaxy.removeAll(keepingCapacity: true) }
+                for node in only.renderStore.nodes.dropFirst(start) {
+                    routingNodeVisitCount &+= 1
+                    nodeToGalaxy[node.id] = only.id
+                }
+                mergedNodes = only.renderStore.nodes
+                mergedNodeEnds = [only.id: mergedNodes.count]
+                if appendOnly { retainedNodePrefix = start }
+            } else {
+                // Appending to an earlier galaxy inserts BEFORE later galaxies.
+                // Keep only the proven old prefix through that galaxy, then redo
+                // the affected suffix with the same first-wins precedence. The
+                // retained routing map doubles as membership without rescanning
+                // the prefix. New high-priority copies displace later copies.
+                let firstChanged = appendOnly ? ordered.firstIndex {
+                    previous[$0.id]?.nodes != $0.renderStore.nodesVersion
+                } : nil
+                let prefix = firstChanged.flatMap { mergedNodeEnds[ordered[$0].id] }
+                let first = firstChanged ?? 0
+                if let prefix {
+                    for node in mergedNodes.dropFirst(prefix) { nodeToGalaxy.removeValue(forKey: node.id) }
+                    mergedNodes.removeSubrange(prefix...)
+                    retainedNodePrefix = prefix
+                } else {
+                    mergedNodes.removeAll(keepingCapacity: true)
+                    nodeToGalaxy.removeAll(keepingCapacity: true)
+                    mergedNodeEnds.removeAll(keepingCapacity: true)
+                }
+                for index in first..<ordered.count {
+                    let galaxy = ordered[index]
+                    let start = index == first && prefix != nil ? previous[galaxy.id]!.nodeCount : 0
+                    for node in galaxy.renderStore.nodes.dropFirst(start) {
+                        routingNodeVisitCount &+= 1
+                        guard nodeToGalaxy[node.id] == nil else { continue }
+                        mergedNodes.append(node)
+                        nodeToGalaxy[node.id] = galaxy.id
+                    }
+                    mergedNodeEnds[galaxy.id] = mergedNodes.count
+                }
+            }
+            if retainedNodePrefix != previousNodeCount { mergedNodeAppendGeneration &+= 1 }
+            lastMergedNodeCount = mergedNodes.count
+            mergedNodesVersion &+= 1
+        }
 
-        if galaxies.count <= 1, let only = galaxies.values.first {
-            // Single-galaxy fast path: CoW references, no allocation or iteration.
-            // With 1 galaxy there are no cross-galaxy edges to discover.
-            let store = only.renderStore
-            mergedNodes = store.nodes
-            mergedEdges = store.edges
-            mergedHubs = store.hubs
-            mergedColorMap = store.colorMap
-            mergedNodeById = store.nodeById
-
-            // Bulk drains only append and bump topology once per slice. Reuse
-            // established routing until final reconciliation; unrelated edits
-            // (including filtering or replacement) still force a full rebuild.
-            let previous = previousRevisions[only.id]
-            let canAppendRouting = only.isDrainingInitialSnapshot
-                && lastSingleGalaxyId == only.id
-                && previous?.identity == ObjectIdentifier(only)
-                && previous.map { $0.topology &+ 1 == store.topologyVersion } == true
-                && nodeToGalaxy.count <= store.nodes.count
-            let start = canAppendRouting ? nodeToGalaxy.count : 0
-            if !canAppendRouting { nodeToGalaxy.removeAll(keepingCapacity: true) }
-            for node in store.nodes.dropFirst(start) { nodeToGalaxy[node.id] = only.id }
-            lastSingleGalaxyId = only.id
-            nodeCount = store.nodes.count
-            edgeCount = store.edges.count
-        } else {
-            // Multi-galaxy: full rebuild
-            var nodes: [NodeData] = []
-            var hubs: Set<UUID> = []
-            var colorMap: [String: Color] = [:]
-            var nodeById: [UUID: NodeData] = [:]
-            var newNodeToGalaxy: [UUID: String] = [:]
-
-            // Precedence order, NOT dictionary order. Every merge below is
-            // first-wins (`seenIds.insert`, `{ existing, _ in existing }`),
-            // so iterating `galaxies.values` made the winner for a duplicated
-            // node depend on hashing — the same memory would jump between
-            // galaxies from one launch to the next. The node filters should
-            // already prevent duplicates; this is the backstop, and a
-            // backstop that picks arbitrarily is how the flicker survives.
-            let ordered = galaxiesInPrecedenceOrder()
-
-            var seenIds = Set<UUID>()
-            for galaxy in ordered {
-                let store = galaxy.renderStore
-                for node in store.nodes {
-                    if seenIds.insert(node.id).inserted {
-                        nodes.append(node)
-                        newNodeToGalaxy[node.id] = galaxy.id
+        if lookupChanged {
+            if let only = ordered.first, ordered.count == 1 {
+                mergedNodeById = only.renderStore.nodeById
+                lookupOwners.removeAll(keepingCapacity: true)
+            } else {
+                // Dictionary lookup has its own mutation guard: access metadata
+                // and hidden-row changes need not alter the visible node array.
+                let appendLookup = appendOnly && ordered.allSatisfy {
+                    previous[$0.id]?.lookupAppendGeneration == $0.renderStore.nodeLookupAppendGeneration
+                }
+                if !appendLookup {
+                    mergedNodeById.removeAll(keepingCapacity: true)
+                    lookupOwners.removeAll(keepingCapacity: true)
+                }
+                for (rank, galaxy) in ordered.enumerated() {
+                    let store = galaxy.renderStore
+                    if appendLookup {
+                        for node in store.nodes.dropFirst(previous[galaxy.id]!.nodeCount) {
+                            guard lookupOwners[node.id].map({ rank <= $0 }) ?? true else { continue }
+                            mergedNodeById[node.id] = store.nodeById[node.id]
+                            lookupOwners[node.id] = rank
+                        }
+                    } else {
+                        for (id, node) in store.nodeById where lookupOwners[id] == nil {
+                            mergedNodeById[id] = node
+                            lookupOwners[id] = rank
+                        }
                     }
                 }
-                hubs.formUnion(store.hubs)
-                colorMap.merge(store.colorMap) { existing, _ in existing }
-                nodeById.merge(store.nodeById) { existing, _ in existing }
             }
-
-            // Cross-galaxy edge merge: iterate ALL galaxies' allEdges, dedup by globalId,
-            // filter against merged visible node set + hiddenRelations.
-            let mergedVisibleIds = Set(nodes.map(\.id))
-            var seen = Set<UUID>()
-            var crossEdges: [EdgeData] = []
-            for galaxy in ordered {
-                for (gid, edge) in galaxy.renderStore.allEdges {
-                    guard seen.insert(gid).inserted else { continue }
-                    guard mergedVisibleIds.contains(edge.sourceId),
-                          mergedVisibleIds.contains(edge.targetId) else { continue }
-                    guard !hiddenRelations.contains(edge.relation) else { continue }
-                    crossEdges.append(edge)
+        }
+        if hubsChanged {
+            if let only = ordered.first, ordered.count == 1 { mergedHubs = only.renderStore.hubs }
+            else {
+                mergedHubs.removeAll(keepingCapacity: true)
+                for galaxy in ordered { mergedHubs.formUnion(galaxy.renderStore.hubs) }
+            }
+            mergedHubsVersion &+= 1
+        }
+        if colorsChanged {
+            if let only = ordered.first, ordered.count == 1 { mergedColorMap = only.renderStore.colorMap }
+            else {
+                mergedColorMap.removeAll(keepingCapacity: true)
+                for galaxy in ordered { mergedColorMap.merge(galaxy.renderStore.colorMap) { old, _ in old } }
+            }
+            mergedColorMapVersion &+= 1
+        }
+        if edgesChanged {
+            if let only = ordered.first, ordered.count == 1 { mergedEdges = only.renderStore.edges }
+            else {
+                var seen: Set<UUID> = []
+                mergedEdges.removeAll(keepingCapacity: true)
+                for galaxy in ordered {
+                    for (id, edge) in galaxy.renderStore.allEdges {
+                        guard seen.insert(id).inserted,
+                              nodeToGalaxy[edge.sourceId] != nil, nodeToGalaxy[edge.targetId] != nil,
+                              !hiddenRelations.contains(edge.relation) else { continue }
+                        mergedEdges.append(edge)
+                    }
                 }
             }
-
-            mergedNodes = nodes
-            mergedEdges = crossEdges
-            mergedHubs = hubs
-            mergedColorMap = colorMap
-            mergedNodeById = nodeById
-            self.nodeToGalaxy = newNodeToGalaxy
-            lastSingleGalaxyId = nil
-            nodeCount = nodes.count
-            edgeCount = crossEdges.count
+            mergedEdgesVersion &+= 1
         }
+        lastSingleGalaxyId = ordered.count == 1 ? ordered.first?.id : nil
+        let nodeCount = mergedNodes.count
+        let edgeCount = mergedEdges.count
 
         #if ENGRAM_INSTRUMENTATION
         let mergeMs = (CFAbsoluteTimeGetCurrent() - mergeStart) * 1000.0
@@ -391,7 +501,7 @@ final class GalaxyRegistry {
         // A background panel scan retains the mutable node buffers. Publishing
         // each partial snapshot would force another full CoW copy next frame.
         // The completed snapshot and every ordinary live update still refresh.
-        if !galaxies.values.contains(where: { $0.isDrainingInitialSnapshot }) {
+        if publishesRenderChange && !galaxies.values.contains(where: { $0.isDrainingInitialSnapshot }) {
             panelSnapshot.refresh(from: self)
         }
     }
@@ -547,11 +657,6 @@ final class GalaxyRegistry {
             }
         }
         return counts.sorted(by: { $0.key < $1.key })
-    }
-
-    /// Merged colorMapVersion — sum of all galaxy versions.
-    var mergedColorMapVersion: UInt64 {
-        mergedTopologyVersion
     }
 
     /// Merged edgeCountByNode.

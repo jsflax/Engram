@@ -421,6 +421,39 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(STATUS.metadata({"previous_pause_reason": "private detail"}), {})
         self.assertEqual(STATUS.metadata({"previous_pause_reason": "emitted"}), {})
 
+    def test_parser_reasons_are_exact_codes_without_private_exception_text(self):
+        for reason in ("partial_final_record", "record_exceeds_scan_limit", "message_exceeds_char_limit",
+                       "ambiguous_fork_history", "missing_fork_ordinal"):
+            self.assertEqual(STATUS.metadata({"reason": reason}), {"reason": reason})
+            self.assertEqual(STATUS.metadata({"reason": reason + " private body"}), {})
+
+    def test_current_blocked_input_reason_overrides_historical_success(self):
+        root = self.learner_fixture(session={"offset": 100, "status": "succeeded", "last_run": RUN},
+            pending={"size_bytes": 200, "paused_request_id": REQUEST, "pause_reason": "blocked"})
+        self.write(root / "runs" / RUN / "run.json", {"session_id": SID, "status": "succeeded"})
+        event = {"session_id": SID, "event": "blocked", "request_id": REQUEST,
+                 "offset": 100, "reason": "message_exceeds_char_limit"}
+        self.write(root / "events.jsonl", [event], log=True)
+        health = self.report()["learner"]["health"]
+        self.assertEqual(health["failure"], {"class": "input_blocked",
+            "reason": "message_exceeds_char_limit", "reason_evidence": "matching_request_and_cursor_event"})
+        self.assertEqual(health["holds"], [])
+        self.assertEqual(health["headline"], "paused")
+        self.assertEqual(health["recovery"], {"action": "inspect_failure", "automatic_replay_authorized": False})
+
+    def test_old_or_mismatched_blocker_is_history_not_current_diagnosis(self):
+        root = self.learner_fixture(session={"offset": 100},
+            pending={"size_bytes": 200, "paused_request_id": REQUEST, "pause_reason": "blocked"})
+        for fields in ({}, {"request_id": "d" * 32}, {"request_id": REQUEST, "offset": 99},
+                       {"request_id": REQUEST, "reason": "private exception"}):
+            self.write(root / "events.jsonl", [{"session_id": SID, "event": "blocked",
+                "offset": 100, "reason": "message_exceeds_char_limit", **fields}], log=True)
+            health = self.report()["learner"]["health"]
+            self.assertEqual(health["failure"], {"class": "input_blocked", "reason_evidence": "not_available_in_window"})
+        self.write(root / "pending" / (SID + ".json"), {"session_id": SID, "identity": IDENTITY,
+            "request_id": REQUEST, "paused_request_id": REQUEST, "pause_reason": "batch_limit"})
+        self.assertEqual(self.report()["learner"]["health"]["failure"]["class"], "none_observed")
+
     def test_success_claim_is_not_native_acknowledgement_or_readback(self):
         root = self.learner_fixture(session={"last_run": RUN})
         self.write(root / "runs" / RUN / "run.json", {"session_id": SID, "status": "failed", "reason": "unverified_completion"})

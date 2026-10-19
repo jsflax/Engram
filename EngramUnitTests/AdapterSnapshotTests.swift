@@ -342,6 +342,361 @@ final class AdapterSnapshotTests: XCTestCase {
         }
     }
 
+    func testStreamingAppendContinuitySpansSeveralChunksBeforePublication() async throws {
+        let (lattice, registry, galaxy, generation, adapter) = try await streamingFixture()
+        defer { lattice.close() }
+        let a = node(label: "First"), b = node(label: "Second"), c = node(label: "Third")
+        let d = node(label: "Fourth")
+        galaxy.applyLoadChunk(nodes: [(1, a)], generation: generation)
+        registry.unifiedSimulation.setPosition(a.id, to: SIMD3<Float>(1, 0, 0))
+        adapter.tick(dt: 1 / 60)
+        let retained = adapter.nodes
+        let compared = adapter.nodePrefixComparisonCount
+        let built = adapter.nodeSnapshotBuildCount
+        let routed = registry.routingNodeVisitCount
+        let appendGeneration = galaxy.renderStore.nodeAppendGeneration
+
+        // More than one producer page may arrive between renderer ticks.
+        galaxy.applyLoadChunk(nodes: [(2, b)], generation: generation)
+        galaxy.applyLoadChunk(nodes: [(3, c), (4, d)], generation: generation)
+        for (index, value) in [b, c, d].enumerated() {
+            registry.unifiedSimulation.setPosition(value.id, to: SIMD3<Float>(Float(index + 2), 0, 0))
+        }
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id, c.id, d.id])
+        XCTAssertEqual(adapter.nodes.map(\.label), ["First", "Second", "Third", "Fourth"])
+        XCTAssertEqual(adapter.positionArray, [1, 2, 3, 4].map { SIMD3<Float>(Float($0), 0, 0) })
+        XCTAssertEqual(retained.map(\.id), [a.id], "Published snapshots must remain immutable")
+        XCTAssertTrue([a, b, c, d].allSatisfy { registry.galaxyForNode($0.id) === galaxy })
+        XCTAssertEqual(Set(registry.nodeToGalaxy.keys), Set([a.id, b.id, c.id, d.id]))
+        XCTAssertEqual(galaxy.renderStore.nodeAppendGeneration, appendGeneration)
+        XCTAssertEqual(adapter.nodePrefixComparisonCount, compared)
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount - built, 3)
+        XCTAssertEqual(registry.routingNodeVisitCount - routed, 3)
+
+        // A separate consumer can publish more than once between adapter
+        // frames. An older certificate must not certify this adapter's prefix.
+        let e = node(label: "Fifth"), f = node(label: "Sixth")
+        let staleVersion = adapter.nodeVersion
+        galaxy.applyLoadChunk(nodes: [(5, e)], generation: generation)
+        registry.mergeRenderData()
+        galaxy.applyLoadChunk(nodes: [(6, f)], generation: generation)
+        registry.mergeRenderData()
+        XCTAssertNil(registry.preservedNodePrefix(since: staleVersion, count: 4))
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id, c.id, d.id, e.id, f.id])
+        XCTAssertEqual(adapter.nodes.map(\.label), ["First", "Second", "Third", "Fourth", "Fifth", "Sixth"])
+        XCTAssertTrue([a, b, c, d, e, f].allSatisfy { registry.galaxyForNode($0.id) === galaxy })
+        XCTAssertGreaterThan(adapter.nodePrefixComparisonCount, compared)
+    }
+
+    func testStreamingPreviewOverlapAndPrefixEditCannotCertifyOldMetadata() async throws {
+        let (lattice, registry, galaxy, generation, adapter) = try await streamingFixture()
+        defer { lattice.close() }
+        let preview = node(label: "Preview"), next = node(label: "Next"), last = node(label: "Last")
+        galaxy.applyLoadChunk(nodes: [(50, preview)], generation: generation)
+        adapter.tick(dt: 1 / 60)
+        let retained = adapter.nodes
+        let appendGeneration = galaxy.renderStore.nodeAppendGeneration
+        let created = Date(timeIntervalSince1970: 1_700_000_000)
+        let changed = NodeData(id: preview.id, project: "Edited project", topic: "Edited topic",
+                               label: "Current", content: "Current body", createdAt: created,
+                               lastAccessedAt: created.addingTimeInterval(10), importance: 5)
+        // The full scan overlaps the preview and edits a prefix member in the
+        // same publication interval as certified suffix inserts.
+        galaxy.applyLoadChunk(nodes: [(1, next)], generation: generation)
+        galaxy.applyLoadChunk(nodes: [(50, changed), (51, last)], generation: generation)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [preview.id, next.id, last.id])
+        let current = try XCTUnwrap(adapter.nodes.first)
+        XCTAssertEqual(current.project, changed.project)
+        XCTAssertEqual(current.topic, changed.topic)
+        XCTAssertEqual(current.label, changed.label)
+        XCTAssertEqual(current.content, changed.content)
+        XCTAssertEqual(current.createdAt, changed.createdAt)
+        XCTAssertEqual(current.lastAccessedAt, changed.lastAccessedAt)
+        XCTAssertEqual(current.importance, changed.importance)
+        XCTAssertEqual(retained.first?.label, "Preview")
+        XCTAssertEqual(Set(adapter.nodes.map(\.id)).count, 3)
+        XCTAssertTrue([preview, next, last].allSatisfy { registry.galaxyForNode($0.id) === galaxy })
+        XCTAssertNotEqual(galaxy.renderStore.nodeAppendGeneration, appendGeneration)
+    }
+
+    func testStreamingEdgeAndHubChangesKeepNodeOutputsAndRefreshHubStyle() async throws {
+        let (lattice, registry, galaxy, generation, adapter) = try await streamingFixture()
+        defer { lattice.close() }
+        let a = node(), b = node()
+        galaxy.applyLoadChunk(nodes: [(1, a), (2, b)], generation: generation)
+        registry.unifiedSimulation.setPosition(a.id, to: SIMD3<Float>(1, 2, 3))
+        registry.unifiedSimulation.setPosition(b.id, to: SIMD3<Float>(4, 5, 6))
+        adapter.tick(dt: 1 / 60)
+        let positions = adapter.positionArray
+        let nodesVersion = adapter.nodeVersion
+        let hubsVersion = adapter.hubVersion
+        let built = adapter.nodeSnapshotBuildCount
+        let compared = adapter.nodePrefixComparisonCount
+        let routed = registry.routingNodeVisitCount
+        let edgeID = UUID()
+        let edge = EdgeData(id: edgeID, sourceId: a.id, targetId: b.id, relation: "relates_to")
+        galaxy.applyLoadChunk(edges: [(1, edge)], generation: generation)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id])
+        XCTAssertEqual(adapter.positionArray, positions)
+        XCTAssertEqual(adapter.edges.map(\.id), [edgeID])
+        XCTAssertFalse(adapter.nodes.contains { $0.isHub })
+        XCTAssertEqual(adapter.nodeVersion, nodesVersion)
+        XCTAssertEqual(adapter.hubVersion, hubsVersion)
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount, built)
+        XCTAssertEqual(adapter.nodePrefixComparisonCount, compared)
+        XCTAssertEqual(registry.routingNodeVisitCount, routed)
+
+        let topologyBeforeHiddenEdge = adapter.topologyVersion
+        let invisible = EdgeData(id: UUID(), sourceId: a.id, targetId: UUID(), relation: "relates_to")
+        galaxy.applyLoadChunk(edges: [(2, invisible)], generation: generation)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [edgeID])
+        XCTAssertEqual(adapter.topologyVersion, topologyBeforeHiddenEdge,
+                       "A singleton allEdges-only change must not invalidate unchanged visible output")
+
+        let edgeBuilt = adapter.edgeSnapshotBuildCount
+        galaxy.renderStore.colorMap[a.project] = .red
+        galaxy.loadStatus = .complete
+        galaxy.worldCenter = SIMD3<Float>(12, 34, 56)
+        galaxy.renderStore.bumpTopology()
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id])
+        XCTAssertEqual(adapter.edges.map(\.id), [edgeID])
+        XCTAssertEqual(adapter.positionArray, positions)
+        XCTAssertEqual(adapter.galaxySnapshots.first?.worldCenter, SIMD3<Float>(12, 34, 56))
+        XCTAssertEqual(adapter.nodeVersion, nodesVersion)
+        XCTAssertEqual(adapter.hubVersion, hubsVersion)
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount, built)
+        XCTAssertEqual(adapter.edgeSnapshotBuildCount, edgeBuilt)
+        XCTAssertEqual(registry.routingNodeVisitCount, routed)
+
+        let hubEdge = EdgeData(id: edgeID, sourceId: a.id, targetId: b.id, relation: "part_of")
+        galaxy.applyLoadChunk(edges: [(1, hubEdge)], generation: generation)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.first?.relation, "part_of")
+        XCTAssertEqual(adapter.hubs, [b.id])
+        XCTAssertEqual(adapter.nodes.filter(\.isHub).map(\.id), [b.id])
+        XCTAssertEqual(adapter.positionArray, positions)
+        XCTAssertEqual(adapter.nodeVersion, nodesVersion)
+        XCTAssertNotEqual(adapter.hubVersion, hubsVersion)
+        XCTAssertGreaterThan(adapter.nodeSnapshotBuildCount, built)
+
+        galaxy.applyLoadChunk(removedEdges: [1], generation: generation)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertTrue(adapter.edges.isEmpty)
+        XCTAssertTrue(adapter.hubs.isEmpty)
+        XCTAssertFalse(adapter.nodes.contains { $0.isHub })
+        XCTAssertTrue([a, b].allSatisfy { registry.galaxyForNode($0.id) === galaxy })
+    }
+
+    func testStreamingFilterDeletionReorderAndShrinkCannotRetainStalePrefix() async throws {
+        let (lattice, registry, galaxy, generation, adapter) = try await streamingFixture()
+        defer { lattice.close() }
+        let a = node(label: "Deleted"), b = node(label: "Hidden"), c = node(label: "Survivor")
+        let d = node(label: "Appended")
+        galaxy.applyLoadChunk(nodes: [(1, a), (2, b), (3, c)], generation: generation)
+        adapter.tick(dt: 1 / 60)
+        let settings = VisualizerConfig()
+        settings.hiddenProjects = ["Hidden project"]
+        registry.updateDrainConfig(from: settings, timeFilter: nil)
+        let hidden = NodeData(id: b.id, project: "Hidden project", topic: b.topic,
+                              label: b.label, content: b.content, createdAt: b.createdAt,
+                              lastAccessedAt: b.lastAccessedAt, importance: b.importance)
+        galaxy.applyLoadChunk(nodes: [(2, hidden), (4, d)], removedNodes: [1], generation: generation)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [c.id, d.id])
+        XCTAssertNil(registry.galaxyForNode(a.id))
+        XCTAssertNil(registry.galaxyForNode(b.id))
+        XCTAssertEqual(Set(registry.nodeToGalaxy.keys), Set([c.id, d.id]))
+
+        // The store revision alone invalidates an earlier append proof,
+        // even when an ordinary mutation does not manually bump topology.
+        galaxy.renderStore.nodes.reverse()
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [d.id, c.id])
+        galaxy.applyLoadChunk(removedNodes: [3], generation: generation)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [d.id])
+        XCTAssertEqual(adapter.positionArray.count, 1)
+        XCTAssertEqual(Set(registry.nodeToGalaxy.keys), [d.id])
+        XCTAssertNil(registry.unifiedSimulation.index(for: c.id))
+    }
+
+    func testStreamingHigherPriorityAppendAndSameIDReplacementChangeWinner() async throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        defer { lattice.close() }
+        let registry = GalaxyRegistry()
+        registry.unifiedSimulation.isActive = false
+        let synced = Galaxy(id: "synced", displayName: "Synced", lattice: lattice.sendableReference)
+        let groupID = "group:team"
+        let group = Galaxy(id: groupID, displayName: "Team", lattice: lattice.sendableReference)
+        let shared = node(label: "Synced copy"), team = node(label: "Team only"), tail = node(label: "Tail")
+        registry.register(synced)
+        registry.register(group)
+        let syncedChanges = await synced.loadChanges
+        let groupChanges = await group.loadChanges
+        let syncedGeneration = syncedChanges.withLock { $0.begin() }
+        let groupGeneration = groupChanges.withLock { $0.begin() }
+        synced.loadStatus = .loading
+        group.loadStatus = .loading
+        synced.applyLoadChunk(nodes: [(1, shared)], generation: syncedGeneration)
+        group.applyLoadChunk(nodes: [(1, team)], generation: groupGeneration)
+        let adapter = GalaxyRegistryAdapter(registry: registry)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [team.id, shared.id])
+
+        let winner = node(id: shared.id, label: "Team wins", topic: "Team topic")
+        group.applyLoadChunk(nodes: [(2, winner)], generation: groupGeneration)
+        synced.applyLoadChunk(nodes: [(2, tail)], generation: syncedGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [team.id, shared.id, tail.id])
+        XCTAssertEqual(adapter.nodes[1].label, "Team wins")
+        XCTAssertEqual(adapter.nodes[1].topic, "Team topic")
+        XCTAssertEqual(registry.mergedNodeById[shared.id]?.label, "Team wins")
+        XCTAssertTrue(registry.galaxyForNode(shared.id) === group)
+        XCTAssertEqual(Set(adapter.nodes.map(\.id)).count, 3)
+        let publishedNodesVersion = adapter.nodeVersion
+
+        // Match counts and the sequence of mutations in the original instance.
+        let replacement = Galaxy(id: groupID, displayName: "Replacement", lattice: lattice.sendableReference)
+        registry.register(replacement)
+        let replacementChanges = await replacement.loadChanges
+        let replacementGeneration = replacementChanges.withLock { $0.begin() }
+        replacement.loadStatus = .loading
+        replacement.applyLoadChunk(nodes: [(1, team)], generation: replacementGeneration)
+        replacement.applyLoadChunk(nodes: [(2, node(id: shared.id, label: "Replacement wins"))],
+                                   generation: replacementGeneration)
+        XCTAssertEqual(replacement.renderStore.topologyVersion, group.renderStore.topologyVersion)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [team.id, shared.id, tail.id])
+        XCTAssertEqual(adapter.nodes[1].label, "Replacement wins")
+        XCTAssertEqual(registry.mergedNodeById[shared.id]?.label, "Replacement wins")
+        XCTAssertTrue(registry.galaxyForNode(shared.id) === replacement)
+        XCTAssertNotEqual(adapter.nodeVersion, publishedNodesVersion)
+
+        registry.remove(groupID)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [shared.id, tail.id])
+        XCTAssertEqual(adapter.nodes.first?.label, "Synced copy")
+        XCTAssertEqual(registry.mergedNodeById[shared.id]?.label, "Synced copy")
+        XCTAssertTrue(registry.galaxyForNode(shared.id) === synced)
+    }
+
+    func testStreamingCrossGalaxyEdgesAndLookupRespectIndependentRevisions() async throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        defer { lattice.close() }
+        let registry = GalaxyRegistry()
+        registry.unifiedSimulation.isActive = false
+        let synced = Galaxy(id: "synced", displayName: "Synced", lattice: lattice.sendableReference)
+        let group = Galaxy(id: "group:team", displayName: "Team", lattice: lattice.sendableReference)
+        registry.register(synced)
+        registry.register(group)
+        let syncedChanges = await synced.loadChanges
+        let groupChanges = await group.loadChanges
+        let syncedGeneration = syncedChanges.withLock { $0.begin() }
+        let groupGeneration = groupChanges.withLock { $0.begin() }
+        let a = node(label: "Group node"), b = node(label: "Synced node")
+        group.applyLoadChunk(nodes: [(1, a)], generation: groupGeneration)
+        synced.applyLoadChunk(nodes: [(1, b)], generation: syncedGeneration)
+        let adapter = GalaxyRegistryAdapter(registry: registry)
+        adapter.tick(dt: 1 / 60)
+        let nodeVersion = adapter.nodeVersion
+        let built = adapter.nodeSnapshotBuildCount
+        let routed = registry.routingNodeVisitCount
+        let edge = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "relates_to")
+        // Neither store contains both endpoints: only the allEdges domain
+        // changes, but the merged scene must still publish this connection.
+        group.applyLoadChunk(edges: [(1, edge)], generation: groupGeneration)
+        XCTAssertTrue(group.renderStore.edges.isEmpty)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [edge.id])
+        XCTAssertEqual(adapter.edges.first?.sourceId, a.id)
+        XCTAssertEqual(adapter.edges.first?.targetId, b.id)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id])
+        XCTAssertEqual(adapter.nodeVersion, nodeVersion)
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount, built)
+        XCTAssertEqual(registry.routingNodeVisitCount, routed)
+
+        registry.hiddenRelations = ["relates_to"]
+        adapter.tick(dt: 1 / 60)
+        XCTAssertTrue(adapter.edges.isEmpty)
+        registry.hiddenRelations = []
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [edge.id])
+
+        let topologyBeforeLookup = adapter.topologyVersion
+        let accessed = a.lastAccessedAt.addingTimeInterval(60)
+        let activityOnly = NodeData(id: a.id, project: a.project, topic: a.topic,
+                                    label: a.label, content: a.content, createdAt: a.createdAt,
+                                    lastAccessedAt: accessed, importance: a.importance)
+        group.applyLoadChunk(nodes: [(1, activityOnly)], generation: groupGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(registry.mergedNodeById[a.id]?.lastAccessedAt, accessed)
+        XCTAssertEqual(adapter.topologyVersion, topologyBeforeLookup,
+                       "Activity metadata must not trigger a full render/centroid publication")
+        XCTAssertEqual(adapter.nodeVersion, nodeVersion)
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount, built)
+        XCTAssertEqual(registry.routingNodeVisitCount, routed)
+        XCTAssertTrue(registry.galaxyForNode(a.id) === group)
+        XCTAssertTrue(registry.galaxyForNode(b.id) === synced)
+
+        synced.applyLoadChunk(removedNodes: [1], generation: syncedGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id])
+        XCTAssertTrue(adapter.edges.isEmpty, "An absent endpoint must remove its cross-galaxy edge")
+        XCTAssertNil(registry.galaxyForNode(b.id))
+    }
+
+    func testStreamingCompletedScanReconcilesPreviewMetadataAndAbsentRows() async throws {
+        let lattice = try Lattice(Memory.self, MemoryEdge.self, configuration: .init(storage: .memory()))
+        defer { lattice.close() }
+        var rows: [Memory] = []
+        for index in 0..<61 {
+            let row = Memory(content: "Current row \(index)", topic: "Current topic", project: "Current project",
+                             importance: 2)
+            try lattice.add(row)
+            rows.append(row)
+        }
+        let ids = try rows.map { try XCTUnwrap($0.globalId) }
+        let previewPrimaryKey = try XCTUnwrap(rows[0].primaryKey)
+        let edge = MemoryEdge(sourceGlobalId: ids[0], targetGlobalId: ids[60], relation: .partOf)
+        try lattice.add(edge)
+        let edgeID = try XCTUnwrap(edge.globalId)
+        let registry = GalaxyRegistry()
+        registry.unifiedSimulation.isActive = false
+        let galaxy = Galaxy(id: "personal", displayName: "Personal", lattice: lattice.sendableReference)
+        registry.register(galaxy)
+        let stale = node(id: ids[0], label: "Stale preview"), absent = node(label: "Absent from database")
+        galaxy.insertNodeBatch([stale, absent], config: config)
+        galaxy.renderStore.pkToGlobalId[previewPrimaryKey] = stale.id
+        galaxy.renderStore.pkToGlobalId[Int64.max] = absent.id
+        galaxy.renderStore.bumpTopology()
+        let adapter = GalaxyRegistryAdapter(registry: registry)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [stale.id, absent.id])
+
+        await galaxy.loadData()
+        await galaxy.stopObservers()
+        adapter.tick(dt: 1 / 60)
+        XCTAssertTrue(galaxy.isLoaded)
+        XCTAssertEqual(galaxy.loadStatus, .complete)
+        XCTAssertEqual(Set(adapter.nodes.map(\.id)), Set(ids))
+        XCTAssertEqual(adapter.nodes.count, ids.count)
+        let refreshed = try XCTUnwrap(adapter.nodes.first { $0.id == stale.id })
+        XCTAssertEqual(refreshed.content, rows[0].content)
+        XCTAssertEqual(refreshed.project, rows[0].project)
+        XCTAssertEqual(refreshed.topic, rows[0].topic)
+        XCTAssertNil(registry.galaxyForNode(absent.id))
+        XCTAssertNil(galaxy.renderStore.pkToGlobalId[Int64.max])
+        XCTAssertEqual(adapter.edges.map(\.id), [edgeID])
+        XCTAssertEqual(adapter.nodes.filter(\.isHub).map(\.id), [ids[60]])
+        XCTAssertTrue(ids.allSatisfy { registry.galaxyForNode($0) === galaxy })
+    }
+
     private func streamingFixture() async throws
         -> (Lattice, GalaxyRegistry, Galaxy, UInt64, GalaxyRegistryAdapter) {
         let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))

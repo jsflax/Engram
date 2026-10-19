@@ -136,6 +136,18 @@ class ExecutionContextTests(unittest.TestCase):
     def validate(self, context, phase="before_forward"):
         return context.validate_inputs(self.manifest(), phase)
 
+    def test_expanded_limits_require_read_only_plan_and_both_bounded_allowances(self):
+        policy = {"max_tool_calls": 12, "max_writes": 5, "privacy": J.PROJECT_SYNC_PRIVACY}
+        for maximum, scan, mode in ((48001, 1024 * 1024, None),
+                                    (262145, 1024 * 1024, "read_only_plan"),
+                                    (60000, 50000, "read_only_plan"),
+                                    (True, 1024 * 1024, "read_only_plan")):
+            with self.subTest(maximum=maximum, scan=scan, mode=mode):
+                with self.assertRaisesRegex(C.ContextError, "invalid_parser_limits"):
+                    self.seal(activate=False, max_chars=maximum, max_scan_bytes=scan,
+                              provider_mode=mode, plan_policy=policy if mode else None)
+                self.assertFalse((self.run_dir / "execution-manifest.json").exists())
+
     def test_seal_preserves_original_state_frontier_parser_and_private_route(self):
         original = {p: p.read_bytes() for p in (self.state_path, self.record_path, self.enrollment, self.path)}
         context = self.seal(activate=False)
@@ -641,8 +653,8 @@ class ExecutionContextTests(unittest.TestCase):
         with self.assertRaises(C.ContextError):
             C.validate_recovery_inputs(wrong, manifest_sha256=context.manifest_sha256)
         source = C._source
-        def mutate_manifest(*args):
-            source(*args)
+        def mutate_manifest(*args, **kwargs):
+            source(*args, **kwargs)
             altered = self.manifest()
             altered["host"] = "changed-during-validation"
             write_json(self.run_dir / "execution-manifest.json", altered)
@@ -654,8 +666,8 @@ class ExecutionContextTests(unittest.TestCase):
         context = self.seal()
         self.fence.close()
         source = C._source
-        def create_hold(*args):
-            source(*args)
+        def create_hold(*args, **kwargs):
+            source(*args, **kwargs)
             write_json(self.root / "migration-holds" / (SID + ".json"), {})
         with mock.patch.object(C, "_source", side_effect=create_hold):
             with self.assertRaises(C.ContextError):

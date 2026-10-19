@@ -4,6 +4,21 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.8] - 2026-10-19
+
+### Fixed
+- Let the read-only Codex learner plan from a complete oversized message up to
+  262,144 characters within the existing scan budget. Preserve the original
+  cursor on refusal and keep saved plans and shared settings unchanged.
+- Show transcript blocking reasons in hook status so a stopped learner reports
+  the cause instead of appearing to have healthy queued work.
+- Reuse unchanged visualizer node snapshots when edges, colors or loading status
+  change. Track hub changes separately so hub styling remains current.
+- Extend streamed node routing and snapshots from store-verified prefixes,
+  preserving preview edits, deletion, filtering and galaxy precedence.
+- Update project and topic label membership from appended nodes while retaining
+  full refreshes after edits and position-dependent cluster calculations.
+
 ## [0.15.7] - 2026-10-18
 
 ### Fixed
