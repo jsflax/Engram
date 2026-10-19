@@ -11,7 +11,7 @@ import re
 import subprocess
 
 CLASSES = ('GalaxyLoadChangesTests', 'GalaxyDrainTests', 'VisualizerHostIsolationTests', 'AdapterSnapshotTests',
-           'FrameLookupInvalidationTests')
+           'FrameLookupInvalidationTests', 'SceneMetadataDomainTests')
 
 def require(ok, message):
     if not ok:

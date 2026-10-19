@@ -70,9 +70,10 @@ public final class RKMascotSystem {
         let nodes = dataProvider.nodes
 
         // Determine which projects need mascots (projects with nodes).
-        // Cached on topologyVersion — the inline set-build over every node
-        // cost ~33ms/frame at 40k nodes.
-        graphIndex.update(nodes: nodes, topologyVersion: dataProvider.topologyVersion, provider: dataProvider)
+        // Edge/color/status revisions do not change patrol membership. Certified
+        // node appends extend the index; arbitrary metadata edits rebuild it.
+        graphIndex.update(nodes: nodes, nodeVersion: dataProvider.nodeVersion,
+                          nodeAppendGeneration: dataProvider.nodeAppendGeneration, provider: dataProvider)
         let activeProjects = graphIndex.projects
 
         // Remove mascots for gone projects

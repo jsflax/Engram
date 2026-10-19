@@ -97,6 +97,8 @@ public protocol SceneDataProvider: AnyObject {
     /// colors, load status and hub membership.
     var nodeVersion: UInt64 { get }
     var hubVersion: UInt64 { get }
+    /// Changes when visible edge identity, order, endpoints or metadata changes.
+    var edgeVersion: UInt64 { get }
     /// Stable only while the complete prior node prefix remains unchanged.
     /// Consumers must also check provider identity and a nonshrinking count.
     var nodeAppendGeneration: UInt64 { get }
@@ -120,6 +122,7 @@ extension SceneDataProvider {
     // gain an append fast path just because their node count grew.
     public var nodeVersion: UInt64 { topologyVersion }
     public var hubVersion: UInt64 { topologyVersion }
+    public var edgeVersion: UInt64 { topologyVersion }
     public var nodeAppendGeneration: UInt64 { nodeVersion }
 
     public var positionArray: [SIMD3<Float>] {

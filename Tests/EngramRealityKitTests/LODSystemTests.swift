@@ -6,6 +6,135 @@ import simd
 @Suite("LODSystem Tests")
 @MainActor
 struct LODSystemTests {
+    @Test
+    func metadataDomainsMatchConservativeVisibilityAcrossMutations() {
+        let optimized = LODSystem(), reference = LODSystem()
+        var owner = NSObject()
+        var nodes = makeNodes(3)
+        var positions: [SIMD3<Float>] = [.init(10, 0, 0), .init(1000, 0, 0), .init(3000, 0, 0)]
+        var edges: [RKEdgeSnapshot] = []
+        var topology: UInt64 = 1, nodeRevision: UInt64 = 1, edgeRevision: UInt64 = 1
+        var hubRevision: UInt64 = 1, generation: UInt64 = 1
+        func compare() {
+            let hubs = Set(nodes.filter(\.isHub).map(\.id))
+            let actual = optimized.computeVisibleSet(
+                nodes: nodes, edges: edges, positions: [:], positionArray: positions,
+                cameraPosition: .zero, selectedNode: nil, glowingNodes: [:], hubs: hubs,
+                topologyVersion: topology, positionVersion: topology, provider: owner,
+                nodeVersion: nodeRevision, hubVersion: hubRevision, edgeVersion: edgeRevision,
+                nodeAppendGeneration: generation)
+            let expected = reference.computeVisibleSet(
+                nodes: nodes, edges: edges, positions: [:], positionArray: positions,
+                cameraPosition: .zero, selectedNode: nil, glowingNodes: [:], hubs: hubs,
+                topologyVersion: topology, positionVersion: topology)
+            #expect(actual.nearNodes == expected.nearNodes)
+            #expect(actual.midNodes == expected.midNodes)
+            #expect(actual.farNodes == expected.farNodes)
+            #expect(actual.visibleEdgeIndices == expected.visibleEdgeIndices)
+            #expect(actual.visibleLabelIndices == expected.visibleLabelIndices)
+        }
+        compare()
+        for _ in 0..<10 {
+            edges.append(RKEdgeSnapshot(id: UUID(), sourceId: nodes[0].id, targetId: nodes[2].id, relation: "r"))
+            edgeRevision += 1
+            topology += 1
+            compare()
+        }
+        #expect(optimized.priorityBuildCount == 3)
+        #expect(optimized.endpointNodeComparisonCount == 0)
+        // Two node chunks arrive before the next consumer frame.
+        nodes += makeNodes(2)
+        positions += [.init(2000, 0, 0), .init(500, 0, 0)]
+        nodeRevision += 2
+        topology += 1
+        // These new fixtures include a hub, so publish that independent domain.
+        hubRevision += 1
+        compare()
+        let countAfterHubChange = optimized.priorityBuildCount
+        let suffix = RKNodeSnapshot(id: UUID(), project: "new", topic: "t", label: "new", importance: 4, isHub: false)
+        nodes.append(suffix)
+        positions.append(.init(750, 0, 0))
+        nodeRevision += 1
+        topology += 1
+        compare()
+        #expect(optimized.priorityBuildCount == countAfterHubChange + 1)
+        // Reorder and edit an existing prefix while the total count grows.
+        nodes.swapAt(0, 1)
+        positions.swapAt(0, 1)
+        let edited = nodes[0]
+        nodes[0] = RKNodeSnapshot(id: edited.id, project: "changed", topic: "t", label: "changed",
+                                  importance: 9, isHub: edited.isHub)
+        nodes.append(suffix)
+        positions.append(.init(200, 0, 0))
+        nodeRevision += 1
+        generation += 1
+        topology += 1
+        compare()
+        nodes.removeFirst(2)
+        positions.removeFirst(2)
+        nodeRevision += 1
+        generation += 1
+        hubRevision += 1
+        topology += 1
+        compare()
+        edges.reverse()
+        if let first = edges.first {
+            edges[0] = RKEdgeSnapshot(id: first.id, sourceId: nodes[0].id, targetId: nodes[1].id, relation: "edited")
+        }
+        edgeRevision += 1
+        topology += 1
+        compare()
+        // Identical revision numbers from a different provider are not authority
+        // to reuse metadata from the previous provider instance.
+        owner = NSObject()
+        nodes.reverse()
+        positions.reverse()
+        topology += 1
+        compare()
+    }
+
+    @Test
+    func metadataReusePreservesMotionAndLivePriorityOverrides() {
+        let lod = LODSystem(), owner = NSObject()
+        lod.maxNodeInstances = 1
+        var nodes = (0..<2).map { _ in
+            RKNodeSnapshot(id: UUID(), project: "p", topic: "t", label: "n", importance: 1, isHub: false)
+        }
+        var positions: [SIMD3<Float>] = [.init(100, 0, 0), .init(100, 0, 0)]
+        var topology: UInt64 = 1, positionRevision: UInt64 = 1, hubRevision: UInt64 = 1
+        func visible(selected: UUID? = nil, glowing: [UUID: Float] = [:]) -> [Int] {
+            let result = lod.computeVisibleSet(
+                nodes: nodes, edges: [], positions: [:], positionArray: positions,
+                cameraPosition: .zero, selectedNode: selected, glowingNodes: glowing,
+                hubs: Set(nodes.filter(\.isHub).map(\.id)), topologyVersion: topology,
+                positionVersion: positionRevision, provider: owner, nodeVersion: 1,
+                hubVersion: hubRevision, edgeVersion: 1, nodeAppendGeneration: 1)
+            return result.nearNodes + result.midNodes + result.farNodes
+        }
+        #expect(visible() == [0])
+        for _ in 0..<100 {
+            topology += 1 // color/status-only publications
+            #expect(visible() == [0])
+        }
+        #expect(lod.priorityBuildCount == 2)
+        #expect(lod.endpointNodeComparisonCount == 0)
+        #expect(visible(selected: nodes[1].id) == [1])
+        #expect(visible(glowing: [nodes[1].id: 0]) == [1])
+        #expect(visible() == [0])
+        let hub = nodes[1]
+        nodes[1] = RKNodeSnapshot(id: hub.id, project: hub.project, topic: hub.topic,
+                                  label: hub.label, importance: 1, isHub: true)
+        hubRevision += 1
+        #expect(visible() == [1])
+        #expect(lod.priorityBuildCount == 4)
+        positions = [.init(10, 0, 0), .init(3000, 0, 0)]
+        positionRevision += 1
+        #expect(visible() == [0])
+        positions.swapAt(0, 1)
+        positionRevision += 1
+        #expect(visible() == [1])
+        #expect(lod.priorityBuildCount == 4)
+    }
 
     @Test("Compact priorities refresh on metadata revisions and preserve live overrides")
     func compactPrioritiesFollowMetadataAndOverrides() {

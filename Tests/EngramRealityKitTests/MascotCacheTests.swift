@@ -5,6 +5,53 @@ import Testing
 @Suite("Mascot graph and asynchronous card caches")
 @MainActor
 struct MascotCacheTests {
+    @Test
+    func routingDomainsExtendOnlyCertifiedNodeSuffixes() {
+        let owner = NSObject()
+        let first = node(project: "A"), second = node(project: "B")
+        let duplicate = node(first.id, project: "B"), fourth = node(project: "C")
+        let index = MascotGraphIndex()
+        index.update(nodes: [first], nodeVersion: 1, nodeAppendGeneration: 7, provider: owner)
+        index.update(nodes: [first, second], nodeVersion: 2, nodeAppendGeneration: 7, provider: owner)
+        index.update(nodes: [first, second, duplicate, fourth], nodeVersion: 4,
+                     nodeAppendGeneration: 7, provider: owner)
+        for _ in 0..<100 {
+            index.update(nodes: [first, second, duplicate, fourth], nodeVersion: 4,
+                         nodeAppendGeneration: 7, provider: owner)
+        }
+        #expect(index.nodesVisited == 4)
+        #expect(index.projects == ["A", "B", "C"])
+        #expect(index.indicesByProject["B"] == [1, 2])
+        #expect(index.indexByID[first.id] == 0)
+        #expect(index.indexByID[fourth.id] == 3)
+    }
+
+    @Test
+    func routingDomainsRebuildForEditsRemovalAndReplacement() {
+        let owner = NSObject(), replacement = NSObject()
+        let a = node(project: "A"), b = node(project: "B"), c = node(project: "C")
+        let index = MascotGraphIndex()
+        index.update(nodes: [a, b], nodeVersion: 1, nodeAppendGeneration: 1, provider: owner)
+        let edited = node(a.id, project: "changed")
+        let cases = [[edited, b, c], [c, b, edited], [b], []]
+        for (offset, nodes) in cases.enumerated() {
+            let revision = UInt64(offset + 2)
+            index.update(nodes: nodes, nodeVersion: revision,
+                         nodeAppendGeneration: revision, provider: owner)
+            #expect(index.projects == Set(nodes.map(\.project)))
+            for project in index.projects {
+                #expect(index.indicesByProject[project] == nodes.indices.filter { nodes[$0].project == project })
+            }
+            #expect(index.indexByID.count == nodes.count)
+            for (i, node) in nodes.enumerated() { #expect(index.indexByID[node.id] == i) }
+        }
+        index.update(nodes: [a, b], nodeVersion: 10, nodeAppendGeneration: 10, provider: owner)
+        index.update(nodes: [c, edited], nodeVersion: 10, nodeAppendGeneration: 10, provider: replacement)
+        #expect(index.projects == ["C", "changed"])
+        #expect(index.indexByID[b.id] == nil)
+        #expect(index.indexByID[a.id] == 1)
+    }
+
     private func node(_ id: UUID = UUID(), project: String) -> RKNodeSnapshot {
         RKNodeSnapshot(id: id, project: project, topic: "topic", label: "Node", importance: 1, isHub: false)
     }

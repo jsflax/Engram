@@ -30,8 +30,8 @@ private final class FrameLookupProvider: SceneDataProvider {
 
 @MainActor
 final class FrameLookupInvalidationTests: XCTestCase {
-    private func node(_ id: UUID, _ project: String) -> RKNodeSnapshot {
-        RKNodeSnapshot(id: id, project: project, topic: "topic", label: project,
+    private func node(_ id: UUID, _ project: String, topic: String = "topic") -> RKNodeSnapshot {
+        RKNodeSnapshot(id: id, project: project, topic: topic, label: project,
                        importance: 1, isHub: false)
     }
 
@@ -186,6 +186,8 @@ final class FrameLookupInvalidationTests: XCTestCase {
         let initial = cache.update(provider)
         XCTAssertTrue(initial.projects == Set(["First"]))
         XCTAssertTrue(initial.topics == Set(["topic"]))
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [SIMD3(0, 8, 0)], positions: [:])
+        let originalTopic = cache.topic(at: 0)
         let visited = cache.nodesVisited, revision = cache.revision
 
         provider.edges = [edge(first, second)]
@@ -210,6 +212,20 @@ final class FrameLookupInvalidationTests: XCTestCase {
         XCTAssertTrue(initial.projects == Set(["First"]))
         XCTAssertTrue(cache.nodesVisited - visited == 2)
         XCTAssertTrue(cache.revision > revision)
+        cache.rescanPositions(nodes: provider.nodes,
+                              positionArray: [SIMD3(0, -2, 0), SIMD3(0, 10, 0), SIMD3(0, -4, 0)],
+                              positions: [:])
+        XCTAssertTrue(cache.maxY(forProject: "First") == -2)
+        XCTAssertTrue(cache.maxY(forProject: "Second") == 10)
+        XCTAssertTrue(cache.maxY(forProject: "Third") == -4)
+        XCTAssertTrue(cache.topicCount == 2)
+        XCTAssertTrue(cache.topic(at: 0)?.name == "topic")
+        XCTAssertTrue(cache.topic(at: 0)?.sum == SIMD3<Float>(0, -6, 0))
+        XCTAssertTrue(cache.topic(at: 0)?.count == 2)
+        XCTAssertTrue(cache.topic(at: 0)?.project == "Third")
+        XCTAssertTrue(cache.topic(at: 1)?.name == "new topic")
+        XCTAssertTrue(cache.topic(at: 1)?.count == 1)
+        XCTAssertTrue(originalTopic?.maxY == 8)
     }
 
     func testLabelMembershipRejectsInvalidContinuity() {
@@ -221,6 +237,8 @@ final class FrameLookupInvalidationTests: XCTestCase {
         provider.nodes = [node(first, "Old"), node(second, "Removed")]
         let initial = cache.update(provider)
         XCTAssertTrue(initial.projects == Set(["Old", "Removed"]))
+        cache.rescanPositions(nodes: provider.nodes,
+                              positionArray: [SIMD3(0, 10, 0), SIMD3(0, 20, 0)], positions: [:])
 
         // Same count, different order and metadata: the old set cannot be
         // extended even though the node array did not shrink.
@@ -230,6 +248,12 @@ final class FrameLookupInvalidationTests: XCTestCase {
         let edited = cache.update(provider)
         XCTAssertTrue(edited.projects == Set(["Current"]))
         XCTAssertTrue(edited.topics == Set(["topic"]))
+        cache.rescanPositions(nodes: provider.nodes,
+                              positionArray: [SIMD3(0, 1, 0), SIMD3(0, 2, 0)], positions: [:])
+        XCTAssertTrue(cache.maxY(forProject: "Old") == nil)
+        XCTAssertTrue(cache.maxY(forProject: "Removed") == nil)
+        XCTAssertTrue(cache.maxY(forProject: "Current") == 2)
+        XCTAssertTrue(cache.topic(at: 0)?.sum == SIMD3<Float>(0, 3, 0))
         provider.nodes.removeAll()
         provider.explicitNodeVersion = 3
         // Defensive shrink refusal also applies if a producer failed to
@@ -237,6 +261,9 @@ final class FrameLookupInvalidationTests: XCTestCase {
         let emptied = cache.update(provider)
         XCTAssertTrue(emptied.projects.isEmpty)
         XCTAssertTrue(emptied.topics.isEmpty)
+        cache.rescanPositions(nodes: [], positionArray: [], positions: [:])
+        XCTAssertTrue(cache.topicCount == 0)
+        XCTAssertTrue(cache.maxY(forProject: "Current") == nil)
 
         provider.nodes = [node(first, "Repopulated")]
         provider.explicitNodeVersion = 4
@@ -250,6 +277,12 @@ final class FrameLookupInvalidationTests: XCTestCase {
         let replaced = cache.update(replacement)
         XCTAssertTrue(replaced.projects == Set(["Replacement"]))
         XCTAssertTrue(replaced.topics == Set(["replacement topic"]))
+        cache.rescanPositions(nodes: replacement.nodes, positionArray: [SIMD3(0, -5, 0)], positions: [:])
+        XCTAssertTrue(cache.maxY(forProject: "Repopulated") == nil)
+        XCTAssertTrue(cache.topicCount == 1)
+        XCTAssertTrue(cache.topic(at: 0)?.name == "replacement topic")
+        XCTAssertTrue(cache.topic(at: 0)?.project == "Replacement")
+        XCTAssertTrue(cache.topic(at: 0)?.maxY == -5)
 
         // The ordinary conservative provider contract changes generation with
         // topology, so a simultaneous prefix edit and append is fully read.
@@ -261,5 +294,108 @@ final class FrameLookupInvalidationTests: XCTestCase {
         let fallback = cache.update(conservative)
         XCTAssertTrue(fallback.projects == Set(["After", "Appended"]))
         XCTAssertTrue(fallback.topics == Set(["topic"]))
+    }
+
+    func testLabelNumericRescanFollowsMotion() {
+        let provider = FrameLookupProvider()
+        var cache = LabelProjectTopicCache()
+        provider.nodes = [node(UUID(), "A"), node(UUID(), "B"), node(UUID(), "A", topic: "other")]
+        _ = cache.update(provider)
+        cache.rescanPositions(nodes: provider.nodes,
+                              positionArray: [SIMD3(2, 8, 4), SIMD3(4, 12, 2), SIMD3(0, 3, 0)],
+                              positions: [:])
+        XCTAssertTrue(cache.maxY(forProject: "A") == 8)
+        XCTAssertTrue(cache.maxY(forProject: "B") == 12)
+        XCTAssertTrue(cache.topic(at: 0)?.sum == SIMD3<Float>(6, 20, 6))
+        XCTAssertTrue(cache.topic(at: 0)?.count == 2)
+        XCTAssertTrue(cache.topic(at: 0)?.project == "B")
+        XCTAssertTrue(cache.topic(at: 0)?.maxY == 12)
+        XCTAssertTrue(cache.topic(at: 1)?.count == 1)
+        let visited = cache.nodesVisited, revision = cache.revision
+
+        provider.positionVersion += 1
+        _ = cache.update(provider)
+        cache.rescanPositions(nodes: provider.nodes,
+                              positionArray: [SIMD3(2, -8, 4), SIMD3(4, -12, 2), SIMD3(0, -3, 0)],
+                              positions: [:])
+        XCTAssertTrue(cache.nodesVisited == visited)
+        XCTAssertTrue(cache.revision == revision)
+        XCTAssertTrue(cache.maxY(forProject: "A") == -3)
+        XCTAssertTrue(cache.maxY(forProject: "B") == -12)
+        XCTAssertTrue(cache.topic(at: 0)?.sum == SIMD3<Float>(6, -20, 6))
+        XCTAssertTrue(cache.topic(at: 0)?.count == 2)
+        XCTAssertTrue(cache.topic(at: 0)?.maxY == -8)
+        XCTAssertTrue(cache.topic(at: 1)?.sum == SIMD3<Float>(0, -3, 0))
+    }
+
+    func testLabelNumericRescanPreservesMissingPositionSemantics() {
+        let provider = FrameLookupProvider()
+        var cache = LabelProjectTopicCache()
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID()
+        provider.nodes = [node(a, "A"), node(b, "B"), node(c, "C"), node(d, "D", topic: "missing")]
+        let membership = cache.update(provider)
+        XCTAssertTrue(membership.projects == Set(["A", "B", "C", "D"]))
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [.zero],
+                              positions: [a: SIMD3(99, 99, 99), b: SIMD3(2, 4, 6)])
+        XCTAssertTrue(cache.maxY(forProject: "A") == 0)
+        XCTAssertTrue(cache.maxY(forProject: "B") == 4)
+        XCTAssertTrue(cache.maxY(forProject: "C") == nil)
+        XCTAssertTrue(cache.maxY(forProject: "D") == nil)
+        XCTAssertTrue(cache.topic(at: 0)?.sum == SIMD3<Float>(2, 4, 6))
+        XCTAssertTrue(cache.topic(at: 0)?.count == 2)
+        XCTAssertTrue(cache.topic(at: 0)?.project == "B")
+        XCTAssertTrue(cache.topic(at: 1) == nil)
+
+        // The previous last valid node disappears; an absent suffix must not
+        // retain its sum, height or color project.
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [.zero], positions: [c: SIMD3(3, 6, 9)])
+        XCTAssertTrue(cache.maxY(forProject: "B") == nil)
+        XCTAssertTrue(cache.topic(at: 0)?.sum == SIMD3<Float>(3, 6, 9))
+        XCTAssertTrue(cache.topic(at: 0)?.project == "C")
+        XCTAssertTrue(cache.topic(at: 0)?.maxY == 6)
+
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [.zero, .zero, .zero, .zero], positions: [:])
+        XCTAssertTrue(cache.topic(at: 0)?.count == 3)
+        XCTAssertTrue(cache.topic(at: 0)?.sum == SIMD3<Float>.zero)
+        XCTAssertTrue(cache.topic(at: 0)?.project == "C")
+        XCTAssertTrue(cache.topic(at: 1)?.count == 1)
+        XCTAssertTrue(cache.maxY(forProject: "D") == 0)
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [], positions: [:])
+        XCTAssertTrue(cache.topicCount == 2) // Atlas membership includes unpositioned nodes.
+        XCTAssertTrue(cache.topic(at: 0) == nil)
+        XCTAssertTrue(cache.topic(at: 1) == nil)
+        XCTAssertTrue(cache.maxY(forProject: "A") == nil)
+    }
+
+    func testLabelNumericSlotsFollowReorderAndTopicChanges() {
+        let provider = FrameLookupProvider()
+        var cache = LabelProjectTopicCache()
+        let a = UUID(), b = UUID()
+        provider.nodes = [node(a, "A"), node(b, "B")]
+        _ = cache.update(provider)
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [],
+                              positions: [a: SIMD3(1, 2, 3), b: SIMD3(4, 5, 6)])
+        XCTAssertTrue(cache.topic(at: 0)?.project == "B")
+        provider.nodes.reverse()
+        provider.topologyVersion += 1
+        _ = cache.update(provider)
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [],
+                              positions: [a: SIMD3(1, 2, 3), b: SIMD3(4, 5, 6)])
+        XCTAssertTrue(cache.topic(at: 0)?.project == "A")
+        XCTAssertTrue(cache.topic(at: 0)?.sum == SIMD3<Float>(5, 7, 9))
+
+        provider.nodes = [node(b, "Changed", topic: "new"), node(a, "Changed", topic: "new")]
+        provider.topologyVersion += 1
+        _ = cache.update(provider)
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [],
+                              positions: [a: SIMD3(1, -2, 3), b: SIMD3(4, -5, 6)])
+        XCTAssertTrue(cache.maxY(forProject: "A") == nil)
+        XCTAssertTrue(cache.maxY(forProject: "B") == nil)
+        XCTAssertTrue(cache.maxY(forProject: "Changed") == -2)
+        XCTAssertTrue(cache.topicCount == 1)
+        XCTAssertTrue(cache.topic(at: 0)?.name == "new")
+        XCTAssertTrue(cache.topic(at: 0)?.project == "Changed")
+        XCTAssertTrue(cache.topic(at: 0)?.sum == SIMD3<Float>(5, -7, 9))
+        XCTAssertTrue(cache.topic(at: 0)?.count == 2)
     }
 }
