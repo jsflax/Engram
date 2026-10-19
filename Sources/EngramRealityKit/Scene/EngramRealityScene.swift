@@ -133,6 +133,10 @@ public final class EngramRealityScene {
     /// update camera smoothing, dispatch forces, etc. Called at the start of each frame.
     public var onFrameCallback: ((Float) -> Void)?
 
+    /// Optional logger-only callback. Returns nested force-preparation wall
+    /// time, or nil when unavailable. The ordinary callback remains unchanged.
+    public var onInstrumentedFrameCallback: ((Float) -> UInt64?)?
+
     // Point light pool (max 16)
     var pointLightPool: [Entity] = []
     let maxPointLights = 16
@@ -232,6 +236,7 @@ public final class EngramRealityScene {
         guard let v = ProcessInfo.processInfo.environment["ENGRAM_FRAME_STATS"], !v.isEmpty else { return nil }
         return v == "1" ? "/tmp/engram-frame-stats.csv" : v
     }()
+    public var isFrameTimingEnabled: Bool { frameStatsPath != nil }
     private var frameStatsBuffer: [String] = []
     private var frameStatsHeaderWritten = false
 
@@ -248,7 +253,7 @@ public final class EngramRealityScene {
         if !frameStatsHeaderWritten {
             let refresh = NSScreen.main?.maximumFramesPerSecond ?? 0
             let header = "# refresh_hz=\(refresh) date=\(Date())\n"
-                + "frame,dt_ms,tick_ms,lod_ms,node_ms,edge_ms,label_ms,commit_ms,nebula_ms,galaxy_titles_ms,mascot_ms,flow_ms,lights_ms,audio_ms,total_ms,nodes,edges,vis_edges,near,mid,far\n"
+                + "frame,dt_ms,tick_ms,lod_ms,node_ms,edge_ms,label_ms,commit_ms,nebula_ms,galaxy_titles_ms,mascot_ms,flow_ms,lights_ms,audio_ms,total_ms,nodes,edges,vis_edges,near,mid,far,tick_callback_ms,tick_force_prepare_ms,tick_drain_ms,tick_sim_ms,tick_merge_ms,tick_snapshot_ms,tick_cache_ms,tick_detail_flags\n"
             FileManager.default.createFile(atPath: path, contents: header.data(using: .utf8))
             frameStatsHeaderWritten = true
         }
@@ -269,14 +274,28 @@ public final class EngramRealityScene {
         updateBody(dt: dt, dataProvider: dataProvider)
     }
 
-    /// Instrumented wrapper: phase timings are captured inside updateBody via
-    /// the phaseMarks array; this keeps the un-instrumented path branch-free.
+    /// Opt-in tick details and shared render phase marks. The ordinary path
+    /// does not acquire diagnostic timestamps or construct timing records.
     private var phaseMarks: [UInt64] = []
     private func updateInstrumented(dt: Float, dataProvider: SceneDataProvider) {
         phaseMarks.removeAll(keepingCapacity: true)
         let t0 = nowNs()
         phaseMarks.append(t0)
-        updateBody(dt: dt, dataProvider: dataProvider)
+        // Keep tick_ms as the entire callback + provider envelope. Subtimings
+        // below are nested details and must not be summed with that envelope.
+        let forcePreparation: UInt64?
+        if let callback = onInstrumentedFrameCallback {
+            forcePreparation = callback(dt)
+        } else {
+            onFrameCallback?(dt)
+            forcePreparation = nil
+        }
+        let callbackEnd = nowNs()
+        animationTime += dt
+        frameCount += 1
+        let providerTimings = dataProvider.tickWithTimings(dt: dt)
+        phaseMark()
+        updateAfterTick(dt: dt, dataProvider: dataProvider)
         let tEnd = nowNs()
         // phaseMarks: [start, afterTick, afterLOD, afterNode, afterEdge,
         //              afterLabel, afterCommit, afterNebula, afterGalaxyTitles, afterMascot,
@@ -286,14 +305,22 @@ public final class EngramRealityScene {
             return Double(phaseMarks[j] &- phaseMarks[i]) / 1_000_000
         }
         let totalMs = Double(tEnd &- t0) / 1_000_000
+        // Availability bits: 1 = callback envelope, 2 = force-dispatch detail,
+        // 4 = provider stages. A missing detail is encoded as zero + bit unset.
+        let detailFlags = 1 | (forcePreparation == nil ? 0 : 2) | (providerTimings == nil ? 0 : 4)
+        func detailMs(_ value: UInt64?) -> Double { Double(value ?? 0) / 1_000_000 }
         let line = String(
-            format: "%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d\n",
+            format: "%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n",
             frameCount, Double(dt) * 1000,
             ms(0, 1), ms(1, 2), ms(2, 3), ms(3, 4), ms(4, 5), ms(5, 6),
             ms(6, 7), ms(7, 8), ms(8, 9), ms(9, 10), ms(10, 11), ms(11, 12), totalMs,
             dataProvider.nodes.count, dataProvider.edges.count,
             visibleSet.visibleEdgeIndices.count, visibleSet.nearNodes.count,
-            visibleSet.midNodes.count, visibleSet.farNodes.count)
+            visibleSet.midNodes.count, visibleSet.farNodes.count,
+            detailMs(callbackEnd - t0), detailMs(forcePreparation),
+            detailMs(providerTimings?.drainNanoseconds), detailMs(providerTimings?.simulationNanoseconds),
+            detailMs(providerTimings?.mergeNanoseconds), detailMs(providerTimings?.rebuildNanoseconds),
+            detailMs(providerTimings?.cacheNanoseconds), detailFlags)
         frameStatsAppend(line)
     }
 
@@ -312,7 +339,11 @@ public final class EngramRealityScene {
         // 1. Tick data provider (drain + simulate)
         dataProvider.tick(dt: dt)
         phaseMark()
+        updateAfterTick(dt: dt, dataProvider: dataProvider)
+    }
 
+    @inline(__always)
+    private func updateAfterTick(dt: Float, dataProvider: SceneDataProvider) {
         // 2. Update scene root component
         var rootComp = rootEntity.components[SceneRootComponent.self] ?? SceneRootComponent()
         rootComp.animationTime = animationTime

@@ -105,10 +105,11 @@ class HostPreparationTests(unittest.TestCase):
         mirrored = re.sub(r'^    func ([a-z])(\w*)\(',
                           lambda match: '    func test' + match[1].upper() + match[2] + '(',
                           mirrored, flags=re.M)
-        mirrored = mirrored.replace('    func testTick(dt: Float) {}', '    func tick(dt: Float) {}')
+        mirrored = mirrored.replace('    func testTick(dt: Float)', '    func tick(dt: Float)')
         mirrored = mirrored.replace('#expect(', 'XCTAssertTrue(')
         self.assertEqual((repo / 'EngramUnitTests/FrameLookupInvalidationTests.swift').read_text(), mirrored)
         expected = ['FrameLookupInvalidationTests/' + name for name in (
+            'testOptionalTickTimingFallbackCallsOrdinaryProviderExactlyOnce',
             'testLightColorsRemainLive', 'testLightNodeInvalidation', 'testSelectedEdgeDeletion',
             'testSelectedEdgeReorderAndReplacement', 'testStableFlowAndSelectionChange',
             'testFlowProviderCountAndCap', 'testLabelMembershipSeparatesDomainsAndExtendsAppendPrefix',
@@ -116,7 +117,7 @@ class HostPreparationTests(unittest.TestCase):
             'testLabelNumericRescanPreservesMissingPositionSemantics',
             'testLabelNumericSlotsFollowReorderAndTopicChanges')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 79)
+        self.assertEqual(len(inventory), 81)
         self.assertEqual([name for name in inventory if name.startswith('FrameLookupInvalidationTests/')],
                          sorted(expected))
         self.assertEqual(M.CLASSES.count('FrameLookupInvalidationTests'), 1)

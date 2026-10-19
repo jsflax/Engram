@@ -122,6 +122,28 @@ class FrameReaderTests(unittest.TestCase):
         self.assertEqual([row["frame"] for row in reader.poll()], [2, 3])
         self.assertEqual([row["frame"] for row in reader.frames], [1, 2, 3])
 
+    def test_optional_tick_details_wait_for_complete_row_and_are_not_replayed(self):
+        details = ["tick_callback_ms", "tick_force_prepare_ms", "tick_drain_ms",
+                   "tick_sim_ms", "tick_merge_ms", "tick_snapshot_ms", "tick_cache_ms",
+                   "tick_detail_flags"]
+        first = self.row(frame=1).strip() + ",2,1,0.1,0.2,0.3,0.4,0.5,7\n"
+        # A provider without detail uses zeros with its availability bits unset.
+        second = self.row(frame=2).strip() + ",2,0,0,0,0,0,0,1\n"
+        self.path.write_text(self.header(self.columns + details) + first + second[:-2])
+        reader = FrameReader(self.path)
+        frames = reader.poll()
+        self.assertEqual([row["frame"] for row in frames], [1])
+        self.assertEqual(frames[0]["tick_cache_ms"], 0.5)
+        self.assertEqual(frames[0]["tick_detail_flags"], 7)
+        self.assertEqual(frames[0]["total_ms"], 5)
+        with self.path.open("a") as destination:
+            destination.write(second[-2:])
+        later = reader.poll()
+        self.assertEqual([row["frame"] for row in later], [2])
+        self.assertEqual(later[0]["tick_detail_flags"], 1)
+        self.assertEqual(reader.poll(), [])
+        self.assertEqual([row["frame"] for row in reader.frames], [1, 2])
+
     def test_missing_and_duplicate_named_columns_are_rejected(self):
         for columns in (self.columns[:-1], self.columns + [self.columns[0]],
                         ["frame", "wall_dt_ms", "total_ms"]):

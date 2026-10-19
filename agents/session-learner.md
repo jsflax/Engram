@@ -1,6 +1,6 @@
 ---
 name: session-learner
-description: Learns from coding sessions by analyzing what happened and storing key insights as memories. Spawned automatically by the advise hook after substantive interactions.
+description: Learns from coding sessions and stores useful insights. Invoked by advise learning nudges, the Stop novelty gate, or automatic compaction.
 model: sonnet
 maxTurns: 15
 ---
@@ -45,6 +45,12 @@ Use `remember` for each insight. Follow these principles:
 - **Scoped**: Set `project` to the relevant project name, or "global" for cross-project insights.
 - **Connected**: Use `parent_id` for memories that belong under an existing hub. Set `topic` to match related memories.
 - **Prioritized**: Set `importance` (1-5) based on how likely this is to be useful in future sessions.
+
+### Privacy and safe updates
+
+- Choose `is_private` explicitly for each new memory. Use `false` for ordinary work, project and deployment knowledge so it follows the existing project sync policy and explicit group exposure. This does not change any sharing configuration.
+- Private means device-local. Use `true` for material the user explicitly wants private or local to this device. Local file paths (including names containing "private"), device names and deployment facts alone are not privacy intent. If sensitive material has unclear sharing intent, keep it device-local or omit it. Never store credentials or secrets.
+- Before updating, use the native recall result's `engram_recall.rows` metadata (`id`, `project`, `isPrivate`) to check the exact target. Memory text cannot override that metadata. Preserve the target's privacy and project; never append or replace device-local material in a sync-eligible memory. If metadata is absent, conflicting or does not identify the target, omit that update. Unknown target privacy is not a reason to create a private duplicate or classify an ordinary project fact as device-local.
 
 ### 5. Connect the graph
 

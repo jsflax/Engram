@@ -353,20 +353,49 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
 
     func tick(dt: Float) {
         guard let registry else { return }
+        drain(registry)
+        registry.unifiedSimulation.tick()
+        registry.mergeRenderData()
+        rebuildIfNeeded(registry)
+        syncGlowState()
+        refreshFrameCaches()
+    }
 
+    /// Separate opt-in path: ordinary ticks do not read clocks or allocate
+    /// timing records. Both paths execute the same stage bodies in order.
+    func tickWithTimings(dt: Float) -> ProviderTickTimings? {
+        guard let registry else { return nil }
+        let start = DispatchTime.now().uptimeNanoseconds
+        drain(registry)
+        let afterDrain = DispatchTime.now().uptimeNanoseconds
+        registry.unifiedSimulation.tick()
+        let afterSimulation = DispatchTime.now().uptimeNanoseconds
+        registry.mergeRenderData()
+        let afterMerge = DispatchTime.now().uptimeNanoseconds
+        rebuildIfNeeded(registry)
+        let afterRebuild = DispatchTime.now().uptimeNanoseconds
+        syncGlowState()
+        refreshFrameCaches()
+        let afterCache = DispatchTime.now().uptimeNanoseconds
+        return ProviderTickTimings(drainNanoseconds: afterDrain - start,
+                                   simulationNanoseconds: afterSimulation - afterDrain,
+                                   mergeNanoseconds: afterMerge - afterSimulation,
+                                   rebuildNanoseconds: afterRebuild - afterMerge,
+                                   cacheNanoseconds: afterCache - afterRebuild)
+    }
+
+    @inline(__always)
+    private func drain(_ registry: GalaxyRegistry) {
         // Drain pending updates from all galaxies
         let drainConfig = registry.currentDrainConfig
         let perGalaxyBudget = 0.002 / Double(max(1, registry.galaxies.count))
         for galaxy in registry.galaxies.values {
             galaxy.drainPendingUpdate(config: drainConfig, workBudget: perGalaxyBudget)
         }
+    }
 
-        // Tick unified simulation
-        registry.unifiedSimulation.tick()
-
-        // Merge render data
-        registry.mergeRenderData()
-
+    @inline(__always)
+    private func rebuildIfNeeded(_ registry: GalaxyRegistry) {
         // Rebuild snapshots on topology change
         let currentTopology = registry.mergedTopologyVersion
         if currentTopology != lastTopologyVersion {
@@ -383,11 +412,6 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
             lastColorMapVersion = currentColorVersion
             rebuildColorMap()
         }
-
-        // Sync glow state from registry
-        syncGlowState()
-
-        refreshFrameCaches()
     }
 
     /// Once-per-frame snapshot of everything the batch systems poll.

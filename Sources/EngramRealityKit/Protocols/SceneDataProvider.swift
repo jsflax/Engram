@@ -59,6 +59,27 @@ public struct RKNebulaCluster: Sendable {
     }
 }
 
+/// Optional diagnostic wall times inside one provider tick. These are nested
+/// within the existing frame CSV tick_ms envelope, not additional frame phases.
+public struct ProviderTickTimings: Sendable {
+    public let drainNanoseconds: UInt64
+    public let simulationNanoseconds: UInt64
+    public let mergeNanoseconds: UInt64
+    /// Render snapshots and palette invalidation/rebuild.
+    public let rebuildNanoseconds: UInt64
+    /// Glow synchronization and moving position/aggregate caches.
+    public let cacheNanoseconds: UInt64
+
+    public init(drainNanoseconds: UInt64, simulationNanoseconds: UInt64,
+                mergeNanoseconds: UInt64, rebuildNanoseconds: UInt64, cacheNanoseconds: UInt64) {
+        self.drainNanoseconds = drainNanoseconds
+        self.simulationNanoseconds = simulationNanoseconds
+        self.mergeNanoseconds = mergeNanoseconds
+        self.rebuildNanoseconds = rebuildNanoseconds
+        self.cacheNanoseconds = cacheNanoseconds
+    }
+}
+
 /// Core abstraction for all data the RealityKit scene needs per frame.
 ///
 /// EngramVisualizer implements this via GalaxyRegistryAdapter;
@@ -115,9 +136,17 @@ public protocol SceneDataProvider: AnyObject {
 
     /// Per-frame update — drain pending changes, tick simulation.
     func tick(dt: Float)
+    /// Called only by the opt-in frame logger. Existing providers may decline
+    /// detail while still executing their ordinary tick exactly once.
+    func tickWithTimings(dt: Float) -> ProviderTickTimings?
 }
 
 extension SceneDataProvider {
+    public func tickWithTimings(dt: Float) -> ProviderTickTimings? {
+        tick(dt: dt)
+        return nil
+    }
+
     // Providers without store-owned continuity remain conservative. They never
     // gain an append fast path just because their node count grew.
     public var nodeVersion: UInt64 { topologyVersion }

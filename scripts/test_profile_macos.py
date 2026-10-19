@@ -58,6 +58,32 @@ class TimingValidationTests(unittest.TestCase):
         self.assertFalse(report["all_updates_under_100ms"])
         self.assertEqual(report["startup_update_max_ms"], 150)
 
+    def test_optional_tick_details_preserve_existing_metrics_and_budgets(self):
+        details = ["tick_callback_ms", "tick_force_prepare_ms", "tick_drain_ms",
+                   "tick_sim_ms", "tick_merge_ms", "tick_snapshot_ms", "tick_cache_ms"]
+        columns = self.columns + details + ["tick_detail_flags"]
+        rows = [self.row(i, dt=40, total=5).strip() for i in range(100)]
+        original = self.parse(self.header + "\n".join(rows) + "\n")
+        # Deliberately large nested details must never be added to total_ms or
+        # substituted for the real frame interval by an older analyzer.
+        extended = self.parse(",".join(columns) + "\n" + "".join(
+            row + "," + ",".join(["500"] * len(details) + ["7"]) + "\n" for row in rows))
+        for key, value in original.items():
+            if key != "timings_ms":
+                self.assertEqual(extended[key], value, key)
+        for key, value in original["timings_ms"].items():
+            self.assertEqual(extended["timings_ms"][key], value, key)
+        for key in details:
+            self.assertEqual(extended["timings_ms"][key]["max"], 500)
+        self.assertNotIn("tick_detail_flags", extended["timings_ms"])
+
+    def test_optional_tick_details_still_require_valid_numeric_values(self):
+        header = self.header.strip() + ",tick_cache_ms,tick_detail_flags\n"
+        for value in ("nan", "inf", "-inf", "-1", "invalid"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.parse(header + "".join(
+                    self.row(frame).strip() + "," + value + ",7\n" for frame in range(100)))
+
 
 if __name__ == "__main__":
     unittest.main()

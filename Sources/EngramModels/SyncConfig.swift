@@ -1,17 +1,17 @@
 import Lattice
 import Foundation
 
-/// Per-project sync configuration. Stored in synced.db (replicates across devices).
+/// Per-project configuration for personal device sync and explicit group exposure.
 ///
 /// Each row maps a project name to a sync policy. The special project name `_default`
 /// sets the fallback policy for projects without an explicit override.
 ///
-/// When a project is set to `.sync`, non-private memories route to `synced.db`
-/// (synced across devices). Private memories always stay in `memory.db` regardless
-/// of this setting.
+/// When a project is set to `.sync`, non-private memories can sync across personal
+/// devices. Private memories remain device-local regardless of this setting.
 ///
-/// The `exposedTeams` field (Phase 2) controls which teams see this project's
-/// non-private memories via contribution DB dual-write. Empty set = no team exposure.
+/// The `exposedTeams` field (use the `exposedGroups` alias) controls which groups
+/// receive this project's non-private memories through the daemon's per-group relay
+/// filters. Exposure is independent of `policy`; an empty set means no group exposure.
 @Model
 public final class SyncConfig {
     /// The project name this config applies to.
@@ -23,7 +23,7 @@ public final class SyncConfig {
     public enum Policy: String, Codable, Sendable {
         /// Disables personal device sync; explicit group exposure can still share non-private memories.
         case local
-        /// Non-private memories go to personal.db (synced across devices).
+        /// Enables personal device sync for non-private memories.
         case sync
     }
 
