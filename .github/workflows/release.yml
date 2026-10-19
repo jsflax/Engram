@@ -166,7 +166,7 @@ jobs:
             --require-swift-test testPreparationRegroupAndCapacityGrowth \
             --require-swift-test testPreparationAsyncDirtyDispatch -- \
             swift test --force-resolved-versions --skip-build --no-parallel \
-            --filter 'ForceEngineTests/(testPreparationCentroidsUseFirstEncodePositionsAndCadence|testPreparationRegroupAndCapacityGrowth|testPreparationAsyncDirtyDispatch)(\(\))?$'
+            --filter 'testPreparationCentroidsUseFirstEncodePositionsAndCadence|testPreparationRegroupAndCapacityGrowth|testPreparationAsyncDirtyDispatch'
 
       - name: Upload force preparation diagnostics
         if: ${{ always() }}
