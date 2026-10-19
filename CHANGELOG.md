@@ -4,6 +4,18 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.9] - 2026-10-19
+
+### Fixed
+- Reuse visualizer node, hub and edge metadata between changes while keeping
+  camera, live positions and animation current. Extend verified appended nodes
+  and reuse project/topic membership during label calculations.
+- Include stored privacy and project metadata in recall results so the session
+  learner can check update targets without inferring privacy from memory text.
+- Remove the learner's private-duplicate fallback for unknown target privacy.
+  Clarify that paths, device names and deployment facts alone do not request
+  device-local storage; preserve explicit privacy and existing sealed plans.
+
 ## [0.15.8] - 2026-10-19
 
 ### Fixed
