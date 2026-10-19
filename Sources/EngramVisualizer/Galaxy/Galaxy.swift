@@ -300,7 +300,8 @@ actor Galaxy: Identifiable {
         let preview = previewLattice.objects(Memory.self).sortedBy(\.primaryKey, order: .reverse).snapshot(limit: 50)
         guard previewLattice.lastQueryError() == nil else { throw LoadFailure.storageUnavailable }
         let previewNodes = preview.compactMap { Self.snapshotNode($0, filter: nodeFilter, projectResolver: projectResolver) }
-        await applyLoadChunk(nodes: previewNodes, generation: generation)
+        await applyLoadChunk(nodes: previewNodes, generation: generation,
+                             diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
         var seenNodes: Set<Int64> = []
         var seenEdges: Set<Int64> = []
         var cursor = Int64.min
@@ -317,7 +318,8 @@ actor Galaxy: Identifiable {
             cursor = last
             let batch = rows.compactMap { Self.snapshotNode($0, filter: nodeFilter, projectResolver: projectResolver) }
             seenNodes.formUnion(batch.map(\.pk))
-            await applyLoadChunk(nodes: batch, generation: generation)
+            await applyLoadChunk(nodes: batch, generation: generation,
+                                 diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
         }
         cursor = Int64.min
         while true {
@@ -332,18 +334,21 @@ actor Galaxy: Identifiable {
             cursor = last
             let batch = rows.compactMap(Self.snapshotEdge)
             seenEdges.formUnion(batch.map(\.pk))
-            await applyLoadChunk(edges: batch, generation: generation)
+            await applyLoadChunk(edges: batch, generation: generation,
+                                 diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
         }
         // Required on overflow/retry: rows deleted before a fresh scan have no
         // new callback to replay. Only a successful complete scan may prune.
         let missing = await missingKeys(nodes: seenNodes, edges: seenEdges, generation: generation)
         for offset in stride(from: 0, to: missing.nodes.count, by: 50) {
             try checkLoad(generation)
-            await applyLoadChunk(removedNodes: Array(missing.nodes[offset..<min(offset + 50, missing.nodes.count)]), generation: generation)
+            await applyLoadChunk(removedNodes: Array(missing.nodes[offset..<min(offset + 50, missing.nodes.count)]), generation: generation,
+                                 diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
         }
         for offset in stride(from: 0, to: missing.edges.count, by: 50) {
             try checkLoad(generation)
-            await applyLoadChunk(removedEdges: Array(missing.edges[offset..<min(offset + 50, missing.edges.count)]), generation: generation)
+            await applyLoadChunk(removedEdges: Array(missing.edges[offset..<min(offset + 50, missing.edges.count)]), generation: generation,
+                                 diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
         }
     }
 
@@ -368,7 +373,8 @@ actor Galaxy: Identifiable {
             else { removedEdges.append(pk) }
         }
         await applyLoadChunk(nodes: nodeRows, edges: edgeRows, removedNodes: removedNodes,
-                             removedEdges: removedEdges, generation: generation)
+                             removedEdges: removedEdges, generation: generation,
+                             diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
     }
 
     @MainActor private func missingKeys(nodes: Set<Int64>, edges: Set<Int64>, generation: UInt64)
@@ -380,9 +386,21 @@ actor Galaxy: Identifiable {
 
     @MainActor func applyLoadChunk(
         nodes: [(pk: Int64, node: NodeData)] = [], edges: [(pk: Int64, edge: EdgeData)] = [],
-        removedNodes: [Int64] = [], removedEdges: [Int64] = [], generation: UInt64
+        removedNodes: [Int64] = [], removedEdges: [Int64] = [], generation: UInt64,
+        diagnosticEnqueuedAt: UInt64? = nil
     ) {
+        let diagnosticStart = FrameGapDiagnostics.timestamp()
+        var accepted = false
+        defer {
+            if let diagnosticStart {
+                FrameGapDiagnostics.shared.recordLoad(
+                    rows: nodes.count + edges.count + removedNodes.count + removedEdges.count,
+                    accepted: accepted, queuedAt: diagnosticEnqueuedAt, startedAt: diagnosticStart,
+                    endedAt: DispatchTime.now().uptimeNanoseconds)
+            }
+        }
         guard !Task.isCancelled, loadChanges.withLock({ $0.accepts(generation) }) else { return }
+        accepted = true
         let config = registry?.currentDrainConfig ?? DrainConfig(
             hiddenProjects: [], hiddenRelations: [], timeFilter: nil, is3D: false,
             soundEnabled: false, notificationsEnabled: false)

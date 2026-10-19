@@ -253,7 +253,8 @@ public final class EngramRealityScene {
         if !frameStatsHeaderWritten {
             let refresh = NSScreen.main?.maximumFramesPerSecond ?? 0
             let header = "# refresh_hz=\(refresh) date=\(Date())\n"
-                + "frame,dt_ms,tick_ms,lod_ms,node_ms,edge_ms,label_ms,commit_ms,nebula_ms,galaxy_titles_ms,mascot_ms,flow_ms,lights_ms,audio_ms,total_ms,nodes,edges,vis_edges,near,mid,far,tick_callback_ms,tick_force_prepare_ms,tick_drain_ms,tick_sim_ms,tick_merge_ms,tick_snapshot_ms,tick_cache_ms,tick_detail_flags\n"
+                + "frame,dt_ms,tick_ms,lod_ms,node_ms,edge_ms,label_ms,commit_ms,nebula_ms,galaxy_titles_ms,mascot_ms,flow_ms,lights_ms,audio_ms,total_ms,nodes,edges,vis_edges,near,mid,far,tick_callback_ms,tick_force_prepare_ms,tick_drain_ms,tick_sim_ms,tick_merge_ms,tick_snapshot_ms,tick_cache_ms,tick_detail_flags,"
+                + FrameGapDiagnostics.csvHeader + "\n"
             FileManager.default.createFile(atPath: path, contents: header.data(using: .utf8))
             frameStatsHeaderWritten = true
         }
@@ -267,7 +268,8 @@ public final class EngramRealityScene {
 
     // MARK: - Per-Frame Update
 
-    /// Called from SceneEvents.Update — drives all systems.
+    /// Called from SceneEvents.Update — dt is RealityKit's supplied delta, not
+    /// an independently measured callback interval or presentation latency.
     public func update(dt: Float) {
         guard let dataProvider else { return }
         if frameStatsPath != nil { return updateInstrumented(dt: dt, dataProvider: dataProvider) }
@@ -278,6 +280,8 @@ public final class EngramRealityScene {
     /// does not acquire diagnostic timestamps or construct timing records.
     private var phaseMarks: [UInt64] = []
     private func updateInstrumented(dt: Float, dataProvider: SceneDataProvider) {
+        let entry = nowNs()
+        let gap = FrameGapDiagnostics.shared.beginCallback(owner: self, at: entry)
         phaseMarks.removeAll(keepingCapacity: true)
         let t0 = nowNs()
         phaseMarks.append(t0)
@@ -305,12 +309,15 @@ public final class EngramRealityScene {
             return Double(phaseMarks[j] &- phaseMarks[i]) / 1_000_000
         }
         let totalMs = Double(tEnd &- t0) / 1_000_000
+        // Keep the existing scene-body boundary. Formatting, append and a
+        // possible flush follow it; their tail appears on the next row with
+        // the previous callback's sequence and an explicit availability bit.
         // Availability bits: 1 = callback envelope, 2 = force-dispatch detail,
         // 4 = provider stages. A missing detail is encoded as zero + bit unset.
         let detailFlags = 1 | (forcePreparation == nil ? 0 : 2) | (providerTimings == nil ? 0 : 4)
         func detailMs(_ value: UInt64?) -> Double { Double(value ?? 0) / 1_000_000 }
         let line = String(
-            format: "%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n",
+            format: "%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d",
             frameCount, Double(dt) * 1000,
             ms(0, 1), ms(1, 2), ms(2, 3), ms(3, 4), ms(4, 5), ms(5, 6),
             ms(6, 7), ms(7, 8), ms(8, 9), ms(9, 10), ms(10, 11), ms(11, 12), totalMs,
@@ -321,7 +328,8 @@ public final class EngramRealityScene {
             detailMs(providerTimings?.drainNanoseconds), detailMs(providerTimings?.simulationNanoseconds),
             detailMs(providerTimings?.mergeNanoseconds), detailMs(providerTimings?.rebuildNanoseconds),
             detailMs(providerTimings?.cacheNanoseconds), detailFlags)
-        frameStatsAppend(line)
+        frameStatsAppend(line + "," + FrameGapDiagnostics.csvValues(gap) + "\n")
+        FrameGapDiagnostics.shared.finishCallback(owner: self, bodyEndedAt: tEnd, exitedAt: nowNs())
     }
 
     @inline(__always)

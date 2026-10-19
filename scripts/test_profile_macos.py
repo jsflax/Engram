@@ -84,6 +84,34 @@ class TimingValidationTests(unittest.TestCase):
                 self.parse(header + "".join(
                     self.row(frame).strip() + "," + value + ",7\n" for frame in range(100)))
 
+    def test_gap_details_exclude_unknown_without_replacing_existing_gates(self):
+        columns = ["gap_flags", "callback_entry_dt_ms", "previous_logger_tail_ms",
+                   "load_apply_ms", "load_queue_samples", "load_queue_ms",
+                   "force_apply_ms", "force_queue_samples", "force_queue_ms"]
+        base = [self.row(frame, dt=40, total=5).strip() for frame in range(100)]
+        old = self.parse(self.header + "\n".join(base) + "\n")
+        # Unknown first/foreign-owner rows contain zero placeholders; completed
+        # intervals with no queue timestamp must not dilute queue statistics.
+        suffixes = ["1,0,0,0,0,0,0,0,0", "0,0,0,0,0,0,0,0,0",
+                    "3,16,2,700,0,0,800,0,0"] + ["3,16,2,700,1,900,800,1,1000"] * 97
+        report = self.parse(self.header.strip() + "," + ",".join(columns) + "\n" + "".join(
+            row + "," + suffix + "\n" for row, suffix in zip(base, suffixes)))
+        for key, value in old.items():
+            if key != "timings_ms":
+                self.assertEqual(report[key], value, key)
+        for key, value in old["timings_ms"].items():
+            self.assertEqual(report["timings_ms"][key], value, key)
+        self.assertFalse(report["frame_p95_under_33ms"])
+        self.assertTrue(report["update_max_under_100ms"])
+        self.assertEqual(report["gap_timing_samples"]["callback_entry_dt_ms"], 98)
+        self.assertEqual(report["timings_ms"]["previous_logger_tail_ms"]["mean"], 2)
+        self.assertEqual(report["gap_timing_samples"]["load_queue_ms"], 97)
+        self.assertEqual(report["timings_ms"]["force_queue_ms"]["mean"], 1000)
+        unavailable = self.parse(self.header.strip() + "," + ",".join(columns) + "\n" + "".join(
+            row + ",0,0,0,0,0,0,0,0,0\n" for row in base))
+        self.assertEqual(unavailable["gap_timing_samples"]["callback_entry_dt_ms"], 0)
+        self.assertNotIn("callback_entry_dt_ms", unavailable["timings_ms"])
+
 
 if __name__ == "__main__":
     unittest.main()

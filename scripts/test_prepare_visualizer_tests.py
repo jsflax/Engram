@@ -109,6 +109,11 @@ class HostPreparationTests(unittest.TestCase):
         mirrored = mirrored.replace('#expect(', 'XCTAssertTrue(')
         self.assertEqual((repo / 'EngramUnitTests/FrameLookupInvalidationTests.swift').read_text(), mirrored)
         expected = ['FrameLookupInvalidationTests/' + name for name in (
+            'testFrameGapIntervalsTailAndDrain',
+            'testFrameGapOwnershipDoesNotStealAndResetsAfterRelease',
+            'testFrameGapWorkAggregatesAndSaturates',
+            'testFrameGapDisabledPathDoesNotReadClock',
+            'testFrameGapForceOutcomesPreserveAcceptanceGuards',
             'testOptionalTickTimingFallbackCallsOrdinaryProviderExactlyOnce',
             'testLightColorsRemainLive', 'testLightNodeInvalidation', 'testSelectedEdgeDeletion',
             'testSelectedEdgeReorderAndReplacement', 'testStableFlowAndSelectionChange',
@@ -117,7 +122,7 @@ class HostPreparationTests(unittest.TestCase):
             'testLabelNumericRescanPreservesMissingPositionSemantics',
             'testLabelNumericSlotsFollowReorderAndTopicChanges')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 87)
+        self.assertEqual(len(inventory), 92)
         self.assertEqual([name for name in inventory if name.startswith('FrameLookupInvalidationTests/')],
                          sorted(expected))
         self.assertEqual(M.CLASSES.count('FrameLookupInvalidationTests'), 1)
