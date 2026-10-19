@@ -55,13 +55,209 @@ struct SimulationIndexCache {
     }
 }
 
+/// Resolves static group membership once per node revision. Position reductions
+/// use dense slots, so neither of the two numeric passes hashes UUIDs/strings or
+/// constructs cluster keys. Missing simulation indices remain excluded.
+@MainActor
+struct CentroidMembershipCache {
+    private struct Member {
+        let project: Int
+        let galaxy: Int
+        let cluster: Int
+        let galaxyProject: Int
+    }
+    private struct Project {
+        let name: String
+        var sum: SIMD3<Float> = .zero
+        var count = 0
+    }
+    private struct Cluster {
+        var sum: SIMD3<Float> = .zero
+        var centroid: SIMD3<Float> = .zero
+        var count = 0
+        var radius: Float = 0
+        var lastMember = 0
+    }
+    private struct GalaxyGroup {
+        let name: String
+        var center: SIMD3<Float>?
+        var count = 0
+        var radius: Float = 0
+        var projectCounts: [String: Int] = [:]
+    }
+    private struct GalaxyProject: Hashable {
+        let galaxy: Int
+        let project: Int
+    }
+    private var members: [Member] = []
+    private var projects: [Project] = []
+    private var clusters: [Cluster] = []
+    private var galaxies: [GalaxyGroup] = []
+    private var galaxyProjects: [GalaxyProject] = []
+    private var galaxyProjectCounts: [Int] = []
+    private var projectSlots: [String: Int] = [:]
+    private var clusterSlots: [String: Int] = [:]
+    private var galaxySlots: [String: Int] = [:]
+    private var galaxyProjectSlots: [GalaxyProject: Int] = [:]
+    private weak var provider: AnyObject?
+    private var nodeVersion: UInt64 = .max
+    private var appendGeneration: UInt64 = .max
+
+    mutating func refresh(nodeCount: Int, nodeVersion: UInt64, appendGeneration: UInt64,
+                          provider: AnyObject,
+                          membership: (Int) -> (project: String, galaxy: String)) {
+        let reset = self.provider !== provider || self.appendGeneration != appendGeneration
+            || members.count > nodeCount
+        if !reset, self.nodeVersion == nodeVersion, members.count == nodeCount { return }
+        if reset {
+            members.removeAll(keepingCapacity: true)
+            projects.removeAll(keepingCapacity: true)
+            clusters.removeAll(keepingCapacity: true)
+            galaxies.removeAll(keepingCapacity: true)
+            galaxyProjects.removeAll(keepingCapacity: true)
+            galaxyProjectCounts.removeAll(keepingCapacity: true)
+            projectSlots.removeAll(keepingCapacity: true)
+            clusterSlots.removeAll(keepingCapacity: true)
+            galaxySlots.removeAll(keepingCapacity: true)
+            galaxyProjectSlots.removeAll(keepingCapacity: true)
+        }
+        if members.capacity < nodeCount {
+            members.reserveCapacity(max(nodeCount, max(64, members.capacity * 2)))
+        }
+        for index in members.count..<nodeCount {
+            let names = membership(index)
+            let project = projectSlots[names.project] ?? projects.count
+            if project == projects.count {
+                projectSlots[names.project] = project
+                projects.append(Project(name: names.project))
+            }
+            let galaxy = galaxySlots[names.galaxy] ?? galaxies.count
+            if galaxy == galaxies.count {
+                galaxySlots[names.galaxy] = galaxy
+                galaxies.append(GalaxyGroup(name: names.galaxy))
+            }
+            // Keep the existing concatenated-key grouping, including delimiter
+            // collisions. Exact galaxy/project counts use a separate pair slot.
+            let key = "\(names.galaxy)|\(names.project)"
+            let cluster = clusterSlots[key] ?? clusters.count
+            if cluster == clusters.count {
+                clusterSlots[key] = cluster
+                clusters.append(Cluster())
+            }
+            let pair = GalaxyProject(galaxy: galaxy, project: project)
+            let galaxyProject = galaxyProjectSlots[pair] ?? galaxyProjects.count
+            if galaxyProject == galaxyProjects.count {
+                galaxyProjectSlots[pair] = galaxyProject
+                galaxyProjects.append(pair)
+                galaxyProjectCounts.append(0)
+            }
+            members.append(Member(project: project, galaxy: galaxy,
+                                  cluster: cluster, galaxyProject: galaxyProject))
+        }
+        self.provider = provider
+        self.nodeVersion = nodeVersion
+        self.appendGeneration = appendGeneration
+    }
+
+    mutating func reduce(positions: [SIMD3<Float>], simulationIndices: [Int],
+                         galaxyCenters: [String: SIMD3<Float>]) {
+        for index in projects.indices {
+            projects[index].sum = .zero
+            projects[index].count = 0
+        }
+        for index in clusters.indices { clusters[index] = Cluster() }
+        for index in galaxies.indices {
+            galaxies[index].center = galaxyCenters[galaxies[index].name]
+            galaxies[index].count = 0
+            galaxies[index].radius = 0
+            galaxies[index].projectCounts.removeAll(keepingCapacity: true)
+        }
+        for index in galaxyProjectCounts.indices { galaxyProjectCounts[index] = 0 }
+        for index in members.indices {
+            guard simulationIndices[index] >= 0 else { continue }
+            let member = members[index], position = positions[index]
+            projects[member.project].sum += position
+            projects[member.project].count += 1
+            clusters[member.cluster].sum += position
+            clusters[member.cluster].count += 1
+            // Baseline cluster labels follow the last usable member when two
+            // galaxy/project pairs share the same concatenated key.
+            clusters[member.cluster].lastMember = index
+            galaxies[member.galaxy].count += 1
+            galaxyProjectCounts[member.galaxyProject] += 1
+        }
+        for index in clusters.indices where clusters[index].count > 0 {
+            clusters[index].centroid = clusters[index].sum / Float(clusters[index].count)
+        }
+        // Moving positions and downward extents are recomputed every publication.
+        for index in members.indices {
+            guard simulationIndices[index] >= 0 else { continue }
+            let member = members[index], position = positions[index]
+            clusters[member.cluster].radius = max(clusters[member.cluster].radius,
+                simd_length(position - clusters[member.cluster].centroid))
+            if let center = galaxies[member.galaxy].center {
+                galaxies[member.galaxy].radius = max(galaxies[member.galaxy].radius,
+                                                    simd_length(position - center))
+            }
+        }
+        // Resolve names once per occupied pair, rather than once per node.
+        for index in galaxyProjects.indices where galaxyProjectCounts[index] > 0 {
+            let pair = galaxyProjects[index]
+            galaxies[pair.galaxy].projectCounts[projects[pair.project].name] = galaxyProjectCounts[index]
+        }
+    }
+
+    var projectCentroids: [String: SIMD3<Float>] {
+        var result: [String: SIMD3<Float>] = [:]
+        for project in projects where project.count > 0 {
+            result[project.name] = project.sum / Float(project.count)
+        }
+        return result
+    }
+
+    var nebulaClusters: [RKNebulaCluster] {
+        clusters.compactMap { cluster in
+            guard cluster.count > 0 else { return nil }
+            let last = members[cluster.lastMember]
+            return RKNebulaCluster(galaxyId: galaxies[last.galaxy].name,
+                                   project: projects[last.project].name,
+                                   centroid: cluster.centroid, count: cluster.count,
+                                   radius: cluster.radius + 40)
+        }
+    }
+
+    func galaxyAggregate(for id: String) -> (count: Int, radius: Float?, dominantProject: String?) {
+        guard let slot = galaxySlots[id] else { return (0, nil, nil) }
+        let group = galaxies[slot]
+        return (group.count, group.count > 0 && group.center != nil ? group.radius : nil,
+                group.projectCounts.max(by: { $0.value < $1.value })?.key)
+    }
+}
+
 /// Bridges GalaxyRegistry data to SceneDataProvider for EngramRealityKit.
 ///
 /// Reads from GalaxyRegistry's merged data each frame, converting NodeData/EdgeData
 /// to RKNodeSnapshot/RKEdgeSnapshot without depending on EngramKit types in the library.
 @MainActor
 final class GalaxyRegistryAdapter: SceneDataProvider {
-    weak var registry: GalaxyRegistry?
+    weak var registry: GalaxyRegistry? {
+        didSet {
+            guard registry !== oldValue else { return }
+            // Equal revision counters from another provider cannot validate
+            // this provider's snapshots, routing, or first centroid preview.
+            lastTopologyVersion = .max
+            lastColorMapVersion = .max
+            lastNodesVersion = .max
+            lastEdgesVersion = .max
+            lastHubsVersion = .max
+            preservesIndexPrefix = false
+            centroidsTopologyVersion = .max
+            centroidPositionVersion = .max
+            frameCentroids.removeAll(keepingCapacity: true)
+            frameNebulaClusters.removeAll(keepingCapacity: true)
+            frameGalaxySnapshots.removeAll(keepingCapacity: true)
+        }
+    }
 
     // Each snapshot follows its own domain; edge/status/color updates do not
     // validate every node again. Hub membership is a node-snapshot dependency.
@@ -92,6 +288,7 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     private var frameNewGlows: [UUID: Float] = [:]
     private var frameCentroids: [String: SIMD3<Float>] = [:]
     private var simulationIndices = SimulationIndexCache()
+    private var centroidMembership = CentroidMembershipCache()
     private var preservesIndexPrefix = true
     private var cachedPositionVersion: UInt64 = .max
     private var centroidPositionVersion: UInt64 = .max
@@ -237,8 +434,8 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         // refresh immediately. Both streaming chunks and legacy bulk draining
         // are loading; streaming does not populate loadingUpdate. This refresh
         // also builds (galaxy, project) nebula clusters and per-galaxy aggregates.
-        // This layer holds nodeToGalaxy, colors and positions together; the
-        // shared centroid and extent passes keep each refresh at O(n).
+        // Membership slots follow the registry's node/ownership revisions;
+        // both O(n) numeric passes reuse them while positions remain fresh.
         frameCounter &+= 1
         let isLoading = registry.galaxies.values.contains {
             $0.isDrainingInitialSnapshot || $0.loadStatus == .loading
@@ -247,65 +444,31 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
             && (!isLoading || frameCentroids.isEmpty || frameCounter % 30 == 0)
         if topologyNeedsCentroids
             || (frameCounter % 30 == 0 && centroidPositionVersion != sim.positionVersion) {
-            let nodeToGalaxy = registry.nodeToGalaxy
-            var sums: [String: (sum: SIMD3<Float>, count: Int)] = [:]
-            // (galaxyId|project) → accumulator; galaxyId → extent accumulator.
-            var clusterSums: [String: (galaxy: String, project: String, sum: SIMD3<Float>, count: Int)] = [:]
-            for (index, node) in cachedNodes.enumerated() {
-                guard simulationIndices.indices[index] >= 0 else { continue }
-                let pos = framePositionArray[index]
-                let entry = sums[node.project] ?? (.zero, 0)
-                sums[node.project] = (entry.sum + pos, entry.count + 1)
-                let galaxy = nodeToGalaxy[node.id] ?? "personal"
-                let key = "\(galaxy)|\(node.project)"
-                let c = clusterSums[key] ?? (galaxy, node.project, .zero, 0)
-                clusterSums[key] = (galaxy, node.project, c.sum + pos, c.count + 1)
+            centroidMembership.refresh(
+                nodeCount: cachedNodes.count, nodeVersion: registry.mergedNodesVersion,
+                appendGeneration: registry.mergedNodeAppendGeneration, provider: registry
+            ) { index in
+                let node = cachedNodes[index]
+                return (node.project, registry.nodeToGalaxy[node.id] ?? "personal")
             }
-            frameCentroids = sums.mapValues { $0.sum / Float($0.count) }
+            centroidMembership.reduce(positions: framePositionArray,
+                                      simulationIndices: simulationIndices.indices,
+                                      galaxyCenters: registry.galaxies.mapValues { $0.worldCenter })
+            frameCentroids = centroidMembership.projectCentroids
+            frameNebulaClusters = centroidMembership.nebulaClusters
 
-            // Second O(n) pass for radii (needs the centroids from pass 1).
-            var clusterCentroids: [String: SIMD3<Float>] = [:]
-            for (key, c) in clusterSums {
-                clusterCentroids[key] = c.sum / Float(c.count)
-            }
-            var clusterMaxDist: [String: Float] = [:]
-            var galaxyMaxDist: [String: Float] = [:]
-            var galaxyCounts: [String: Int] = [:]
-            var galaxyProjectCounts: [String: [String: Int]] = [:]
-            let galaxyCenters = registry.galaxies.mapValues { $0.worldCenter }
-            for (index, node) in cachedNodes.enumerated() {
-                guard simulationIndices.indices[index] >= 0 else { continue }
-                let pos = framePositionArray[index]
-                let galaxy = nodeToGalaxy[node.id] ?? "personal"
-                let key = "\(galaxy)|\(node.project)"
-                if let centroid = clusterCentroids[key] {
-                    clusterMaxDist[key] = max(clusterMaxDist[key] ?? 0, simd_length(pos - centroid))
-                }
-                if let center = galaxyCenters[galaxy] {
-                    galaxyMaxDist[galaxy] = max(galaxyMaxDist[galaxy] ?? 0, simd_length(pos - center))
-                }
-                galaxyCounts[galaxy, default: 0] += 1
-                galaxyProjectCounts[galaxy, default: [:]][node.project, default: 0] += 1
-            }
-
-            frameNebulaClusters = clusterSums.map { key, c in
-                RKNebulaCluster(galaxyId: c.galaxy, project: c.project,
-                                centroid: clusterCentroids[key] ?? .zero,
-                                count: c.count,
-                                radius: (clusterMaxDist[key] ?? 0) + 40)
-            }
             frameGalaxySnapshots = registry.galaxies.values.map { galaxy in
                 // Dominant color = largest project's color in THIS galaxy.
-                let dominant = galaxyProjectCounts[galaxy.id]?
-                    .max(by: { $0.value < $1.value })?.key
-                let color = dominant.flatMap { cachedColorMap[$0] } ?? SIMD3<Float>(0.5, 0.5, 0.6)
+                let aggregate = centroidMembership.galaxyAggregate(for: galaxy.id)
+                let color = aggregate.dominantProject.flatMap { cachedColorMap[$0] }
+                    ?? SIMD3<Float>(0.5, 0.5, 0.6)
                 return RKGalaxySnapshot(
                     id: galaxy.id,
                     displayName: galaxy.displayName,
                     worldCenter: galaxy.worldCenter,
                     dominantColor: color,
-                    nodeCount: galaxyCounts[galaxy.id] ?? 0,
-                    radius: galaxyMaxDist[galaxy.id] ?? 300,
+                    nodeCount: aggregate.count,
+                    radius: aggregate.radius ?? 300,
                     parentGalaxyId: galaxy.parentGalaxyId)
             }
             centroidsTopologyVersion = lastTopologyVersion
