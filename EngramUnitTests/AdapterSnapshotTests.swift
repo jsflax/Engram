@@ -241,11 +241,21 @@ final class AdapterSnapshotTests: XCTestCase {
         adapter.tick(dt: 1 / 60)
         let topology = adapter.topologyVersion
         XCTAssertEqual(adapter.positionArray, [.zero])
+        XCTAssertTrue(adapter.projectCentroids.isEmpty)
+        XCTAssertTrue(adapter.nebulaClusters.isEmpty)
+        XCTAssertEqual(adapter.galaxySnapshots.first?.nodeCount, 0)
+        XCTAssertEqual(adapter.galaxySnapshots.first?.radius, 300)
         registry.unifiedSimulation.addNode(n.id, project: n.project, topic: n.topic)
         registry.unifiedSimulation.setPosition(n.id, to: SIMD3<Float>(10, 20, 30))
         adapter.tick(dt: 1 / 60)
         XCTAssertEqual(adapter.topologyVersion, topology)
         XCTAssertEqual(adapter.positionArray, [SIMD3<Float>(10, 20, 30)])
+        XCTAssertTrue(adapter.projectCentroids.isEmpty, "Position-only publication keeps the 30-frame cadence")
+        for _ in 3...30 { adapter.tick(dt: 1 / 60) }
+        XCTAssertEqual(adapter.projectCentroids[n.project], SIMD3<Float>(10, 20, 30))
+        XCTAssertEqual(adapter.nebulaClusters.first?.count, 1)
+        XCTAssertEqual(adapter.nebulaClusters.first?.radius, 40)
+        XCTAssertEqual(adapter.galaxySnapshots.first?.nodeCount, 1)
     }
 
     func testAdapterSameCountReplacementAndReorderCannotReuseOldSlots() throws {
@@ -704,6 +714,224 @@ final class AdapterSnapshotTests: XCTestCase {
         XCTAssertTrue(ids.allSatisfy { registry.galaxyForNode($0) === galaxy })
     }
 
+    func testCentroidSlotsPreserveGroupingMissingPositionsAndDownwardExtents() throws {
+        let provider = GalaxyRegistry()
+        var cache = CentroidMembershipCache()
+        let groups = [(project: "x|y", galaxy: "g"), (project: "y", galaxy: "g|x"),
+                      (project: "x|y", galaxy: "g"), (project: "Solo", galaxy: "personal"),
+                      (project: "Missing", galaxy: "empty")]
+        cache.refresh(nodeCount: groups.count, nodeVersion: 1, appendGeneration: 1,
+                      provider: provider) { groups[$0] }
+        let positions = [SIMD3<Float>.zero, SIMD3<Float>(10, 0, 0), SIMD3<Float>(20, 0, 0),
+                         .zero, SIMD3<Float>(999, 0, 0)]
+        let centers = ["g": SIMD3<Float>.zero, "g|x": SIMD3<Float>(10, 0, 0),
+                       "personal": .zero, "empty": .zero]
+        // A mapped but unreadable simulation position is already gathered as
+        // zero by the adapter; only a negative index is excluded from reduction.
+        cache.reduce(positions: positions, simulationIndices: [0, 1, 2, 100, -1], galaxyCenters: centers)
+        XCTAssertEqual(cache.projectCentroids, ["x|y": SIMD3<Float>(10, 0, 0),
+                                               "y": SIMD3<Float>(10, 0, 0), "Solo": .zero])
+        XCTAssertEqual(cache.nebulaClusters.count, 2)
+        let collision = try XCTUnwrap(cache.nebulaClusters.first { $0.count == 3 })
+        XCTAssertEqual(collision.galaxyId, "g")
+        XCTAssertEqual(collision.project, "x|y")
+        XCTAssertEqual(collision.centroid, SIMD3<Float>(10, 0, 0))
+        XCTAssertEqual(collision.radius, 50)
+        XCTAssertEqual(cache.galaxyAggregate(for: "g").count, 2)
+        XCTAssertEqual(cache.galaxyAggregate(for: "g").radius, 20)
+        XCTAssertEqual(cache.galaxyAggregate(for: "g").dominantProject, "x|y")
+        XCTAssertEqual(cache.galaxyAggregate(for: "g|x").dominantProject, "y")
+        XCTAssertEqual(cache.galaxyAggregate(for: "g|x").radius, 0)
+        XCTAssertEqual(cache.galaxyAggregate(for: "personal").radius, 0)
+        XCTAssertNil(cache.galaxyAggregate(for: "empty").radius)
+        XCTAssertEqual(cache.galaxyAggregate(for: "unknown").count, 0)
+
+        // The last usable member supplies collision labels; an unresolved tail
+        // cannot override them. No membership rebuild is needed as slots resolve.
+        cache.reduce(positions: positions, simulationIndices: [0, 1, -1, 100, -1], galaxyCenters: centers)
+        let partial = try XCTUnwrap(cache.nebulaClusters.first { $0.count == 2 })
+        XCTAssertEqual(partial.galaxyId, "g|x")
+        XCTAssertEqual(partial.project, "y")
+        XCTAssertEqual(partial.centroid, SIMD3<Float>(5, 0, 0))
+        XCTAssertEqual(partial.radius, 45)
+        cache.reduce(positions: Array(repeating: .zero, count: groups.count),
+                     simulationIndices: [0, 1, 2, 100, -1],
+                     galaxyCenters: ["g": SIMD3<Float>(3, 0, 0), "personal": .zero])
+        XCTAssertTrue(cache.nebulaClusters.allSatisfy { $0.centroid == .zero && $0.radius == 40 })
+        XCTAssertEqual(cache.galaxyAggregate(for: "g").radius, 3)
+        XCTAssertNil(cache.galaxyAggregate(for: "g|x").radius, "Unknown galaxy centers have no extent")
+        XCTAssertEqual(cache.galaxyAggregate(for: "g|x").count, 1)
+        cache.reduce(positions: positions, simulationIndices: Array(repeating: -1, count: groups.count),
+                     galaxyCenters: centers)
+        XCTAssertTrue(cache.projectCentroids.isEmpty)
+        XCTAssertTrue(cache.nebulaClusters.isEmpty)
+        XCTAssertEqual(cache.galaxyAggregate(for: "g").count, 0)
+        XCTAssertNil(cache.galaxyAggregate(for: "g").radius)
+        XCTAssertNil(cache.galaxyAggregate(for: "g").dominantProject)
+    }
+
+    func testCentroidSlotsReuseCertifiedAppendAndInvalidateMembershipChanges() {
+        let provider = GalaxyRegistry(), replacement = GalaxyRegistry()
+        var cache = CentroidMembershipCache()
+        var groups = [(project: "P", galaxy: "g"), (project: "Q", galaxy: "h")]
+        var visits: [Int] = []
+        cache.refresh(nodeCount: 2, nodeVersion: 1, appendGeneration: 7, provider: provider) {
+            visits.append($0); return groups[$0]
+        }
+        XCTAssertEqual(visits, [0, 1])
+        visits.removeAll()
+        cache.refresh(nodeCount: 2, nodeVersion: 1, appendGeneration: 7, provider: provider) {
+            visits.append($0); return groups[$0]
+        }
+        XCTAssertTrue(visits.isEmpty)
+        groups.append(("P", "g"))
+        // Several skipped append publications share the same continuity domain.
+        cache.refresh(nodeCount: 3, nodeVersion: 4, appendGeneration: 7, provider: provider) {
+            visits.append($0); return groups[$0]
+        }
+        XCTAssertEqual(visits, [2])
+        let positions = [SIMD3<Float>(1, 0, 0), SIMD3<Float>(2, 0, 0), SIMD3<Float>(3, 0, 0)]
+        cache.reduce(positions: positions, simulationIndices: [0, 1, 2], galaxyCenters: [:])
+        XCTAssertEqual(cache.projectCentroids, ["P": SIMD3<Float>(2, 0, 0), "Q": SIMD3<Float>(2, 0, 0)])
+
+        groups[0] = ("Edited", "h") // Same count, changed project AND owner.
+        visits.removeAll()
+        cache.refresh(nodeCount: 3, nodeVersion: 5, appendGeneration: 8, provider: provider) {
+            visits.append($0); return groups[$0]
+        }
+        XCTAssertEqual(visits, [0, 1, 2])
+        cache.reduce(positions: positions, simulationIndices: [0, 1, 2], galaxyCenters: [:])
+        XCTAssertEqual(cache.projectCentroids["Edited"], positions[0])
+        XCTAssertEqual(cache.projectCentroids["P"], positions[2])
+        XCTAssertEqual(cache.galaxyAggregate(for: "g").count, 1)
+        XCTAssertEqual(cache.galaxyAggregate(for: "h").count, 2)
+
+        groups.reverse()
+        cache.refresh(nodeCount: 3, nodeVersion: 6, appendGeneration: 9, provider: provider) { groups[$0] }
+        cache.reduce(positions: positions, simulationIndices: [0, 1, 2], galaxyCenters: [:])
+        XCTAssertEqual(cache.projectCentroids["P"], positions[0])
+        XCTAssertEqual(cache.projectCentroids["Edited"], positions[2])
+        groups.removeLast()
+        cache.refresh(nodeCount: 2, nodeVersion: 7, appendGeneration: 10, provider: provider) { groups[$0] }
+        cache.reduce(positions: Array(positions.prefix(2)), simulationIndices: [0, 1], galaxyCenters: [:])
+        XCTAssertNil(cache.projectCentroids["Edited"])
+        XCTAssertEqual(cache.galaxyAggregate(for: "h").count, 1)
+
+        groups[0] = ("Replacement", "new")
+        visits.removeAll()
+        cache.refresh(nodeCount: 2, nodeVersion: 7, appendGeneration: 10, provider: replacement) {
+            visits.append($0); return groups[$0]
+        }
+        XCTAssertEqual(visits, [0, 1], "Equal counters from another provider cannot certify membership")
+        cache.reduce(positions: Array(positions.prefix(2)), simulationIndices: [0, 1], galaxyCenters: [:])
+        XCTAssertNil(cache.projectCentroids["P"])
+        XCTAssertEqual(cache.projectCentroids["Replacement"], positions[0])
+        XCTAssertEqual(cache.galaxyAggregate(for: "g").count, 0)
+        cache.refresh(nodeCount: 0, nodeVersion: 8, appendGeneration: 11, provider: replacement) { groups[$0] }
+        cache.reduce(positions: [], simulationIndices: [], galaxyCenters: [:])
+        XCTAssertTrue(cache.projectCentroids.isEmpty)
+        XCTAssertTrue(cache.nebulaClusters.isEmpty)
+    }
+
+    func testAdapterCentroidGroupsTrackSameSizeProjectAndOwnershipChanges() throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        defer { lattice.close() }
+        let registry = GalaxyRegistry()
+        registry.unifiedSimulation.isActive = false
+        let personal = Galaxy(id: "personal", displayName: "Personal", lattice: lattice.sendableReference)
+        let team = Galaxy(id: "group:team", displayName: "Team", lattice: lattice.sendableReference)
+        let empty = Galaxy(id: "empty", displayName: "Empty", lattice: lattice.sendableReference)
+        for galaxy in [personal, team, empty] { registry.register(galaxy) }
+        personal.worldCenter = .zero
+        team.worldCenter = SIMD3<Float>(10, 0, 0)
+        let a = node(project: "A"), b = node(project: "A"), c = node(project: "B"), d = node(project: "B")
+        personal.insertNodeBatch([a, b, c], config: config)
+        team.insertNodeBatch([d], config: config)
+        personal.renderStore.colorMap["A"] = .red
+        personal.renderStore.colorMap["B"] = .blue
+        team.renderStore.colorMap["B"] = .blue
+        for (n, x) in [(a, Float(0)), (b, 4), (c, 2), (d, 10)] {
+            registry.unifiedSimulation.setPosition(n.id, to: SIMD3<Float>(x, 0, 0))
+        }
+        let adapter = GalaxyRegistryAdapter(registry: registry)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.projectCentroids, ["A": SIMD3<Float>(2, 0, 0), "B": SIMD3<Float>(6, 0, 0)])
+        let first = try XCTUnwrap(adapter.galaxySnapshots.first { $0.id == "personal" })
+        XCTAssertEqual(first.nodeCount, 3)
+        XCTAssertEqual(first.radius, 4)
+        XCTAssertEqual(first.dominantColor, adapter.projectColorMap["A"])
+        XCTAssertEqual(adapter.galaxySnapshots.first { $0.id == "group:team" }?.radius, 0)
+        XCTAssertEqual(adapter.galaxySnapshots.first { $0.id == "empty" }?.radius, 300)
+
+        let changed = node(id: a.id, project: "B")
+        personal.renderStore.nodes[0] = changed
+        personal.renderStore.nodeById[changed.id] = changed
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.count, 4)
+        XCTAssertEqual(adapter.projectCentroids, ["A": SIMD3<Float>(4, 0, 0), "B": SIMD3<Float>(4, 0, 0)])
+        XCTAssertEqual(adapter.galaxySnapshots.first { $0.id == "personal" }?.dominantColor,
+                       adapter.projectColorMap["B"])
+
+        // Higher-priority duplicate changes ownership without changing merged count.
+        team.insertNodeBatch([changed], config: config)
+        registry.unifiedSimulation.setPosition(changed.id, to: .zero)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.count, 4)
+        XCTAssertTrue(registry.galaxyForNode(changed.id) === team)
+        XCTAssertEqual(adapter.galaxySnapshots.first { $0.id == "personal" }?.nodeCount, 2)
+        XCTAssertEqual(adapter.galaxySnapshots.first { $0.id == "group:team" }?.nodeCount, 2)
+        let cluster = try XCTUnwrap(adapter.nebulaClusters.first { $0.galaxyId == "group:team" && $0.project == "B" })
+        XCTAssertEqual(cluster.centroid, SIMD3<Float>(5, 0, 0))
+        XCTAssertEqual(cluster.count, 2)
+        XCTAssertEqual(cluster.radius, 45)
+        let nodeVersion = adapter.nodeVersion
+        team.worldCenter = SIMD3<Float>(5, 0, 0)
+        team.renderStore.colorMap["B"] = .green
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodeVersion, nodeVersion)
+        let moved = try XCTUnwrap(adapter.galaxySnapshots.first { $0.id == "group:team" })
+        XCTAssertEqual(moved.worldCenter, SIMD3<Float>(5, 0, 0))
+        XCTAssertEqual(moved.radius, 5)
+        XCTAssertEqual(moved.dominantColor, adapter.projectColorMap["B"])
+    }
+
+    func testAdapterCentroidProviderReplacementRejectsEqualRevisionCounters() throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        defer { lattice.close() }
+        let old = GalaxyRegistry(), replacement = GalaxyRegistry()
+        old.unifiedSimulation.isActive = false
+        replacement.unifiedSimulation.isActive = false
+        let personal = Galaxy(id: "personal", displayName: "Old", lattice: lattice.sendableReference)
+        let team = Galaxy(id: "group:team", displayName: "New", lattice: lattice.sendableReference,
+                          parentGalaxyId: "parent")
+        old.register(personal)
+        replacement.register(team)
+        let a = node(project: "Old"), b = node(project: "New")
+        personal.insertNodeBatch([a], config: config)
+        team.insertNodeBatch([b], config: config)
+        old.unifiedSimulation.setPosition(a.id, to: .zero)
+        replacement.unifiedSimulation.setPosition(b.id, to: SIMD3<Float>(9, 0, 0))
+        team.worldCenter = SIMD3<Float>(9, 0, 0)
+        let adapter = GalaxyRegistryAdapter(registry: old)
+        adapter.tick(dt: 1 / 60)
+        replacement.mergeRenderData()
+        XCTAssertEqual(old.mergedTopologyVersion, replacement.mergedTopologyVersion)
+        XCTAssertEqual(old.mergedNodesVersion, replacement.mergedNodesVersion)
+        XCTAssertEqual(old.mergedNodeAppendGeneration, replacement.mergedNodeAppendGeneration)
+        adapter.registry = replacement
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [b.id])
+        XCTAssertEqual(adapter.positionArray, [SIMD3<Float>(9, 0, 0)])
+        XCTAssertEqual(adapter.projectCentroids, ["New": SIMD3<Float>(9, 0, 0)])
+        XCTAssertEqual(adapter.nebulaClusters.first?.galaxyId, "group:team")
+        let snapshot = try XCTUnwrap(adapter.galaxySnapshots.first)
+        XCTAssertEqual(snapshot.id, "group:team")
+        XCTAssertEqual(snapshot.displayName, "New")
+        XCTAssertEqual(snapshot.parentGalaxyId, "parent")
+        XCTAssertEqual(snapshot.nodeCount, 1)
+        XCTAssertEqual(snapshot.radius, 0)
+    }
+
     private func streamingFixture() async throws
         -> (Lattice, GalaxyRegistry, Galaxy, UInt64, GalaxyRegistryAdapter) {
         let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
@@ -717,8 +945,8 @@ final class AdapterSnapshotTests: XCTestCase {
         return (lattice, registry, galaxy, generation, GalaxyRegistryAdapter(registry: registry))
     }
 
-    private func node(id: UUID = UUID(), label: String = "Original", topic: String = "Topic") -> NodeData {
-        NodeData(id: id, project: "Project", topic: topic, label: label, content: label,
+    private func node(id: UUID = UUID(), label: String = "Original", topic: String = "Topic", project: String = "Project") -> NodeData {
+        NodeData(id: id, project: project, topic: topic, label: label, content: label,
                  createdAt: .distantPast, lastAccessedAt: .distantPast, importance: 3)
     }
 }
