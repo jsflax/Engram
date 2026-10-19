@@ -1,5 +1,6 @@
 @testable import Engram
 import EngramKit
+import Foundation
 import Lattice
 import SwiftUI
 import XCTest
@@ -87,9 +88,29 @@ final class GalaxyDrainTests: XCTestCase {
     }
 
     func testStreamingLoaderReadsEveryPageAndKeepsObserversLive() async throws {
+        // This fixture intentionally overlaps a writer with live background
+        // readers. Use the production file-backed topology instead of a
+        // shared-cache in-memory store with different table-lock semantics.
+        let environment = ProcessInfo.processInfo.environment
+        let root = try XCTUnwrap(environment["ENGRAM_TEST_ROOT"])
+        let temporary = try XCTUnwrap(environment["TMPDIR"])
+        let temporaryURL = URL(fileURLWithPath: temporary, isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
+        let expectedTemporary = URL(fileURLWithPath: root, isDirectory: true)
+            .deletingLastPathComponent().appendingPathComponent("tmp", isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
+        _ = try XCTUnwrap(temporaryURL == expectedTemporary ? temporaryURL : nil,
+                          "Use the test lane's explicit owned temporary directory")
+        let directory = temporaryURL.appendingPathComponent("galaxy-streaming-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        // Cancellation does not join every background reader. Keep this owned
+        // fixture until ephemeral hosted runner teardown; do not unlink a live store.
+        var observedGalaxy: Galaxy?
         var phase = "init"
         do {
-            let lattice = try Lattice(Memory.self, MemoryEdge.self, configuration: .init(storage: .memory()))
+            let lattice = try Lattice(Memory.self, MemoryEdge.self,
+                                      configuration: .init(fileURL: directory.appendingPathComponent("memory.sqlite")))
             var rows: [Memory] = []
             for i in 0..<151 {
                 let row = Memory(content: "Streaming row \(i)", topic: "general", project: "Stream", importance: 1)
@@ -104,6 +125,7 @@ final class GalaxyDrainTests: XCTestCase {
             let edge = MemoryEdge(sourceGlobalId: firstID, targetGlobalId: lastID, relation: .partOf)
             try lattice.add(edge)
             let galaxy = Galaxy(id: "stream", displayName: "Stream", lattice: lattice.sendableReference)
+            observedGalaxy = galaxy
             await galaxy.loadData()
             XCTAssertTrue(galaxy.isLoaded)
             XCTAssertEqual(galaxy.loadStatus, .complete)
@@ -133,6 +155,9 @@ final class GalaxyDrainTests: XCTestCase {
             XCTAssertEqual(galaxy.renderStore.allNodes.count, 151)
             XCTAssertTrue(galaxy.renderStore.allEdges.isEmpty)
         } catch {
+            // Stop subscriptions on errors too. This cancels optional cluster
+            // work; stopObservers does not promise to join an in-flight pass.
+            if let observedGalaxy { await observedGalaxy.stopObservers() }
             let failure = error as NSError
             print("GalaxyDrainTests.streaming_loader failure phase=\(phase) domain=\(failure.domain) code=\(failure.code)")
             throw error

@@ -33,6 +33,8 @@ public func rotateFileIfNeeded(_ path: String, maxBytes: Int = 256 * 1024) {
 ///   - wallClockSeconds: Hard kill after this long, via a portable sh
 ///     watcher (macOS has no `timeout(1)`); pairs with maxTurns so one
 ///     wedged tool call can't hold the process open either.
+///   - learnerLogContext: Optional per-session launch/exit attribution. Child
+///     exit status is not a memory-write or persistence receipt.
 public func spawnClaudeSubprocess(
     prompt: String,
     systemPrompt: String,
@@ -44,42 +46,23 @@ public func spawnClaudeSubprocess(
     extraClaudeArgs: String = "",
     postCommand: String? = nil,
     maxTurns: Int = 15,
-    wallClockSeconds: Int = 720
+    wallClockSeconds: Int = 720,
+    learnerLogContext: LearnerLogContext? = nil
 ) throws {
-    let escapedPrompt = prompt.replacingOccurrences(of: "'", with: "'\\''")
-    let escapedSystemPrompt = systemPrompt.replacingOccurrences(of: "'", with: "'\\''")
-
     rotateFileIfNeeded(logPath)
-
-    // Per-run temp capture, appended to the log on completion: keeps
-    // concurrent spawns from interleaving AND lets the failure checks below
-    // grep THIS run's output only (grepping the shared log would re-match a
-    // previous run's errors forever).
-    // `;` separators, NOT `&&`: `a && b & ` backgrounds the whole chain
-    // (POSIX precedence), which would leave $T set only inside the
-    // backgrounded subshell and make the wall-clock kill hit the wrapper
-    // instead of claude.
-    let shellCommand = """
-    T=$(mktemp) || exit 1; \
-    echo '===== started at '\\''\(ISO8601DateFormatter().string(from: Date()))'\\'' =====' >> '\(logPath)'; \
-    claude -p '\(escapedPrompt)' \
-      --model \(model) \
-      --allowedTools '\(allowedTools)' \
-      --max-turns \(maxTurns) \
-      --no-session-persistence \
-      --output-format text \
-      --append-system-prompt '\(escapedSystemPrompt)' \
-      \(extraClaudeArgs) \
-      > "$T" 2>&1 & CPID=$!; \
-    ( sleep \(wallClockSeconds) && kill "$CPID" 2>/dev/null \
-      && echo '===== killed at \(wallClockSeconds)s wall-clock bound =====' >> "$T" ) & WPID=$!; \
-    wait "$CPID"; RC=$?; kill "$WPID" 2>/dev/null; cat "$T" >> '\(logPath)'; \
-    if grep -qi 'not logged in\\|invalid api key\\|please run /login' "$T"; then \
-      echo '===== ERROR: spawned claude is NOT AUTHENTICATED — the subprocess died before doing anything. Headless/env-auth setups strip ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN from hook children; use credential-file auth in CLAUDE_CONFIG_DIR, or spawn from a non-hook process. =====' >> '\(logPath)'; \
-    elif [ "$RC" -ne 0 ]; then \
-      echo "===== ERROR: spawned claude exited $RC =====" >> '\(logPath)'; \
-    fi; rm -f "$T"\(postCommand.map { "; \($0)" } ?? "")
-    """
+    let lifecycleLog = learnerLogContext.map { LearnerLifecycleLog(context: $0) }
+    if let lifecycleLog {
+        // Best effort only. Failure to create a diagnostic directory must not
+        // suppress the learner or change its permissions, tools or budget.
+        try? FileManager.default.createDirectory(
+            atPath: URL(fileURLWithPath: lifecycleLog.path).deletingLastPathComponent().path,
+            withIntermediateDirectories: true)
+    }
+    let shellCommand = claudeSubprocessShellCommand(
+        prompt: prompt, systemPrompt: systemPrompt, allowedTools: allowedTools,
+        model: model, logPath: logPath, extraClaudeArgs: extraClaudeArgs,
+        postCommand: postCommand, maxTurns: maxTurns,
+        wallClockSeconds: wallClockSeconds, lifecycleLog: lifecycleLog)
 
     let sh = Process()
     sh.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -98,6 +81,50 @@ public func spawnClaudeSubprocess(
 
     try sh.run()
     // Don't wait — fire and forget
+}
+
+/// Pure command construction also lets the detached shell contract be tested
+/// with a fake executable, without a provider, transcript or memory store.
+func claudeSubprocessShellCommand(
+    prompt: String, systemPrompt: String, allowedTools: String, model: String,
+    logPath: String, extraClaudeArgs: String = "", postCommand: String? = nil,
+    maxTurns: Int = 15, wallClockSeconds: Int = 720,
+    lifecycleLog: LearnerLifecycleLog? = nil
+) -> String {
+    let escapedPrompt = prompt.replacingOccurrences(of: "'", with: "'\\''")
+    let escapedSystemPrompt = systemPrompt.replacingOccurrences(of: "'", with: "'\\''")
+    let started = lifecycleLog?.appendCommand(event: "learner_child_started") ?? ""
+    let exited = lifecycleLog?.appendCommand(event: "learner_child_exited", includeExitCode: true) ?? ""
+
+    // Per-run temp capture, appended to the log on completion: keeps
+    // concurrent spawns from interleaving AND lets the failure checks below
+    // grep THIS run's output only (grepping the shared log would re-match a
+    // previous run's errors forever).
+    // `;` separators, NOT `&&`: `a && b & ` backgrounds the whole chain
+    // (POSIX precedence), which would leave $T set only inside the
+    // backgrounded subshell and make the wall-clock kill hit the wrapper
+    // instead of claude.
+    return """
+    T=$(mktemp) || exit 1; \
+    echo '===== started at '\\''\(ISO8601DateFormatter().string(from: Date()))'\\'' =====' >> '\(logPath)'; \
+    claude -p '\(escapedPrompt)' \
+      --model \(model) \
+      --allowedTools '\(allowedTools)' \
+      --max-turns \(maxTurns) \
+      --no-session-persistence \
+      --output-format text \
+      --append-system-prompt '\(escapedSystemPrompt)' \
+      \(extraClaudeArgs) \
+      > "$T" 2>&1 & CPID=$!; \
+    ( sleep \(wallClockSeconds) && kill "$CPID" 2>/dev/null \
+      && echo '===== killed at \(wallClockSeconds)s wall-clock bound =====' >> "$T" ) & WPID=$!;\(started) \
+    wait "$CPID"; RC=$?; kill "$WPID" 2>/dev/null;\(exited) cat "$T" >> '\(logPath)'; \
+    if grep -qi 'not logged in\\|invalid api key\\|please run /login' "$T"; then \
+      echo '===== ERROR: spawned claude is NOT AUTHENTICATED — the subprocess died before doing anything. Headless/env-auth setups strip ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN from hook children; use credential-file auth in CLAUDE_CONFIG_DIR, or spawn from a non-hook process. =====' >> '\(logPath)'; \
+    elif [ "$RC" -ne 0 ]; then \
+      echo "===== ERROR: spawned claude exited $RC =====" >> '\(logPath)'; \
+    fi; rm -f "$T"\(postCommand.map { "; \($0)" } ?? "")
+    """
 }
 
 /// Strip YAML frontmatter (--- delimited block) from markdown content.

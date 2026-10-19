@@ -94,7 +94,15 @@ final class GraphRenderStore {
         }
     }
     var edges: [EdgeData] = [] { didSet { edgesVersion &+= 1 } }
-    var hubs: Set<UUID> = [] { didSet { hubsVersion &+= 1 } }
+    private var hubMembers: Set<UUID> = []
+    var hubs: Set<UUID> {
+        get { hubMembers }
+        set {
+            guard hubMembers != newValue else { return }
+            hubMembers = newValue
+            hubsVersion &+= 1
+        }
+    }
     private(set) var nodesVersion: UInt64 = 0
     private(set) var edgesVersion: UInt64 = 0
     private(set) var hubsVersion: UInt64 = 0
@@ -103,6 +111,31 @@ final class GraphRenderStore {
     private(set) var nodeAppendGeneration: UInt64 = 0
     private(set) var nodeLookupAppendGeneration: UInt64 = 0
     private var appendingVisibleNode = false
+
+    // Hot edge mutations operate on the backing Set directly. An oldValue
+    // observer would retain its storage and force a copy even for insertion.
+    // Repeated part_of targets must not invalidate unchanged node snapshots.
+    @discardableResult
+    func insertHub(_ id: UUID) -> Bool {
+        let inserted = hubMembers.insert(id).inserted
+        if inserted { hubsVersion &+= 1 }
+        return inserted
+    }
+
+    @discardableResult
+    func removeHub(_ id: UUID) -> Bool {
+        let removed = hubMembers.remove(id) != nil
+        if removed { hubsVersion &+= 1 }
+        return removed
+    }
+
+    func subtractHubs(_ ids: Set<UUID>) {
+        var changed = false
+        for id in ids {
+            if hubMembers.remove(id) != nil { changed = true }
+        }
+        if changed { hubsVersion &+= 1 }
+    }
 
     /// Only this store-owned mutation certifies that every existing node is
     /// unchanged. Ordinary assignment, subscript edits, removals and reorders

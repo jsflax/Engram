@@ -944,7 +944,7 @@ final class GalaxyRegistry {
             // Hub detection
             if let edges = store.edgesByNode[nd.id] {
                 for edge in edges where edge.relation == "part_of" && edge.targetId == nd.id {
-                    store.hubs.insert(nd.id)
+                    store.insertHub(nd.id)
                     break
                 }
             }

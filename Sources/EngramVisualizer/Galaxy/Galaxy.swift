@@ -558,7 +558,7 @@ actor Galaxy: Identifiable {
             // Hub detection
             if let edges = store.edgesByNode[nd.id] {
                 for edge in edges where edge.relation == "part_of" && edge.targetId == nd.id {
-                    store.hubs.insert(nd.id)
+                    store.insertHub(nd.id)
                     break
                 }
             }
@@ -846,7 +846,7 @@ actor Galaxy: Identifiable {
         }
         store.nodes.removeAll { gids.contains($0.id) }
         store.edges.removeAll { removedEdgeIds.contains($0.id) }
-        store.hubs.subtract(gids)
+        store.subtractHubs(gids)
         store.bumpTopology()
         if !isInitialLoad && soundEnabled {
             DispatchQueue.global(qos: .utility).async { GraphView.removeSound?.play() }
@@ -925,7 +925,7 @@ actor Galaxy: Identifiable {
                     store.edges.append(edge)
                 }
                 if edge.relation == "part_of" && edge.targetId == gid {
-                    store.hubs.insert(gid)
+                    store.insertHub(gid)
                 }
             }
 
@@ -1002,9 +1002,9 @@ actor Galaxy: Identifiable {
             store.edgeCountByNode[data.targetId, default: 0] += 1
             if let old, old.relation == "part_of",
                !(store.edgesByNode[old.targetId] ?? []).contains(where: { $0.relation == "part_of" && $0.targetId == old.targetId }) {
-                store.hubs.remove(old.targetId)
+                store.removeHub(old.targetId)
             }
-            if data.relation == "part_of" { store.hubs.insert(data.targetId) }
+            if data.relation == "part_of" { store.insertHub(data.targetId) }
             if store.visibleNodeIds.contains(data.sourceId), store.visibleNodeIds.contains(data.targetId),
                !config.hiddenRelations.contains(data.relation) {
                 store.edges.append(data)
@@ -1028,7 +1028,7 @@ actor Galaxy: Identifiable {
             store.edgeCountByNode[old.targetId, default: 1] -= 1
             if old.relation == "part_of" {
                 let stillHub = (store.edgesByNode[old.targetId] ?? []).contains { $0.relation == "part_of" && $0.targetId == old.targetId }
-                if !stillHub { store.hubs.remove(old.targetId) }
+                if !stillHub { store.removeHub(old.targetId) }
             }
         }
         store.bumpTopology()
@@ -1076,7 +1076,7 @@ actor Galaxy: Identifiable {
                 addedVisibleEdge = true
             }
             if data.relation == "part_of" {
-                store.hubs.insert(data.targetId)
+                store.insertHub(data.targetId)
             }
         }
         // Bump topology whenever visible edges were added — ensures mergeRenderData

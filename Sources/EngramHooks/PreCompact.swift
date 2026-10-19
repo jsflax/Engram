@@ -112,7 +112,8 @@ struct PreCompact: AsyncParsableCommand {
                 cwd: input.cwd,
                 // Remote mode: explicit --mcp-config (cwd-independent wiring)
                 // that also tags the learner's ops for analytics attribution.
-                extraClaudeArgs: RemoteConfig.active?.learnerMcpArgs ?? ""
+                extraClaudeArgs: RemoteConfig.active?.learnerMcpArgs ?? "",
+                learnerLogContext: LearnerLogContext(sessionId: input.sessionId, trigger: .autoPrecompact)
             )
             hookLog("PreCompact hook: spawned session-learner CLI for project \(project)")
         } catch {

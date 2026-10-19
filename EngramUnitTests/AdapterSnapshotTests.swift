@@ -970,6 +970,304 @@ final class AdapterSnapshotTests: XCTestCase {
         XCTAssertEqual(snapshot.radius, 0)
     }
 
+    func testHubMembershipRevisionChangesOnlyForActualMembership() {
+        let store = GraphRenderStore()
+        let a = UUID(), b = UUID(), absent = UUID()
+        let initial = store.hubsVersion
+        XCTAssertFalse(store.removeHub(absent))
+        store.subtractHubs([absent])
+        store.hubs = []
+        XCTAssertEqual(store.hubsVersion, initial)
+        XCTAssertTrue(store.insertHub(a))
+        let inserted = store.hubsVersion
+        let retained = store.hubs
+        XCTAssertFalse(store.insertHub(a))
+        store.hubs.insert(a) // Compatibility mutation must also be a no-op.
+        store.hubs = [a]
+        store.subtractHubs([absent])
+        XCTAssertEqual(store.hubsVersion, inserted)
+        XCTAssertTrue(store.insertHub(b))
+        XCTAssertNotEqual(store.hubsVersion, inserted)
+        XCTAssertEqual(store.hubs, [a, b])
+        XCTAssertEqual(retained, [a], "Previously published membership must remain immutable")
+        let both = store.hubsVersion
+        store.subtractHubs([a, absent])
+        XCTAssertNotEqual(store.hubsVersion, both)
+        XCTAssertEqual(store.hubs, [b])
+        let subtracted = store.hubsVersion
+        store.subtractHubs([a, absent])
+        XCTAssertEqual(store.hubsVersion, subtracted)
+        XCTAssertTrue(store.removeHub(b))
+        XCTAssertTrue(store.hubs.isEmpty)
+        let empty = store.hubsVersion
+        XCTAssertFalse(store.removeHub(b))
+        XCTAssertEqual(store.hubsVersion, empty)
+        store.hubs = [a, b]
+        XCTAssertNotEqual(store.hubsVersion, empty)
+        XCTAssertEqual(store.hubs, [a, b])
+    }
+
+    func testStreamingPartOfHubChangesPatchOnlyAffectedSnapshots() async throws {
+        let (lattice, registry, galaxy, generation, adapter) = try await streamingFixture()
+        defer { lattice.close() }
+        let a = node(label: "Source"), b = node(label: "Parent"), c = node(label: "Other")
+        galaxy.applyLoadChunk(nodes: [(1, a), (2, b), (3, c)], generation: generation)
+        let positions = [SIMD3<Float>(1, 2, 3), SIMD3<Float>(4, 5, 6), SIMD3<Float>(7, 8, 9)]
+        for (value, position) in zip([a, b, c], positions) {
+            registry.unifiedSimulation.setPosition(value.id, to: position)
+        }
+        adapter.tick(dt: 1 / 60)
+        let retained = adapter.nodes
+        let built = adapter.nodeSnapshotBuildCount, compared = adapter.nodePrefixComparisonCount
+        let nodeVersion = adapter.nodeVersion
+        let first = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "part_of")
+        let second = EdgeData(id: UUID(), sourceId: c.id, targetId: b.id, relation: "part_of")
+        let third = EdgeData(id: UUID(), sourceId: a.id, targetId: c.id, relation: "part_of")
+        galaxy.applyLoadChunk(edges: [(1, first)], generation: generation)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [false, true, false])
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount - built, 1)
+        let firstHubVersion = galaxy.renderStore.hubsVersion
+
+        galaxy.applyLoadChunk(edges: [(2, second)], generation: generation)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(galaxy.renderStore.hubsVersion, firstHubVersion)
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount - built, 1)
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [false, true, false])
+        XCTAssertEqual(adapter.edges.map(\.id), [first.id, second.id])
+
+        galaxy.applyLoadChunk(edges: [(3, third)], generation: generation)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [false, true, true])
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount - built, 2)
+        let bothHubVersion = galaxy.renderStore.hubsVersion
+        galaxy.applyLoadChunk(removedEdges: [1], generation: generation)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(galaxy.renderStore.hubsVersion, bothHubVersion)
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount - built, 2)
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [false, true, true])
+        galaxy.applyLoadChunk(removedEdges: [2], generation: generation)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [false, false, true])
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount - built, 3)
+        XCTAssertEqual(adapter.edges.map(\.id), [third.id])
+        galaxy.applyLoadChunk(removedEdges: [3], generation: generation)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [false, false, false])
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount - built, 4)
+        XCTAssertTrue(adapter.hubs.isEmpty)
+        XCTAssertTrue(adapter.edges.isEmpty)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id, c.id])
+        XCTAssertEqual(adapter.nodes.map(\.label), [a.label, b.label, c.label])
+        XCTAssertEqual(adapter.positionArray, positions)
+        XCTAssertEqual(adapter.nodeVersion, nodeVersion)
+        XCTAssertEqual(adapter.nodePrefixComparisonCount, compared)
+        XCTAssertFalse(retained.contains { $0.isHub })
+    }
+
+    func testCertifiedAppendAndHubPatchPreservePrefixMetadataAndPositions() async throws {
+        let (lattice, registry, galaxy, generation, adapter) = try await streamingFixture()
+        defer { lattice.close() }
+        let a = node(label: "Prefix A"), b = node(label: "Prefix B")
+        let c = node(label: "Suffix C"), d = node(label: "Suffix D")
+        galaxy.applyLoadChunk(nodes: [(1, a), (2, b)], generation: generation)
+        registry.unifiedSimulation.setPosition(a.id, to: SIMD3<Float>(1, 0, 0))
+        registry.unifiedSimulation.setPosition(b.id, to: SIMD3<Float>(2, 0, 0))
+        adapter.tick(dt: 1 / 60)
+        let retained = adapter.nodes
+        let built = adapter.nodeSnapshotBuildCount, compared = adapter.nodePrefixComparisonCount
+        let appendGeneration = galaxy.renderStore.nodeAppendGeneration
+        galaxy.applyLoadChunk(nodes: [(3, c)], generation: generation)
+        galaxy.applyLoadChunk(nodes: [(4, d)], generation: generation)
+        galaxy.applyLoadChunk(edges: [
+            (1, EdgeData(id: UUID(), sourceId: c.id, targetId: a.id, relation: "part_of")),
+            (2, EdgeData(id: UUID(), sourceId: d.id, targetId: c.id, relation: "part_of")),
+        ], generation: generation)
+        registry.unifiedSimulation.setPosition(c.id, to: SIMD3<Float>(3, 0, 0))
+        registry.unifiedSimulation.setPosition(d.id, to: SIMD3<Float>(4, 0, 0))
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id, c.id, d.id])
+        XCTAssertEqual(adapter.nodes.map(\.label), [a.label, b.label, c.label, d.label])
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [true, false, true, false])
+        XCTAssertEqual(adapter.positionArray, [1, 2, 3, 4].map { SIMD3<Float>(Float($0), 0, 0) })
+        XCTAssertEqual(galaxy.renderStore.nodeAppendGeneration, appendGeneration)
+        XCTAssertEqual(adapter.nodePrefixComparisonCount, compared)
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount - built, 3,
+                       "Build two appended snapshots and patch only the changed prefix hub")
+        XCTAssertEqual(retained.map(\.id), [a.id, b.id])
+        XCTAssertFalse(retained.contains { $0.isHub })
+
+        let absent = UUID(), afterAppend = adapter.nodeSnapshotBuildCount
+        galaxy.renderStore.insertHub(absent)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertTrue(adapter.hubs.contains(absent))
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [true, false, true, false])
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount, afterAppend)
+        XCTAssertEqual(adapter.nodePrefixComparisonCount, compared)
+    }
+
+    func testHubPatchesRespectMetadataReorderDeletionAndDuplicateIDs() async throws {
+        let (lattice, registry, galaxy, generation, adapter) = try await streamingFixture()
+        defer { lattice.close() }
+        let a = node(label: "Original"), b = node(label: "Delete"), c = node(label: "Keep")
+        galaxy.applyLoadChunk(nodes: [(1, a), (2, b), (3, c)], generation: generation)
+        let pa = SIMD3<Float>(1, 0, 0), pb = SIMD3<Float>(2, 0, 0), pc = SIMD3<Float>(3, 0, 0)
+        for (value, position) in zip([a, b, c], [pa, pb, pc]) {
+            registry.unifiedSimulation.setPosition(value.id, to: position)
+        }
+        adapter.tick(dt: 1 / 60)
+        let compared = adapter.nodePrefixComparisonCount
+        let edited = node(id: a.id, label: "Edited", topic: "New topic", project: "New project")
+        galaxy.applyLoadChunk(nodes: [(1, edited)], generation: generation)
+        galaxy.renderStore.nodes.reverse()
+        galaxy.renderStore.insertHub(a.id)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [c.id, b.id, a.id])
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [false, false, true])
+        XCTAssertEqual(adapter.positionArray, [pc, pb, pa])
+        let current = try XCTUnwrap(adapter.nodes.last)
+        XCTAssertEqual(current.label, edited.label)
+        XCTAssertEqual(current.content, edited.content)
+        XCTAssertEqual(current.project, edited.project)
+        XCTAssertEqual(current.topic, edited.topic)
+        XCTAssertEqual(current.createdAt, edited.createdAt)
+        XCTAssertEqual(current.lastAccessedAt, edited.lastAccessedAt)
+        XCTAssertEqual(current.importance, edited.importance)
+        XCTAssertGreaterThan(adapter.nodePrefixComparisonCount, compared)
+        galaxy.applyLoadChunk(removedNodes: [2], generation: generation)
+        galaxy.renderStore.removeHub(a.id)
+        galaxy.renderStore.insertHub(c.id)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [c.id, a.id])
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [true, false])
+        XCTAssertEqual(adapter.positionArray, [pc, pa])
+
+        // Arbitrary single-store data can contain duplicate UUIDs. Every row
+        // must get the hub style, without silently picking one cached index.
+        let duplicate = node(id: a.id, label: "Duplicate copy", topic: "Duplicate topic")
+        galaxy.renderStore.nodes = [edited, c, duplicate]
+        adapter.tick(dt: 1 / 60)
+        let beforeHub = adapter.nodeSnapshotBuildCount, beforeComparison = adapter.nodePrefixComparisonCount
+        galaxy.renderStore.insertHub(a.id)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, c.id, a.id])
+        XCTAssertEqual(adapter.nodes.map(\.label), [edited.label, c.label, duplicate.label])
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [true, true, true])
+        XCTAssertEqual(adapter.positionArray, [pa, pc, pa])
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount - beforeHub, 2)
+        XCTAssertEqual(adapter.nodePrefixComparisonCount, beforeComparison)
+
+        // Truncating the duplicate suffix must leave a correct unique index.
+        galaxy.renderStore.nodes.removeLast()
+        adapter.tick(dt: 1 / 60)
+        let beforeRemoval = adapter.nodeSnapshotBuildCount
+        galaxy.renderStore.removeHub(a.id)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, c.id])
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [false, true])
+        XCTAssertEqual(adapter.positionArray, [pa, pc])
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount - beforeRemoval, 1)
+    }
+
+    func testHubSnapshotIdentityResetsForSameIDGalaxyAndRegistryReplacement() throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        defer { lattice.close() }
+        let old = GalaxyRegistry(), replacement = GalaxyRegistry()
+        old.unifiedSimulation.isActive = false
+        replacement.unifiedSimulation.isActive = false
+        let first = Galaxy(id: "personal", displayName: "First", lattice: lattice.sendableReference)
+        let second = Galaxy(id: "personal", displayName: "Second", lattice: lattice.sendableReference)
+        old.register(first)
+        replacement.register(second)
+        let a = node(label: "A"), b = node(label: "B")
+        first.insertNodeBatch([a, b], config: config)
+        second.insertNodeBatch([a, b], config: config)
+        first.renderStore.insertHub(a.id)
+        second.renderStore.insertHub(b.id)
+        let pa = SIMD3<Float>(1, 0, 0), pb = SIMD3<Float>(2, 0, 0)
+        old.unifiedSimulation.setPosition(a.id, to: .zero)
+        old.unifiedSimulation.setPosition(b.id, to: .zero)
+        replacement.unifiedSimulation.setPosition(a.id, to: pa)
+        replacement.unifiedSimulation.setPosition(b.id, to: pb)
+        let adapter = GalaxyRegistryAdapter(registry: old)
+        adapter.tick(dt: 1 / 60)
+        replacement.mergeRenderData()
+        XCTAssertEqual(old.mergedNodesVersion, replacement.mergedNodesVersion)
+        XCTAssertEqual(old.mergedHubsVersion, replacement.mergedHubsVersion)
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [true, false])
+        adapter.registry = replacement
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id])
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [false, true])
+        XCTAssertEqual(adapter.positionArray, [pa, pb])
+
+        let sameID = Galaxy(id: "personal", displayName: "Same ID, new instance", lattice: lattice.sendableReference)
+        replacement.register(sameID)
+        let edited = node(id: a.id, label: "New instance A", topic: "New topic")
+        sameID.insertNodeBatch([edited, b], config: config)
+        sameID.renderStore.insertHub(a.id)
+        XCTAssertEqual(sameID.renderStore.hubsVersion, second.renderStore.hubsVersion)
+        replacement.unifiedSimulation.setPosition(a.id, to: pa)
+        replacement.unifiedSimulation.setPosition(b.id, to: pb)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id])
+        XCTAssertEqual(adapter.nodes.map(\.label), [edited.label, b.label])
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [true, false])
+        XCTAssertEqual(adapter.positionArray, [pa, pb])
+        XCTAssertTrue(replacement.galaxyForNode(a.id) === sameID)
+    }
+
+    func testMultigalaxyHubUnionSurvivesRemovalFromOneDuplicateOwner() async throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        defer { lattice.close() }
+        let registry = GalaxyRegistry()
+        registry.unifiedSimulation.isActive = false
+        let group = Galaxy(id: "group:team", displayName: "Team", lattice: lattice.sendableReference)
+        let synced = Galaxy(id: "synced", displayName: "Synced", lattice: lattice.sendableReference)
+        registry.register(group)
+        registry.register(synced)
+        let a = node(label: "Team source"), b = node(label: "Team winner"), c = node(label: "Synced source")
+        let losingCopy = node(id: b.id, label: "Synced duplicate")
+        group.insertNodeBatch([a, b], config: config)
+        synced.insertNodeBatch([c, losingCopy], config: config)
+        let groupChanges = await group.loadChanges
+        let syncedChanges = await synced.loadChanges
+        let groupGeneration = groupChanges.withLock { $0.begin() }
+        let syncedGeneration = syncedChanges.withLock { $0.begin() }
+        let groupEdge = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "part_of")
+        let syncedEdge = EdgeData(id: UUID(), sourceId: c.id, targetId: b.id, relation: "part_of")
+        group.applyLoadChunk(edges: [(1, groupEdge)], generation: groupGeneration)
+        synced.applyLoadChunk(edges: [(1, syncedEdge)], generation: syncedGeneration)
+        let positions = [SIMD3<Float>(1, 0, 0), SIMD3<Float>(2, 0, 0), SIMD3<Float>(3, 0, 0)]
+        for (value, position) in zip([a, b, c], positions) {
+            registry.unifiedSimulation.setPosition(value.id, to: position)
+        }
+        let adapter = GalaxyRegistryAdapter(registry: registry)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id, c.id])
+        XCTAssertEqual(adapter.nodes.map(\.label), [a.label, b.label, c.label])
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [false, true, false])
+        XCTAssertTrue(registry.galaxyForNode(b.id) === group)
+        let built = adapter.nodeSnapshotBuildCount, compared = adapter.nodePrefixComparisonCount
+        group.applyLoadChunk(removedEdges: [1], generation: groupGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertFalse(group.renderStore.hubs.contains(b.id))
+        XCTAssertTrue(synced.renderStore.hubs.contains(b.id))
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [false, true, false])
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount, built)
+        XCTAssertEqual(adapter.edges.map(\.id), [syncedEdge.id])
+        synced.applyLoadChunk(removedEdges: [1], generation: syncedGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id, c.id])
+        XCTAssertEqual(adapter.nodes.map(\.label), [a.label, b.label, c.label])
+        XCTAssertEqual(adapter.nodes.map(\.isHub), [false, false, false])
+        XCTAssertEqual(adapter.positionArray, positions)
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount - built, 1)
+        XCTAssertEqual(adapter.nodePrefixComparisonCount, compared)
+        XCTAssertTrue(adapter.edges.isEmpty)
+        XCTAssertTrue(registry.galaxyForNode(b.id) === group)
+    }
+
     private func streamingFixture() async throws
         -> (Lattice, GalaxyRegistry, Galaxy, UInt64, GalaxyRegistryAdapter) {
         let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
