@@ -4,6 +4,21 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.13] - 2026-10-19
+
+### Fixed
+- Prepare the mascot asset once after a successful load and share pending work
+  between concurrent requests. Give each project an independent recursive clone;
+  failed loads remain retryable.
+- Reuse fixed geometry for the arcane circle, conjure orb and holo screen while
+  preserving independent project effect entities and material values.
+- Forward the Show mascots setting to the scene. Hiding mascots disables their
+  complete subtree and frame updates; showing them resumes retained entities
+  and state.
+
+These changes remove repeated preparation. Live measurements are still required
+to establish startup, frame-rate or memory improvement.
+
 ## [0.15.12] - 2026-10-19
 
 ### Diagnostics
