@@ -81,6 +81,9 @@ final class GalaxyRegistry {
     @ObservationIgnored private var lastMergedRevisions: [String: RenderRevision] = [:]
     @ObservationIgnored private var lastMergedOrder: [String] = []
     @ObservationIgnored private var lastHiddenRelations: Set<String> = []
+    // Absent endpoints of first-wins, non-hidden edges from the last full
+    // multi-galaxy merge. Unrelated certified node appends cannot reveal them.
+    @ObservationIgnored private var missingEdgeEndpoints: Set<UUID> = []
     @ObservationIgnored private var mergedNodeEnds: [String: Int] = [:]
     @ObservationIgnored private var lookupOwners: [UUID: Int] = [:]
     @ObservationIgnored private var lastMergedNodeCount = 0
@@ -330,19 +333,30 @@ final class GalaxyRegistry {
         let lookupChanged = identitiesChanged || ordered.contains {
             previous[$0.id]?.lookup != $0.renderStore.nodeLookupVersion
         }
-        // Cross-galaxy edges depend on ALL source edges and merged visibility,
-        // including endpoints in different galaxies and currently hidden rows.
-        let edgesChanged = identitiesChanged || hiddenRelations != lastHiddenRelations
-            || (ordered.count > 1 && nodesChanged) || ordered.contains {
-                let store = $0.renderStore
-                return ordered.count == 1 ? previous[$0.id]?.edges != store.edgesVersion
-                    : previous[$0.id]?.allEdges != store.allEdgesVersion
-            }
         let appendOnly = !identitiesChanged && ordered.allSatisfy {
             guard let old = previous[$0.id] else { return false }
             let store = $0.renderStore
             return old.nodeAppendGeneration == store.nodeAppendGeneration
                 && old.nodeCount <= store.nodes.count
+        }
+        // Cross-galaxy edges depend on ALL source edges and merged visibility.
+        // Certified appends preserve every old visible UUID, even if an earlier
+        // galaxy takes ownership. Only an absent endpoint can reveal an edge.
+        let edgeInputsChanged = identitiesChanged || hiddenRelations != lastHiddenRelations
+            || ordered.contains {
+                let store = $0.renderStore
+                return ordered.count == 1 ? previous[$0.id]?.edges != store.edgesVersion
+                    : previous[$0.id]?.allEdges != store.allEdgesVersion
+            }
+        let edgesChanged: Bool
+        if ordered.count > 1, nodesChanged, appendOnly, !edgeInputsChanged {
+            edgesChanged = !missingEdgeEndpoints.isEmpty && ordered.contains { galaxy in
+                galaxy.renderStore.nodes.dropFirst(previous[galaxy.id]!.nodeCount).contains {
+                    missingEdgeEndpoints.contains($0.id)
+                }
+            }
+        } else {
+            edgesChanged = edgeInputsChanged || (ordered.count > 1 && nodesChanged)
         }
         // Access-only lookup changes and singleton hidden-edge bookkeeping do
         // not publish new render inputs. Explicit topology/status and layout
@@ -462,6 +476,7 @@ final class GalaxyRegistry {
             mergedColorMapVersion &+= 1
         }
         if edgesChanged {
+            missingEdgeEndpoints.removeAll(keepingCapacity: true)
             if let only = ordered.first, ordered.count == 1 { mergedEdges = only.renderStore.edges }
             else {
                 var seen: Set<UUID> = []
@@ -469,8 +484,12 @@ final class GalaxyRegistry {
                 for galaxy in ordered {
                     for (id, edge) in galaxy.renderStore.allEdges {
                         guard seen.insert(id).inserted,
-                              nodeToGalaxy[edge.sourceId] != nil, nodeToGalaxy[edge.targetId] != nil,
                               !hiddenRelations.contains(edge.relation) else { continue }
+                        let sourceVisible = nodeToGalaxy[edge.sourceId] != nil
+                        let targetVisible = nodeToGalaxy[edge.targetId] != nil
+                        if !sourceVisible { missingEdgeEndpoints.insert(edge.sourceId) }
+                        if !targetVisible { missingEdgeEndpoints.insert(edge.targetId) }
+                        guard sourceVisible, targetVisible else { continue }
                         mergedEdges.append(edge)
                     }
                 }
