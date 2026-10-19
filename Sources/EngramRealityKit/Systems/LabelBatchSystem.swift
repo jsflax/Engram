@@ -4,8 +4,10 @@ import simd
 import EngramSceneKit
 
 /// Project/topic membership follows node contents, not edges or load status.
-/// A certified append can extend the sets across several skipped frames;
-/// replacement, prefix edits and removals rebuild them from the current nodes.
+/// A certified append can extend the sets and dense group slots across several
+/// skipped frames; replacement, prefix edits and removals rebuild them. Moving
+/// positions reduce into reusable numeric arrays without hashing group names
+/// for every node on every rescan.
 @MainActor
 struct LabelProjectTopicCache {
     private weak var provider: (any SceneDataProvider)?
@@ -14,8 +16,26 @@ struct LabelProjectTopicCache {
     private var nodeCount = 0
     private var projects: Set<String> = []
     private var topics: Set<String> = []
+    private var projectSlots: [String: Int] = [:]
+    private var topicSlots: [String: Int] = [:]
+    private var projectNames: [String] = []
+    private var topicNames: [String] = []
+    private struct Membership {
+        let project: Int
+        let topic: Int
+    }
+    private struct TopicReduction {
+        var sum: SIMD3<Float> = .zero
+        var count = 0
+        var project = 0
+        var maxY = -Float.greatestFiniteMagnitude
+    }
+    private var memberships: [Membership] = []
+    private var projectMaxima: [Float?] = []
+    private var topicReductions: [TopicReduction] = []
     private(set) var nodesVisited: UInt64 = 0
     private(set) var revision: UInt64 = 0
+    var topicCount: Int { topicNames.count }
 
     mutating func update(_ dataProvider: SceneDataProvider) -> (projects: Set<String>, topics: Set<String>) {
         let nodes = dataProvider.nodes
@@ -28,12 +48,38 @@ struct LabelProjectTopicCache {
         if !append {
             projects.removeAll(keepingCapacity: true)
             topics.removeAll(keepingCapacity: true)
+            projectSlots.removeAll(keepingCapacity: true)
+            topicSlots.removeAll(keepingCapacity: true)
+            projectNames.removeAll(keepingCapacity: true)
+            topicNames.removeAll(keepingCapacity: true)
+            memberships.removeAll(keepingCapacity: true)
+            projectMaxima.removeAll(keepingCapacity: true)
+            topicReductions.removeAll(keepingCapacity: true)
             nodeCount = 0
         }
         for node in nodes.dropFirst(nodeCount) {
             nodesVisited &+= 1
-            projects.insert(node.project)
-            topics.insert(node.topic)
+            let project: Int
+            if let existing = projectSlots[node.project] {
+                project = existing
+            } else {
+                project = projectNames.count
+                projects.insert(node.project)
+                projectSlots[node.project] = project
+                projectNames.append(node.project)
+                projectMaxima.append(nil)
+            }
+            let topic: Int
+            if let existing = topicSlots[node.topic] {
+                topic = existing
+            } else {
+                topic = topicNames.count
+                topics.insert(node.topic)
+                topicSlots[node.topic] = topic
+                topicNames.append(node.topic)
+                topicReductions.append(TopicReduction())
+            }
+            memberships.append(Membership(project: project, topic: topic))
         }
         provider = dataProvider
         nodeVersion = dataProvider.nodeVersion
@@ -41,6 +87,44 @@ struct LabelProjectTopicCache {
         nodeCount = nodes.count
         revision &+= 1
         return (projects, topics)
+    }
+
+    /// Call after membership is updated. A flat-array position (including zero)
+    /// wins over the map; a missing map entry in the remaining suffix is omitted.
+    /// Reset maxima as well as sums so a cluster can move down or lose its peak.
+    mutating func rescanPositions(
+        nodes: [RKNodeSnapshot], positionArray: [SIMD3<Float>], positions: [UUID: SIMD3<Float>]
+    ) {
+        for index in projectMaxima.indices { projectMaxima[index] = nil }
+        for index in topicReductions.indices { topicReductions[index] = TopicReduction() }
+        for index in memberships.indices {
+            guard let pos = index < positionArray.count ? positionArray[index] : positions[nodes[index].id] else {
+                continue
+            }
+            let membership = memberships[index]
+            projectMaxima[membership.project] = max(
+                projectMaxima[membership.project] ?? -Float.greatestFiniteMagnitude, pos.y)
+            var topic = topicReductions[membership.topic]
+            topic.sum += pos
+            topic.count += 1
+            // Topics remain shared across projects. Their color comes from the
+            // last node with a usable position, in current node order.
+            topic.project = membership.project
+            topic.maxY = max(topic.maxY, pos.y)
+            topicReductions[membership.topic] = topic
+        }
+    }
+
+    func maxY(forProject project: String) -> Float? {
+        guard let slot = projectSlots[project] else { return nil }
+        return projectMaxima[slot]
+    }
+
+    /// Resolve strings once per emitted group, outside the node reduction loop.
+    func topic(at slot: Int) -> (name: String, sum: SIMD3<Float>, count: Int, project: String, maxY: Float)? {
+        let value = topicReductions[slot]
+        guard value.count > 0 else { return nil }
+        return (topicNames[slot], value.sum, value.count, projectNames[value.project], value.maxY)
     }
 }
 
@@ -84,8 +168,6 @@ public final class LabelBatchSystem {
     }
 
     // Cached cluster data — recomputed every N frames instead of every frame
-    private var cachedProjectMaxY: [String: Float] = [:]
-    private var cachedTopicSums: [String: (sum: SIMD3<Float>, count: Int, project: String, maxY: Float)] = [:]
     private var lastClusterFrame: UInt64 = 0
     private var clusterPositionVersion: UInt64?
     private var clusterNodeRevision: UInt64?
@@ -279,18 +361,9 @@ public final class LabelBatchSystem {
             lastClusterFrame = frameCount
             clusterPositionVersion = dataProvider.positionVersion
             clusterNodeRevision = projectTopicCache.revision
-            cachedProjectMaxY.removeAll(keepingCapacity: true)
-            cachedTopicSums.removeAll(keepingCapacity: true)
-            for (index, node) in nodes.enumerated() {
-                guard let pos = index < positionArray.count ? positionArray[index] : positions[node.id] else { continue }
-                cachedProjectMaxY[node.project] = max(
-                    cachedProjectMaxY[node.project] ?? -Float.greatestFiniteMagnitude, pos.y)
-                let entry = cachedTopicSums[node.topic] ?? (.zero, 0, node.project, -Float.greatestFiniteMagnitude)
-                cachedTopicSums[node.topic] = (entry.sum + pos, entry.count + 1, node.project, max(entry.maxY, pos.y))
-            }
+            projectTopicCache.rescanPositions(nodes: nodes, positionArray: positionArray, positions: positions)
         }
         mark("rescan")
-        let projectMaxY = cachedProjectMaxY
 
         // Project cluster labels — large, floating above top of cluster
         // Much larger than node labels and visible from across the scene
@@ -301,7 +374,7 @@ public final class LabelBatchSystem {
         for (project, centroid) in dataProvider.projectCentroids {
             guard let rect = projRects[project] else { continue }
             let color = colorMap[project] ?? SIMD3<Float>(0.9, 0.9, 0.9)
-            let topY = projectMaxY[project] ?? centroid.y
+            let topY = projectTopicCache.maxY(forProject: project) ?? centroid.y
             let anchor = SIMD3<Float>(centroid.x, topY + 40.0, centroid.z) * scaleFactor
             let halfH: Float = 14.0
             let halfW = halfH * (rect.u1 - rect.u0) / max(rect.v1 - rect.v0, 0.001) * aspectCorrection
@@ -335,9 +408,9 @@ public final class LabelBatchSystem {
         let topicRects = scene.labelAtlasGenerator.topicRects
         if !topicRects.isEmpty {
             // Use cached topic centroids (recomputed above on throttle interval)
-            let topicSums = cachedTopicSums
-            for (topic, data) in topicSums where data.count >= 2 {
-                guard let rect = topicRects[topic] else { continue }
+            for slot in 0..<projectTopicCache.topicCount {
+                guard let data = projectTopicCache.topic(at: slot), data.count >= 2,
+                      let rect = topicRects[data.name] else { continue }
                 let centroid = data.sum / Float(data.count)
                 let color = colorMap[data.project] ?? SIMD3<Float>(0.7, 0.7, 0.7)
                 let anchor = SIMD3<Float>(centroid.x, data.maxY + 25.0, centroid.z) * scaleFactor

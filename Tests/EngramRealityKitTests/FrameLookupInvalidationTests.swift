@@ -31,8 +31,8 @@ private final class FrameLookupProvider: SceneDataProvider {
 @Suite("Frame lookup invalidation")
 @MainActor
 struct FrameLookupInvalidationTests {
-    private func node(_ id: UUID, _ project: String) -> RKNodeSnapshot {
-        RKNodeSnapshot(id: id, project: project, topic: "topic", label: project,
+    private func node(_ id: UUID, _ project: String, topic: String = "topic") -> RKNodeSnapshot {
+        RKNodeSnapshot(id: id, project: project, topic: topic, label: project,
                        importance: 1, isHub: false)
     }
 
@@ -194,6 +194,8 @@ struct FrameLookupInvalidationTests {
         let initial = cache.update(provider)
         #expect(initial.projects == Set(["First"]))
         #expect(initial.topics == Set(["topic"]))
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [SIMD3(0, 8, 0)], positions: [:])
+        let originalTopic = cache.topic(at: 0)
         let visited = cache.nodesVisited, revision = cache.revision
 
         provider.edges = [edge(first, second)]
@@ -218,6 +220,20 @@ struct FrameLookupInvalidationTests {
         #expect(initial.projects == Set(["First"]))
         #expect(cache.nodesVisited - visited == 2)
         #expect(cache.revision > revision)
+        cache.rescanPositions(nodes: provider.nodes,
+                              positionArray: [SIMD3(0, -2, 0), SIMD3(0, 10, 0), SIMD3(0, -4, 0)],
+                              positions: [:])
+        #expect(cache.maxY(forProject: "First") == -2)
+        #expect(cache.maxY(forProject: "Second") == 10)
+        #expect(cache.maxY(forProject: "Third") == -4)
+        #expect(cache.topicCount == 2)
+        #expect(cache.topic(at: 0)?.name == "topic")
+        #expect(cache.topic(at: 0)?.sum == SIMD3<Float>(0, -6, 0))
+        #expect(cache.topic(at: 0)?.count == 2)
+        #expect(cache.topic(at: 0)?.project == "Third")
+        #expect(cache.topic(at: 1)?.name == "new topic")
+        #expect(cache.topic(at: 1)?.count == 1)
+        #expect(originalTopic?.maxY == 8)
     }
 
     @Test("Label membership drops stale values after edits, shrink and provider replacement")
@@ -230,6 +246,8 @@ struct FrameLookupInvalidationTests {
         provider.nodes = [node(first, "Old"), node(second, "Removed")]
         let initial = cache.update(provider)
         #expect(initial.projects == Set(["Old", "Removed"]))
+        cache.rescanPositions(nodes: provider.nodes,
+                              positionArray: [SIMD3(0, 10, 0), SIMD3(0, 20, 0)], positions: [:])
 
         // Same count, different order and metadata: the old set cannot be
         // extended even though the node array did not shrink.
@@ -239,6 +257,12 @@ struct FrameLookupInvalidationTests {
         let edited = cache.update(provider)
         #expect(edited.projects == Set(["Current"]))
         #expect(edited.topics == Set(["topic"]))
+        cache.rescanPositions(nodes: provider.nodes,
+                              positionArray: [SIMD3(0, 1, 0), SIMD3(0, 2, 0)], positions: [:])
+        #expect(cache.maxY(forProject: "Old") == nil)
+        #expect(cache.maxY(forProject: "Removed") == nil)
+        #expect(cache.maxY(forProject: "Current") == 2)
+        #expect(cache.topic(at: 0)?.sum == SIMD3<Float>(0, 3, 0))
         provider.nodes.removeAll()
         provider.explicitNodeVersion = 3
         // Defensive shrink refusal also applies if a producer failed to
@@ -246,6 +270,9 @@ struct FrameLookupInvalidationTests {
         let emptied = cache.update(provider)
         #expect(emptied.projects.isEmpty)
         #expect(emptied.topics.isEmpty)
+        cache.rescanPositions(nodes: [], positionArray: [], positions: [:])
+        #expect(cache.topicCount == 0)
+        #expect(cache.maxY(forProject: "Current") == nil)
 
         provider.nodes = [node(first, "Repopulated")]
         provider.explicitNodeVersion = 4
@@ -259,6 +286,12 @@ struct FrameLookupInvalidationTests {
         let replaced = cache.update(replacement)
         #expect(replaced.projects == Set(["Replacement"]))
         #expect(replaced.topics == Set(["replacement topic"]))
+        cache.rescanPositions(nodes: replacement.nodes, positionArray: [SIMD3(0, -5, 0)], positions: [:])
+        #expect(cache.maxY(forProject: "Repopulated") == nil)
+        #expect(cache.topicCount == 1)
+        #expect(cache.topic(at: 0)?.name == "replacement topic")
+        #expect(cache.topic(at: 0)?.project == "Replacement")
+        #expect(cache.topic(at: 0)?.maxY == -5)
 
         // The ordinary conservative provider contract changes generation with
         // topology, so a simultaneous prefix edit and append is fully read.
@@ -270,5 +303,111 @@ struct FrameLookupInvalidationTests {
         let fallback = cache.update(conservative)
         #expect(fallback.projects == Set(["After", "Appended"]))
         #expect(fallback.topics == Set(["topic"]))
+    }
+
+    @Test("Label numeric rescans refresh moving sums and downward maxima without revisiting metadata")
+    func labelNumericRescanFollowsMotion() {
+        let provider = FrameLookupProvider()
+        var cache = LabelProjectTopicCache()
+        provider.nodes = [node(UUID(), "A"), node(UUID(), "B"), node(UUID(), "A", topic: "other")]
+        _ = cache.update(provider)
+        cache.rescanPositions(nodes: provider.nodes,
+                              positionArray: [SIMD3(2, 8, 4), SIMD3(4, 12, 2), SIMD3(0, 3, 0)],
+                              positions: [:])
+        #expect(cache.maxY(forProject: "A") == 8)
+        #expect(cache.maxY(forProject: "B") == 12)
+        #expect(cache.topic(at: 0)?.sum == SIMD3<Float>(6, 20, 6))
+        #expect(cache.topic(at: 0)?.count == 2)
+        #expect(cache.topic(at: 0)?.project == "B")
+        #expect(cache.topic(at: 0)?.maxY == 12)
+        #expect(cache.topic(at: 1)?.count == 1)
+        let visited = cache.nodesVisited, revision = cache.revision
+
+        provider.positionVersion += 1
+        _ = cache.update(provider)
+        cache.rescanPositions(nodes: provider.nodes,
+                              positionArray: [SIMD3(2, -8, 4), SIMD3(4, -12, 2), SIMD3(0, -3, 0)],
+                              positions: [:])
+        #expect(cache.nodesVisited == visited)
+        #expect(cache.revision == revision)
+        #expect(cache.maxY(forProject: "A") == -3)
+        #expect(cache.maxY(forProject: "B") == -12)
+        #expect(cache.topic(at: 0)?.sum == SIMD3<Float>(6, -20, 6))
+        #expect(cache.topic(at: 0)?.count == 2)
+        #expect(cache.topic(at: 0)?.maxY == -8)
+        #expect(cache.topic(at: 1)?.sum == SIMD3<Float>(0, -3, 0))
+    }
+
+    @Test("Label reductions preserve flat-prefix, missing-map and explicit-zero position semantics")
+    func labelNumericRescanPreservesMissingPositionSemantics() {
+        let provider = FrameLookupProvider()
+        var cache = LabelProjectTopicCache()
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID()
+        provider.nodes = [node(a, "A"), node(b, "B"), node(c, "C"), node(d, "D", topic: "missing")]
+        let membership = cache.update(provider)
+        #expect(membership.projects == Set(["A", "B", "C", "D"]))
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [.zero],
+                              positions: [a: SIMD3(99, 99, 99), b: SIMD3(2, 4, 6)])
+        #expect(cache.maxY(forProject: "A") == 0)
+        #expect(cache.maxY(forProject: "B") == 4)
+        #expect(cache.maxY(forProject: "C") == nil)
+        #expect(cache.maxY(forProject: "D") == nil)
+        #expect(cache.topic(at: 0)?.sum == SIMD3<Float>(2, 4, 6))
+        #expect(cache.topic(at: 0)?.count == 2)
+        #expect(cache.topic(at: 0)?.project == "B")
+        #expect(cache.topic(at: 1) == nil)
+
+        // The previous last valid node disappears; an absent suffix must not
+        // retain its sum, height or color project.
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [.zero], positions: [c: SIMD3(3, 6, 9)])
+        #expect(cache.maxY(forProject: "B") == nil)
+        #expect(cache.topic(at: 0)?.sum == SIMD3<Float>(3, 6, 9))
+        #expect(cache.topic(at: 0)?.project == "C")
+        #expect(cache.topic(at: 0)?.maxY == 6)
+
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [.zero, .zero, .zero, .zero], positions: [:])
+        #expect(cache.topic(at: 0)?.count == 3)
+        #expect(cache.topic(at: 0)?.sum == SIMD3<Float>.zero)
+        #expect(cache.topic(at: 0)?.project == "C")
+        #expect(cache.topic(at: 1)?.count == 1)
+        #expect(cache.maxY(forProject: "D") == 0)
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [], positions: [:])
+        #expect(cache.topicCount == 2) // Atlas membership includes unpositioned nodes.
+        #expect(cache.topic(at: 0) == nil)
+        #expect(cache.topic(at: 1) == nil)
+        #expect(cache.maxY(forProject: "A") == nil)
+    }
+
+    @Test("Label slots follow node reorder and same-count project/topic edits")
+    func labelNumericSlotsFollowReorderAndTopicChanges() {
+        let provider = FrameLookupProvider()
+        var cache = LabelProjectTopicCache()
+        let a = UUID(), b = UUID()
+        provider.nodes = [node(a, "A"), node(b, "B")]
+        _ = cache.update(provider)
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [],
+                              positions: [a: SIMD3(1, 2, 3), b: SIMD3(4, 5, 6)])
+        #expect(cache.topic(at: 0)?.project == "B")
+        provider.nodes.reverse()
+        provider.topologyVersion += 1
+        _ = cache.update(provider)
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [],
+                              positions: [a: SIMD3(1, 2, 3), b: SIMD3(4, 5, 6)])
+        #expect(cache.topic(at: 0)?.project == "A")
+        #expect(cache.topic(at: 0)?.sum == SIMD3<Float>(5, 7, 9))
+
+        provider.nodes = [node(b, "Changed", topic: "new"), node(a, "Changed", topic: "new")]
+        provider.topologyVersion += 1
+        _ = cache.update(provider)
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [],
+                              positions: [a: SIMD3(1, -2, 3), b: SIMD3(4, -5, 6)])
+        #expect(cache.maxY(forProject: "A") == nil)
+        #expect(cache.maxY(forProject: "B") == nil)
+        #expect(cache.maxY(forProject: "Changed") == -2)
+        #expect(cache.topicCount == 1)
+        #expect(cache.topic(at: 0)?.name == "new")
+        #expect(cache.topic(at: 0)?.project == "Changed")
+        #expect(cache.topic(at: 0)?.sum == SIMD3<Float>(5, -7, 9))
+        #expect(cache.topic(at: 0)?.count == 2)
     }
 }

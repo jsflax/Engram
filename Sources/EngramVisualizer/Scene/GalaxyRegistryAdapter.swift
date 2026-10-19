@@ -151,6 +151,7 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     }
     var nodeVersion: UInt64 { registry?.mergedNodesVersion ?? 0 }
     var hubVersion: UInt64 { registry?.mergedHubsVersion ?? 0 }
+    var edgeVersion: UInt64 { registry?.mergedEdgesVersion ?? 0 }
     var nodeAppendGeneration: UInt64 { registry?.mergedNodeAppendGeneration ?? 0 }
 
     func tick(dt: Float) {

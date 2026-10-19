@@ -340,7 +340,12 @@ public final class EngramRealityScene {
             glowingNodes: dataProvider.glowingNodes,
             hubs: dataProvider.hubs,
             topologyVersion: dataProvider.topologyVersion,
-            positionVersion: dataProvider.positionVersion
+            positionVersion: dataProvider.positionVersion,
+            provider: dataProvider,
+            nodeVersion: dataProvider.nodeVersion,
+            hubVersion: dataProvider.hubVersion,
+            edgeVersion: dataProvider.edgeVersion,
+            nodeAppendGeneration: dataProvider.nodeAppendGeneration
         )
         phaseMark()
 

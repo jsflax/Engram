@@ -92,7 +92,7 @@ public final class LODSystem {
 
     public init() {}
 
-    // Reused per-frame buffers + topology-cached edge endpoint indices.
+    // Reused per-frame buffers + domain-cached edge endpoint indices.
     private var nearBuf: [LODBudgetSelection.Candidate] = []
     private var midBuf: [LODBudgetSelection.Candidate] = []
     private var farBuf: [LODBudgetSelection.Candidate] = []
@@ -101,9 +101,17 @@ public final class LODSystem {
     // snapshot. Keep them compact so orbiting a settled graph does not walk
     // the strings/dates in tens of thousands of immutable snapshots per frame.
     private var basePriorities: [Int] = []
-    private var prioritiesTopologyVersion: UInt64 = .max
+    private weak var cachedProvider: AnyObject?
+    private var usedProvider = false
+    private var prioritiesNodeVersion: UInt64 = .max
+    private var prioritiesHubVersion: UInt64 = .max
+    private var prioritiesAppendGeneration: UInt64?
+    private(set) var priorityBuildCount = 0
     private var edgeEndpoints = EdgeEndpointIndexCache()
-    private var edgeTopologyVersion: UInt64 = .max
+    private var endpointNodeVersion: UInt64 = .max
+    private var endpointEdgeVersion: UInt64 = .max
+    var endpointNodeComparisonCount: Int { edgeEndpoints.nodePrefixComparisonCount }
+    var endpointEdgeComparisonCount: Int { edgeEndpoints.edgePrefixComparisonCount }
     /// EMA of the previous frames' min/max node-to-camera distance —
     /// the basis for scale-free LOD tier thresholds.
     private var distMinEMA: Float = 0
@@ -139,13 +147,39 @@ public final class LODSystem {
         glowingNodes: [UUID: Float],
         hubs: Set<UUID>,
         topologyVersion: UInt64 = 0,
-        positionVersion: UInt64? = nil
+        positionVersion: UInt64? = nil,
+        provider: AnyObject? = nil,
+        nodeVersion: UInt64? = nil,
+        hubVersion: UInt64? = nil,
+        edgeVersion: UInt64? = nil,
+        nodeAppendGeneration: UInt64? = nil
     ) -> VisibleSet {
         let n = nodes.count
         let useArray = positionArray.count == n
-        if prioritiesTopologyVersion != topologyVersion || basePriorities.count != n || hubs != lastHubs {
-            basePriorities = nodes.map { $0.isHub ? 100 : $0.importance }
-            prioritiesTopologyVersion = topologyVersion
+        let sameProvider = provider != nil && cachedProvider === provider
+        let providerChanged = usedProvider != (provider != nil) || (provider != nil && !sameProvider)
+        let nodesRevision = nodeVersion ?? topologyVersion
+        let hubsRevision = hubVersion ?? topologyVersion
+        let edgesRevision = edgeVersion ?? topologyVersion
+        let priorityMetadataChanged = providerChanged || prioritiesNodeVersion != nodesRevision
+            || prioritiesHubVersion != hubsRevision || basePriorities.count != n || hubs != lastHubs
+        let endpointMetadataChanged = providerChanged || endpointNodeVersion != nodesRevision
+            || endpointEdgeVersion != edgesRevision || edgeEndpoints.sourceIndices.count != edges.count
+            || edgeEndpoints.nodeCount != n
+        if priorityMetadataChanged {
+            // A hub change can edit isHub in the existing prefix independently
+            // of the node domain. Only unchanged hubs permit suffix reuse.
+            let keepsPrefix = sameProvider && nodeVersion != nil && nodeAppendGeneration != nil
+                && prioritiesAppendGeneration == nodeAppendGeneration
+                && prioritiesHubVersion == hubsRevision && hubs == lastHubs && n >= basePriorities.count
+            if !keepsPrefix { basePriorities.removeAll(keepingCapacity: true) }
+            for index in basePriorities.count..<n {
+                basePriorities.append(nodes[index].isHub ? 100 : nodes[index].importance)
+                priorityBuildCount += 1
+            }
+            prioritiesNodeVersion = nodesRevision
+            prioritiesHubVersion = hubsRevision
+            prioritiesAppendGeneration = nodeAppendGeneration
         }
 
         let glowingIDs = Set(glowingNodes.keys)
@@ -153,6 +187,7 @@ public final class LODSystem {
         // Callers without a position revision deliberately bypass this cache.
         // Recall membership can displace a node when a tier exceeds its budget.
         if let cached = cachedVisibleSet,
+           !priorityMetadataChanged, !endpointMetadataChanged, !providerChanged,
            distanceRangeIsSettled,
            let positionVersion, positionVersion == lastPositionVersion,
            topologyVersion == lastVisibleTopologyVersion,
@@ -252,13 +287,15 @@ public final class LODSystem {
         if nearCapped.isEmpty && midCapped.isEmpty && farCapped.isEmpty && n > 0 {
             farCapped = Array(0..<min(n, maxNodeInstances))
         }
-        // Edge endpoints as node indices, cached on topology. The UUID-Set
+        // Edge endpoints as node indices, cached on their metadata domains. The UUID-Set
         // filter did 2 hashed lookups × edge count per frame (460k+ at 230k
         // edges); with int indices + a bit array it's two loads and two tests.
-        if edgeTopologyVersion != topologyVersion || edgeEndpoints.sourceIndices.count != edges.count
-            || edgeEndpoints.nodeCount != n {
-            edgeEndpoints.update(nodes: nodes, edges: edges)
-            edgeTopologyVersion = topologyVersion
+        if endpointMetadataChanged {
+            edgeEndpoints.update(nodes: nodes, edges: edges, provider: provider,
+                                 nodeVersion: nodeVersion, edgeVersion: edgeVersion,
+                                 nodeAppendGeneration: nodeAppendGeneration)
+            endpointNodeVersion = nodesRevision
+            endpointEdgeVersion = edgesRevision
         }
 
         if visibleBits.count != n { visibleBits = [Bool](repeating: false, count: n) }
@@ -306,6 +343,8 @@ public final class LODSystem {
             visibleLabelIndices: visibleLabels
         )
         cachedVisibleSet = result
+        cachedProvider = provider
+        usedProvider = provider != nil
         lastCameraPosition = cameraPosition
         lastVisibleTopologyVersion = topologyVersion
         lastSelectedNode = selectedNode

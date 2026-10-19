@@ -47,6 +47,8 @@ final class AdapterSnapshotTests: XCTestCase {
         let adapter = GalaxyRegistryAdapter(registry: registry)
         adapter.tick(dt: 1 / 60)
         XCTAssertEqual(adapter.edges.count, 1)
+        let originalEdgeVersion = adapter.edgeVersion
+        let originalNodeVersion = adapter.nodeVersion
 
         galaxy.renderStore.edges = [
             EdgeData(id: original.id, sourceId: nodes[0].id, targetId: nodes[2].id, relation: "part_of"),
@@ -57,12 +59,17 @@ final class AdapterSnapshotTests: XCTestCase {
         XCTAssertEqual(adapter.edges.count, 2)
         XCTAssertEqual(adapter.edges[0].targetId, nodes[2].id)
         XCTAssertEqual(adapter.edges[0].relation, "part_of")
+        XCTAssertNotEqual(adapter.edgeVersion, originalEdgeVersion)
+        XCTAssertEqual(adapter.nodeVersion, originalNodeVersion)
+        let editedEdgeVersion = adapter.edgeVersion
 
         galaxy.renderStore.edges.removeFirst()
         galaxy.renderStore.bumpTopology()
         adapter.tick(dt: 1 / 60)
         XCTAssertEqual(adapter.edges.count, 1)
         XCTAssertEqual(adapter.edges[0].sourceId, nodes[1].id)
+        XCTAssertNotEqual(adapter.edgeVersion, editedEdgeVersion)
+        XCTAssertEqual(adapter.nodeVersion, originalNodeVersion)
     }
 
     func testSimulationIndexGenerationPreservesAppendButInvalidatesCompaction() {

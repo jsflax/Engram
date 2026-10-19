@@ -83,7 +83,7 @@ class HostPreparationTests(unittest.TestCase):
             original = products / 'Engram.xctestrun'
             original.write_bytes(plistlib.dumps(self.original))
             result = M.prepare(root)
-            self.assertEqual(result['expected_tests'], 5)
+            self.assertEqual(result['expected_tests'], 6)
             output = plistlib.loads(Path(result['prepared']).read_bytes())
             environment = output['TestConfigurations'][0]['TestTargets'][0]['EnvironmentVariables']
             self.assertEqual(environment['CLAUDE_MEMORY_DB'], str(root / 'fixtures/app-memory.sqlite'))
@@ -112,12 +112,25 @@ class HostPreparationTests(unittest.TestCase):
             'testLightColorsRemainLive', 'testLightNodeInvalidation', 'testSelectedEdgeDeletion',
             'testSelectedEdgeReorderAndReplacement', 'testStableFlowAndSelectionChange',
             'testFlowProviderCountAndCap', 'testLabelMembershipSeparatesDomainsAndExtendsAppendPrefix',
-            'testLabelMembershipRejectsInvalidContinuity')]
+            'testLabelMembershipRejectsInvalidContinuity', 'testLabelNumericRescanFollowsMotion',
+            'testLabelNumericRescanPreservesMissingPositionSemantics',
+            'testLabelNumericSlotsFollowReorderAndTopicChanges')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 65)
+        self.assertEqual(len(inventory), 75)
         self.assertEqual([name for name in inventory if name.startswith('FrameLookupInvalidationTests/')],
                          sorted(expected))
         self.assertEqual(M.CLASSES.count('FrameLookupInvalidationTests'), 1)
+        domain_controls = ['SceneMetadataDomainTests/' + name for name in (
+            'testRevisionDomainsPreserveLateEndpointsAndSkipUnchangedPrefixes',
+            'testRevisionFallbacksMatchConservativeEndpointResults',
+            'testDuplicateAppendPreservesExistingEndpointPolicy',
+            'testRoutingDomainsExtendOnlyCertifiedNodeSuffixes',
+            'testRoutingDomainsRebuildForEditsRemovalAndReplacement',
+            'testMetadataDomainsMatchConservativeVisibilityAcrossMutations',
+            'testMetadataReusePreservesMotionAndLivePriorityOverrides')]
+        self.assertEqual([name for name in inventory if name.startswith('SceneMetadataDomainTests/')],
+                         sorted(domain_controls))
+        self.assertEqual(M.CLASSES.count('SceneMetadataDomainTests'), 1)
 
 class DependencyPreparationTests(unittest.TestCase):
     def setUp(self):

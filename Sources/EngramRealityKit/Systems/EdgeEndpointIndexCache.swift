@@ -1,7 +1,8 @@
 import Foundation
 
-/// Maintains flat edge endpoints while a graph arrives in batches. Verifying
-/// compact UUID prefixes is much cheaper than hashing every endpoint again.
+/// Maintains flat edge endpoints while a graph arrives in batches. Provider
+/// revisions avoid rechecking unchanged domains; changed edge prefixes and
+/// callers without continuity still receive the compact-key validation.
 /// Keep compact keys rather than retaining the provider arrays: a retained
 /// snapshot would force those arrays to copy on their next append.
 struct EdgeEndpointIndexCache {
@@ -23,15 +24,39 @@ struct EdgeEndpointIndexCache {
     private var edgeKeys: [EdgeKey] = []
     private var nodeIndices: [UUID: Int32] = [:]
     private var unresolvedEdges: [Int] = []
+    private weak var cachedProvider: AnyObject?
+    private var cachedNodeVersion: UInt64?
+    private var cachedEdgeVersion: UInt64?
+    private var cachedAppendGeneration: UInt64?
+    private(set) var nodePrefixComparisonCount = 0
+    private(set) var edgePrefixComparisonCount = 0
     private(set) var sourceIndices: [Int32] = []
     private(set) var targetIndices: [Int32] = []
     var nodeCount: Int { nodeIDs.count }
 
     @discardableResult
-    mutating func update(nodes: [RKNodeSnapshot], edges: [RKEdgeSnapshot]) -> UpdateKind {
-        let keepsPrefix = nodes.count >= nodeIDs.count && edges.count >= edgeKeys.count
-            && nodeIDs.indices.allSatisfy { nodeIDs[$0] == nodes[$0].id }
-            && edgeKeys.indices.allSatisfy { edgeKeys[$0] == EdgeKey(edges[$0]) }
+    mutating func update(
+        nodes: [RKNodeSnapshot], edges: [RKEdgeSnapshot],
+        provider: AnyObject? = nil, nodeVersion: UInt64? = nil,
+        edgeVersion: UInt64? = nil, nodeAppendGeneration: UInt64? = nil
+    ) -> UpdateKind {
+        let sameProvider = provider != nil && cachedProvider === provider
+        let unchangedNodes = sameProvider && nodeVersion != nil
+            && cachedNodeVersion == nodeVersion && nodes.count == nodeIDs.count
+        let certifiedAppend = sameProvider && nodeAppendGeneration != nil
+            && cachedAppendGeneration == nodeAppendGeneration && nodes.count >= nodeIDs.count
+        let unchangedEdges = sameProvider && edgeVersion != nil
+            && cachedEdgeVersion == edgeVersion && edges.count == edgeKeys.count
+        let providerChanged = provider != nil && !sameProvider
+        let keepsPrefix = !providerChanged && nodes.count >= nodeIDs.count && edges.count >= edgeKeys.count
+            && (unchangedNodes || certifiedAppend || nodeIDs.indices.allSatisfy {
+                nodePrefixComparisonCount += 1
+                return nodeIDs[$0] == nodes[$0].id
+            })
+            && (unchangedEdges || edgeKeys.indices.allSatisfy {
+                edgePrefixComparisonCount += 1
+                return edgeKeys[$0] == EdgeKey(edges[$0])
+            })
         if !keepsPrefix {
             nodeIDs.removeAll(keepingCapacity: true)
             edgeKeys.removeAll(keepingCapacity: true)
@@ -73,6 +98,10 @@ struct EdgeEndpointIndexCache {
             targetIndices.append(target)
             if source < 0 || target < 0 { unresolvedEdges.append(index) }
         }
+        cachedProvider = provider
+        cachedNodeVersion = nodeVersion
+        cachedEdgeVersion = edgeVersion
+        cachedAppendGeneration = nodeAppendGeneration
         if !keepsPrefix { return .rebuilt }
         return nodes.count == oldNodeCount && edges.count == oldEdgeCount ? .unchanged : .appended
     }
