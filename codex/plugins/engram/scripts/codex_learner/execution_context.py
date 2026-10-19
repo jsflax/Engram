@@ -25,7 +25,7 @@ import stat
 import time
 
 from . import admission, execution_manifest as journal, file_identity, host_admission
-from . import memory_config, migration as durable, stdio_bridge, transcript
+from . import learner_settings, memory_config, migration as durable, stdio_bridge, transcript
 from .writer_fence import HeldFence
 
 MAX_SCAN = 32 * 1024 * 1024
@@ -372,13 +372,15 @@ def _interval(path, identity, start, end):
 
 
 def _source(request, parser, source, expected_next, *, verified=None, runtime_admission=None,
-            retained_plugin=None):
+            retained_plugin=None, provider_mode=None):
     journal._keys(parser, {"version", "input", "limits", "runtime", "interval_sha256"})
     journal._version(parser["version"])
     journal._keys(parser["input"], {"offset", "recent_messages", "current_turn_id"})
     journal._keys(parser["limits"], {"max_chars", "max_scan_bytes"})
     maximum, scan = parser["limits"]["max_chars"], parser["limits"]["max_scan_bytes"]
-    _require(type(maximum) is int and 1 <= maximum <= 48000
+    ceiling = (max(48000, min(scan, learner_settings.MAX_PLANNING_EXCERPT_CHARS))
+               if provider_mode == "read_only_plan" and type(scan) is int else 48000)
+    _require(type(maximum) is int and 1 <= maximum <= ceiling
              and type(scan) is int and 1 <= scan <= MAX_SCAN
              and source["start_offset"] == parser["input"]["offset"]
              and source["end_offset"] - source["start_offset"] <= scan, "invalid_parser_limits")
@@ -431,10 +433,10 @@ def _source_backend_inputs(paths, manifest, decoded, *, source_cache=None, runti
              and route["runtime"]["sha256"] == manifest["backend"]["runtime_sha256"], "backend_changed")
     arguments = (request, decoded["parser_state"], manifest["source"], decoded["next_parser_state"])
     if source_cache is None and runtime_admission is None and retained_plugin is None:
-        _source(*arguments)
+        _source(*arguments, provider_mode=manifest.get("provider_mode"))
     else:
         _source(*arguments, verified=source_cache, runtime_admission=runtime_admission,
-                retained_plugin=retained_plugin)
+                retained_plugin=retained_plugin, provider_mode=manifest.get("provider_mode"))
     _require(_same(admission.check(paths.root, request), request["admission"]), "binding_changed")
     return True
 

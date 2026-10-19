@@ -63,13 +63,21 @@ struct SimulationIndexCache {
 final class GalaxyRegistryAdapter: SceneDataProvider {
     weak var registry: GalaxyRegistry?
 
-    // Cached snapshots — rebuilt on topology change
+    // Each snapshot follows its own domain; edge/status/color updates do not
+    // validate every node again. Hub membership is a node-snapshot dependency.
     private var cachedNodes: [RKNodeSnapshot] = []
     private var cachedEdges: [RKEdgeSnapshot] = []
     private var cachedHubs: Set<UUID> = []
     private var cachedColorMap: [String: SIMD3<Float>] = [:]
     private var lastTopologyVersion: UInt64 = 0
     private var lastColorMapVersion: UInt64 = 0
+    private var lastNodesVersion: UInt64 = .max
+    private var lastEdgesVersion: UInt64 = .max
+    private var lastHubsVersion: UInt64 = .max
+    private(set) var nodePrefixComparisonCount: UInt64 = 0
+    private(set) var nodeSnapshotBuildCount: UInt64 = 0
+    private(set) var edgePrefixComparisonCount: UInt64 = 0
+    private(set) var edgeSnapshotBuildCount: UInt64 = 0
 
     // Visual state — elapsed times tracked per-frame
     private var glowStartTimes: [UUID: Date] = [:]
@@ -141,6 +149,9 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     var topologyVersion: UInt64 {
         registry?.mergedTopologyVersion ?? 0
     }
+    var nodeVersion: UInt64 { registry?.mergedNodesVersion ?? 0 }
+    var hubVersion: UInt64 { registry?.mergedHubsVersion ?? 0 }
+    var nodeAppendGeneration: UInt64 { registry?.mergedNodeAppendGeneration ?? 0 }
 
     func tick(dt: Float) {
         guard let registry else { return }
@@ -314,63 +325,80 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         guard let registry else { return }
 
         let mergedHubs = registry.mergedHubs
-        let nodes = registry.mergedNodes
-        // During loading the graph normally grows by appending. Validate the
-        // entire old prefix, including metadata, before reusing its snapshots;
-        // count growth alone cannot rule out a simultaneous edit/replacement.
-        let canAppendNodes = nodes.count >= cachedNodes.count
-            && cachedNodes.indices.allSatisfy { index in
-                let old = cachedNodes[index], node = nodes[index]
-                return old.id == node.id && old.project == node.project
-                    && old.topic == node.topic && old.label == node.label
-                    && old.content == node.content && old.importance == node.importance
-                    && old.createdAt == node.createdAt && old.lastAccessedAt == node.lastAccessedAt
-                    && old.isHub == mergedHubs.contains(node.id)
+        let hubsChanged = lastHubsVersion != registry.mergedHubsVersion
+        if lastNodesVersion != registry.mergedNodesVersion || hubsChanged {
+            let nodes = registry.mergedNodes
+            // Only store-certified continuity can bypass comparisons. Arbitrary
+            // edits, missed publications, replacement and hub changes retain
+            // the complete metadata-prefix validation used by ordinary updates.
+            let prefix = hubsChanged ? nil : registry.preservedNodePrefix(
+                since: lastNodesVersion, count: cachedNodes.count)
+            let canAppendNodes = prefix == nil && nodes.count >= cachedNodes.count
+                && cachedNodes.indices.allSatisfy { index in
+                    nodePrefixComparisonCount &+= 1
+                    let old = cachedNodes[index], node = nodes[index]
+                    return old.id == node.id && old.project == node.project
+                        && old.topic == node.topic && old.label == node.label
+                        && old.content == node.content && old.importance == node.importance
+                        && old.createdAt == node.createdAt && old.lastAccessedAt == node.lastAccessedAt
+                        && old.isHub == mergedHubs.contains(node.id)
+                }
+            let retained = prefix ?? (canAppendNodes ? cachedNodes.count : 0)
+            if retained < cachedNodes.count {
+                preservesIndexPrefix = false
+                cachedNodes.removeSubrange(retained...)
             }
-        if !canAppendNodes {
-            preservesIndexPrefix = false
-            cachedNodes.removeAll(keepingCapacity: true)
-        }
-        if cachedNodes.capacity < nodes.count {
-            cachedNodes.reserveCapacity(max(nodes.count, max(64, cachedNodes.capacity * 2)))
-        }
-        for node in nodes.dropFirst(cachedNodes.count) {
-            cachedNodes.append(RKNodeSnapshot(
-                id: node.id,
-                project: node.project,
-                topic: node.topic,
-                label: node.label,
-                content: node.content,
-                importance: node.importance,
-                isHub: mergedHubs.contains(node.id),
-                createdAt: node.createdAt,
-                lastAccessedAt: node.lastAccessedAt
-            ))
+            if cachedNodes.capacity < nodes.count {
+                cachedNodes.reserveCapacity(max(nodes.count, max(64, cachedNodes.capacity * 2)))
+            }
+            for node in nodes.dropFirst(cachedNodes.count) {
+                nodeSnapshotBuildCount &+= 1
+                cachedNodes.append(RKNodeSnapshot(
+                    id: node.id,
+                    project: node.project,
+                    topic: node.topic,
+                    label: node.label,
+                    content: node.content,
+                    importance: node.importance,
+                    isHub: mergedHubs.contains(node.id),
+                    createdAt: node.createdAt,
+                    lastAccessedAt: node.lastAccessedAt
+                ))
+            }
+            lastNodesVersion = registry.mergedNodesVersion
         }
 
-        let edges = registry.mergedEdges
-        let canAppendEdges = edges.count >= cachedEdges.count
-            && cachedEdges.indices.allSatisfy { index in
-                let old = cachedEdges[index], edge = edges[index]
-                return old.id == edge.id && old.sourceId == edge.sourceId
-                    && old.targetId == edge.targetId && old.relation == edge.relation
+        if lastEdgesVersion != registry.mergedEdgesVersion {
+            let edges = registry.mergedEdges
+            let canAppendEdges = edges.count >= cachedEdges.count
+                && cachedEdges.indices.allSatisfy { index in
+                    edgePrefixComparisonCount &+= 1
+                    let old = cachedEdges[index], edge = edges[index]
+                    return old.id == edge.id && old.sourceId == edge.sourceId
+                        && old.targetId == edge.targetId && old.relation == edge.relation
+                }
+            if !canAppendEdges { cachedEdges.removeAll(keepingCapacity: true) }
+            if cachedEdges.capacity < edges.count {
+                cachedEdges.reserveCapacity(max(edges.count, max(64, cachedEdges.capacity * 2)))
             }
-        if !canAppendEdges { cachedEdges.removeAll(keepingCapacity: true) }
-        if cachedEdges.capacity < edges.count {
-            cachedEdges.reserveCapacity(max(edges.count, max(64, cachedEdges.capacity * 2)))
-        }
-        for edge in edges.dropFirst(cachedEdges.count) {
-            cachedEdges.append(RKEdgeSnapshot(
-                id: edge.id,
-                sourceId: edge.sourceId,
-                targetId: edge.targetId,
-                relation: edge.relation
-            ))
+            for edge in edges.dropFirst(cachedEdges.count) {
+                edgeSnapshotBuildCount &+= 1
+                cachedEdges.append(RKEdgeSnapshot(
+                    id: edge.id,
+                    sourceId: edge.sourceId,
+                    targetId: edge.targetId,
+                    relation: edge.relation
+                ))
+            }
+            lastEdgesVersion = registry.mergedEdgesVersion
         }
 
         // Do not pin the mutable render store's Set storage via this cache or
         // LOD's retained prior hub set while the next loading batch inserts.
-        cachedHubs = Set(mergedHubs.map { $0 })
+        if hubsChanged {
+            cachedHubs = Set(mergedHubs.map { $0 })
+            lastHubsVersion = registry.mergedHubsVersion
+        }
     }
 
     private func rebuildColorMap() {

@@ -56,6 +56,8 @@ STARTUP_REASONS = frozenset({
     "writer_fence_generation_revoked", "writer_fence_lock_changed", "writer_fence_generation_changed",
     "validation_failed", "io_error", "unexpected_error"})
 WRITE_TOOLS = {"remember", "update", "connect", "merge", "consolidate", "organize"}
+PARSER_REASONS = {"partial_final_record", "record_exceeds_scan_limit",
+                  "message_exceeds_char_limit", "ambiguous_fork_history", "missing_fork_ordinal"}
 # Exact codes emitted by the bundled admission/runner source. Never accept a
 # prefix or arbitrary exception text: reasons may otherwise contain private data.
 REASONS = {"admission_session_not_enrolled", "admission_project_mismatch",
@@ -81,6 +83,7 @@ REASONS |= {"unverified_completion", "timeout", "output_limit", "output_line_lim
             "admission_incomplete_durable_record", "admission_cursor_before_frontier",
             "admission_cursor_binding_changed", "admission_cursor_changed_while_waiting"}
 REASONS |= SETTLEMENT_REASONS
+REASONS |= PARSER_REASONS
 REASONS |= {"resume_missing_request_or_state", "resume_worker_active", "resume_request_or_state_changed",
             "resume_request_not_safely_paused", "resume_backoff", "resume_transcript_identity_changed",
             "resume_transcript_truncated"}
@@ -1032,6 +1035,17 @@ def health_summary(learner, *, backlog=None, now=None):
         failure = {"class": "metadata_unavailable"}
     elif progress["backlog"]["state"] == "identity_mismatch":
         failure = {"class": "transcript_identity_mismatch"}
+    elif paused and pending.get("pause_reason") == "blocked":
+        failure = {"class": "input_blocked", "reason_evidence": "not_available_in_window"}
+        # Old blocked events lack request IDs. Keep them visible as history,
+        # but never attribute them to a new request at the same cursor.
+        blocked = next((event for event in reversed(learner.get("events", []))
+                        if event.get("event") == "blocked"
+                        and event.get("request_id") == pending["request_id"]
+                        and type(session.get("offset")) is int
+                        and event.get("offset") == session["offset"]), {})
+        if blocked.get("reason") in PARSER_REASONS:
+            failure.update(reason=blocked["reason"], reason_evidence="matching_request_and_cursor_event")
     elif (receipt.get("status") == "failed" and not old_failure_resolved) or session.get("status") == "failed":
         reason = receipt.get("reason")
         failure = {"class": "timeout" if reason == "timeout" else "unverified_completion" if reason == "unverified_completion"

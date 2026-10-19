@@ -522,8 +522,7 @@ actor Galaxy: Identifiable {
                 (config.timeFilter == nil || nd.createdAt <= config.timeFilter!)
             guard visible, !store.visibleNodeIds.contains(nd.id) else { continue }
 
-            store.nodes.append(nd)
-            store.nodeById[nd.id] = nd
+            store.appendVisibleNode(nd)
             store.visibleNodeIds.insert(nd.id)
             if let derived, nd.topic != "general", nd.topic != "episode" {
                 let key = "\(nd.project)|\(nd.topic)"
@@ -901,8 +900,7 @@ actor Galaxy: Identifiable {
                 (config.timeFilter == nil || node.createdAt <= config.timeFilter!)
             guard visible && !store.visibleNodeIds.contains(gid) else { continue }
 
-            store.nodes.append(node)
-            store.nodeById[gid] = node
+            store.appendVisibleNode(node)
             store.visibleNodeIds.insert(gid)
 
             // Notify mascot fleet of new node (only after initial load)

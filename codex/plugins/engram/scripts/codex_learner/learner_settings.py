@@ -1,5 +1,9 @@
 """Shared bounded learner policy, used by runner and sealed proxy context."""
 
+# Prospective whole-message planning only; configured batch targets and legacy
+# execution limits remain unchanged. Provider output/write budgets are separate.
+MAX_PLANNING_EXCERPT_CHARS = 256 * 1024
+
 DEFAULTS = {"min_chars": 400, "max_chars": 24000, "max_scan_bytes": 8 * 1024 * 1024,
             "wall_seconds": 600, "max_tool_calls": 12, "max_writes": 5,
             "max_runs_per_worker": 4, "retry_seconds": 300}

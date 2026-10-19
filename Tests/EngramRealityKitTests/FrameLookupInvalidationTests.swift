@@ -19,6 +19,12 @@ private final class FrameLookupProvider: SceneDataProvider {
     var projectCentroids: [String: SIMD3<Float>] = [:]
     var topologyVersion: UInt64 = 0
     var positionVersion: UInt64 = 0
+    var explicitNodeVersion: UInt64?
+    var explicitHubVersion: UInt64?
+    var explicitAppendGeneration: UInt64?
+    var nodeVersion: UInt64 { explicitNodeVersion ?? topologyVersion }
+    var hubVersion: UInt64 { explicitHubVersion ?? topologyVersion }
+    var nodeAppendGeneration: UInt64 { explicitAppendGeneration ?? topologyVersion }
     func tick(dt: Float) {}
 }
 
@@ -174,5 +180,95 @@ struct FrameLookupInvalidationTests {
         system.update(dataProvider: replacement, dt: 0.4)
         #expect(system.connectedEdgeIndices.isEmpty)
         #expect(system.particles.isEmpty)
+    }
+
+    @Test("Label membership reuses independent edge and hub changes and extends certified appends")
+    func labelMembershipSeparatesDomainsAndExtendsAppendPrefix() {
+        let provider = FrameLookupProvider()
+        var cache = LabelProjectTopicCache()
+        let first = UUID(), second = UUID(), third = UUID()
+        provider.explicitNodeVersion = 1
+        provider.explicitHubVersion = 1
+        provider.explicitAppendGeneration = 1
+        provider.nodes = [node(first, "First")]
+        let initial = cache.update(provider)
+        #expect(initial.projects == Set(["First"]))
+        #expect(initial.topics == Set(["topic"]))
+        let visited = cache.nodesVisited, revision = cache.revision
+
+        provider.edges = [edge(first, second)]
+        provider.topologyVersion += 1
+        provider.hubs = [first]
+        provider.explicitHubVersion = 2
+        let independent = cache.update(provider)
+        #expect(independent.projects == initial.projects)
+        #expect(independent.topics == initial.topics)
+        #expect(cache.nodesVisited == visited)
+        #expect(cache.revision == revision)
+
+        // Two producer publications may arrive before this consumer updates.
+        provider.nodes.append(RKNodeSnapshot(id: second, project: "Second", topic: "new topic",
+                                            label: "Second", importance: 1, isHub: false))
+        provider.explicitNodeVersion = 2
+        provider.nodes.append(node(third, "Third"))
+        provider.explicitNodeVersion = 3
+        let appended = cache.update(provider)
+        #expect(appended.projects == Set(["First", "Second", "Third"]))
+        #expect(appended.topics == Set(["topic", "new topic"]))
+        #expect(initial.projects == Set(["First"]))
+        #expect(cache.nodesVisited - visited == 2)
+        #expect(cache.revision > revision)
+    }
+
+    @Test("Label membership drops stale values after edits, shrink and provider replacement")
+    func labelMembershipRejectsInvalidContinuity() {
+        let provider = FrameLookupProvider()
+        var cache = LabelProjectTopicCache()
+        let first = UUID(), second = UUID()
+        provider.explicitNodeVersion = 1
+        provider.explicitAppendGeneration = 1
+        provider.nodes = [node(first, "Old"), node(second, "Removed")]
+        let initial = cache.update(provider)
+        #expect(initial.projects == Set(["Old", "Removed"]))
+
+        // Same count, different order and metadata: the old set cannot be
+        // extended even though the node array did not shrink.
+        provider.nodes = [node(second, "Current"), node(first, "Current")]
+        provider.explicitNodeVersion = 2
+        provider.explicitAppendGeneration = 2
+        let edited = cache.update(provider)
+        #expect(edited.projects == Set(["Current"]))
+        #expect(edited.topics == Set(["topic"]))
+        provider.nodes.removeAll()
+        provider.explicitNodeVersion = 3
+        // Defensive shrink refusal also applies if a producer failed to
+        // advance its generation; no stale project/topic survives.
+        let emptied = cache.update(provider)
+        #expect(emptied.projects.isEmpty)
+        #expect(emptied.topics.isEmpty)
+
+        provider.nodes = [node(first, "Repopulated")]
+        provider.explicitNodeVersion = 4
+        provider.explicitAppendGeneration = 3
+        #expect(cache.update(provider).projects == Set(["Repopulated"]))
+        let replacement = FrameLookupProvider()
+        replacement.nodes = [RKNodeSnapshot(id: first, project: "Replacement", topic: "replacement topic",
+                                             label: "Replacement", importance: 1, isHub: false)]
+        replacement.explicitNodeVersion = provider.explicitNodeVersion
+        replacement.explicitAppendGeneration = provider.explicitAppendGeneration
+        let replaced = cache.update(replacement)
+        #expect(replaced.projects == Set(["Replacement"]))
+        #expect(replaced.topics == Set(["replacement topic"]))
+
+        // The ordinary conservative provider contract changes generation with
+        // topology, so a simultaneous prefix edit and append is fully read.
+        let conservative = FrameLookupProvider()
+        conservative.nodes = [node(first, "Before")]
+        #expect(cache.update(conservative).projects == Set(["Before"]))
+        conservative.nodes = [node(first, "After"), node(second, "Appended")]
+        conservative.topologyVersion += 1
+        let fallback = cache.update(conservative)
+        #expect(fallback.projects == Set(["After", "Appended"]))
+        #expect(fallback.topics == Set(["topic"]))
     }
 }

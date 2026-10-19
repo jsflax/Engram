@@ -414,8 +414,8 @@ class OversizedMessageTests(unittest.TestCase):
         self.assertEqual(following.next_offset, self.f.path.stat().st_size)
 
     def test_refusals_keep_cursor_settings_and_scan_bound_without_preparing(self):
-        cases = ((48001, 128 * 1024, 2000, False, 'read_only_plan', 2),
-                 (48001, 128 * 1024, 48000, False, 'read_only_plan', 1),
+        cases = ((262145, 1024 * 1024, 2000, False, 'read_only_plan', 3),
+                 (262145, 1024 * 1024, 48000, False, 'read_only_plan', 2),
                  (5000, 4096, 2000, False, 'read_only_plan', 1),
                  (3000, 128 * 1024, 2000, True, 'read_only_plan', 1),
                  (3000, 128 * 1024, 2000, False, None, 1))
@@ -438,6 +438,69 @@ class OversizedMessageTests(unittest.TestCase):
                 self.assertEqual(self.p.provider_runs, [])
                 self.assertEqual(self.p.calls, [])
                 self.assertFalse((self.f.root / 'runs').exists())
+                event = json.loads((self.f.root / 'events.jsonl').read_text().splitlines()[-1])
+                self.assertEqual(event['request_id'], self.f.request['request_id'])
+                self.assertEqual(event['offset'], self.f.frontier)
+
+    def test_large_assistant_message_is_whole_and_following_record_remains_pending(self):
+        self.f.config['max_scan_bytes'] = 1024 * 1024
+        fixtures.write(self.f.root / 'settings.json', self.f.config)
+        body = 'x' * 184448
+        self.replace_records({'type': 'response_item', 'payload': {'type': 'message',
+            'role': 'assistant', 'channel': 'final', 'content': [{'type': 'output_text', 'text': body}]}})
+        first_end = self.f.path.stat().st_size
+        self.f.append('next ' + 'y' * 100000)
+        (excerpt, config), reads = self.select()
+        self.assertEqual([call.kwargs['max_chars'] for call in reads], [2000, 48000, 262144])
+        self.assertEqual(excerpt.text, '[ASSISTANT]\n' + body)
+        self.assertEqual(len(excerpt.text), 184460)
+        self.assertEqual(excerpt.next_offset, first_end)
+        self.assertEqual(excerpt.message_count, 1)
+        self.assertTrue(excerpt.has_more)
+        self.assertEqual(config, {**self.f.config, 'max_chars': 262144})
+
+    def test_large_fallback_respects_smaller_scan_allowance_and_exact_char_boundary(self):
+        self.f.config['max_scan_bytes'] = 65536
+        fixtures.write(self.f.root / 'settings.json', self.f.config)
+        self.replace_records(self.message('s' * 60000))
+        (excerpt, config), reads = self.select()
+        self.assertEqual(excerpt.text, '[USER]\n' + 's' * 60000)
+        self.assertEqual(config['max_chars'], 65536)
+        self.assertEqual([call.kwargs['max_chars'] for call in reads], [2000, 48000, 65536])
+        self.f.config['max_scan_bytes'] = 1024 * 1024
+        fixtures.write(self.f.root / 'settings.json', self.f.config)
+        self.replace_records(self.message('b' * (262144 - len('[USER]\n'))))
+        (excerpt, config), _ = self.select()
+        self.assertEqual(len(excerpt.text), 262144)
+        self.assertEqual(excerpt.next_offset, self.f.path.stat().st_size)
+        self.assertEqual(config['max_chars'], 262144)
+
+    def test_changed_selection_with_no_visible_text_keeps_parser_only_target(self):
+        self.replace_records(self.message('x' * 184448))
+        self.f.config['max_scan_bytes'] = 1024 * 1024
+        before = self.preimages()
+        refused = fixtures.T.read_excerpt(self.f.path, self.f.frontier, max_chars=2000,
+            max_scan_bytes=self.f.config['max_scan_bytes'], stable_identity=True)
+        from dataclasses import replace
+        empty = replace(refused, blocked_reason=None)
+        with mock.patch.object(R, 'read_excerpt', side_effect=[refused, refused, empty]), \
+             mock.patch.object(self.f.service, 'parser', return_value='parser-only') as parser, \
+             mock.patch.object(self.f.service, 'prepare') as prepare:
+            self.assertEqual(self.p.process(), 'parser-only')
+        self.assertIs(parser.call_args.args[4], self.f.config)
+        self.assertEqual(parser.call_args.args[4]['max_chars'], 2000)
+        prepare.assert_not_called()
+        self.assertEqual(self.preimages(), before)
+
+    def test_large_provider_failure_keeps_cursor_and_creates_no_plan(self):
+        self.f.config['max_scan_bytes'] = 1024 * 1024
+        fixtures.write(self.f.root / 'settings.json', self.f.config)
+        self.replace_records(self.message('x' * 184448))
+        self.p.failed = True
+        self.assertEqual(self.p.process(), 'failed')
+        self.assertEqual(json.loads(self.f.state_path.read_bytes())['offset'], self.f.frontier)
+        self.assertEqual(self.p.calls, [])
+        self.assertFalse((self.p.provider_runs[0] / L.PLAN_NAME).exists())
 
     def resume(self):
         class Future(datetime.datetime):
@@ -450,13 +513,22 @@ class OversizedMessageTests(unittest.TestCase):
 
     def test_effective_limit_is_sealed_and_lost_ack_resumes_exact_plan(self):
         self.replace_records(self.message('a' * 3000))
+        self.check_sealed_limit_and_resume(48000)
+
+    def test_large_effective_limit_is_sealed_and_lost_ack_resumes_exact_plan(self):
+        self.f.config['max_scan_bytes'] = 1024 * 1024
+        fixtures.write(self.f.root / 'settings.json', self.f.config)
+        self.replace_records(self.message('a' * 184448))
+        self.check_sealed_limit_and_resume(262144)
+
+    def check_sealed_limit_and_resume(self, maximum):
         before = self.preimages()
         self.assertIsInstance(self.p.process(), P.Continuation)
         run = self.p.provider_runs[0]
         manifest, _ = J.read_manifest(run)
         parser = J._json(J._unseal(manifest['inputs']['parser_state']))
         configuration = J._json(J._unseal(manifest['inputs']['backend_config']))
-        self.assertEqual(parser['limits'], {'max_chars': 48000, 'max_scan_bytes': 128 * 1024})
+        self.assertEqual(parser['limits'], {'max_chars': maximum, 'max_scan_bytes': self.f.config['max_scan_bytes']})
         self.assertEqual(parser['input'], {'offset': self.f.frontier, 'recent_messages': [], 'current_turn_id': None})
         self.assertEqual(configuration['settings']['sha256'], J.sha256(before[3]))
         self.assertEqual(configuration['settings']['value']['max_chars'], 2000)

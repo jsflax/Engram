@@ -111,9 +111,10 @@ class HostPreparationTests(unittest.TestCase):
         expected = ['FrameLookupInvalidationTests/' + name for name in (
             'testLightColorsRemainLive', 'testLightNodeInvalidation', 'testSelectedEdgeDeletion',
             'testSelectedEdgeReorderAndReplacement', 'testStableFlowAndSelectionChange',
-            'testFlowProviderCountAndCap')]
+            'testFlowProviderCountAndCap', 'testLabelMembershipSeparatesDomainsAndExtendsAppendPrefix',
+            'testLabelMembershipRejectsInvalidContinuity')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 56)
+        self.assertEqual(len(inventory), 65)
         self.assertEqual([name for name in inventory if name.startswith('FrameLookupInvalidationTests/')],
                          sorted(expected))
         self.assertEqual(M.CLASSES.count('FrameLookupInvalidationTests'), 1)

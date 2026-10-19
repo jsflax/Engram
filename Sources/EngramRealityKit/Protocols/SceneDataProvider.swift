@@ -93,6 +93,13 @@ public protocol SceneDataProvider: AnyObject {
     var projectCentroids: [String: SIMD3<Float>] { get }
     /// Increments on topology or render metadata changes (including labels/hubs).
     var topologyVersion: UInt64 { get }
+    /// Changes only when node content/order changes, independently of edges,
+    /// colors, load status and hub membership.
+    var nodeVersion: UInt64 { get }
+    var hubVersion: UInt64 { get }
+    /// Stable only while the complete prior node prefix remains unchanged.
+    /// Consumers must also check provider identity and a nonshrinking count.
+    var nodeAppendGeneration: UInt64 { get }
     /// Increments when positions or their node ordering change; stable while idle.
     var positionVersion: UInt64 { get }
 
@@ -109,6 +116,12 @@ public protocol SceneDataProvider: AnyObject {
 }
 
 extension SceneDataProvider {
+    // Providers without store-owned continuity remain conservative. They never
+    // gain an append fast path just because their node count grew.
+    public var nodeVersion: UInt64 { topologyVersion }
+    public var hubVersion: UInt64 { topologyVersion }
+    public var nodeAppendGeneration: UInt64 { nodeVersion }
+
     public var positionArray: [SIMD3<Float>] {
         nodes.map { positions[$0.id] ?? .zero }
     }

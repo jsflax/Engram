@@ -73,7 +73,11 @@ struct DyingNode {
 @MainActor
 final class GraphRenderStore {
     var nodes: [NodeData] = [] {
-        didSet { _recentNodes = nil }
+        didSet {
+            _recentNodes = nil
+            nodesVersion &+= 1
+            if !appendingVisibleNode { nodeAppendGeneration &+= 1 }
+        }
     }
     /// Top 50 nodes by createdAt — lazily sorted, cached until `nodes` changes.
     var recentNodes: [NodeData] {
@@ -83,22 +87,47 @@ final class GraphRenderStore {
         return sorted
     }
     private var _recentNodes: [NodeData]?
-    var nodeById: [UUID: NodeData] = [:]
-    var edges: [EdgeData] = []
-    var hubs: Set<UUID> = []
+    var nodeById: [UUID: NodeData] = [:] {
+        didSet {
+            nodeLookupVersion &+= 1
+            if !appendingVisibleNode { nodeLookupAppendGeneration &+= 1 }
+        }
+    }
+    var edges: [EdgeData] = [] { didSet { edgesVersion &+= 1 } }
+    var hubs: Set<UUID> = [] { didSet { hubsVersion &+= 1 } }
+    private(set) var nodesVersion: UInt64 = 0
+    private(set) var edgesVersion: UInt64 = 0
+    private(set) var hubsVersion: UInt64 = 0
+    private(set) var nodeLookupVersion: UInt64 = 0
+    private(set) var allEdgesVersion: UInt64 = 0
+    private(set) var nodeAppendGeneration: UInt64 = 0
+    private(set) var nodeLookupAppendGeneration: UInt64 = 0
+    private var appendingVisibleNode = false
+
+    /// Only this store-owned mutation certifies that every existing node is
+    /// unchanged. Ordinary assignment, subscript edits, removals and reorders
+    /// invalidate continuity, even when count and topology happen to match.
+    func appendVisibleNode(_ node: NodeData) {
+        if nodeById[node.id] != nil { nodeLookupAppendGeneration &+= 1 }
+        appendingVisibleNode = true
+        nodes.append(node)
+        nodeById[node.id] = node
+        appendingVisibleNode = false
+    }
     var colorMap: [String: Color] = [:] {
         didSet { colorMapVersion &+= 1 }
     }
     /// Incremented whenever colorMap changes. Scene checks this to invalidate its SIMD cache.
     private(set) var colorMapVersion: UInt64 = 0
 
-    /// Incremented when nodes/hubs/projects change. Replaces O(n) Set comparison per frame in atlas check.
+    /// General render publication, including load status and derived metadata.
+    /// Consumers of individual arrays use the domain revisions above instead.
     private(set) var topologyVersion: UInt64 = 0
     func bumpTopology() { topologyVersion &+= 1 }
 
     // Internal data — never triggers SwiftUI body re-evaluation.
     var allNodes: [UUID: NodeData] = [:]
-    var allEdges: [UUID: EdgeData] = [:]
+    var allEdges: [UUID: EdgeData] = [:] { didSet { allEdgesVersion &+= 1 } }
     var edgesByNode: [UUID: [EdgeData]] = [:]
     var pkToGlobalId: [Int64: UUID] = [:]
     var edgePkToGlobalId: [Int64: UUID] = [:]
