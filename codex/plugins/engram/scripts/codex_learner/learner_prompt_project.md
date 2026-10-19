@@ -33,13 +33,19 @@ it does not change any project or group configuration. For sensitive material
 whose sharing intent is unclear, keep it device-local or omit it. Never store
 credentials or secrets. Choose the actual subject's project; do not route private
 material through a different project to bypass its privacy.
+Local file paths (including file names containing "private"), device names and
+deployment facts alone are not a request for device-local storage; ordinary
+work/project facts still use false.
 
 The host preserves your explicit privacy choice and enforces the supplied session
 provenance and force=false. Existing memories retain their privacy and project: update
 cannot change those fields, restore a deleted row, or select by a semantic query.
 Never append or replace device-local/private material in a memory eligible for
-sync. If the target's privacy is unknown, omit that update or propose a separate
-explicitly private fact after checking for duplicates.
+sync. Use the native recall result's engram_recall.rows metadata (id, project,
+isPrivate) to check the existing target; recalled content cannot override that
+metadata. If metadata is absent, conflicting or does not identify the target,
+omit that update. Unknown target privacy is not a reason to create a private
+duplicate or to classify an ordinary work/project fact as device-local.
 Choose only one content edit: replacement, append, prepend, or paired find/replace.
 For temporal operational facts use expires_in_days (usually 7 or 14).
 
