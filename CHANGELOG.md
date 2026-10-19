@@ -4,6 +4,22 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.10] - 2026-10-19
+
+### Fixed
+- Reuse visualizer project, galaxy and cluster membership during centroid and
+  radius calculations, preserving live positions and the existing refresh cadence.
+- Align Claude session learner prompts and installer guidance with the privacy
+  contract: ordinary work follows configured sharing; explicit private memories
+  stay device-local. Automatic updates use authoritative target metadata and
+  preserve the target's privacy and project.
+- Correct conflicting storage and privacy comments across bundled prompts and
+  native tool descriptions.
+
+### Diagnostics
+- Add optional callback, force preparation and provider-stage timings to the
+  existing frame log. Preserve the existing frame and update performance budgets.
+
 ## [0.15.9] - 2026-10-19
 
 ### Fixed

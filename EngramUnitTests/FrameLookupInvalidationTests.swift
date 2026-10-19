@@ -25,11 +25,21 @@ private final class FrameLookupProvider: SceneDataProvider {
     var nodeVersion: UInt64 { explicitNodeVersion ?? topologyVersion }
     var hubVersion: UInt64 { explicitHubVersion ?? topologyVersion }
     var nodeAppendGeneration: UInt64 { explicitAppendGeneration ?? topologyVersion }
-    func tick(dt: Float) {}
+    private(set) var tickDeltas: [Float] = []
+    func tick(dt: Float) { tickDeltas.append(dt) }
 }
 
 @MainActor
 final class FrameLookupInvalidationTests: XCTestCase {
+    func testOptionalTickTimingFallbackCallsOrdinaryProviderExactlyOnce() {
+        let provider = FrameLookupProvider()
+        let erased: any SceneDataProvider = provider
+        XCTAssertTrue(erased.tickWithTimings(dt: 0.25) == nil)
+        XCTAssertTrue(provider.tickDeltas == [0.25])
+        erased.tick(dt: 0.5)
+        XCTAssertTrue(provider.tickDeltas == [0.25, 0.5])
+    }
+
     private func node(_ id: UUID, _ project: String, topic: String = "topic") -> RKNodeSnapshot {
         RKNodeSnapshot(id: id, project: project, topic: topic, label: project,
                        importance: 1, isHub: false)

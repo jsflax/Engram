@@ -92,6 +92,11 @@ final class RKSceneManager {
         self.rkScene.onFrameCallback = { [weak self] dt in
             self?.renderTick(dt: dt)
         }
+        if self.rkScene.isFrameTimingEnabled {
+            self.rkScene.onInstrumentedFrameCallback = { [weak self] dt in
+                self?.renderTickWithTimings(dt: dt)
+            }
+        }
     }
 
     // MARK: - Per-Frame
@@ -113,7 +118,26 @@ final class RKSceneManager {
     /// Called by EngramRealityScene via SceneEvents.Update — additional per-frame work.
     func renderTick(dt: Float) {
         guard let registry = galaxyRegistry else { return }
+        updateCameraForFrame(dt: dt)
+        dispatchForces()
+        syncCameraPositions(registry)
+    }
 
+    /// Measures the synchronous force-dispatch call, including its early exits
+    /// or preparation/encoding/submission. Async GPU execution and its later
+    /// completion/readback are outside this interval.
+    private func renderTickWithTimings(dt: Float) -> UInt64? {
+        guard let registry = galaxyRegistry else { return nil }
+        updateCameraForFrame(dt: dt)
+        let start = DispatchTime.now().uptimeNanoseconds
+        dispatchForces()
+        let forcePreparation = DispatchTime.now().uptimeNanoseconds - start
+        syncCameraPositions(registry)
+        return forcePreparation
+    }
+
+    @inline(__always)
+    private func updateCameraForFrame(dt: Float) {
         // Camera update
         camera.pollKeyboard(dt: dt)
         if let orbitRate = Self.harnessOrbitRate {
@@ -127,12 +151,10 @@ final class RKSceneManager {
                 exit(0)
             }
         }
+    }
 
-        // Dispatch GPU forces
-        dispatchForces()
-
-        // Spatial audio handled by RKSpatialAudioSystem in EngramRealityScene.update()
-
+    @inline(__always)
+    private func syncCameraPositions(_ registry: GalaxyRegistry) {
         // Sync camera state (~2fps to avoid cascade)
         if let cam3D = camera3DState, Int.random(in: 0..<30) == 0 {
             cam3D.positions = registry.mergedPositions

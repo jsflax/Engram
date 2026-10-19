@@ -53,7 +53,7 @@ public final class Memory {
 
     /// Whether this memory stays on this device. Private memories are excluded
     /// from personal cloud/device sync and group sharing, even when the project's
-    /// sync policy is enabled. Default: false (follow the project's sync policy).
+    /// sync policy is enabled. Default: false (follow the project's personal sync policy and explicit group exposure).
     ///
     /// Retract semantics: flipping this to `true` on a memory ALREADY shared
     /// with a group emits a real DELETE to the group DB (row-level filter

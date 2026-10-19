@@ -325,6 +325,44 @@ final class AdapterSnapshotTests: XCTestCase {
         XCTAssertEqual(adapter.positionArray, [origin, next])
     }
 
+    func testOptionalTickTimingsPreserveAdapterOutputsAndPublicationCadence() async throws {
+        let (plainLattice, plainRegistry, plainGalaxy, plainGeneration, plain) = try await streamingFixture()
+        defer { plainLattice.close() }
+        let (timedLattice, timedRegistry, timedGalaxy, timedGeneration, timed) = try await streamingFixture()
+        defer { timedLattice.close() }
+        let a = node(), b = node()
+        let origin = SIMD3<Float>.zero, next = SIMD3<Float>(60, 0, 0)
+        for frame in 1...30 {
+            if frame <= 2 {
+                let value = frame == 1 ? a : b
+                let position = frame == 1 ? origin : next
+                plainGalaxy.applyLoadChunk(nodes: [(Int64(frame), value)], generation: plainGeneration)
+                timedGalaxy.applyLoadChunk(nodes: [(Int64(frame), value)], generation: timedGeneration)
+                plainRegistry.unifiedSimulation.setPosition(value.id, to: position)
+                timedRegistry.unifiedSimulation.setPosition(value.id, to: position)
+            }
+            plain.tick(dt: 1 / 60)
+            XCTAssertNotNil(timed.tickWithTimings(dt: 1 / 60))
+            XCTAssertEqual(timed.nodes.map(\.id), plain.nodes.map(\.id))
+            XCTAssertEqual(timed.positionArray, plain.positionArray)
+            XCTAssertEqual(timed.projectCentroids, plain.projectCentroids)
+            XCTAssertEqual(timed.nebulaClusters.first?.centroid, plain.nebulaClusters.first?.centroid)
+            XCTAssertEqual(timed.nebulaClusters.first?.count, plain.nebulaClusters.first?.count)
+            XCTAssertEqual(timed.nebulaClusters.first?.radius, plain.nebulaClusters.first?.radius)
+            XCTAssertEqual(timed.galaxySnapshots.first?.nodeCount, plain.galaxySnapshots.first?.nodeCount)
+            XCTAssertEqual(timed.galaxySnapshots.first?.radius, plain.galaxySnapshots.first?.radius)
+            // A duplicate or omitted provider tick would publish at the wrong
+            // frame even if both paths eventually contained the same nodes.
+            XCTAssertEqual(timed.projectCentroids[a.project], frame < 30 ? origin : SIMD3<Float>(30, 0, 0))
+            XCTAssertEqual(timed.nebulaClusters.first?.count, frame < 30 ? 1 : 2)
+        }
+        XCTAssertEqual(timed.nodes.map(\.id), [a.id, b.id])
+        XCTAssertEqual(timed.positionArray, [origin, next])
+        XCTAssertEqual(timed.nebulaClusters.first?.radius, 70)
+        timed.registry = nil
+        XCTAssertNil(timed.tickWithTimings(dt: 1 / 60))
+    }
+
     func testStreamingTerminalStatesAndCompletedEditsRefreshCentroidsImmediately() async throws {
         for terminal in [GalaxyLoadStatus.complete, .failed, .cancelled] {
             let (lattice, registry, galaxy, generation, adapter) = try await streamingFixture()

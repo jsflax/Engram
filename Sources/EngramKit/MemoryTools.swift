@@ -17,9 +17,10 @@ import Foundation
 /// - **disconnect**: Remove edges by ID or by (from, to) pair.
 /// - **graph**: View a memory's neighborhood in the knowledge graph.
 public actor MemoryTools {
-    /// Local database — all writes go here. Reads go here for local-only projects.
+    /// Primary store for new memories, included in every composed read.
+    /// Edits to existing memories use the store that owns the target row.
     package var localLattice: Lattice { requireDatabases().local }
-    /// Synced database (memory-synced.sqlite) — reads go here for synced projects.
+    /// Personal synced database — included in reads when the project sync policy allows it.
     /// Contains cross-device data relayed by the sync daemon. Nil if no synced DB exists.
     package var syncedLattice: Lattice? { requireDatabases().synced }
     /// `any Embedder` (not the concrete CoreML actor): the contract suite
@@ -177,10 +178,10 @@ public actor MemoryTools {
         return result
     }
 
-    /// Returns the right Lattice for reading based on the project's sync policy.
-    /// For synced projects, returns a UNION ALL view spanning both local and synced DBs
-    /// so we get local memories + cross-device data in one query.
-    /// For local projects, returns localLattice directly.
+    /// Returns the Lattice for reading local data plus the allowed attachments.
+    /// Personal synced data is included according to project policy. Live group
+    /// spokes attach by membership regardless of policy or exposure, within the
+    /// attachment limit. A local project with no spokes reads localLattice directly.
     /// Attach-set-keyed cache of union handles. Keyed rather than single
     /// because the set genuinely varies within one process: a synced project
     /// and a local-only project differ, and spokes appear/disappear under
@@ -655,7 +656,7 @@ public actor MemoryTools {
                         ]),
                         "is_private": .object([
                             "type": .string("boolean"),
-                            "description": .string("Keep this memory on this device. Private memories are excluded from personal cloud/device sync and group sharing, even when the project's sync policy is enabled. Default: false (follow the project's sync policy)."),
+                            "description": .string("Keep this memory on this device. Private memories are excluded from personal cloud/device sync and group sharing, even when the project's sync policy is enabled. Default: false (follow the project's personal sync policy and explicit group exposure)."),
                         ]),
                     ]),
                     "required": .array([.string("content")]),

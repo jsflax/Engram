@@ -530,7 +530,7 @@ extension MemoryTools {
         log("[recall] START query=\"\(query.prefix(80))\", project=\(projectFilter ?? "nil"), topic=\(topicFilter ?? "nil"), limit=\(limit), depth=\(depth)")
         sessionLog("[recall] START query=\"\(query.prefix(60))\"")
 
-        // Build base query — route reads to the right DB based on project sync policy
+        // Build base query — include local data, policy-selected personal sync and live membership spokes
         sessionLog("[recall] readLattice...")
         let db = readLattice(for: projectFilter)
         log("[recall] DB selected")
