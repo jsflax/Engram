@@ -4,6 +4,17 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.12] - 2026-10-19
+
+### Diagnostics
+- Extend the optional visualizer frame log with monotonic callback spacing,
+  previous-callback logging time, and main-thread load and force application
+  timings. Distinguish unavailable intervals and queue samples from measured
+  zero values. Existing frame budgets and animation cadence are unchanged.
+- Preserve the disabled path without additional clock reads. These measurements
+  help investigate remaining visualizer delays; this release does not claim a
+  performance improvement.
+
 ## [0.15.11] - 2026-10-19
 
 ### Fixed
