@@ -3,6 +3,41 @@ import Foundation
 import simd
 import CoreGraphics
 
+/// Keeps the prepared asset out of the scene. Each caller receives its own
+/// hierarchy; RealityKit clones share the underlying mesh/texture resources.
+@MainActor
+final class MascotModelPrototypeCache {
+    private let load: @MainActor () async -> Entity?
+    private var prototype: Entity?
+    private var pending: (generation: UInt64, task: Task<Entity?, Never>)?
+    private var generation: UInt64 = 0
+
+    init(load: @escaping @MainActor () async -> Entity?) { self.load = load }
+
+    func clone() async -> Entity? {
+        if let prototype { return prototype.clone(recursive: true) }
+        let task: Task<Entity?, Never>
+        if let pending {
+            task = pending.task
+        } else {
+            generation &+= 1
+            let attempt = generation
+            task = Task { @MainActor in
+                let loaded = await self.load()
+                // Publish before resuming waiters. Failed loads are not cached,
+                // and an older completion cannot clear a newer pending attempt.
+                if self.pending?.generation == attempt {
+                    self.prototype = loaded
+                    self.pending = nil
+                }
+                return loaded
+            }
+            pending = (attempt, task)
+        }
+        return await task.value?.clone(recursive: true)
+    }
+}
+
 /// Loads mascot USDZ and manages joint mapping for skeleton animation.
 ///
 /// The mascot has a 5-joint UsdSkel skeleton:
@@ -24,9 +59,23 @@ enum MascotEntityFactory {
     /// All joint paths for skeleton queries.
     static let allJointPaths = [jointRoot, jointLeftArm, jointRightArm, jointEye, jointBottom]
 
-    /// Load a mascot entity from the USDZ asset.
-    /// Searches main bundle, module bundle, and Resources subdirectory.
+    private static let modelCache = MascotModelPrototypeCache(load: loadPreparedModel)
+
+    // Only geometry is shared. Each project still gets fresh effect entities
+    // and material values, including independently replaceable holo textures.
+    private static let arcaneCircleMesh = MeshResource.generatePlane(width: 15, depth: 15, cornerRadius: 7.5)
+    private static let conjureOrbMesh = MeshResource.generateSphere(radius: 3)
+    private static let holoScreenMesh = MeshResource.generatePlane(width: 20, height: 15)
+
+    /// Clone the prepared USDZ hierarchy. The authored model color is preserved;
+    /// the project tint is applied to the separately created effect materials.
     static func loadMascotEntity(tint: SIMD3<Float>) async -> Entity? {
+        await modelCache.clone()
+    }
+
+    /// Preserve main-bundle, module-bundle, then named-asset fallback order.
+    /// A total failure remains retryable by a later factory call.
+    private static func loadPreparedModel() async -> Entity? {
         let mascotScale: Float = 10.0  // ~node-sized in world units
 
         // Try main bundle first (EngramVisualizer app)
@@ -39,7 +88,7 @@ enum MascotEntityFactory {
             } catch {}
         }
 
-        // Try module bundle (EngramPreview copies it via .copy("Resources/mascot.usdz"))
+        // Try module bundle (EngramRealityKit copies it via .copy("Resources/mascot.usdz"))
         if let url = Bundle.module.url(forResource: "mascot", withExtension: "usdz") {
             do {
                 let entity = try await Entity(contentsOf: url)
@@ -126,8 +175,6 @@ enum MascotEntityFactory {
     // MARK: - Effect Entities
 
     private static func createArcaneCircle(tint: SIMD3<Float>) -> Entity {
-        let s: Float = 15.0
-        let mesh = MeshResource.generatePlane(width: s, depth: s, cornerRadius: s * 0.5)
         var mat = PhysicallyBasedMaterial()
         mat.emissiveColor = .init(color: .init(
             red: CGFloat(tint.x * 0.5 + 0.5),
@@ -138,13 +185,12 @@ enum MascotEntityFactory {
         mat.emissiveIntensity = 3.0
         mat.blending = .transparent(opacity: .init(floatLiteral: 0.4))
         mat.faceCulling = .none
-        let entity = ModelEntity(mesh: mesh, materials: [mat])
+        let entity = ModelEntity(mesh: arcaneCircleMesh, materials: [mat])
         entity.position.y = -5.0
         return entity
     }
 
     private static func createConjureOrb(tint: SIMD3<Float>) -> Entity {
-        let mesh = MeshResource.generateSphere(radius: 3.0)
         var mat = PhysicallyBasedMaterial()
         mat.emissiveColor = .init(color: .init(
             red: CGFloat(tint.x),
@@ -154,11 +200,10 @@ enum MascotEntityFactory {
         ))
         mat.emissiveIntensity = 8.0
         mat.blending = .transparent(opacity: .init(floatLiteral: 0.8))
-        return ModelEntity(mesh: mesh, materials: [mat])
+        return ModelEntity(mesh: conjureOrbMesh, materials: [mat])
     }
 
     private static func createHoloScreen(tint: SIMD3<Float>) -> Entity {
-        let mesh = MeshResource.generatePlane(width: 20.0, height: 15.0)
         // Start with a blank unlit material — texture is applied dynamically
         // when the mascot hovers over a node.
         var mat = UnlitMaterial()
@@ -172,7 +217,7 @@ enum MascotEntityFactory {
         )
         mat.blending = .transparent(opacity: .init(floatLiteral: 1.0))
         mat.faceCulling = .none
-        let entity = ModelEntity(mesh: mesh, materials: [mat])
+        let entity = ModelEntity(mesh: holoScreenMesh, materials: [mat])
         entity.position = SIMD3(0, 8.0, 18.0)
         return entity
     }

@@ -2,12 +2,44 @@
 import EngramKit
 import EngramSceneKit
 import Lattice
+import RealityKit
 import XCTest
 
 @MainActor
 final class AdapterSnapshotTests: XCTestCase {
     private let config = DrainConfig(hiddenProjects: [], hiddenRelations: [], timeFilter: nil,
                                      is3D: true, soundEnabled: false, notificationsEnabled: false)
+
+    func testMascotVisibilityReachesSceneAndPreservesExistingEntities() throws {
+        let registry = GalaxyRegistry()
+        let manager = try XCTUnwrap(RKSceneManager(registry: registry))
+        let mascot = Entity()
+        mascot.position = SIMD3<Float>(1, 2, 3)
+        manager.rkScene.mascotContainer.addChild(mascot)
+        XCTAssertTrue(manager.showMascots)
+        XCTAssertTrue(manager.rkScene.mascotContainer.isEnabled)
+
+        manager.showMascots = false
+        XCTAssertFalse(manager.rkScene.showMascots)
+        XCTAssertFalse(manager.rkScene.mascotContainer.isEnabled)
+        XCTAssertTrue(mascot.parent === manager.rkScene.mascotContainer)
+        XCTAssertFalse(mascot.isEnabledInHierarchy)
+        // An already-started async factory may finish while hidden.
+        let lateMascot = Entity()
+        lateMascot.position = SIMD3<Float>(4, 5, 6)
+        manager.rkScene.mascotContainer.addChild(lateMascot)
+        XCTAssertFalse(lateMascot.isEnabledInHierarchy)
+
+        manager.showMascots = true
+        XCTAssertTrue(manager.rkScene.showMascots)
+        XCTAssertTrue(manager.rkScene.mascotContainer.isEnabled)
+        XCTAssertTrue(manager.rkScene.mascotContainer.children.first === mascot)
+        XCTAssertTrue(lateMascot.parent === manager.rkScene.mascotContainer)
+        XCTAssertTrue(mascot.isEnabledInHierarchy)
+        XCTAssertTrue(lateMascot.isEnabledInHierarchy)
+        XCTAssertEqual(mascot.position, SIMD3<Float>(1, 2, 3))
+        XCTAssertEqual(lateMascot.position, SIMD3<Float>(4, 5, 6))
+    }
 
     func testAppendDoesNotHideEditsToExistingNodeMetadataOrHubStyle() throws {
         let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
