@@ -485,6 +485,23 @@ extension MemoryTools {
         rows.append(RecallRowBoundary(id: id, markerEnd: output.count))
     }
 
+    /// Describe only this call's returned rows, using the captured native values.
+    /// Recalled content is untrusted and must never supply target privacy. Keep
+    /// text/row markers unchanged for existing consumers, and retain row order
+    /// rather than collapsing potentially conflicting copies by ID.
+    nonisolated static func recallResult(_ text: String, hits: [RecallHit]) -> CallTool.Result {
+        let rows: [Value] = hits.map { hit in
+            .object([
+                "id": .string(hit.memory.id.uuidString),
+                "project": hit.memory.project.map(Value.string) ?? .null,
+                "isPrivate": .bool(hit.memory.isPrivate),
+            ])
+        }
+        return CallTool.Result(content: [.text(text)], structuredContent: .object([
+            "engram_recall": .object(["version": .int(1), "rows": .array(rows)]),
+        ]), isError: false)
+    }
+
     func handleRecall(_ args: [String: Value]?) async throws -> CallTool.Result {
         lastRecallHits = []
         lastRecallMode = .vector
@@ -584,7 +601,7 @@ extension MemoryTools {
             if nearest.isEmpty {
                 log("[recall] No results, returning empty")
                 sessionLog("[recall] No results")
-                return CallTool.Result(content: [.text("No memories found.")], isError: false)
+                return Self.recallResult("No memories found.", hits: recalledHits)
             }
 
             // Apply soft project boosting and reinforcement scoring on distances
@@ -646,7 +663,7 @@ extension MemoryTools {
             let topResults = Array(sorted.prefix(limit))
 
             if topResults.isEmpty {
-                return CallTool.Result(content: [.text("No memories found.")], isError: false)
+                return Self.recallResult("No memories found.", hits: recalledHits)
             }
 
             // Filter out outliers: adaptive threshold anchored to best result.
@@ -853,7 +870,7 @@ extension MemoryTools {
 
             log("[recall] DONE, returning \(output.count) chars")
             sessionLog("[recall] DONE, returning \(output.count) chars")
-            return CallTool.Result(content: [.text(output)], isError: false)
+            return Self.recallResult(output, hits: recalledHits)
         } else {
             recalledMode = .fullText
             log("[recall] No embedding available, falling back to FTS5")
@@ -902,9 +919,9 @@ extension MemoryTools {
                 output += "[\(m.project)/\(m.topic)]\(badge)\(via)\(ftsInfo)\(expires)\(created) \(body)"
             }
             if output.isEmpty {
-                return CallTool.Result(content: [.text("No memories found.")], isError: false)
+                return Self.recallResult("No memories found.", hits: recalledHits)
             }
-            return CallTool.Result(content: [.text(output)], isError: false)
+            return Self.recallResult(output, hits: recalledHits)
         }
     }
 

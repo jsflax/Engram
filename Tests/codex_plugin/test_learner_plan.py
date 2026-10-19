@@ -133,14 +133,17 @@ class LearnerPlanTests(unittest.TestCase):
 
     def test_new_privacy_choices_survive_seal_lost_reply_and_exact_resume(self):
         self.select_new_privacy_fixture()
+        facts = ('Engram deployment receipt on Laptop 2 is ~/localdev/deploy/private-review.json.',
+                 'User explicitly requested this fixture stay private and local to this device.')
         operations = [{'key': f'op_{i}', 'tool': 'remember', 'arguments': {
-            'content': f'Fixture {i}', 'project': 'fixture-project', 'is_private': private}}
+            'content': facts[i - 1], 'project': 'fixture-project', 'is_private': private}}
             for i, private in enumerate((False, True), 1)]
         plan = self.seal(operations)
         before = (self.run / P.PLAN_NAME).read_bytes()
         requests = [J._json(J._unseal(op['request'])) for op in plan['operations']]
         self.assertEqual([r['mutation']['request']['isPrivate'] for r in requests], [False, True])
         self.assertEqual([r['mutation']['request']['project'] for r in requests], ['fixture-project'] * 2)
+        self.assertEqual([r['mutation']['request']['content'] for r in requests], list(facts))
         self.ledger.lose.add(plan['operations'][1]['operation_id'])
         self.assertEqual(self.execute()['status'], 'pending')
         self.assertEqual(self.execute()['status'], 'complete')
@@ -149,6 +152,8 @@ class LearnerPlanTests(unittest.TestCase):
         self.assertEqual(self.ledger.calls[-1], self.ledger.calls[-2])
 
     def test_old_omitted_and_null_privacy_keep_exact_private_requests(self):
+        original_manifest = (self.run / 'execution-manifest.json').read_bytes()
+        self.assertEqual(P.provider_contract(self.manifest), (P.PROPOSAL_SCHEMA, 'learner_prompt.md'))
         operations = [{'key': f'op_{i}', 'tool': 'remember', 'arguments': {
             'content': f'Fixture {i}', **({'is_private': None} if i == 2 else {})}} for i in (1, 2)]
         plan = self.seal(operations)
@@ -161,8 +166,13 @@ class LearnerPlanTests(unittest.TestCase):
                     'isPrivate': True, 'source': 'codex-session:' + SID}}}
             self.assertEqual(J._unseal(operation['request']), J.encode(expected))
         self.assertEqual(P.read_plan(self.run)[0], plan)
+        self.ledger.lose.add(plan['operations'][1]['operation_id'])
+        self.assertEqual(self.execute()['status'], 'pending')
         self.assertEqual(self.execute()['status'], 'complete')
         self.assertEqual((self.run / P.PLAN_NAME).read_bytes(), before)
+        self.assertEqual((self.run / 'execution-manifest.json').read_bytes(), original_manifest)
+        self.assertEqual(set(self.ledger.effects.values()), {1})
+        self.assertEqual(self.ledger.calls[-1], self.ledger.calls[-2])
         changed = copy.deepcopy(self.manifest)
         changed['plan_policy']['privacy'] = J.PROJECT_SYNC_PRIVACY
         with self.assertRaisesRegex(ValueError, 'immutable_record_conflict'):
