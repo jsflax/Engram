@@ -532,7 +532,8 @@ final class AdapterSnapshotTests: XCTestCase {
         let registry = GalaxyRegistry()
         registry.unifiedSimulation.isActive = false
         let synced = Galaxy(id: "synced", displayName: "Synced", lattice: lattice.sendableReference)
-        let group = Galaxy(id: "group:team", displayName: "Team", lattice: lattice.sendableReference)
+        let groupID = "group:team"
+        let group = Galaxy(id: groupID, displayName: "Team", lattice: lattice.sendableReference)
         let shared = node(label: "Synced copy"), team = node(label: "Team only"), tail = node(label: "Tail")
         registry.register(synced)
         registry.register(group)
@@ -561,7 +562,7 @@ final class AdapterSnapshotTests: XCTestCase {
         let publishedNodesVersion = adapter.nodeVersion
 
         // Match counts and the sequence of mutations in the original instance.
-        let replacement = Galaxy(id: group.id, displayName: "Replacement", lattice: lattice.sendableReference)
+        let replacement = Galaxy(id: groupID, displayName: "Replacement", lattice: lattice.sendableReference)
         registry.register(replacement)
         let replacementChanges = await replacement.loadChanges
         let replacementGeneration = replacementChanges.withLock { $0.begin() }
@@ -577,7 +578,7 @@ final class AdapterSnapshotTests: XCTestCase {
         XCTAssertTrue(registry.galaxyForNode(shared.id) === replacement)
         XCTAssertNotEqual(adapter.nodeVersion, publishedNodesVersion)
 
-        registry.remove(group.id)
+        registry.remove(groupID)
         adapter.tick(dt: 1 / 60)
         XCTAssertEqual(adapter.nodes.map(\.id), [shared.id, tail.id])
         XCTAssertEqual(adapter.nodes.first?.label, "Synced copy")
@@ -661,6 +662,7 @@ final class AdapterSnapshotTests: XCTestCase {
             rows.append(row)
         }
         let ids = try rows.map { try XCTUnwrap($0.globalId) }
+        let previewPrimaryKey = try XCTUnwrap(rows[0].primaryKey)
         let edge = MemoryEdge(sourceGlobalId: ids[0], targetGlobalId: ids[60], relation: .partOf)
         try lattice.add(edge)
         let edgeID = try XCTUnwrap(edge.globalId)
@@ -670,7 +672,7 @@ final class AdapterSnapshotTests: XCTestCase {
         registry.register(galaxy)
         let stale = node(id: ids[0], label: "Stale preview"), absent = node(label: "Absent from database")
         galaxy.insertNodeBatch([stale, absent], config: config)
-        galaxy.renderStore.pkToGlobalId[rows[0].primaryKey] = stale.id
+        galaxy.renderStore.pkToGlobalId[previewPrimaryKey] = stale.id
         galaxy.renderStore.pkToGlobalId[Int64.max] = absent.id
         galaxy.renderStore.bumpTopology()
         let adapter = GalaxyRegistryAdapter(registry: registry)
