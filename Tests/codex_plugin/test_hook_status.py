@@ -129,6 +129,34 @@ class StatusTests(unittest.TestCase):
         self.assertNotIn("secret", json.dumps(result))
         self.assertNotIn(OTHER, json.dumps(result))
 
+    def test_subagent_stop_survives_selected_report_without_widening_metadata(self):
+        # Stored metadata fixtures exercise reporting, not host hook delivery.
+        root = self.learner_fixture(pending={"event": "SubagentStop",
+            "hook_session_id": SID, "prompt": "PRIVATE_SUBAGENT_BODY"})
+        self.write(self.modern / "router-receipts.jsonl", [
+            {"session_id": SID, "hook_event": "SubagentStop", "status": "queued", "at": STAMP,
+             "last_assistant_message": "PRIVATE_SUBAGENT_BODY"},
+            {"session_id": OTHER, "hook_event": "SubagentStop", "status": "queued"},
+            {"session_id": SID, "hook_event": "SubagentStop PRIVATE_EVENT", "status": "observed"}], log=True)
+        self.write(root / "events.jsonl", [
+            {"session_id": SID, "event": "queued", "hook_event": "SubagentStop", "request_id": REQUEST},
+            {"session_id": OTHER, "event": "queued", "hook_event": "SubagentStop"}], log=True)
+        rendered = STATUS.render_report(self.report())
+        result = json.loads(rendered)
+        router = result["router"]["receipts"]
+        self.assertEqual(len(router), 2)
+        self.assertEqual(router[0]["hook_event"], "SubagentStop")
+        self.assertEqual(router[0]["status"], "queued")
+        self.assertNotIn("hook_event", router[1])
+        events = result["learner"]["events"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event"], "queued")
+        self.assertEqual(events[0]["hook_event"], "SubagentStop")
+        self.assertEqual(result["learner"]["pending"]["metadata"]["event"], "SubagentStop")
+        self.assertEqual(result["learner"]["memory_readback"], "not_performed")
+        self.assertNotIn("PRIVATE_", rendered)
+        self.assertTrue(all(row["session_id"] == SID for row in router + events))
+
     def test_runtime_identity_bounded_fields_only(self):
         raw = {"schema_version": 1, "evidence": "observed_package_files", "status": "complete",
                "package": {"path": "/private/secret", "version": "0.2.0+codex.20260917123456",

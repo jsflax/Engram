@@ -63,7 +63,8 @@ struct OnStop: AsyncParsableCommand {
             try spawnSampleGate(
                 transcriptPath: transcriptPath,
                 project: project,
-                cwd: input.cwd ?? FileManager.default.currentDirectoryPath
+                cwd: input.cwd ?? FileManager.default.currentDirectoryPath,
+                sessionId: input.sessionId
             )
             hookLog("Stop hook: spawned sample-gate for project \(project)")
         } catch {
@@ -76,7 +77,7 @@ struct OnStop: AsyncParsableCommand {
     /// Spawn `memory-hooks sample-gate` as a detached fire-and-forget subprocess.
     /// The sample-gate will run TranscriptSampler (~1-12s) and only spawn the
     /// session-learner claude subprocess if novel content is found.
-    private func spawnSampleGate(transcriptPath: String, project: String, cwd: String) throws {
+    private func spawnSampleGate(transcriptPath: String, project: String, cwd: String, sessionId: String?) throws {
         let bin = Self.hooksBin
         let logPath = NSHomeDirectory() + "/.claude/sample-gate.log"
 
@@ -85,12 +86,18 @@ struct OnStop: AsyncParsableCommand {
         let escapedTranscript = transcriptPath.replacingOccurrences(of: "'", with: "'\\''")
         let escapedProject = project.replacingOccurrences(of: "'", with: "'\\''")
         let escapedCwd = cwd.replacingOccurrences(of: "'", with: "'\\''")
+        let sessionArgument: String
+        if let sessionId, LearnerLogContext(sessionId: sessionId, trigger: .stop) != nil {
+            sessionArgument = " --session-id '" + sessionId.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        } else {
+            sessionArgument = ""
+        }
 
         let shellCommand = """
         '\(bin)' sample-gate \
           --transcript-path '\(escapedTranscript)' \
           --project '\(escapedProject)' \
-          --cwd '\(escapedCwd)' \
+          --cwd '\(escapedCwd)'\(sessionArgument) \
           >> '\(logPath)' 2>&1
         """
 

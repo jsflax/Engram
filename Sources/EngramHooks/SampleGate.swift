@@ -27,6 +27,9 @@ struct SampleGate: AsyncParsableCommand {
     @Option(help: "Working directory for the session")
     var cwd: String
 
+    @Option(help: "Optional originating session ID for learner diagnostic logs")
+    var sessionId: String?
+
     // MARK: - Session Learner Config (moved from OnStop)
 
     private static let sessionLearnerSystemPrompt: String = loadAgentSystemPrompt(
@@ -161,7 +164,8 @@ struct SampleGate: AsyncParsableCommand {
             cwd: cwd,
             // Remote mode: explicit --mcp-config (cwd-independent wiring) that
             // also tags the learner's ops for analytics attribution.
-            extraClaudeArgs: RemoteConfig.active?.learnerMcpArgs ?? ""
+            extraClaudeArgs: RemoteConfig.active?.learnerMcpArgs ?? "",
+            learnerLogContext: LearnerLogContext(sessionId: sessionId, trigger: .stop)
         )
     }
 

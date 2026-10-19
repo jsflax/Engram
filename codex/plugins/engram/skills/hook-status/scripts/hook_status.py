@@ -25,7 +25,7 @@ RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}")
 UUID_TEXT = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 HASH = re.compile(r"(?:[0-9a-f]{20}|[0-9a-f]{64})")
 TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})")
-EVENTS = {"SessionStart", "UserPromptSubmit", "SubagentStart", "Stop", "PreCompact", "SessionEnd",
+EVENTS = {"SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop", "PreCompact", "SessionEnd",
           "PreToolUse", "PostToolUse", "unknown",
           "queued", "rejected", "duplicate_event", "blocked", "deferred_short", "learner_finished", "worker_error",
           "reconciliation_required", "resumed", "resume_refused"}

@@ -4,6 +4,19 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.11] - 2026-10-19
+
+### Fixed
+- Keep visualizer node snapshots when a repeated hub insertion leaves membership
+  unchanged. Refresh affected hub flags without rebuilding unrelated nodes,
+  preserving node edits, deletion and galaxy precedence.
+- Include SubagentStop events in the Codex hook-status report.
+
+### Diagnostics
+- Correlate detached Claude learner starts and exits with their originating
+  session, trigger, run and process in the existing session log. Exit status
+  describes the process outcome; memory persistence still requires readback.
+
 ## [0.15.10] - 2026-10-19
 
 ### Fixed

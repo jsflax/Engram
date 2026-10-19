@@ -262,6 +262,8 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     // Each snapshot follows its own domain; edge/status/color updates do not
     // validate every node again. Hub membership is a node-snapshot dependency.
     private var cachedNodes: [RKNodeSnapshot] = []
+    private var cachedNodeIndices: [UUID: Int] = [:]
+    private var cachedNodeIDsAreUnique = true
     private var cachedEdges: [RKEdgeSnapshot] = []
     private var cachedHubs: Set<UUID> = []
     private var cachedColorMap: [String: SIMD3<Float>] = [:]
@@ -514,12 +516,12 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
 
         let mergedHubs = registry.mergedHubs
         let hubsChanged = lastHubsVersion != registry.mergedHubsVersion
-        if lastNodesVersion != registry.mergedNodesVersion || hubsChanged {
+        if lastNodesVersion != registry.mergedNodesVersion {
             let nodes = registry.mergedNodes
             // Only store-certified continuity can bypass comparisons. Arbitrary
-            // edits, missed publications, replacement and hub changes retain
-            // the complete metadata-prefix validation used by ordinary updates.
-            let prefix = hubsChanged ? nil : registry.preservedNodePrefix(
+            // edits, missed publications and replacement retain complete node
+            // metadata validation. Independent hub flags are patched below.
+            let prefix = registry.preservedNodePrefix(
                 since: lastNodesVersion, count: cachedNodes.count)
             let canAppendNodes = prefix == nil && nodes.count >= cachedNodes.count
                 && cachedNodes.indices.allSatisfy { index in
@@ -529,18 +531,34 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
                         && old.topic == node.topic && old.label == node.label
                         && old.content == node.content && old.importance == node.importance
                         && old.createdAt == node.createdAt && old.lastAccessedAt == node.lastAccessedAt
-                        && old.isHub == mergedHubs.contains(node.id)
                 }
             let retained = prefix ?? (canAppendNodes ? cachedNodes.count : 0)
             if retained < cachedNodes.count {
                 preservesIndexPrefix = false
+                if cachedNodeIDsAreUnique {
+                    for node in cachedNodes.dropFirst(retained) {
+                        cachedNodeIndices.removeValue(forKey: node.id)
+                    }
+                }
                 cachedNodes.removeSubrange(retained...)
+                if !cachedNodeIDsAreUnique {
+                    cachedNodeIndices.removeAll(keepingCapacity: true)
+                    cachedNodeIDsAreUnique = true
+                    for (index, node) in cachedNodes.enumerated() {
+                        if cachedNodeIndices.updateValue(index, forKey: node.id) != nil {
+                            cachedNodeIDsAreUnique = false
+                        }
+                    }
+                }
             }
             if cachedNodes.capacity < nodes.count {
                 cachedNodes.reserveCapacity(max(nodes.count, max(64, cachedNodes.capacity * 2)))
             }
             for node in nodes.dropFirst(cachedNodes.count) {
                 nodeSnapshotBuildCount &+= 1
+                if cachedNodeIndices.updateValue(cachedNodes.count, forKey: node.id) != nil {
+                    cachedNodeIDsAreUnique = false
+                }
                 cachedNodes.append(RKNodeSnapshot(
                     id: node.id,
                     project: node.project,
@@ -584,9 +602,35 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         // Do not pin the mutable render store's Set storage via this cache or
         // LOD's retained prior hub set while the next loading batch inserts.
         if hubsChanged {
+            let changed = cachedHubs.symmetricDifference(mergedHubs)
+            if cachedNodeIDsAreUnique {
+                for id in changed {
+                    if let index = cachedNodeIndices[id] {
+                        updateCachedHub(at: index, isHub: mergedHubs.contains(id))
+                    }
+                }
+            } else {
+                // Registry merging deduplicates normal multi-galaxy inputs.
+                // An arbitrary single-store replacement may contain duplicates;
+                // preserve all of its rows rather than choosing one cached slot.
+                for index in cachedNodes.indices where changed.contains(cachedNodes[index].id) {
+                    updateCachedHub(at: index, isHub: mergedHubs.contains(cachedNodes[index].id))
+                }
+            }
             cachedHubs = Set(mergedHubs.map { $0 })
             lastHubsVersion = registry.mergedHubsVersion
         }
+    }
+
+    private func updateCachedHub(at index: Int, isHub: Bool) {
+        let node = cachedNodes[index]
+        guard node.isHub != isHub else { return }
+        nodeSnapshotBuildCount &+= 1
+        cachedNodes[index] = RKNodeSnapshot(
+            id: node.id, project: node.project, topic: node.topic,
+            label: node.label, content: node.content, importance: node.importance,
+            isHub: isHub, createdAt: node.createdAt, lastAccessedAt: node.lastAccessedAt
+        )
     }
 
     private func rebuildColorMap() {
