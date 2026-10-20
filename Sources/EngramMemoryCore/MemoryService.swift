@@ -154,15 +154,21 @@ public struct RecallHit: Sendable, Codable {
     public var depth: Int
     /// Foreign-authored relative to the service principal (drives fencing).
     public var isForeign: Bool
+    /// Provenance when a service reads more than one explicitly granted graph.
+    public var sourceGraphId: UUID?
+    public var sourceGraphName: String?
 
     public init(memory: MemoryRecord, distance: Double,
                 boostedDistance: Double? = nil, depth: Int = 0,
-                isForeign: Bool = false) {
+                isForeign: Bool = false, sourceGraphId: UUID? = nil,
+                sourceGraphName: String? = nil) {
         self.memory = memory
         self.distance = distance
         self.boostedDistance = boostedDistance
         self.depth = depth
         self.isForeign = isForeign
+        self.sourceGraphId = sourceGraphId
+        self.sourceGraphName = sourceGraphName
     }
 }
 
@@ -203,11 +209,18 @@ public struct AdviseResult: Sendable, Codable {
     /// feedback loop's join key (transcript matching → recall_feedback).
     public var memoryIds: [UUID]
     public var mode: RecallMode?
+    /// Exact query and source-attributed hits for native Advise hook cards.
+    /// Optional for compatibility with older remote backends.
+    public var query: String?
+    public var hits: [RecallHit]?
 
-    public init(block: String?, memoryIds: [UUID] = [], mode: RecallMode? = nil) {
+    public init(block: String?, memoryIds: [UUID] = [], mode: RecallMode? = nil,
+                query: String? = nil, hits: [RecallHit]? = nil) {
         self.block = block
         self.memoryIds = memoryIds
         self.mode = mode
+        self.query = query
+        self.hits = hits
     }
 }
 

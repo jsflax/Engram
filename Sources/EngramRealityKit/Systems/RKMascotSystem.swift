@@ -18,6 +18,31 @@ public final class RKMascotSystem {
     private var currentPositions: [String: SIMD3<Float>] = [:]
     private var currentYaws: [String: Float] = [:]
     private var mascotLoadingProjects: Set<String> = []
+    private var loadingTasks: [String: Task<Void, Never>] = [:]
+    private var inFlightLoads: [UUID: Task<Void, Never>] = [:]
+    private let loadMascot: @MainActor (String, SIMD3<Float>) async -> Entity
+    private var lifecycleGeneration: UInt64 = 0
+    private var isActive = true
+    private var isTornDown = false
+
+    public func setActive(_ active: Bool) {
+        guard !isTornDown else { return }
+        isActive = active
+        if !active {
+            lifecycleGeneration &+= 1
+            for task in loadingTasks.values { task.cancel() }
+            loadingTasks.removeAll(); mascotLoadingProjects.removeAll()
+        }
+    }
+
+    public func teardown() {
+        setActive(false); isTornDown = true
+        for entity in activeMascots.values { entity.removeFromParent() }
+        activeMascots.removeAll(); mascotStates.removeAll(); taskQueues.removeAll()
+        idleTimers.removeAll(); patrolThresholds.removeAll(); animationTimes.removeAll()
+        currentPositions.removeAll(); currentYaws.removeAll(); cachedActiveProjects.removeAll()
+        lastHoloNodeIds.removeAll(); holoOpacities.removeAll()
+    }
 
     /// Priority-comparable task type for mascot behavior.
     public enum MascotTask: Comparable {
@@ -50,7 +75,18 @@ public final class RKMascotSystem {
     private var cachedActiveProjects = Set<String>()
     private var cachedProjectsTopologyVersion: UInt64 = .max
 
-    public init() {}
+    public convenience init() {
+        self.init(loadMascot: { project, tint in await MascotEntityFactory.createMascotGroup(project: project, tint: tint) })
+    }
+    /// Same loading boundary, injectable by owned fixtures to hold a late asset completion.
+    init(loadMascot: @escaping @MainActor (String, SIMD3<Float>) async -> Entity) { self.loadMascot = loadMascot }
+
+    public func drainPendingLoads() async {
+        while let (id, task) = inFlightLoads.first {
+            await task.value
+            inFlightLoads.removeValue(forKey: id)
+        }
+    }
 
     public func update(
         container: Entity,
@@ -58,6 +94,7 @@ public final class RKMascotSystem {
         dt: Float,
         scaleFactor: Float
     ) {
+        guard isActive, !isTornDown else { return }
         let colorMap = dataProvider.projectColorMap
         let positions = dataProvider.positions
         let nodes = dataProvider.nodes
@@ -72,6 +109,11 @@ public final class RKMascotSystem {
             cachedProjectsTopologyVersion = dataProvider.topologyVersion
         }
         let activeProjects = cachedActiveProjects
+
+        for project in loadingTasks.keys where !activeProjects.contains(project) {
+            loadingTasks.removeValue(forKey: project)?.cancel()
+            mascotLoadingProjects.remove(project)
+        }
 
         // Remove mascots for gone projects
         for (project, entity) in activeMascots where !activeProjects.contains(project) {
@@ -90,9 +132,18 @@ public final class RKMascotSystem {
             let tint = colorMap[project] ?? SIMD3<Float>(0, 0.8, 1.0)
             mascotLoadingProjects.insert(project)
             let proj = project
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                let entity = await MascotEntityFactory.createMascotGroup(project: proj, tint: tint)
+            let generation = lifecycleGeneration
+            let centroid = dataProvider.projectCentroids[proj]
+            let load = loadMascot
+            let loadID = UUID()
+            let task = Task { @MainActor [weak self] in
+                defer { self?.inFlightLoads.removeValue(forKey: loadID) }
+                guard !Task.isCancelled else { return }
+                let entity = await load(proj, tint)
+                guard let self, !Task.isCancelled, self.isActive, !self.isTornDown,
+                      self.lifecycleGeneration == generation,
+                      self.cachedActiveProjects.contains(proj) else { return }
+                self.loadingTasks.removeValue(forKey: proj)
                 container.addChild(entity)
                 self.activeMascots[proj] = entity
                 self.mascotStates[proj] = .idle(.awake)
@@ -102,11 +153,12 @@ public final class RKMascotSystem {
                 self.mascotLoadingProjects.remove(proj)
 
                 // Initial position near project centroid
-                if let centroid = dataProvider.projectCentroids[proj] {
+                if let centroid {
                     self.currentPositions[proj] = centroid + SIMD3(0, 50, 0)
                     entity.position = (centroid + SIMD3(0, 50, 0)) * scaleFactor
                 }
             }
+            loadingTasks[proj] = task; inFlightLoads[loadID] = task
         }
 
         // Update each active mascot

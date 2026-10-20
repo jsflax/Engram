@@ -61,6 +61,9 @@ public final class ForceSimulation3D {
     private var _positionsCache: [UUID: SIMD3<Float>] = [:]
     private var _positionsCacheGeneration: UInt64 = .max
     private var _positionsGeneration: UInt64 = 0
+    /// Changes when topology or CPU position data changes, including a late GPU result.
+    /// Alpha/velocity-only ticks do not invalidate position consumers.
+    public var positionRevision: UInt64 { _positionsGeneration }
     public var positions: [UUID: SIMD3<Float>] {
         if _positionsCacheGeneration != _positionsGeneration {
             _positionsCache.removeAll(keepingCapacity: true)
@@ -451,7 +454,9 @@ public final class ForceSimulation3D {
         guard isActive else { return }
         let n = ids.count
         guard n > 1 else {
-            if n == 1 { x[0] = center.x; y[0] = center.y; z[0] = center.z; syncPositions() }
+            if n == 1, SIMD3(x[0], y[0], z[0]) != center {
+                x[0] = center.x; y[0] = center.y; z[0] = center.z; syncPositions()
+            }
             return
         }
 
@@ -501,15 +506,14 @@ public final class ForceSimulation3D {
             settledFrameCount += 1
             if settledFrameCount >= 30 {
                 isSettled = true
-                syncPositions()
                 return
             }
         } else {
             settledFrameCount = 0
         }
 
-        syncPositions()
-
+        // tick only changes alpha/settling metadata. Position writers invalidate
+        // their revision directly; retain the cached layout until a real delivery.
         let totalTickMs = (CFAbsoluteTimeGetCurrent() - tickStart) * 1000.0
         if framesSinceWake % 60 == 1 || totalTickMs > 20 {
             print("[engram:sim] tick n=\(n) integrate=\(String(format: "%.1f", totalTickMs))ms maxSpeedSq=\(String(format: "%.4f", maxSpeedSq)) alpha=\(String(format: "%.4f", alpha)) settled=\(isSettled)")

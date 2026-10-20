@@ -32,7 +32,12 @@ public final class RKSpatialAudioSystem {
     /// Maximum number of concurrent edge hum voices.
     public var maxEdgeHumVoices: Int = 6
     /// Whether audio is enabled.
-    public var isEnabled: Bool = true
+    public var isEnabled: Bool = true {
+        didSet { if !isEnabled { stopAll() } }
+    }
+    /// Legacy desktop diagnostic. Embedded hosts can suppress its startup tone
+    /// independently of the graph's actual proximity/edge/event audio.
+    public var playsStartupDiagnosticTone = true
 
     // MARK: - Audio Resources (generated once)
 
@@ -65,6 +70,8 @@ public final class RKSpatialAudioSystem {
     /// Temp WAV files that back AudioFileResources. PHASE loads audio data
     /// asynchronously — files must stay on disk until the system is torn down.
     private var tempFileURLs: [URL] = []
+    private var eventVoices: [UUID: (Entity, AudioPlaybackController, Task<Void, Never>)] = [:]
+    private var isTornDown = false
 
     // MARK: - Throttling
 
@@ -110,7 +117,7 @@ public final class RKSpatialAudioSystem {
 
         // Smoke test: play a tone on the root entity with AmbientAudioComponent
         // to verify audio output works at all on this system.
-        if let testResource = proximityToneResources[3] {
+        if playsStartupDiagnosticTone, let testResource = proximityToneResources[3] {
             let testEntity = Entity()
             testEntity.name = "AudioSmokeTest"
             var ambient = AmbientAudioComponent()
@@ -122,13 +129,16 @@ public final class RKSpatialAudioSystem {
             audioLog.info("Audio smoke test: playing 440Hz tone via AmbientAudioComponent, controller.isPlaying=\(controller.isPlaying)")
 
             // Stop after 3 seconds
-            Task { @MainActor in
+            let id = UUID()
+            let task = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(3))
                 controller.stop()
                 testEntity.removeFromParent()
+                self?.eventVoices.removeValue(forKey: id)
                 audioLog.info("Audio smoke test: stopped")
             }
-        } else {
+            eventVoices[id] = (testEntity, controller, task)
+        } else if playsStartupDiagnosticTone {
             audioLog.error("Audio smoke test: no proximity tone resource for importance 3")
         }
     }
@@ -141,7 +151,7 @@ public final class RKSpatialAudioSystem {
         visibleSet: VisibleSet,
         dt: Float
     ) {
-        guard isEnabled else { return }
+        guard isEnabled, !isTornDown else { return }
 
         // Lazy pool setup — needs scene root to be in the RealityView
         if !poolsInitialized {
@@ -335,11 +345,13 @@ public final class RKSpatialAudioSystem {
                 scene.rootEntity.addChild(audioEntity)
                 let controller = audioEntity.playAudio(resource)
                 // Clean up after playback completes (resource is 0.5s, non-looping)
-                Task { @MainActor in
+                let id = UUID()
+                let task = Task { @MainActor [weak self] in
                     try? await Task.sleep(for: .seconds(2))
-                    controller.stop()
-                    audioEntity.removeFromParent()
+                    controller.stop(); audioEntity.removeFromParent()
+                    self?.eventVoices.removeValue(forKey: id)
                 }
+                eventVoices[id] = (audioEntity, controller, task)
             }
         }
 
@@ -355,7 +367,7 @@ public final class RKSpatialAudioSystem {
 
     /// Attach thruster audio to a mascot entity.
     public func attachThrusterAudio(to entity: Entity, project: String) {
-        guard let resource = thrusterResource else { return }
+        guard isEnabled, !isTornDown, let resource = thrusterResource else { return }
 
         var spatialAudio = SpatialAudioComponent()
         spatialAudio.gain = -20.0
@@ -384,6 +396,10 @@ public final class RKSpatialAudioSystem {
     // MARK: - Stop All
 
     public func stopAll() {
+        for (entity, controller, task) in eventVoices.values {
+            task.cancel(); controller.stop(); entity.removeFromParent()
+        }
+        eventVoices.removeAll()
         muteAllProximity()
         muteAllEdge()
 
@@ -391,6 +407,19 @@ public final class RKSpatialAudioSystem {
             controller.stop()
         }
         activeMascotControllers.removeAll()
+    }
+
+    /// Release only this system's generated WAVs and retained playback resources.
+    public func teardown() {
+        guard !isTornDown else { return }
+        isTornDown = true; isEnabled = false; stopAll()
+        for voice in proximityPool { voice.entity.removeFromParent() }
+        for voice in edgePool { voice.entity.removeFromParent() }
+        proximityPool.removeAll(); edgePool.removeAll(); pendingGlowNodes.removeAll()
+        proximityToneResources.removeAll(); edgeHumResource = nil; recallGlowResource = nil
+        nodeCreateResource = nil; nodeDeleteResource = nil; thrusterResource = nil
+        for url in tempFileURLs { try? FileManager.default.removeItem(at: url) }
+        tempFileURLs.removeAll()
     }
 
     // MARK: - Audio Resource Generation

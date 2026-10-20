@@ -341,7 +341,7 @@ extension MemoryTools {
         // Fetch all memories by globalId
         var sources: [(memory: Memory, lattice: Lattice)] = []
         for gid in ids {
-            guard let found = findMemory(id: gid) else {
+            guard let found = findWritableMemory(id: gid) else {
                 return CallTool.Result(content: [.text("Memory with id \(gid.uuidString) not found.")], isError: true)
             }
             sources.append(found)
@@ -377,7 +377,7 @@ extension MemoryTools {
         }()
 
         // Generate embedding for summary
-        guard let floats = try await embedder.embed(text: a.content) else {
+        guard let floats = try await embedding(for: a.content) else {
             throw MCPError.internalError("Embedding model unavailable — cannot consolidate memories without a vector. Check that the CoreML model is bundled correctly.")
         }
         let embeddingVec = Vector<Float>(floats)

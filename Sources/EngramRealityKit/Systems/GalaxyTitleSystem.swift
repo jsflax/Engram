@@ -1,5 +1,7 @@
 import RealityKit
-import AppKit
+import CoreGraphics
+import CoreText
+import Foundation
 import simd
 
 /// Big glowing galaxy titles: each galaxy's displayName rendered as a
@@ -95,20 +97,22 @@ public final class GalaxyTitleSystem {
     /// with increasing shadow blur in the galaxy's tint, then once sharp in
     /// near-white. Reads as glow without any post-processing.
     private func renderGlowingText(_ text: String, tint: SIMD3<Float>) -> CGImage? {
-        let font = NSFont.systemFont(ofSize: 96, weight: .bold)
-        let tintColor = NSColor(
+        let font = RKPlatform.font(size: 96, bold: true)
+        let tintColor = CGColor(
             red: CGFloat(min(1, tint.x * 1.2 + 0.15)),
             green: CGFloat(min(1, tint.y * 1.2 + 0.15)),
             blue: CGFloat(min(1, tint.z * 1.2 + 0.15)),
             alpha: 1)
 
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .kern: 10,
-            .foregroundColor: NSColor.white.withAlphaComponent(0.95),
+        let attributes: [CFString: Any] = [
+            kCTFontAttributeName: font, kCTKernAttributeName: 10,
+            kCTForegroundColorAttributeName: CGColor(gray: 1, alpha: 0.95),
         ]
-        let attributed = NSAttributedString(string: text, attributes: attributes)
-        let textSize = attributed.size()
+        let attributed = CFAttributedStringCreate(nil, text as CFString, attributes as CFDictionary)!
+        let line = CTLineCreateWithAttributedString(attributed)
+        var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
+        let width = CTLineGetTypographicBounds(line, &ascent, &descent, &leading)
+        let textSize = CGSize(width: ceil(width), height: ceil(ascent + descent + leading))
         let pad: CGFloat = 64   // room for the halo
         let size = CGSize(width: ceil(textSize.width) + pad * 2,
                           height: ceil(textSize.height) + pad * 2)
@@ -121,21 +125,21 @@ public final class GalaxyTitleSystem {
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else { return nil }
 
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
-        let origin = CGPoint(x: pad, y: pad)
+        context.textMatrix = .identity
+        let origin = CGPoint(x: pad, y: pad + descent)
 
         // Halo passes: wide + soft first, tighter after.
         for blur in [28.0, 14.0] {
             context.saveGState()
             context.setShadow(offset: .zero, blur: blur,
-                              color: tintColor.withAlphaComponent(0.9).cgColor)
-            attributed.draw(at: origin)
+                              color: tintColor.copy(alpha: 0.9))
+            context.textPosition = origin
+            CTLineDraw(line, context)
             context.restoreGState()
         }
         // Sharp pass on top.
-        attributed.draw(at: origin)
-        NSGraphicsContext.restoreGraphicsState()
+        context.textPosition = origin
+        CTLineDraw(line, context)
 
         return context.makeImage()
     }

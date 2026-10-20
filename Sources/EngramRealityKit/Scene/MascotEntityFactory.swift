@@ -27,22 +27,26 @@ enum MascotEntityFactory {
     /// Load a mascot entity from the USDZ asset.
     /// Searches main bundle, module bundle, and Resources subdirectory.
     static func loadMascotEntity(tint: SIMD3<Float>) async -> Entity? {
+        guard !Task.isCancelled else { return nil }
         let mascotScale: Float = 10.0  // ~node-sized in world units
 
-        // Try main bundle first (EngramVisualizer app)
-        if let url = Bundle.main.url(forResource: "mascot", withExtension: "usdz") {
+        // Prefer the renderer module asset used by resource validation.
+        if let url = Bundle.module.url(forResource: "mascot", withExtension: "usdz") {
             do {
                 let entity = try await Entity(contentsOf: url)
+                guard !Task.isCancelled else { return nil }
                 entity.scale = SIMD3<Float>(repeating: mascotScale)
                 tameMascotMaterials(entity)
                 return entity
             } catch {}
         }
 
-        // Try module bundle (EngramPreview copies it via .copy("Resources/mascot.usdz"))
-        if let url = Bundle.module.url(forResource: "mascot", withExtension: "usdz") {
+        // Legacy standalone fallback when the module asset is absent/unreadable.
+        guard !Task.isCancelled else { return nil }
+        if let url = Bundle.main.url(forResource: "mascot", withExtension: "usdz") {
             do {
                 let entity = try await Entity(contentsOf: url)
+                guard !Task.isCancelled else { return nil }
                 entity.scale = SIMD3<Float>(repeating: mascotScale)
                 tameMascotMaterials(entity)
                 return entity
@@ -50,8 +54,10 @@ enum MascotEntityFactory {
         }
 
         // Try named asset (Xcode asset catalog)
+        guard !Task.isCancelled else { return nil }
         do {
             let entity = try await Entity(named: "mascot", in: .main)
+            guard !Task.isCancelled else { return nil }
             entity.scale = SIMD3<Float>(repeating: mascotScale)
             tameMascotMaterials(entity)
             return entity
@@ -98,6 +104,7 @@ enum MascotEntityFactory {
             model.name = "MascotModel"
             group.addChild(model)
         }
+        guard !Task.isCancelled else { return group }
 
         // Arcane circle — flat disk child entity
         let arcaneCircle = createArcaneCircle(tint: tint)

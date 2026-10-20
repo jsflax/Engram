@@ -1,4 +1,5 @@
 import RealityKit
+import CoreGraphics
 import Metal
 import simd
 import EngramSceneKit
@@ -12,8 +13,10 @@ public final class LabelBatchSystem {
     private static let vertsPerLabel = 4
     private static let indicesPerLabel = 6
 
-    private var lastAtlasVersion: UInt64 = 0
-    private var lastAtlasFrame: UInt64 = 0
+    // Post-creation material reassignments only; no extra resource retention.
+    private(set) var diagnosticMaterialAssignments: UInt64 = 0
+    private var lastAtlasVersion: UInt64?
+    private var lastAtlasFrame: UInt64?
     private var labelStaging: [BatchVertex] = []
 
     // Cached cluster data — recomputed every N frames instead of every frame
@@ -72,28 +75,36 @@ public final class LabelBatchSystem {
         let totalLabelCount = visibleCount + projCount + topicCount
         mark("counts")
         if frameCount % 120 == 0 {
-            print("[labels] frame=\(frameCount) visibleNodes=\(visibleCount) projects=\(projCount) topics=\(topicCount) totalNodes=\(dataProvider.nodes.count) projRects=\(scene.labelAtlasGenerator.projectRects.count) topicRects=\(scene.labelAtlasGenerator.topicRects.count) atlasFrame=\(lastAtlasFrame)")
+            print("[labels] frame=\(frameCount) visibleNodes=\(visibleCount) projects=\(projCount) topics=\(topicCount) totalNodes=\(dataProvider.nodes.count) projRects=\(scene.labelAtlasGenerator.projectRects.count) topicRects=\(scene.labelAtlasGenerator.topicRects.count) atlasFrame=\(lastAtlasFrame ?? 0)")
         }
+        scene.labelBatchEntity?.isEnabled = totalLabelCount > 0
         guard totalLabelCount > 0 else { return }
 
-        // Regenerate atlas if topology changed (debounced), or on first frame with data
-        let hasNodes = !dataProvider.nodes.isEmpty
-        let needsInitialAtlas = lastAtlasFrame == 0 && hasNodes
-        if (topologyChanged || needsInitialAtlas) && (frameCount - lastAtlasFrame) > 60 || needsInitialAtlas {
+        // The scene's topologyChanged flag lasts one frame. Keep the last
+        // successful version until this system's debounce admits the latest data.
+        let version = dataProvider.topologyVersion
+        let needsAtlas = lastAtlasVersion != version || scene.labelAtlasGenerator.atlasTexture == nil
+        let mayAttempt = lastAtlasFrame.map { (frameCount &- $0) > 60 } ?? true
+        if needsAtlas, mayAttempt, !dataProvider.nodes.isEmpty {
+            lastAtlasFrame = frameCount
             let (projects, topics) = projectTopicSets(dataProvider)
-            scene.labelAtlasGenerator.regenerateAtlas(
+            let previousTexture = scene.labelAtlasGenerator.atlasTexture
+            let succeeded = scene.labelAtlasGenerator.refreshAtlas(
                 nodes: dataProvider.nodes,
                 hubs: dataProvider.hubs,
                 projects: projects,
                 topics: topics
             )
-            lastAtlasFrame = frameCount
-
-            // Update material with new atlas texture
-            if let texture = scene.labelAtlasGenerator.atlasTexture,
-               let labelEntity = scene.labelBatchEntity {
-                let mat = MaterialFactory.makeLabelMaterial(device: scene.device, atlasTexture: texture)
-                labelEntity.model?.materials = [mat]
+            if succeeded {
+                lastAtlasVersion = version
+                // Edge-only topology changes can reuse the exact raster inputs.
+                // Keep the existing material when the atlas resource is unchanged.
+                if let texture = scene.labelAtlasGenerator.atlasTexture,
+                   texture !== previousTexture, let labelEntity = scene.labelBatchEntity {
+                    let mat = MaterialFactory.makeLabelMaterial(device: scene.device, atlasTexture: texture)
+                    labelEntity.model?.materials = [mat]
+                    if labelEntity.model != nil { diagnosticMaterialAssignments &+= 1 }
+                }
             }
         }
 
@@ -115,6 +126,7 @@ public final class LabelBatchSystem {
         let camPos = cameraPosition * scaleFactor
         let camRight: SIMD3<Float>
         let camUp: SIMD3<Float>
+        let cameraState = scene.cameraProvider?.cameraState
 
         if let provider = scene.cameraProvider {
             let state = provider.cameraState
@@ -209,9 +221,15 @@ public final class LabelBatchSystem {
             guard let rect = projRects[project] else { continue }
             let color = colorMap[project] ?? SIMD3<Float>(0.9, 0.9, 0.9)
             let topY = projectMaxY[project] ?? centroid.y
-            let anchor = SIMD3<Float>(centroid.x, topY + 40.0, centroid.z) * scaleFactor
-            let halfH: Float = 14.0
-            let halfW = halfH * (rect.u1 - rect.u0) / max(rect.v1 - rect.v0, 0.001) * aspectCorrection
+            let anchor = SIMD3<Float>(centroid.x, topY + ClusterLabelKind.project.graphVerticalOffset, centroid.z) * scaleFactor
+            let labelAspect = (rect.u1 - rect.u0) / max(rect.v1 - rect.v0, 0.001) * aspectCorrection
+            let halfH = ClusterLabelSizing.halfHeight(legacy: 14.0, bounded: scene.usesViewportBoundedClusterLabels,
+                aspect: labelAspect, depth: cameraState.map { simd_dot(anchor - camPos, $0.forward) } ?? 0,
+                fovDegrees: cameraState?.fovDegrees ?? 0, viewport: scene.clusterLabelViewportSize,
+                maximumHeight: Float(ClusterLabelKind.project.maximumPointHeight),
+                maximumWidthFraction: Float(ClusterLabelKind.project.maximumViewportWidthFraction))
+            guard halfH > 0 else { continue }
+            let halfW = halfH * labelAspect
             let dist = simd_length(anchor - camPos)
             let opacity: Float = max(0.5, 1.0 - min(1.0, dist / 8000.0))
             let r = camRight * halfW
@@ -247,9 +265,15 @@ public final class LabelBatchSystem {
                 guard let rect = topicRects[topic] else { continue }
                 let centroid = data.sum / Float(data.count)
                 let color = colorMap[data.project] ?? SIMD3<Float>(0.7, 0.7, 0.7)
-                let anchor = SIMD3<Float>(centroid.x, data.maxY + 25.0, centroid.z) * scaleFactor
-                let halfH: Float = 8.0
-                let halfW = halfH * (rect.u1 - rect.u0) / max(rect.v1 - rect.v0, 0.001) * aspectCorrection
+                let anchor = SIMD3<Float>(centroid.x, data.maxY + ClusterLabelKind.topic.graphVerticalOffset, centroid.z) * scaleFactor
+                let labelAspect = (rect.u1 - rect.u0) / max(rect.v1 - rect.v0, 0.001) * aspectCorrection
+                let halfH = ClusterLabelSizing.halfHeight(legacy: 8.0, bounded: scene.usesViewportBoundedClusterLabels,
+                    aspect: labelAspect, depth: cameraState.map { simd_dot(anchor - camPos, $0.forward) } ?? 0,
+                    fovDegrees: cameraState?.fovDegrees ?? 0, viewport: scene.clusterLabelViewportSize,
+                    maximumHeight: Float(ClusterLabelKind.topic.maximumPointHeight),
+                    maximumWidthFraction: Float(ClusterLabelKind.topic.maximumViewportWidthFraction))
+                guard halfH > 0 else { continue }
+                let halfW = halfH * labelAspect
                 let dist = simd_length(anchor - camPos)
                 let opacity: Float = max(0.3, 1.0 - min(1.0, dist / 5000.0))
                 let r = camRight * halfW
@@ -279,17 +303,23 @@ public final class LabelBatchSystem {
         mark("labelloops")
         let usedVerts = instanceIdx * Self.vertsPerLabel
         if usedVerts < totalVerts {
-            memset(&labelStaging[usedVerts], 0, (totalVerts - usedVerts) * MemoryLayout<BatchVertex>.stride)
+            labelStaging.withUnsafeMutableBytes { bytes in
+                let offset = usedVerts * MemoryLayout<BatchVertex>.stride
+                let byteCount = (totalVerts - usedVerts) * MemoryLayout<BatchVertex>.stride
+                precondition(offset >= 0 && offset + byteCount <= bytes.count)
+                bytes.baseAddress!.advanced(by: offset).initializeMemory(as: UInt8.self, repeating: 0, count: byteCount)
+            }
         }
 
-        // GPU-synchronized write
-        guard let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer() else { return }
-        let destBuffer = mesh.replace(bufferIndex: 0, using: cmdBuf)
-        let dest = destBuffer.contents().bindMemory(to: BatchVertex.self, capacity: totalVerts)
-        labelStaging.withUnsafeBufferPointer { src in
-            dest.update(from: src.baseAddress!, count: totalVerts)
+        // CPU replacement owns writable storage only for this synchronous callback.
+        // replace(bufferIndex:using:) is reserved for GPU writes, not CPU contents().
+        mesh.replaceUnsafeMutableBytes(bufferIndex: 0) { destination in
+            labelStaging.withUnsafeBytes { source in
+                let byteCount = totalVerts * MemoryLayout<BatchVertex>.stride
+                precondition(byteCount <= destination.count && byteCount <= source.count)
+                destination.baseAddress!.copyMemory(from: source.baseAddress!, byteCount: byteCount)
+            }
         }
-        if commandBuffer == nil { cmdBuf.commit() }
         mark("write")
         if sectionStats && frameCount % 120 == 7 {
             var out = "[labels-sections] frame=\(frameCount)"
@@ -299,5 +329,40 @@ public final class LabelBatchSystem {
             }
             print(out + " totalLabels=\(totalLabelCount) topics=\(topicCount)")
         }
+    }
+}
+
+/// Shared placement and screen-size contract for rendered cluster labels and
+/// an embedded host's initial/explicit camera fit. Desktop sizing stays opt-in.
+public enum ClusterLabelKind: Sendable, Equatable {
+    case project, topic
+    public var graphVerticalOffset: Float { self == .project ? 40 : 25 }
+    public var maximumPointHeight: CGFloat { self == .project ? 18 : 12 }
+    public var maximumViewportWidthFraction: CGFloat { self == .project ? 0.6 : 0.5 }
+    public func maximumPointSize(in viewport: CGSize) -> CGSize {
+        CGSize(width: viewport.width * maximumViewportWidthFraction, height: maximumPointHeight)
+    }
+}
+
+/// Billboard point size follows perspective depth; it never enlarges the legacy
+/// world-space glyphs. Invalid/unmeasured mobile geometry renders no cluster title.
+/// This scalar calculation runs only for the already-cached cluster labels.
+enum ClusterLabelSizing {
+    static func halfHeight(legacy: Float, bounded: Bool, aspect: Float, depth: Float,
+                           fovDegrees: Float, viewport: CGSize?, maximumHeight: Float,
+                           maximumWidthFraction: Float) -> Float {
+        guard bounded else { return legacy }
+        guard let viewport, viewport.width.isFinite, viewport.height.isFinite,
+              viewport.width > 0, viewport.height > 0,
+              aspect.isFinite, aspect > 0, depth.isFinite, depth > 0,
+              fovDegrees.isFinite, fovDegrees > 0, fovDegrees < 180,
+              maximumHeight.isFinite, maximumHeight > 0,
+              maximumWidthFraction.isFinite, maximumWidthFraction > 0,
+              legacy.isFinite, legacy > 0 else { return 0 }
+        let height = min(Double(maximumHeight),
+                         Double(viewport.width) * Double(maximumWidthFraction) / Double(aspect))
+        let half = height * Double(depth) * tan(Double(fovDegrees) * .pi / 360) / Double(viewport.height)
+        guard half.isFinite, half > 0 else { return 0 }
+        return Float(min(Double(legacy), half))
     }
 }

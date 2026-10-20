@@ -59,7 +59,7 @@ public enum GroupDirectory {
     /// Overridable for tests (point at a fixture file). Defaults to the
     /// daemon-written location.
     nonisolated(unsafe) public static var fileURL: URL = {
-        let home = FileManager.default.homeDirectoryForCurrentUser
+        let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
         return home.appendingPathComponent(".claude/sync/groups.json")
     }()
 

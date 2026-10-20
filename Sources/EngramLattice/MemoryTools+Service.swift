@@ -25,6 +25,7 @@ extension MemoryTools: MemoryService {
     // MARK: Core reads
 
     public func recall(_ request: RecallRequest) async throws -> RecallResult {
+        defer { retireAllReadMarks() }
         var args: [String: Value] = [
             "query": .string(request.query),
             "depth": .int(request.depth),
@@ -32,12 +33,24 @@ extension MemoryTools: MemoryService {
         ]
         if let project = request.project { args["project"] = .string(project) }
         let result = try await handleRecall(args)
-        return RecallResult(hits: lastRecallHits,
+        let hits = lastRecallHits.map { hit in
+            var hit = hit
+            if let sharedId = spokeResidentGroupId(hit.memory.id) {
+                hit.sourceGraphId = sharedId
+                hit.sourceGraphName = sharedGraphNames[sharedId]
+            } else if let graphBinding {
+                hit.sourceGraphId = graphBinding.graphId
+                hit.sourceGraphName = graphBinding.displayName
+            }
+            return hit
+        }
+        return RecallResult(hits: hits,
                             mode: lastRecallMode,
                             renderedText: Self.text(from: result))
     }
 
     public func advise(_ request: AdviseRequest) async throws -> AdviseResult {
+        defer { retireAllReadMarks() }
         // The hook pipeline, server-side: distill content words, recall,
         // wrap as the injection-ready section. Gate-less v1 — the server
         // runs once per agent event, not per keystroke-prompt; the
@@ -48,19 +61,32 @@ extension MemoryTools: MemoryService {
             query: query, project: request.project, depth: 1, limit: 5))
         guard !recallResult.hits.isEmpty,
               recallResult.renderedText != "No memories found." else {
-            return AdviseResult(block: nil, memoryIds: [], mode: recallResult.mode)
+            return AdviseResult(block: nil, memoryIds: [], mode: recallResult.mode, query: query, hits: [])
         }
+        let budget = max(0, request.budget)
+        let overhead = AdviseAssembly.memorySection(renderedRecall: "", query: query).count
+        guard budget > overhead else {
+            return AdviseResult(block: nil, memoryIds: [], mode: recallResult.mode, query: query, hits: [])
+        }
+        let available = budget - overhead
         var rendered = recallResult.renderedText
-        if rendered.count > request.budget {
-            rendered = String(rendered.prefix(request.budget)) + "\n… (truncated)"
+        if rendered.count > available {
+            let suffix = "\n… (truncated)"
+            rendered = String(rendered.prefix(max(0, available - suffix.count)))
+                + String(suffix.prefix(available))
+        }
+        let visibleHits = recallResult.hits.filter { rendered.contains($0.memory.id.uuidString) }
+        guard !visibleHits.isEmpty else {
+            return AdviseResult(block: nil, memoryIds: [], mode: recallResult.mode, query: query, hits: [])
         }
         return AdviseResult(
-            block: AdviseAssembly.memorySection(renderedRecall: rendered),
-            memoryIds: recallResult.hits.map(\.memory.id),
-            mode: recallResult.mode)
+            block: AdviseAssembly.memorySection(renderedRecall: rendered, query: query),
+            memoryIds: visibleHits.map(\.memory.id),
+            mode: recallResult.mode, query: query, hits: visibleHits)
     }
 
     public func graph(_ request: GraphRequest) async throws -> GraphResult {
+        defer { retireAllReadMarks() }
         // Resolve BEFORE rendering: a missing/hard-deleted id is a typed
         // notFound, not whatever prose the handler renders for it.
         guard let (root, _) = findMemory(id: request.id) else {
@@ -79,6 +105,7 @@ extension MemoryTools: MemoryService {
     // MARK: Core writes
 
     public func remember(_ request: RememberRequest) async throws -> RememberResult {
+        defer { retireAllReadMarks() }
         var args: [String: Value] = [
             "content": .string(request.content),
             "is_private": .bool(request.isPrivate),
@@ -95,10 +122,12 @@ extension MemoryTools: MemoryService {
             // Conflict-warning path: the handler declined to store.
             throw MemoryServiceError.invalidArguments(Self.text(from: result))
         }
-        return RememberResult(id: id, message: Self.text(from: result))
+        return RememberResult(id: id, message: Self.text(from: result),
+                              embeddingPending: lastRememberedEmbeddingPending)
     }
 
     public func update(_ request: UpdateRequest) async throws -> ToolReply {
+        defer { retireAllReadMarks() }
         var args: [String: Value] = ["id": .string(request.id.uuidString)]
         if let v = request.content { args["content"] = .string(v) }
         if let v = request.append { args["append"] = .string(v) }
@@ -106,7 +135,7 @@ extension MemoryTools: MemoryService {
         if let v = request.find { args["find"] = .string(v) }
         if let v = request.replace { args["replace"] = .string(v) }
         if let v = request.topic { args["topic"] = .string(v) }
-        if let v = request.project { args["project"] = .string(v) }
+        if let v = request.project { args["set_project"] = .string(v) }
         if let v = request.importance { args["importance"] = .int(v) }
         if let v = request.expiresInDays { args["expires_in_days"] = .int(v) }
         if let v = request.isPrivate { args["is_private"] = .bool(v) }
@@ -115,6 +144,7 @@ extension MemoryTools: MemoryService {
     }
 
     public func forget(_ request: ForgetRequest) async throws -> ToolReply {
+        defer { retireAllReadMarks() }
         var args: [String: Value] = [:]
         if let id = request.id { args["id"] = .string(id.uuidString) }
         if let topic = request.topic { args["topic"] = .string(topic) }
@@ -123,7 +153,8 @@ extension MemoryTools: MemoryService {
     }
 
     public func connect(_ request: ConnectRequest) async throws -> ToolReply {
-        Self.reply(try handleConnect([
+        defer { retireAllReadMarks() }
+        return Self.reply(try handleConnect([
             "from": .string(request.sourceId.uuidString),
             "to": .string(request.targetId.uuidString),
             "relation": .string(request.relation),
@@ -131,7 +162,8 @@ extension MemoryTools: MemoryService {
     }
 
     public func disconnect(_ request: ConnectRequest) async throws -> ToolReply {
-        Self.reply(try handleDisconnect([
+        defer { retireAllReadMarks() }
+        return Self.reply(try handleDisconnect([
             "from": .string(request.sourceId.uuidString),
             "to": .string(request.targetId.uuidString),
             "relation": .string(request.relation),
@@ -139,6 +171,7 @@ extension MemoryTools: MemoryService {
     }
 
     public func merge(ids: [UUID], content: String, topic: String?, project: String?) async throws -> ToolReply {
+        defer { retireAllReadMarks() }
         var args: [String: Value] = [
             "ids": .array(ids.map { .string($0.uuidString) }),
             "content": .string(content),
@@ -151,14 +184,17 @@ extension MemoryTools: MemoryService {
     // MARK: Rendered-text surface
 
     public func stats(project: String?) async throws -> ToolReply {
-        Self.reply(try handleStats(project.map { ["project": .string($0)] }))
+        defer { retireAllReadMarks() }
+        return Self.reply(try handleStats(project.map { ["project": .string($0)] }))
     }
 
     public func listTopics(project: String?) async throws -> ToolReply {
-        Self.reply(try handleListTopics(project.map { ["project": .string($0)] }))
+        defer { retireAllReadMarks() }
+        return Self.reply(try handleListTopics(project.map { ["project": .string($0)] }))
     }
 
     public func timeline(project: String?, groupBy: String?) async throws -> ToolReply {
+        defer { retireAllReadMarks() }
         var args: [String: Value] = [:]
         if let project { args["project"] = .string(project) }
         if let groupBy { args["group_by"] = .string(groupBy) }
@@ -166,11 +202,13 @@ extension MemoryTools: MemoryService {
     }
 
     public func beginEpisode(title: String, sessionKey: String?) async throws -> ToolReply {
+        defer { retireAllReadMarks() }
         _ = sessionKey  // lattice conformance: one session per process (CLI)
         return Self.reply(try await handleBeginEpisode(["title": .string(title)]))
     }
 
     public func endEpisode(summary: String?, sessionKey: String?) async throws -> ToolReply {
+        defer { retireAllReadMarks() }
         _ = sessionKey
         var args: [String: Value] = [:]
         if let summary { args["summary"] = .string(summary) }
@@ -178,37 +216,45 @@ extension MemoryTools: MemoryService {
     }
 
     public func recallEpisode(id: UUID, limit: Int?) async throws -> ToolReply {
+        defer { retireAllReadMarks() }
         var args: [String: Value] = ["episode_id": .string(id.uuidString)]
         if let limit { args["limit"] = .int(limit) }
         return Self.reply(try handleRecallEpisode(args))
     }
 
     public func listEpisodes(limit: Int?) async throws -> ToolReply {
-        Self.reply(try handleListEpisodes(limit.map { ["limit": .int($0)] }))
+        defer { retireAllReadMarks() }
+        return Self.reply(try handleListEpisodes(limit.map { ["limit": .int($0)] }))
     }
 
     public func checkpoint(title: String, sessionKey: String?) async throws -> ToolReply {
+        defer { retireAllReadMarks() }
         _ = sessionKey
         return Self.reply(try handleCheckpoint(["title": .string(title)]))
     }
 
     public func resume(taskId: Int) async throws -> ToolReply {
-        Self.reply(try handleResume(["task_id": .int(taskId)]))
+        defer { retireAllReadMarks() }
+        return Self.reply(try handleResume(["task_id": .int(taskId)]))
     }
 
     public func listTasks() async throws -> ToolReply {
-        Self.reply(try handleListTasks(nil))
+        defer { retireAllReadMarks() }
+        return Self.reply(try handleListTasks(nil))
     }
 
     public func findClusters(project: String?) async throws -> ToolReply {
-        Self.reply(try await handleFindClusters(project.map { ["project": .string($0)] }))
+        defer { retireAllReadMarks() }
+        return Self.reply(try await handleFindClusters(project.map { ["project": .string($0)] }))
     }
 
     public func detectCommunities(project: String) async throws -> ToolReply {
-        Self.reply(try await handleDetectCommunities(["project": .string(project)]))
+        defer { retireAllReadMarks() }
+        return Self.reply(try await handleDetectCommunities(["project": .string(project)]))
     }
 
     public func organize(ids: [UUID], label: String, project: String?, summary: String?) async throws -> ToolReply {
+        defer { retireAllReadMarks() }
         var args: [String: Value] = [
             "ids": .array(ids.map { .string($0.uuidString) }),
             "label": .string(label),
@@ -219,6 +265,7 @@ extension MemoryTools: MemoryService {
     }
 
     public func consolidate(ids: [UUID], content: String, topic: String?, project: String?, force: Bool) async throws -> ToolReply {
+        defer { retireAllReadMarks() }
         var args: [String: Value] = [
             "ids": .array(ids.map { .string($0.uuidString) }),
             "content": .string(content),
@@ -230,11 +277,13 @@ extension MemoryTools: MemoryService {
     }
 
     public func vacuum() async throws -> ToolReply {
-        Self.reply(try handleVacuum())
+        defer { retireAllReadMarks() }
+        return Self.reply(try handleVacuum())
     }
 
     public func trainVectors() async throws -> ToolReply {
-        Self.reply(try handleTrainVectors())
+        defer { retireAllReadMarks() }
+        return Self.reply(try handleTrainVectors())
     }
 
     // MARK: Result mapping

@@ -24,7 +24,11 @@ public final class RKLabelAtlasGenerator {
     /// Atlas texture resource for RealityKit materials.
     public private(set) var atlasTexture: TextureResource?
 
-    private var cachedNodeIds: Set<UUID> = []
+    // Counts successful atlas creation, excluding cached-input early returns.
+    private(set) var diagnosticAtlasCreations: UInt64 = 0
+    private var cachedEntries: [AtlasEntry] = []
+    private var cachedProjects: Set<String> = []
+    private var cachedTopics: Set<String> = []
 
     public init(device: MTLDevice) {
         self.device = device
@@ -41,16 +45,21 @@ public final class RKLabelAtlasGenerator {
         projects: Set<String> = [],
         topics: Set<String> = []
     ) {
+        _ = refreshAtlas(nodes: nodes, hubs: hubs, projects: projects, topics: topics)
+    }
+
+    /// True when these exact raster inputs have a valid cached or newly created atlas.
+    func refreshAtlas(
+        nodes: [RKNodeSnapshot], hubs: Set<UUID>, projects: Set<String>, topics: Set<String>
+    ) -> Bool {
         let entries = nodes.map { node in
             AtlasEntry(id: node.id, label: node.label, isHub: hubs.contains(node.id))
         }
 
-        // Skip if entries haven't changed
-        let newIds = Set(entries.map(\.id))
-        if newIds == cachedNodeIds && atlasTexture != nil { return }
-        cachedNodeIds = newIds
-
-        guard !entries.isEmpty else { return }
+        // Compare raster inputs only at regeneration boundaries, never per frame.
+        if entries == cachedEntries, projects == cachedProjects, topics == cachedTopics,
+           atlasTexture != nil { return true }
+        guard !entries.isEmpty else { return false }
 
         // Fonts
         let monoMedium = CTFontCreateWithName("SF Mono" as CFString, 14, nil)
@@ -59,6 +68,16 @@ public final class RKLabelAtlasGenerator {
         let topicFont = CTFontCreateWithName("SF Mono" as CFString, 24, nil)
 
         let padding: CGFloat = 4
+        let maxDim = 4096
+        // Keep the complete line. If it exceeds the bounded native texture,
+        // uniformly reduce its raster scale instead of clipping or dropping it.
+        func boundedMetrics(width: CGFloat, height: CGFloat, ascent: CGFloat)
+            -> (width: CGFloat, height: CGFloat, ascent: CGFloat, scale: CGFloat) {
+            let limit = CGFloat(maxDim) - padding * 2
+            let scale = min(1, min(limit / max(width, 1), limit / max(height, 1)))
+            return (width * scale, height * scale, ascent * scale, scale)
+        }
+        let labelColor = CGColor(gray: 1, alpha: 1)
 
         // --- Measure project labels ---
         struct ClusterLabel {
@@ -67,39 +86,45 @@ public final class RKLabelAtlasGenerator {
             let width: CGFloat
             let height: CGFloat
             let ascent: CGFloat
+            let rasterScale: CGFloat
         }
         var projLabels: [ClusterLabel] = []
         for name in projects.sorted() {
-            let attrs: [NSAttributedString.Key: Any] = [.font: projFont, .foregroundColor: CGColor.white]
+            let attrs: [NSAttributedString.Key: Any] = [.font: projFont, .foregroundColor: labelColor]
             let attrStr = NSAttributedString(string: name.uppercased(), attributes: attrs)
             let line = CTLineCreateWithAttributedString(attrStr)
             var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
             let w = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
-            projLabels.append(ClusterLabel(key: name, line: line, width: w + 8, height: ascent + descent + leading, ascent: ascent))
+            let metrics = boundedMetrics(width: w + 8, height: ascent + descent + leading, ascent: ascent)
+            projLabels.append(ClusterLabel(key: name, line: line, width: metrics.width,
+                height: metrics.height, ascent: metrics.ascent, rasterScale: metrics.scale))
         }
 
         // --- Measure topic labels ---
         var topicLabels: [ClusterLabel] = []
         for name in topics.sorted() {
-            let attrs: [NSAttributedString.Key: Any] = [.font: topicFont, .foregroundColor: CGColor.white]
+            let attrs: [NSAttributedString.Key: Any] = [.font: topicFont, .foregroundColor: labelColor]
             let attrStr = NSAttributedString(string: name, attributes: attrs)
             let line = CTLineCreateWithAttributedString(attrStr)
             var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
             let w = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
-            topicLabels.append(ClusterLabel(key: name, line: line, width: w + 8, height: ascent + descent + leading, ascent: ascent))
+            let metrics = boundedMetrics(width: w + 8, height: ascent + descent + leading, ascent: ascent)
+            topicLabels.append(ClusterLabel(key: name, line: line, width: metrics.width,
+                height: metrics.height, ascent: metrics.ascent, rasterScale: metrics.scale))
         }
 
         // --- Measure node labels ---
-        var labelInfos: [(entry: AtlasEntry, line: CTLine, width: CGFloat, height: CGFloat, ascent: CGFloat)] = []
+        var labelInfos: [(entry: AtlasEntry, line: CTLine, width: CGFloat, height: CGFloat, ascent: CGFloat, rasterScale: CGFloat)] = []
         for entry in entries {
             let font = entry.isHub ? monoBold : monoMedium
-            let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: CGColor.white]
+            let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: labelColor]
             let attrStr = NSAttributedString(string: entry.label, attributes: attributes)
             let line = CTLineCreateWithAttributedString(attrStr)
             var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
             let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
             let height = ascent + descent + leading
-            labelInfos.append((entry, line, width + 8, height + 4, ascent))
+            let metrics = boundedMetrics(width: width + 8, height: height + 4, ascent: ascent)
+            labelInfos.append((entry, line, metrics.width, metrics.height, metrics.ascent, metrics.scale))
         }
         labelInfos.sort { $0.height > $1.height }
 
@@ -117,9 +142,13 @@ public final class RKLabelAtlasGenerator {
             return curY + rowH
         }
 
-        let maxDim = 4096
         var atlasW: Int = 512
         var atlasH: Int = 512
+        // Row wrapping alone cannot fit a rectangle wider than the bitmap.
+        let widestCluster = max(projLabels.map(\.width).max() ?? 0, topicLabels.map(\.width).max() ?? 0)
+        let widest = max(widestCluster, labelInfos.map(\.width).max() ?? 0)
+        let minimumWidth = min(maxDim, Int(ceil(widest + padding * 2)))
+        while atlasW < minimumWidth { atlasW *= 2 }
 
         // Expand atlas to fit cluster labels + as many node labels as possible
         while true {
@@ -164,8 +193,18 @@ public final class RKLabelAtlasGenerator {
             bytesPerRow: bytesPerRow,
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return }
+        ) else { return false }
         context.clear(CGRect(x: 0, y: 0, width: atlasW, height: atlasH))
+
+        func drawLine(_ line: CTLine, x: CGFloat, y: CGFloat, scale: CGFloat) {
+            context.saveGState()
+            context.translateBy(x: x, y: y)
+            context.scaleBy(x: scale, y: scale)
+            context.textMatrix = .identity
+            context.textPosition = .zero
+            CTLineDraw(line, context)
+            context.restoreGState()
+        }
 
         let uvW = Float(atlasW)
         let uvH = Float(atlasH)
@@ -184,8 +223,7 @@ public final class RKLabelAtlasGenerator {
 
                 let drawX = CGFloat(curX) + padding
                 let drawY = CGFloat(atlasH - curY) - label.ascent - padding
-                context.textPosition = CGPoint(x: drawX, y: drawY)
-                CTLineDraw(label.line, context)
+                drawLine(label.line, x: drawX, y: drawY, scale: label.rasterScale)
 
                 let u0 = Float(curX) / uvW
                 let v0 = Float(atlasH - curY - h) / uvH
@@ -201,11 +239,9 @@ public final class RKLabelAtlasGenerator {
 
         // 1. Pack project labels first (highest priority)
         let (projRectMap, afterProjY) = drawClusterLabels(projLabels, startY: 0)
-        self.projectRects = projRectMap
 
         // 2. Pack topic labels next
         let (topicRectMap, afterTopicY) = drawClusterLabels(topicLabels, startY: afterProjY)
-        self.topicRects = topicRectMap
 
         // 3. Pack node labels in remaining space
         var nodeRectMap: [UUID: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
@@ -222,8 +258,7 @@ public final class RKLabelAtlasGenerator {
 
             let drawX = CGFloat(curX) + padding
             let drawY = CGFloat(atlasH - curY) - info.ascent - padding
-            context.textPosition = CGPoint(x: drawX, y: drawY)
-            CTLineDraw(info.line, context)
+            drawLine(info.line, x: drawX, y: drawY, scale: info.rasterScale)
 
             let u0 = Float(curX) / uvW
             let v0 = Float(atlasH - curY - h) / uvH
@@ -234,23 +269,28 @@ public final class RKLabelAtlasGenerator {
             curX += w
             rowH = max(rowH, h)
         }
-        self.nodeRects = nodeRectMap
-        self.aspectCorrection = Float(atlasW) / Float(atlasH)
-
         // Create TextureResource from CGContext's CGImage
-        guard let image = context.makeImage() else { return }
+        guard let image = context.makeImage() else { return false }
 
         do {
             let texture = try TextureResource(image: image, options: .init(semantic: .raw))
+            // Publish matching UVs, dimensions and cache inputs only with the
+            // successful texture. A failed rebuild leaves the prior atlas coherent.
             self.atlasTexture = texture
+            self.projectRects = projRectMap; self.topicRects = topicRectMap
+            self.nodeRects = nodeRectMap
+            self.aspectCorrection = Float(atlasW) / Float(atlasH)
+            cachedEntries = entries; cachedProjects = projects; cachedTopics = topics
+            diagnosticAtlasCreations &+= 1
+            return true
         } catch {
-            // Fallback — atlas generation failed
+            return false
         }
     }
 }
 
 /// Internal atlas entry for label generation.
-struct AtlasEntry {
+struct AtlasEntry: Equatable {
     let id: UUID
     let label: String
     let isHub: Bool

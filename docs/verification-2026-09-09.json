@@ -1,0 +1,41 @@
+{
+  "recorded_at": "2026-09-09T03:26:06Z",
+  "status": "verified local implementation; uncommitted and not deployed",
+  "base_git_head_not_release_revision": "185e656ebf910cc93d17063039d469f6cde36b65",
+  "source_digest": {
+    "file_count": 321,
+    "sha256": "cd1beeb88e73daf9a4f3f2aa08a15a7dac55f0a1942f0b45608699a54b8b5388"
+  },
+  "source_digest_definition": "SHA256 over lexically sorted relative paths, each UTF-8 path then NUL then binary SHA256(file bytes). Inputs: existing root Package.swift/Package.resolved, Desktop/Package.swift, Portable/Package.swift, Kit/Package.swift, and nonsymlink regular files recursively under Sources, Tests, Plugins, scripts, include, src; exclude .DS_Store. Documentation and build outputs excluded.",
+  "local_dependency_source_digests": {
+    "lattice": {
+      "file_count": 172,
+      "sha256": "8ebed214ba87900b0e6cb07c22b5f3c72946405063c97c56abe630fa4164507e"
+    },
+    "LatticeCore": {
+      "file_count": 845,
+      "sha256": "aa987677d4c1da6a81a56a5545b53e285ab141790b457df3cdd9b3e81ed793ec"
+    }
+  },
+  "runs": [
+    {
+      "name": "Portable full suite",
+      "log_local_path": "/tmp/engram-portable-final-full-tests.log",
+      "log_sha256": "bba6fdc3a055ea5ae326e73e57a608753fd7f11a08fc482d3d28965ed1441a02",
+      "tests": 42,
+      "suites": 12,
+      "seconds": 0.854,
+      "result": "passed"
+    },
+    {
+      "name": "Real audit/snapshot transport, source validation and bundled CoreML",
+      "log_local_path": "/tmp/engram-final-transfer-tests2.log",
+      "log_sha256": "c670d114ada713eba1e0dbe345dc45537a4ce7533f53af4925300b5ab50fbc14",
+      "tests": 11,
+      "suites": 3,
+      "seconds": 1.312,
+      "result": "passed"
+    }
+  ],
+  "release_limit": "Coordinated LatticeCore, Lattice and Engram changes require real committed/published dependency revisions before a consumer release. The base HEAD is not a pin for these changes."
+}

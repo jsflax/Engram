@@ -18,6 +18,9 @@ import Foundation
 /// - **graph**: View a memory's neighborhood in the knowledge graph.
 public actor MemoryTools {
     /// Local database — all writes go here. Reads go here for local-only projects.
+    package let privateGraphOnly: Bool
+    package let graphBinding: AgentMemoryBinding?
+    package let sharedGraphNames: [UUID: String]
     package let localLattice: Lattice
     /// Synced database (memory-synced.sqlite) — reads go here for synced projects.
     /// Contains cross-device data relayed by the sync daemon. Nil if no synced DB exists.
@@ -80,6 +83,7 @@ public actor MemoryTools {
     var lastRecallMode: RecallMode = .vector
 
     /// The globalId of the last remembered row — same capture contract.
+    var lastRememberedEmbeddingPending = false
     var lastRememberedId: UUID?
 
     /// DTO mapping for the contract surface (never leaks live rows).
@@ -107,10 +111,17 @@ public actor MemoryTools {
                 syncedRef: LatticeThreadSafeReference?,
                 groupRefs: [GroupSpokeRef] = [],
                 embedder: any Embedder,
-                identity: any IdentityProviding = GroupDirectoryIdentityProvider()) {
+                identity: any IdentityProviding = GroupDirectoryIdentityProvider(),
+                privateGraphOnly: Bool = false,
+                graphBinding: AgentMemoryBinding? = nil,
+                sharedGraphNames: [UUID: String] = [:]) {
         guard let local = localRef.resolve() else {
             fatalError("Failed to resolve local lattice reference")
         }
+        self.fenceForeignContent = privateGraphOnly
+        self.privateGraphOnly = privateGraphOnly
+        self.graphBinding = graphBinding
+        self.sharedGraphNames = sharedGraphNames
         self.localLattice = local
         self.syncedLattice = syncedRef?.resolve()
         self.groupSpokes = groupRefs.compactMap { spoke in
@@ -306,7 +317,7 @@ public actor MemoryTools {
     func viaMarker(for globalId: UUID) -> String {
         guard !groupSpokes.isEmpty,
               let gid = spokeResidentGroupId(globalId) else { return "" }
-        let name = GroupDirectory.groupName(for: gid)
+        let name = sharedGraphNames[gid] ?? GroupDirectory.groupName(for: gid)
             ?? String(gid.uuidString.prefix(8))
         return " [via:\(name)]"
     }
@@ -392,6 +403,27 @@ public actor MemoryTools {
         return nil
     }
 
+    /// Mutation lookups never traverse an agent's read-only recall sources.
+    func findWritableMemory(id: UUID) -> (memory: Memory, lattice: Lattice)? {
+        guard privateGraphOnly else { return findMemory(id: id) }
+        guard let memory = localLattice.objects(Memory.self).where({ $0.globalId == id }).first else { return nil }
+        return (memory, localLattice)
+    }
+
+    func findWritableEdge(id: UUID) -> (edge: Edge, lattice: Lattice)? {
+        guard privateGraphOnly else { return findEdge(id: id) }
+        guard let edge = localLattice.objects(Edge.self).where({ $0.globalId == id }).first else { return nil }
+        return (edge, localLattice)
+    }
+
+    func writeLattice(for project: String?) -> Lattice {
+        privateGraphOnly ? localLattice : readLattice(for: project)
+    }
+
+    var writableSpokes: [(groupId: UUID, path: String, lattice: Lattice)] {
+        privateGraphOnly ? [] : liveGroupSpokes()
+    }
+
     /// Finds an edge by globalId: local, then synced, then group spokes.
     /// Group-only edges (both endpoints group-resident) live exclusively in
     /// a spoke — they never transit the hub, where they would dangle.
@@ -462,7 +494,10 @@ public actor MemoryTools {
 
     // MARK: - Tool Definitions
 
-    public var definitions: [Tool] {
+    public var definitions: [Tool] { Self.toolDefinitions }
+
+    /// Static tool metadata for settings; reading it never opens an agent graph.
+    public nonisolated static var toolDefinitions: [Tool] {
         [
             Tool(
                 name: "remember",
@@ -1208,7 +1243,7 @@ public actor MemoryTools {
     /// Every lattice this instance can hold a read generation on: the hub,
     /// the personal synced mirror, the group spokes, and the attach-cache
     /// union handles built over them.
-    private func retireAllReadMarks() {
+    func retireAllReadMarks() {
         localLattice.retireAllGenerations()
         syncedLattice?.retireAllGenerations()
         for spoke in groupSpokes {

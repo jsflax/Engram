@@ -1,3 +1,4 @@
+import EngramGraphUI
 import SwiftUI
 import Lattice
 import Combine
@@ -133,56 +134,7 @@ struct SearchBarView: View {
     @FocusState private var isFocused: Bool
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.white.opacity(0.4))
-                .font(.system(size: 12))
-            TextField("Search memories…", text: $text)
-                .textFieldStyle(.plain)
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.9))
-                .focused($isFocused)
-                .onAppear {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        isFocused = false
-                    }
-                }
-                .frame(width: 180)
-                .onKeyPress(.escape) {
-                    text = ""
-                    matchIds = []
-                    isActive = false
-                    isFocused = false
-                    return .handled
-                }
-            if !text.isEmpty {
-                Button {
-                    text = ""
-                    matchIds = []
-                    isActive = false
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.white.opacity(0.4))
-                        .font(.system(size: 11))
-                }
-                .buttonStyle(.plain)
-
-                let matchCount = matchIds.count
-                Text("\(matchCount) match\(matchCount == 1 ? "" : "es")")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.4))
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color(red: 0.08, green: 0.1, blue: 0.14))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .strokeBorder(.white.opacity(isFocused ? 0.3 : 0.1), lineWidth: 1)
-                )
-        )
+        EngramGraphSearchField(text: $text, matchCount: matchIds.count)
         .task(id: text) {
             let query = text
             guard !query.isEmpty else {

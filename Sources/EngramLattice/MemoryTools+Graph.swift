@@ -25,10 +25,10 @@ extension MemoryTools {
         }
 
         // Validate both memories exist
-        guard findMemory(id: fromGid) != nil else {
+        guard findWritableMemory(id: fromGid) != nil else {
             return CallTool.Result(content: [.text("Memory with id \(fromGid.uuidString) not found.")], isError: true)
         }
-        guard findMemory(id: toGid) != nil else {
+        guard findWritableMemory(id: toGid) != nil else {
             return CallTool.Result(content: [.text("Memory with id \(toGid.uuidString) not found.")], isError: true)
         }
 
@@ -78,7 +78,7 @@ extension MemoryTools {
         // (a hard edge delete replicates to every member); purely-local
         // edges keep the hard delete.
         if let edgeGid = a.id?.value {
-            guard let (edge, foundLattice) = findEdge(id: edgeGid) else {
+            guard let (edge, foundLattice) = findWritableEdge(id: edgeGid) else {
                 return CallTool.Result(content: [.text("Edge with id \(edgeGid.uuidString) not found.")], isError: true)
             }
             if edgeTouchesGroupSharedMemory(edge) {
@@ -103,10 +103,10 @@ extension MemoryTools {
         }
 
         // Validate memories exist
-        guard findMemory(id: fromGid) != nil else {
+        guard findWritableMemory(id: fromGid) != nil else {
             return CallTool.Result(content: [.text("Memory with id \(fromGid.uuidString) not found.")], isError: true)
         }
-        guard findMemory(id: toGid) != nil else {
+        guard findWritableMemory(id: toGid) != nil else {
             return CallTool.Result(content: [.text("Memory with id \(toGid.uuidString) not found.")], isError: true)
         }
 
@@ -147,7 +147,7 @@ extension MemoryTools {
     /// drives tombstone-vs-hard-delete for edge removal.
     func edgeTouchesGroupSharedMemory(_ edge: Edge) -> Bool {
         for gid in [edge.sourceGlobalId, edge.targetGlobalId] {
-            if let (mem, _) = findMemory(id: gid), isGroupShared(mem) {
+            if let (mem, _) = findWritableMemory(id: gid), isGroupShared(mem) {
                 return true
             }
         }
@@ -300,7 +300,7 @@ extension MemoryTools {
         var total = 0
         let now = Date()
         var lattices: [Lattice] = [localLattice]
-        if let syncedLattice { lattices.append(syncedLattice) }
+        if !privateGraphOnly, let syncedLattice { lattices.append(syncedLattice) }
         for lattice in lattices {
             for gid in globalIds {
                 let edges = lattice.objects(Edge.self)
@@ -324,7 +324,7 @@ extension MemoryTools {
     func reviveEdgesForMemory(_ gid: UUID) -> Int {
         var total = 0
         var lattices: [Lattice] = [localLattice]
-        if let syncedLattice { lattices.append(syncedLattice) }
+        if !privateGraphOnly, let syncedLattice { lattices.append(syncedLattice) }
         for lattice in lattices {
             let edges = lattice.objects(Edge.self)
                 .where { ($0.sourceGlobalId == gid || $0.targetGlobalId == gid) && $0.deletedAt != nil }

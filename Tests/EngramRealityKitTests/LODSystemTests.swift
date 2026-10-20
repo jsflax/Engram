@@ -184,3 +184,116 @@ struct LODSystemTests {
         #expect(result.visibleLabelIndices.count == 5)
     }
 }
+
+@Suite("LOD invalidation and settled work") @MainActor
+struct LODInvalidationTests {
+    private func nodes(_ count: Int) -> [RKNodeSnapshot] {
+        (0..<count).map { RKNodeSnapshot(id: UUID(), project: "p", topic: "t", label: "n\($0)", importance: 1, isHub: false) }
+    }
+    private func visible(_ value: VisibleSet) -> Set<Int> {
+        Set(value.nearNodes + value.midNodes + value.farNodes)
+    }
+
+    @Test(arguments: [true, false])
+    func movedPositionsInvalidateWithOrWithoutRevision(hasRevision: Bool) {
+        let lod = LODSystem(), rows = nodes(3)
+        func compute(_ x: [Float], _ revision: UInt64) -> VisibleSet {
+            lod.computeVisibleSet(nodes: rows, edges: [], positions: [:],
+                positionArray: x.map { SIMD3<Float>($0, 0, 0) }, cameraPosition: .zero,
+                selectedNode: nil, glowingNodes: [:], hubs: [], topologyVersion: 1,
+                positionRevision: hasRevision ? revision : nil)
+        }
+        for _ in 0..<256 { _ = compute([10, 20, 30], 1) }
+        #expect(visible(compute([10, 20, 30], 1)).contains(0))
+        let before = lod.visibilityComputationCount
+        // Same camera, same topology, changed published force coordinates.
+        #expect(!visible(compute([3000, 20, 30], 2)).contains(0))
+        #expect(lod.visibilityComputationCount == before + 1)
+        #expect(visible(compute([10, 20, 30], 3)).contains(0))
+        if !hasRevision {
+            let before = lod.visibilityComputationCount
+            for _ in 0..<20 { _ = compute([10, 20, 30], 3) }
+            #expect(lod.visibilityComputationCount == before + 20)
+        }
+    }
+
+    @Test func emaConvergesAfterRestorationWithoutCameraInputThenStopsWork() {
+        let lod = LODSystem(), rows = nodes(2)
+        let edge = RKEdgeSnapshot(id: UUID(), sourceId: rows[0].id, targetId: rows[1].id, relation: "r")
+        func compute(_ restored: Bool) -> VisibleSet {
+            lod.computeVisibleSet(nodes: rows, edges: restored ? [edge] : [], positions: [:],
+                positionArray: [SIMD3<Float>(10, 0, 0), SIMD3<Float>(restored ? 10_000 : 20, 0, 0)],
+                cameraPosition: .zero, selectedNode: nil, glowingNodes: [:], hubs: [],
+                topologyVersion: restored ? 2 : 1, positionRevision: restored ? 2 : 1)
+        }
+        for _ in 0..<256 { _ = compute(false) }
+        let first = compute(true)
+        #expect(first.totalNodeCount == 1 && first.visibleEdgeIndices.isEmpty)
+        // A single publication is sufficient: EMA must continue without a new
+        // position revision, Center action, selection, or camera movement.
+        for _ in 0..<256 { _ = compute(true) }
+        let settled = compute(true), before = lod.visibilityComputationCount
+        #expect(settled.totalNodeCount == 2 && settled.visibleEdgeIndices == [0])
+        for _ in 0..<1_000 { _ = compute(true) }
+        #expect(lod.visibilityComputationCount == before)
+    }
+
+    @Test func glowMembershipAndSelectionChangeBudgetWinnersButGlowAgeDoesNot() {
+        let lod = LODSystem(), rows = nodes(3)
+        lod.maxNodeInstances = 1
+        func compute(_ glow: [UUID: Float], selected: UUID? = nil) -> VisibleSet {
+            lod.computeVisibleSet(nodes: rows, edges: [], positions: [:],
+                positionArray: Array(repeating: SIMD3<Float>(100, 0, 0), count: 3),
+                cameraPosition: .zero, selectedNode: selected, glowingNodes: glow, hubs: [],
+                topologyVersion: 1, positionRevision: 1)
+        }
+        for _ in 0..<256 { _ = compute([rows[0].id: 0]) }
+        #expect(visible(compute([rows[0].id: 0])) == [0])
+        #expect(visible(compute([rows[2].id: 0])) == [2])
+        let before = lod.visibilityComputationCount
+        #expect(visible(compute([rows[2].id: 20])) == [2])
+        #expect(lod.visibilityComputationCount == before)
+        #expect(visible(compute([rows[2].id: 20], selected: rows[1].id)) == [1])
+        #expect(visible(compute([rows[0].id: 0])) == [0])
+    }
+
+    @Test func liveBudgetChangesRecomputeNodesEdgesAndLabels() {
+        let lod = LODSystem(), rows = nodes(2)
+        let edge = RKEdgeSnapshot(id: UUID(), sourceId: rows[0].id, targetId: rows[1].id, relation: "r")
+        func compute() -> VisibleSet {
+            lod.computeVisibleSet(nodes: rows, edges: [edge], positions: [:],
+                positionArray: Array(repeating: SIMD3<Float>(100, 0, 0), count: 2),
+                cameraPosition: .zero, selectedNode: nil, glowingNodes: [:], hubs: [],
+                topologyVersion: 1, positionRevision: 1)
+        }
+        for _ in 0..<256 { _ = compute() }
+        #expect(compute().totalNodeCount == 2)
+        #expect(compute().visibleLabelIndices.count == 2)
+        #expect(compute().visibleEdgeIndices == [0])
+        lod.maxNodeInstances = 1
+        #expect(compute().totalNodeCount == 1 && compute().visibleEdgeIndices.isEmpty)
+        lod.maxNodeInstances = 2; lod.maxEdgeInstances = 0; lod.maxLabelInstances = 0
+        let limited = compute()
+        #expect(limited.totalNodeCount == 2 && limited.visibleEdgeIndices.isEmpty && limited.visibleLabelIndices.isEmpty)
+        lod.maxEdgeInstances = 1; lod.maxLabelInstances = 2
+        #expect(compute().visibleEdgeIndices == [0] && compute().visibleLabelIndices.count == 2)
+    }
+
+    @Test func smallCameraMovementAndMetadataPublicationInvalidate() {
+        let lod = LODSystem(), original = nodes(2)
+        lod.maxNodeInstances = 1
+        var rows = original
+        func compute(camera: SIMD3<Float> = .zero, topology: UInt64 = 1) -> VisibleSet {
+            lod.computeVisibleSet(nodes: rows, edges: [], positions: [:],
+                positionArray: Array(repeating: SIMD3<Float>(100, 0, 0), count: 2),
+                cameraPosition: camera, selectedNode: nil, glowingNodes: [:], hubs: [],
+                topologyVersion: topology, positionRevision: 1)
+        }
+        for _ in 0..<256 { _ = compute() }
+        let before = lod.visibilityComputationCount
+        _ = compute(camera: SIMD3(0.01, 0, 0))
+        #expect(lod.visibilityComputationCount == before + 1)
+        rows[1] = RKNodeSnapshot(id: original[1].id, project: "p", topic: "t", label: "changed", importance: 99, isHub: true)
+        #expect(visible(compute(topology: 2)) == [1])
+    }
+}

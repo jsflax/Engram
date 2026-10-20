@@ -169,11 +169,14 @@ public final class ForceEngine {
         return result
     }
 
-    /// Attempt to encode a GPU force pass (async).
+    /// Attempt to encode a GPU force pass (async). `onSettled` runs after the
+    /// native completion/readback and the main-actor result callback, including
+    /// GPU-error paths. A nil return submits no work and invokes neither callback.
     @discardableResult
     public func encodeForcePass(
         queue: MTLCommandQueue,
         snapshot: SimulationSnapshot,
+        onSettled: (@MainActor @Sendable () -> Void)? = nil,
         onComplete: @MainActor @Sendable @escaping (ForceResult) -> Void
     ) -> MTLCommandBuffer? {
         guard !snapshot.isSettled,
@@ -241,7 +244,7 @@ public final class ForceEngine {
             GPULog.log("FORCE GPU \(String(format: "%.2f", gpuMs))ms algo=\(fc.lastChargeAlgorithm) n=\(nodeCount)")
             if cb.status == .error {
                 GPULog.log("FORCE ERROR: \(cb.error?.localizedDescription ?? "unknown")")
-                Task { @MainActor in fc.inFlight = false }
+                Task { @MainActor in fc.inFlight = false; onSettled?() }
                 return
             }
 
@@ -251,15 +254,17 @@ public final class ForceEngine {
                 Task { @MainActor in
                     fc.inFlight = false
                     onComplete(ForceResult(positions: positions))
+                    onSettled?()
                 }
             } else if let forces = fc.readBackForces() {
                 let result = ForceResult(fx: forces.fx, fy: forces.fy, fz: forces.fz)
                 Task { @MainActor in
                     fc.inFlight = false
                     onComplete(result)
+                    onSettled?()
                 }
             } else {
-                Task { @MainActor in fc.inFlight = false }
+                Task { @MainActor in fc.inFlight = false; onSettled?() }
             }
         }
         cmdBuf.commit()

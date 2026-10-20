@@ -1,4 +1,5 @@
 import SwiftLM
+import EngramCoreML
 import Foundation
 
 /// Manages the CoreML embedding model for semantic memory search.
@@ -48,10 +49,7 @@ public actor EmbeddingService {
 
         if let customPath {
             url = URL(fileURLWithPath: customPath)
-        } else if let bundledURL = Bundle.module.url(
-            forResource: "paraphrase-MiniLM-L6-v2_Embedding",
-            withExtension: "mlmodelc"
-        ) {
+        } else if let bundledURL = CoreMLMemoryAssets.modelURL {
             url = bundledURL
         } else {
             log("No embedding model found (not bundled, no CLAUDE_MEMORY_MODEL). Running in degraded mode (text search only).")
@@ -61,10 +59,7 @@ public actor EmbeddingService {
         do {
             // Find the tokenizer — check bundle first, then auto-discover alongside model
             let tokenizerDir: URL?
-            if let bundledTokenizer = Bundle.module.url(
-                forResource: "paraphrase-MiniLM-L6-v2_tokenizer",
-                withExtension: nil
-            ) {
+            if let bundledTokenizer = CoreMLMemoryAssets.tokenizerDirectory {
                 tokenizerDir = bundledTokenizer
             } else {
                 tokenizerDir = nil  // Let SwiftLM auto-discover from model path

@@ -1,5 +1,5 @@
 import RealityKit
-import AppKit
+import Foundation
 import simd
 
 /// Nebula gas: per-(galaxy, project) cluster emitters, a single-color
@@ -20,7 +20,7 @@ public final class NebulaBatchSystem {
     private var activeGalaxyGas: [String: Entity] = [:]
     private var galaxyGasRadii: [String: Float] = [:]
     private var activeBridges: [String: Entity] = [:]
-    private var colorCache: [String: (start: NSColor, end: NSColor)] = [:]
+    private var colorCache: [String: (start: RKPlatformColor, end: RKPlatformColor)] = [:]
     private var lastColorMapHash: Int = 0
     /// Last applied LOD opacity per entity key — write-on-change only.
     private var lastOpacity: [String: Float] = [:]
@@ -243,16 +243,16 @@ public final class NebulaBatchSystem {
         lastOpacity[key] = clamped
     }
 
-    private func nebulaColors(for key: String, rgb: SIMD3<Float>) -> (start: NSColor, end: NSColor) {
+    private func nebulaColors(for key: String, rgb: SIMD3<Float>) -> (start: RKPlatformColor, end: RKPlatformColor) {
         if let cached = colorCache[key] { return cached }
 
-        let start = NSColor(
+        let start = RKPlatformColor(
             red: CGFloat(min(1.0, rgb.x * 1.3 + 0.1)),
             green: CGFloat(min(1.0, rgb.y * 1.3 + 0.1)),
             blue: CGFloat(min(1.0, rgb.z * 1.3 + 0.1)),
             alpha: 0.035
         )
-        let end = NSColor(
+        let end = RKPlatformColor(
             red: CGFloat(min(1.0, rgb.x * 0.7 + 0.05)),
             green: CGFloat(min(1.0, rgb.y * 0.7 + 0.05)),
             blue: CGFloat(min(1.0, rgb.z * 0.7 + 0.05)),
@@ -266,8 +266,8 @@ public final class NebulaBatchSystem {
     private func makeNebulaEmitter(
         radius: Float,
         scaleFactor: Float,
-        startColor: NSColor,
-        endColor: NSColor,
+        startColor: RKPlatformColor,
+        endColor: RKPlatformColor,
         dense: Bool = false
     ) -> ParticleEmitterComponent {
         var emitter = ParticleEmitterComponent()

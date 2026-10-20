@@ -4,7 +4,6 @@ import simd
 import CoreGraphics
 import EngramSceneKit
 import Foundation
-import AppKit
 
 /// Core RealityKit scene manager — owns entity hierarchy and wires systems to data.
 ///
@@ -62,7 +61,7 @@ public final class EngramRealityScene {
 
     // MARK: - macOS 26+ Instance Resources
     // Stored as Any? to avoid availability constraints on stored properties.
-    // Cast back to concrete types in @available(macOS 26, *) methods.
+    // Cast back to concrete types in @available(macOS 26, iOS 26, *) methods.
 
     /// Sphere template entity for MeshInstancesComponent (macOS 26+).
     var nodeTemplateEntity: ModelEntity?
@@ -74,9 +73,9 @@ public final class EngramRealityScene {
     var _edgeInstanceData: Any?
     /// Per-instance visual data texture for nodes — `LowLevelTexture` (macOS 15+). N×1 rgba16Float.
     var nodeInstanceTexture: LowLevelTexture?
-    /// Per-instance visual data texture for edges — `LowLevelTexture` (macOS 15+). N×1 rgba16Float.
+    /// Per-instance visual data texture for edges — row-packed rgba16Float.
     var edgeInstanceTexture: LowLevelTexture?
-    /// Current texture widths (tracks allocated capacity).
+    /// Current texture row widths; edge capacity can span multiple rows.
     var nodeInstanceTextureWidth: Int = 0
     var edgeInstanceTextureWidth: Int = 0
     /// Set when instance data is replaced (capacity resize) — signals batch systems
@@ -85,14 +84,14 @@ public final class EngramRealityScene {
     var edgeInstanceDataChanged: Bool = false
 
     /// Type-safe accessor for `_nodeInstanceData` (macOS 26+).
-    @available(macOS 26, *)
+    @available(macOS 26, iOS 26, *)
     var nodeInstanceData: LowLevelInstanceData? {
         get { _nodeInstanceData as? LowLevelInstanceData }
         set { _nodeInstanceData = newValue; nodeInstanceDataChanged = true }
     }
 
     /// Type-safe accessor for `_edgeInstanceData` (macOS 26+).
-    @available(macOS 26, *)
+    @available(macOS 26, iOS 26, *)
     var edgeInstanceData: LowLevelInstanceData? {
         get { _edgeInstanceData as? LowLevelInstanceData }
         set { _edgeInstanceData = newValue; edgeInstanceDataChanged = true }
@@ -107,20 +106,29 @@ public final class EngramRealityScene {
 
     // MARK: - Systems
 
-    public let lodSystem: LODSystem
-    public let nodeBatchSystem: NodeBatchSystem
-    public let edgeBatchSystem: EdgeBatchSystem
-    public let labelBatchSystem: LabelBatchSystem
-    public let cameraSystem: CameraSystem
-    public let nebulaBatchSystem: NebulaBatchSystem
-    public let galaxyTitleSystem: GalaxyTitleSystem
-    public let mascotSystem: RKMascotSystem
-    public let flowParticleSystem: RKFlowParticleSystem
+    public private(set) var lodSystem: LODSystem
+    public private(set) var nodeBatchSystem: NodeBatchSystem
+    public private(set) var edgeBatchSystem: EdgeBatchSystem
+    public private(set) var labelBatchSystem: LabelBatchSystem
+    public private(set) var cameraSystem: CameraSystem
+    public private(set) var nebulaBatchSystem: NebulaBatchSystem
+    public private(set) var galaxyTitleSystem: GalaxyTitleSystem
+    /// Embedded single-graph hosts already present the graph title in their UI.
+    /// The desktop multi-galaxy renderer keeps its world-space titles by default.
+    public var showsGalaxyTitles = true {
+        didSet { galaxyTitleContainer.isEnabled = showsGalaxyTitles }
+    }
+    /// Optional point-size caps for project/topic billboards in a small embedded viewport.
+    /// Desktop hosts retain their original world-space sizes unless they opt in.
+    public var usesViewportBoundedClusterLabels = false
+    public var clusterLabelViewportSize: CGSize?
+    public private(set) var mascotSystem: RKMascotSystem
+    public private(set) var flowParticleSystem: RKFlowParticleSystem
     public let spatialAudioSystem: RKSpatialAudioSystem
 
     // MARK: - Label Atlas
 
-    public let labelAtlasGenerator: RKLabelAtlasGenerator
+    public private(set) var labelAtlasGenerator: RKLabelAtlasGenerator
 
     // MARK: - Frame State
 
@@ -132,10 +140,125 @@ public final class EngramRealityScene {
     /// Per-frame callback for the app layer (RKSceneManager) to poll keyboard,
     /// update camera smoothing, dispatch forces, etc. Called at the start of each frame.
     public var onFrameCallback: ((Float) -> Void)?
+    public private(set) var isActive = true
+    public private(set) var isTornDown = false
+    private var setupCompleted = false
+    let diagnosticGeneration = UUID().uuidString.lowercased()
+    private var diagnosticResourceVersion: [UInt64] = []
+    public private(set) var materialFallbacks = Set<String>()
+    func recordMaterialFallback(_ name: String) { materialFallbacks.insert(name) }
+    var stopFrameSubscription: (() -> Void)?
+    private var pendingFrameSubmissions = Set<UUID>()
+    private var frameDrainWaiters: [CheckedContinuation<Void, Never>] = []
+    private var contentHostDetachers: [UUID: () -> Void] = [:]
+    private var retirementTask: Task<Void, Never>?
+    private(set) var resourcesReleased = false
+    var pendingFrameSubmissionCount: Int { pendingFrameSubmissions.count }
+    var attachedContentHostCount: Int { contentHostDetachers.count }
+
+    /// The owner has added this root to actual view content. The callback must
+    /// remove that exact root through the host's public content API. Returning
+    /// from it acknowledges content removal, not CoreRE/GPU presentation completion.
+    func registerContentHost(detach: @escaping () -> Void) -> UUID? {
+        guard !isTornDown else { detach(); return nil }
+        let token = UUID()
+        contentHostDetachers[token] = detach
+        EngramRenderLifecycleDiagnostic.record(.contentAttached, snapshot: renderDiagnosticSnapshot())
+        return token
+    }
+
+    func removeContentHost(_ token: UUID) {
+        guard let detach = contentHostDetachers.removeValue(forKey: token) else { return }
+        EngramRenderLifecycleDiagnostic.record(.contentDetaching, snapshot: renderDiagnosticSnapshot())
+        detach()
+        EngramRenderLifecycleDiagnostic.record(.contentDetached, snapshot: renderDiagnosticSnapshot())
+    }
+
+    /// Call after pause/teardown. Join native asset loads and submitted mesh
+    /// writes; cancellation withdraws visibility immediately but does not pretend
+    /// that a native operation has already returned.
+    public func drainPendingWork() async {
+        await drainSubmittedWork()
+        if let retirementTask { await retirementTask.value }
+    }
+
+    private func drainSubmittedWork() async {
+        await mascotSystem.drainPendingLoads()
+        if !pendingFrameSubmissions.isEmpty {
+            await withCheckedContinuation { frameDrainWaiters.append($0) }
+        }
+    }
+
+    private func finishFrameSubmission(_ id: UUID) {
+        pendingFrameSubmissions.remove(id)
+        if pendingFrameSubmissions.isEmpty {
+            let waiters = frameDrainWaiters; frameDrainWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+        }
+    }
+
+    /// Reversible visibility/background pause. Data remains owned by the host.
+    public func setActive(_ active: Bool) {
+        guard !isTornDown else { return }
+        let changed = isActive != active
+        isActive = active
+        rootEntity.isEnabled = active
+        mascotSystem.setActive(active)
+        if !active { stopFrameSubscription?(); spatialAudioSystem.stopAll() }
+        if changed { EngramRenderLifecycleDiagnostic.record(.sceneActivity, snapshot: renderDiagnosticSnapshot()) }
+    }
+
+    /// Terminal stop for graph replacement/revocation. Visibility, callbacks and
+    /// data authority are withdrawn synchronously. Exact host content is detached
+    /// before a completion-owned task releases resources used by submitted work.
+    /// Call drainPendingWork() to join that retirement; cancellation cannot skip it.
+    public func teardown() {
+        guard !isTornDown else { return }
+        EngramRenderLifecycleDiagnostic.record(.teardownStarting, snapshot: renderDiagnosticSnapshot())
+        setActive(false)
+        isTornDown = true
+        stopFrameSubscription = nil
+        onFrameCallback = nil; dataProvider = nil; cameraProvider = nil
+        for token in Array(contentHostDetachers.keys) { removeContentHost(token) }
+        // Also support callers that attached the root below an ordinary Entity.
+        rootEntity.removeFromParent()
+        retirementTask = Task { @MainActor [self] in
+            EngramRenderLifecycleDiagnostic.record(.retirementWaiting, snapshot: renderDiagnosticSnapshot())
+            await drainSubmittedWork()
+            releaseRetiredResources()
+            retirementTask = nil
+        }
+    }
+
+    private func releaseRetiredResources() {
+        guard isTornDown, !resourcesReleased else { return }
+        precondition(contentHostDetachers.isEmpty && pendingFrameSubmissions.isEmpty)
+        EngramRenderLifecycleDiagnostic.record(.resourcesReleasing, snapshot: renderDiagnosticSnapshot())
+        mascotSystem.teardown(); spatialAudioSystem.teardown()
+        rootEntity.children.removeAll()
+        nebulaContainer.children.removeAll(); galaxyTitleContainer.children.removeAll()
+        mascotContainer.children.removeAll(); lightContainer.children.removeAll()
+        nodeBatchEntity = nil; edgeBatchEntity = nil; labelBatchEntity = nil; flowParticleEntity = nil
+        nodeTemplateEntity = nil; edgeTemplateEntity = nil
+        nodeBatchMesh = nil; edgeBatchMesh = nil; labelBatchMesh = nil; flowParticleMesh = nil
+        _nodeInstanceData = nil; _edgeInstanceData = nil
+        nodeInstanceTexture = nil; edgeInstanceTexture = nil
+        pointLightPool.removeAll(); visibleSet = .init()
+        lodSystem = LODSystem(); nodeBatchSystem = NodeBatchSystem(); edgeBatchSystem = EdgeBatchSystem()
+        labelBatchSystem = LabelBatchSystem(); cameraSystem = CameraSystem()
+        nebulaBatchSystem = NebulaBatchSystem(); galaxyTitleSystem = GalaxyTitleSystem()
+        flowParticleSystem = RKFlowParticleSystem()
+        labelAtlasGenerator = RKLabelAtlasGenerator(device: device)
+        frameStatsFlush()
+        resourcesReleased = true
+        EngramRenderLifecycleDiagnostic.record(.resourcesReleased, snapshot: renderDiagnosticSnapshot())
+    }
 
     // Point light pool (max 16)
     var pointLightPool: [Entity] = []
     let maxPointLights = 16
+    private var activePointLightCount = 0
+    private(set) var diagnosticPointLightWrites: UInt64 = 0
 
     // MARK: - Scale Factor
 
@@ -145,12 +268,24 @@ public final class EngramRealityScene {
 
     // MARK: - Init
 
-    public init() {
-        guard let device = MTLCreateSystemDefaultDevice(),
-              let commandQueue = device.makeCommandQueue() else {
+    public convenience init() {
+        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
             fatalError("Metal is required for EngramRealityKit")
         }
+        self.init(device: device, commandQueue: queue)
+    }
 
+    /// Embedded hosts use this instead of the legacy fatal initializer.
+    public static func makeValidated(requireMascot: Bool = true) throws -> EngramRealityScene {
+        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
+            throw RendererResourceError.metalUnavailable
+        }
+        let scene = EngramRealityScene(device: device, commandQueue: queue)
+        do { try scene.validateResources(requireMascot: requireMascot); return scene }
+        catch { scene.teardown(); throw error }
+    }
+
+    private init(device: MTLDevice, commandQueue: MTLCommandQueue) {
         self.device = device
         self.commandQueue = commandQueue
         self.library = try? device.makeDefaultLibrary(bundle: .module)
@@ -207,17 +342,21 @@ public final class EngramRealityScene {
             lightContainer.addChild(light)
             pointLightPool.append(light)
         }
+        EngramRenderLifecycleDiagnostic.record(.sceneCreated, snapshot: renderDiagnosticSnapshot())
     }
 
     // MARK: - Setup
 
     /// Creates and returns the root entity ready for RealityView. Call once.
     public func setup() -> Entity {
+        guard !isTornDown, !setupCompleted else { return rootEntity }
+        setupCompleted = true
         // Create batch entities with initial materials
         setupNodeBatch()
         setupEdgeBatch()
         setupLabelBatch()
         setupFlowParticles()
+        EngramRenderLifecycleDiagnostic.record(.sceneSetupCompleted, snapshot: renderDiagnosticSnapshot())
         return rootEntity
     }
 
@@ -245,7 +384,7 @@ public final class EngramRealityScene {
     public func frameStatsFlush() {
         guard let path = frameStatsPath, !frameStatsBuffer.isEmpty else { return }
         if !frameStatsHeaderWritten {
-            let refresh = NSScreen.main?.maximumFramesPerSecond ?? 0
+            let refresh = RKPlatform.maximumFramesPerSecond
             let header = "# refresh_hz=\(refresh) date=\(Date())\n"
                 + "frame,dt_ms,tick_ms,lod_ms,node_ms,edge_ms,label_ms,commit_ms,nebula_ms,mascot_ms,flow_ms,lights_ms,audio_ms,total_ms,nodes,edges,vis_edges,near,mid,far\n"
             FileManager.default.createFile(atPath: path, contents: header.data(using: .utf8))
@@ -263,7 +402,7 @@ public final class EngramRealityScene {
 
     /// Called from SceneEvents.Update — drives all systems.
     public func update(dt: Float) {
-        guard let dataProvider else { return }
+        guard isActive, !isTornDown, let dataProvider else { return }
         if frameStatsPath != nil { return updateInstrumented(dt: dt, dataProvider: dataProvider) }
         updateBody(dt: dt, dataProvider: dataProvider)
     }
@@ -304,12 +443,14 @@ public final class EngramRealityScene {
     private func updateBody(dt: Float, dataProvider: SceneDataProvider) {
         // 0. App-layer per-frame callback (keyboard, camera smoothing, force dispatch)
         onFrameCallback?(dt)
+        guard isActive, !isTornDown else { return }
 
         animationTime += dt
         frameCount += 1
 
         // 1. Tick data provider (drain + simulate)
         dataProvider.tick(dt: dt)
+        guard isActive, !isTornDown else { return }
         phaseMark()
 
         // 2. Update scene root component
@@ -338,7 +479,8 @@ public final class EngramRealityScene {
             selectedNode: dataProvider.selectedNode,
             glowingNodes: dataProvider.glowingNodes,
             hubs: dataProvider.hubs,
-            topologyVersion: dataProvider.topologyVersion
+            topologyVersion: dataProvider.topologyVersion,
+            positionRevision: dataProvider.positionRevision
         )
         phaseMark()
 
@@ -347,7 +489,7 @@ public final class EngramRealityScene {
         }
 
         // Shared command buffer for all batch system GPU writes — one commit instead of 3-4.
-        let sharedCmdBuf = commandQueue.makeCommandBuffer()
+        guard let sharedCmdBuf = commandQueue.makeCommandBuffer() else { return }
 
         // 5. Node batch update
         nodeBatchSystem.update(
@@ -394,7 +536,25 @@ public final class EngramRealityScene {
         // color with its own transform, so no flashing. (A waitUntilCompleted
         // here was tried: it cost measurable frame time and still couldn't
         // order OUR blit against RealityKit's internal instance-data upload.)
-        sharedCmdBuf?.commit()
+        let submission = UUID()
+        pendingFrameSubmissions.insert(submission)
+        sharedCmdBuf.addCompletedHandler { [weak self] _ in
+            Task { @MainActor [weak self] in self?.finishFrameSubmission(submission) }
+        }
+        sharedCmdBuf.commit()
+        if EngramRenderLifecycleDiagnostic.isEnabled {
+            // Small scalar signature only. No snapshots/logging on unchanged
+            // frames except one pulse every 120 actual hosted frame callbacks.
+            let version = [UInt64(nodeBatchCapacity), UInt64(edgeBatchCapacity), UInt64(labelBatchCapacity),
+                labelAtlasGenerator.diagnosticAtlasCreations, labelBatchSystem.diagnosticMaterialAssignments,
+                _nodeInstanceData == nil ? 0 : 1, _edgeInstanceData == nil ? 0 : 1]
+            if version != diagnosticResourceVersion {
+                diagnosticResourceVersion = version
+                EngramRenderLifecycleDiagnostic.record(.resourceGenerationChanged, snapshot: renderDiagnosticSnapshot())
+            } else if frameCount % 120 == 0 {
+                EngramRenderLifecycleDiagnostic.record(.framePulse, snapshot: renderDiagnosticSnapshot())
+            }
+        }
         phaseMark()
 
         // 8. Nebula update — cameraPos drives the far-LOD crossfade
@@ -409,11 +569,13 @@ public final class EngramRealityScene {
         phaseMark()
 
         // 8b. Galaxy titles — glowing displayName above each galaxy.
-        galaxyTitleSystem.update(
-            container: galaxyTitleContainer,
-            dataProvider: dataProvider,
-            scaleFactor: scaleFactor
-        )
+        if showsGalaxyTitles {
+            galaxyTitleSystem.update(
+                container: galaxyTitleContainer,
+                dataProvider: dataProvider,
+                scaleFactor: scaleFactor
+            )
+        }
         phaseMark()
 
         // 9. Mascot update
@@ -557,16 +719,19 @@ public final class EngramRealityScene {
     // MARK: - macOS 26+ Instance Resource Setup
 
     /// Ensure sphere template entity and instance data/texture exist with sufficient capacity.
-    @available(macOS 26, *)
+    @available(macOS 26, iOS 26, *)
     func ensureNodeInstanceResources(capacity: Int) {
         guard nodeInstanceData == nil else { return }
         // Allocate once at LOD max — instanceCount starts at 0, capacity is fixed.
         let maxCap = lodSystem.maxNodeInstances
+        guard maxCap > 0 else { return }
         print("[NODE-INST] ensureNodeInstanceResources allocating capacity=\(maxCap)")
 
-        let instData = try? LowLevelInstanceData(instanceCount: 0, instanceCapacity: maxCap)
-        print("[NODE-INST] LowLevelInstanceData created: \(instData != nil), capacity=\(instData?.instanceCapacity ?? -1)")
-        nodeInstanceData = instData
+        guard let instData = try? LowLevelInstanceData(instanceCount: 0, instanceCapacity: maxCap) else {
+            print("[NODE-INST] ERROR: failed to create LowLevelInstanceData")
+            return
+        }
+        print("[NODE-INST] LowLevelInstanceData created: true, capacity=\(instData.instanceCapacity)")
 
         // Create visual data texture (maxCap×1, rgba16Float)
         let texDesc = LowLevelTexture.Descriptor(
@@ -575,12 +740,9 @@ public final class EngramRealityScene {
             width: maxCap, height: 1,
             textureUsage: [.shaderRead]
         )
-        nodeInstanceTexture = try? LowLevelTexture(descriptor: texDesc)
-        nodeInstanceTextureWidth = maxCap
-        print("[NODE-INST] LowLevelTexture created: \(nodeInstanceTexture != nil), width=\(maxCap)")
-
-        // Build TextureResource from LowLevelTexture for material assignment
-        guard let tex = nodeInstanceTexture,
+        // Keep every resource local until the entity is completely configured.
+        // A failed allocation must not latch the once-only admission guard.
+        guard let tex = try? LowLevelTexture(descriptor: texDesc),
               let texResource = try? TextureResource(from: tex) else {
             print("[NODE-INST] ERROR: failed to create TextureResource")
             return
@@ -597,38 +759,56 @@ public final class EngramRealityScene {
             device: device,
             instanceTexture: texResource,
             textureWidth: Float(maxCap),
-            mode: 1.0
+            mode: 1.0,
+            onFallback: { [weak self] in self?.recordMaterialFallback("node") }
         )
         print("[NODE-INST] Creating node_instanced entity")
         let entity = ModelEntity(mesh: sphereMesh, materials: [material])
         entity.name = "node_instanced"
+        guard let instances = try? MeshInstancesComponent(
+            mesh: sphereMesh, instances: instData, bounds: LowLevelMeshFactory.batchMeshBounds
+        ) else {
+            print("[NODE-INST] ERROR: failed to create MeshInstancesComponent")
+            return
+        }
         entity.components.set(NodeBatchComponent())
-        rootEntity.addChild(entity)
+        entity.components.set(instances)
+
+        // Publish one complete zero-instance group before attaching it. Later
+        // updates change this same data object, never replace the component.
+        nodeInstanceTexture = tex
+        nodeInstanceTextureWidth = maxCap
         nodeTemplateEntity = entity
+        nodeInstanceData = instData
+        rootEntity.addChild(entity)
     }
 
     /// Ensure cylinder template entity and instance data/texture exist with sufficient capacity.
-    @available(macOS 26, *)
+    @available(macOS 26, iOS 26, *)
     func ensureEdgeInstanceResources(capacity: Int) {
         guard edgeInstanceData == nil else { return }
         let maxCap = min(lodSystem.maxEdgeInstances, 16384)
+        guard maxCap > 0 else { return }
+        // The iOS simulator accepts at most 8192 texels per dimension. Keep
+        // every existing edge slot by packing across rows on every platform.
+        // A Metal descriptor validation abort cannot be caught by `try?`.
+        let textureWidth = min(maxCap, 8192)
+        let textureHeight = (maxCap + textureWidth - 1) / textureWidth
         print("[EDGE-INST] ensureEdgeInstanceResources allocating capacity=\(maxCap)")
 
-        let instData = try? LowLevelInstanceData(instanceCount: 0, instanceCapacity: maxCap)
-        print("[EDGE-INST] LowLevelInstanceData created: \(instData != nil), capacity=\(instData?.instanceCapacity ?? -1)")
-        edgeInstanceData = instData
+        guard let instData = try? LowLevelInstanceData(instanceCount: 0, instanceCapacity: maxCap) else {
+            print("[EDGE-INST] ERROR: failed to create LowLevelInstanceData")
+            return
+        }
+        print("[EDGE-INST] LowLevelInstanceData created: true, capacity=\(instData.instanceCapacity)")
 
         let texDesc = LowLevelTexture.Descriptor(
             textureType: .type2D,
             pixelFormat: .rgba16Float,
-            width: maxCap, height: 1,
+            width: textureWidth, height: textureHeight,
             textureUsage: [.shaderRead]
         )
-        edgeInstanceTexture = try? LowLevelTexture(descriptor: texDesc)
-        edgeInstanceTextureWidth = maxCap
-        print("[EDGE-INST] LowLevelTexture created: \(edgeInstanceTexture != nil), width=\(maxCap)")
-
-        guard let tex = edgeInstanceTexture,
+        guard let tex = try? LowLevelTexture(descriptor: texDesc),
               let texResource = try? TextureResource(from: tex) else {
             print("[EDGE-INST] ERROR: failed to create TextureResource")
             return
@@ -641,20 +821,34 @@ public final class EngramRealityScene {
         let material = MaterialFactory.makeEdgeMaterial(
             device: device,
             instanceTexture: texResource,
-            textureWidth: Float(maxCap),
-            useGeometryModifier: true
+            textureWidth: Float(textureWidth),
+            useGeometryModifier: true,
+            onFallback: { [weak self] in self?.recordMaterialFallback("edge") }
         )
         print("[EDGE-INST] Creating edge_instanced entity")
         let entity = ModelEntity(mesh: cylinderMesh, materials: [material])
         entity.name = "edge_instanced"
+        guard let instances = try? MeshInstancesComponent(
+            mesh: cylinderMesh, instances: instData, bounds: LowLevelMeshFactory.batchMeshBounds
+        ) else {
+            print("[EDGE-INST] ERROR: failed to create MeshInstancesComponent")
+            return
+        }
         entity.components.set(EdgeBatchComponent())
-        rootEntity.addChild(entity)
+        entity.components.set(instances)
+
+        // Match node initialization: no visible default ModelEntity and no
+        // partially published resource set if any required creation fails.
+        edgeInstanceTexture = tex
+        edgeInstanceTextureWidth = textureWidth
         edgeTemplateEntity = entity
+        edgeInstanceData = instData
+        rootEntity.addChild(entity)
     }
 
     // MARK: - Point Lights
 
-    private func updatePointLights(dataProvider: SceneDataProvider) {
+    func updatePointLights(dataProvider: SceneDataProvider) {
         // Collect all nodes that need lights: glowing + new node glow + search matches
         var lightTargets: [(id: UUID, color: SIMD3<Float>, intensity: Float)] = []
 
@@ -676,7 +870,10 @@ public final class EngramRealityScene {
         lightTargets.sort { $0.intensity > $1.intensity }
         let activeCount = min(lightTargets.count, maxPointLights)
 
-        for i in 0..<maxPointLights {
+        // The pool begins disabled. Touch active lights each frame for their
+        // animated intensity/position, and disable departed slots exactly once.
+        // A static graph with no glow needs no component writes.
+        for i in 0..<max(activeCount, activePointLightCount) {
             let light = pointLightPool[i]
             if i < activeCount {
                 let target = lightTargets[i]
@@ -692,12 +889,15 @@ public final class EngramRealityScene {
                         intensity: target.intensity,
                         attenuationRadius: 100
                     ))
+                    diagnosticPointLightWrites &+= 1
                 }
             } else {
                 // Deactivate — set intensity to 0 instead of removing from scene graph
                 light.components.set(PointLightComponent(color: .white, intensity: 0, attenuationRadius: 10))
+                diagnosticPointLightWrites &+= 1
             }
         }
+        activePointLightCount = activeCount
     }
 
     func projectColor(for nodeId: UUID, dataProvider: SceneDataProvider) -> SIMD3<Float> {

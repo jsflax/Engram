@@ -5,6 +5,28 @@ import Foundation
 /// - Xcode: compiles .metal → metallib automatically, loaded via `Bundle.module`.
 /// - `swift test`: falls back to runtime compilation of compute kernels from bundled source.
 public enum EngramMetalShaders {
+    /// Embedded acceptance requires the actual packaged library. This never
+    /// substitutes runtime source compilation for a missing build resource.
+    public static func makePackagedLibrary(device: MTLDevice) throws -> MTLLibrary {
+        guard let library = try? device.makeDefaultLibrary(bundle: Bundle.module) else {
+            throw PackagedShaderError.libraryMissing
+        }
+        for name in ["compute_charge_forces", "compute_charge_forces_bh", "compute_spring_and_structural", "integrate_positions"] {
+            guard library.makeFunction(name: name) != nil else { throw PackagedShaderError.functionMissing(name) }
+        }
+        return library
+    }
+
+    public enum PackagedShaderError: Error, LocalizedError {
+        case libraryMissing, functionMissing(String)
+        public var errorDescription: String? {
+            switch self {
+            case .libraryMissing: "The Engram compute shader library is missing."
+            case .functionMissing(let name): "The Engram compute shader library is incomplete: \(name)"
+            }
+        }
+    }
+
     public static func makeLibrary(device: MTLDevice) throws -> MTLLibrary {
         // Xcode pre-compiles the metallib into the bundle
         if let lib = try? device.makeDefaultLibrary(bundle: Bundle.module) {

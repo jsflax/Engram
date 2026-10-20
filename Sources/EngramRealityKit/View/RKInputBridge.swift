@@ -1,3 +1,4 @@
+#if os(macOS)
 import SwiftUI
 import AppKit
 import RealityKit
@@ -13,6 +14,8 @@ public final class RKInputBridge {
     public weak var camera: CameraController?
     public weak var scene: EngramRealityScene?
     private var eventMonitor: Any?
+    /// Embedded hosts supply their view; legacy standalone callers keep nil.
+    public weak var inputView: NSView?
 
     public init() {}
 
@@ -44,8 +47,26 @@ public final class RKInputBridge {
     }
 
     private func handleEvent(_ event: NSEvent) -> NSEvent? {
+        if let view = inputView {
+            guard event.window === view.window, view.window != nil else {
+                camera?.heldKeys.removeAll()
+                return event
+            }
+            if [.keyDown, .keyUp, .flagsChanged].contains(event.type) {
+                guard let responder = view.window?.firstResponder as? NSView,
+                      responder === view || responder.isDescendant(of: view) else { return event }
+            } else {
+                guard view.bounds.contains(view.convert(event.locationInWindow, from: nil)) else { return event }
+                // Controls above an embedded canvas own their scroll/gestures.
+                // A bounding box alone would still move the camera beneath them.
+                guard let root = view.window?.contentView else { return event }
+                let point = root.superview?.convert(event.locationInWindow, from: nil) ?? event.locationInWindow
+                guard let hit = root.hitTest(point), hit === view || hit.isDescendant(of: view) else { return event }
+            }
+        }
         // If camera is nil, still consume keyboard events to prevent beep
         guard let cam = camera else {
+            if inputView != nil { return event }
             if (event.type == .keyDown || event.type == .keyUp),
                event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting(.shift).isEmpty {
                 return nil
@@ -82,18 +103,21 @@ public final class RKInputBridge {
                     return nil  // consume
                 }
                 // Teleport keys — handled via callback
-                if key == "t" && noMods { onTeleport?(1); return nil }
-                if key == "r" && noMods { onTeleport?(-1); return nil }
-                if key == "]" && noMods { onGalaxyTeleport?(1); return nil }
-                if key == "[" && noMods { onGalaxyTeleport?(-1); return nil }
+                if key == "t" && noMods, let onTeleport { onTeleport(1); return nil }
+                if key == "r" && noMods, let onTeleport { onTeleport(-1); return nil }
+                if key == "]" && noMods, let onGalaxyTeleport { onGalaxyTeleport(1); return nil }
+                if key == "[" && noMods, let onGalaxyTeleport { onGalaxyTeleport(-1); return nil }
                 // Consume all other unmodified keys to suppress system beep
-                if noMods { return nil }
+                // only for the legacy standalone monitor. Embedded controls own
+                // Escape/Tab/shortcuts which are not camera movement.
+                if noMods && inputView == nil { return nil }
             } else {
                 if Self.movementKeys.contains(key) {
                     cam.heldKeys.remove(key)
+                    if noMods { return nil }
                 }
                 // Consume all unmodified keyUp to match keyDown consumption
-                if noMods { return nil }
+                if noMods && inputView == nil { return nil }
             }
             return event
         }
@@ -126,9 +150,9 @@ public final class RKInputBridge {
     // MARK: - Callbacks for app-specific actions
 
     /// Called when T/R keys are pressed (teleport to next/prev project).
-    public var onTeleport: ((Int) -> Void)?
+    public var onTeleport: (@MainActor (Int) -> Void)?
     /// Called when [/] keys are pressed (teleport to next/prev galaxy).
-    public var onGalaxyTeleport: ((Int) -> Void)?
+    public var onGalaxyTeleport: (@MainActor (Int) -> Void)?
 
     // MARK: - Per-Frame
 
@@ -137,3 +161,5 @@ public final class RKInputBridge {
         camera?.pollKeyboard(dt: dt)
     }
 }
+
+#endif

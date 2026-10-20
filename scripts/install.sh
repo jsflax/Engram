@@ -16,6 +16,7 @@ rm -f "$INSTALL_DIR/memory"
 rm -f "$INSTALL_DIR/memory-hooks"
 rm -f "$INSTALL_DIR/memory-sync"
 rm -rf "$INSTALL_DIR/Engram_EngramKit.bundle"
+rm -rf "$INSTALL_DIR/Engram_EngramCoreML.bundle"
 rm -rf "$INSTALL_DIR/swift-transformers_Hub.bundle"
 rm -rf "$INSTALL_DIR/SwiftLM_SwiftLM.bundle"
 mkdir -p "$INSTALL_DIR"
@@ -24,11 +25,12 @@ if [ "$1" = "--from-source" ]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     REPO_DIR="$(dirname "$SCRIPT_DIR")"
     echo "Building from source: $REPO_DIR"
-    cd "$REPO_DIR" && swift build -c release
+    cd "$REPO_DIR" && swift build --package-path Desktop --scratch-path .build -c release
     cp .build/release/Engram "$INSTALL_DIR/memory"
     cp .build/release/EngramHooks "$INSTALL_DIR/memory-hooks"
     cp .build/release/EngramDaemon "$INSTALL_DIR/memory-sync"
     cp -R .build/release/Engram_EngramKit.bundle "$INSTALL_DIR/"
+    cp -R .build/release/Engram_EngramCoreML.bundle "$INSTALL_DIR/"
     cp -R .build/release/swift-transformers_Hub.bundle "$INSTALL_DIR/"
     cp -R .build/release/SwiftLM_SwiftLM.bundle "$INSTALL_DIR/"
     # Re-sign binaries — linker-signed ad-hoc binaries can be rejected by macOS Taskgated

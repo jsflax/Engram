@@ -1,15 +1,6 @@
 {
-  "originHash" : "bc12f7c04bffbd70a9b6fa4cce7f1d837b9a05c54ceb0f39087f9154664b4365",
+  "originHash" : "5785d9b3d4a46d6108be847c579cac432936bcc1cfac6248d6961862de2eb87d",
   "pins" : [
-    {
-      "identity" : "appauth-ios",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/openid/AppAuth-iOS.git",
-      "state" : {
-        "revision" : "2781038865a80e2c425a1da12cc1327bcd56501f",
-        "version" : "1.7.6"
-      }
-    },
     {
       "identity" : "async-http-client",
       "kind" : "remoteSourceControl",
@@ -47,68 +38,6 @@
       }
     },
     {
-      "identity" : "googlesignin-ios",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/google/GoogleSignIn-iOS.git",
-      "state" : {
-        "revision" : "a7965d134c5d3567026c523e0a8a583f73b62b0d",
-        "version" : "7.1.0"
-      }
-    },
-    {
-      "identity" : "gtm-session-fetcher",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/google/gtm-session-fetcher.git",
-      "state" : {
-        "revision" : "a2ab612cb980066ee56d90d60d8462992c07f24b",
-        "version" : "3.5.0"
-      }
-    },
-    {
-      "identity" : "gtmappauth",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/google/GTMAppAuth.git",
-      "state" : {
-        "revision" : "5d7d66f647400952b1758b230e019b07c0b4b22a",
-        "version" : "4.1.1"
-      }
-    },
-    {
-      "identity" : "lattice",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/jsflax/lattice.git",
-      "state" : {
-        "revision" : "270086a4ea5e6d87bc35cf4bdfae8c0d7a77e034",
-        "version" : "1.6.2"
-      }
-    },
-    {
-      "identity" : "latticecore",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/jsflax/LatticeCore.git",
-      "state" : {
-        "revision" : "36b828864cbb1543e945898be31589f9c04d6384",
-        "version" : "1.4.2"
-      }
-    },
-    {
-      "identity" : "mlx-swift",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/ml-explore/mlx-swift",
-      "state" : {
-        "revision" : "0bb916c67f4b9e5c682cbe02a42c701c93ab5021",
-        "version" : "0.31.6"
-      }
-    },
-    {
-      "identity" : "mlx-swift-lm",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/ml-explore/mlx-swift-lm",
-      "state" : {
-        "revision" : "e3cb1e1b4fb373391a414c33e9221516d02134ef"
-      }
-    },
-    {
       "identity" : "multipart-kit",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/vapor/multipart-kit.git",
@@ -127,30 +56,12 @@
       }
     },
     {
-      "identity" : "sparkle",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/sparkle-project/Sparkle.git",
-      "state" : {
-        "revision" : "5581748cef2bae787496fe6d61139aebe0a451f6",
-        "version" : "2.8.1"
-      }
-    },
-    {
       "identity" : "swift-algorithms",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-algorithms.git",
       "state" : {
         "revision" : "87e50f483c54e6efd60e885f7f5aa946cee68023",
         "version" : "1.2.1"
-      }
-    },
-    {
-      "identity" : "swift-argument-parser",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/apple/swift-argument-parser.git",
-      "state" : {
-        "revision" : "c5d11a805e765f52ba34ec7284bd4fcd6ba68615",
-        "version" : "1.7.0"
       }
     },
     {
@@ -376,15 +287,6 @@
       "state" : {
         "revision" : "2fa33e1f5e7131a7fc64c28e6d161dcec0d24820",
         "version" : "1.3.3"
-      }
-    },
-    {
-      "identity" : "swiftlm",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/jsflax/SwiftLM.git",
-      "state" : {
-        "branch" : "main",
-        "revision" : "1d423512d267efa2c5108720fc9fbe3a789c80f6"
       }
     },
     {

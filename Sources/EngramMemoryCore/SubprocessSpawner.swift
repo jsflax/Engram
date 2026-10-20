@@ -11,6 +11,7 @@ public func rotateFileIfNeeded(_ path: String, maxBytes: Int = 256 * 1024) {
     try? fm.moveItem(atPath: path, toPath: backup)
 }
 
+#if os(macOS) || os(Linux)
 /// Spawn a `claude` CLI subprocess as a fire-and-forget background process.
 ///
 /// Uses `/bin/sh -c` with shell redirection to capture output to a log file.
@@ -99,6 +100,8 @@ public func spawnClaudeSubprocess(
     try sh.run()
     // Don't wait — fire and forget
 }
+
+#endif
 
 /// Strip YAML frontmatter (--- delimited block) from markdown content.
 public func stripFrontmatter(_ content: String) -> String {

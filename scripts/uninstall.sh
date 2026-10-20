@@ -12,6 +12,7 @@ env -u CLAUDECODE claude mcp remove memory 2>/dev/null || true
 rm -f "$INSTALL_DIR/memory"
 rm -f "$INSTALL_DIR/memory-hooks"
 rm -rf "$INSTALL_DIR/Engram_EngramKit.bundle"
+rm -rf "$INSTALL_DIR/Engram_EngramCoreML.bundle"
 rm -rf "$INSTALL_DIR/swift-transformers_Hub.bundle"
 rm -rf "$INSTALL_DIR/SwiftLM_SwiftLM.bundle"
 

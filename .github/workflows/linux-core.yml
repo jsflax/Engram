@@ -4,8 +4,8 @@ name: Linux — EngramMemoryCore
 # agents deployment consumes on Linux. This gate keeps it Linux-clean —
 # no CoreML, no NaturalLanguage, no Lattice, no MCP may creep in.
 #
-# Build-only by design: `swift test` would build the entire test graph
-# (EngramKit → CoreML → fails on Linux). Test EXECUTION on Linux happens in
+# The root package is portable; this fast lane checks the core contract.
+# Lattice-backed test EXECUTION on Linux happens in
 # engram-server's CI, which depends on EngramMemoryCore as a product and
 # runs the contract suite there (increment 5). Compiling the test target
 # here still type-checks every test.
@@ -27,7 +27,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: swift:6.0-noble
+    container: swift:6.3.3-noble
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4

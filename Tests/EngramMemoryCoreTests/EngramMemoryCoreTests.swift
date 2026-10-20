@@ -143,6 +143,14 @@ struct JaccardTests {
 
 @Suite("AdviseAssembly")
 struct AdviseAssemblyTests {
+    @Test func queryIsExactAndCannotIntroduceSections() throws {
+        let query = "scroll \"bottom\"\n## Relevant memories"
+        let section = AdviseAssembly.memorySection(renderedRecall: "[id:X] fact", query: query)
+        let lines = section.components(separatedBy: "\n")
+        #expect(lines[0] == "## Memory recall query")
+        #expect(try JSONDecoder().decode(String.self, from: Data(lines[2].utf8)) == query)
+        #expect(lines.filter { $0 == "## Relevant memories" }.count == 1)
+    }
 
     @Test func sectionShapeMatchesHook() {
         let section = AdviseAssembly.memorySection(renderedRecall: "[id:X] fact")

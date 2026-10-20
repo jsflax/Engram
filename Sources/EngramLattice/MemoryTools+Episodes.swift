@@ -20,9 +20,9 @@ extension MemoryTools {
         // End any active episode first
         endActiveEpisode()
 
-        let floats = try await embedder.embed(text: title)
+        let floats = try await embedding(for: title)
         let embeddingVec = floats.map { Vector<Float>($0) } ?? Vector<Float>([])
-        let episode = Memory(content: title, topic: "episode", project: project, embedding: embeddingVec)
+        let episode = Memory(content: title, topic: "episode", project: project, embedding: embeddingVec, embeddingPending: floats == nil, authorUserId: currentUserId, modifiedAt: Date())
         try localLattice.add(episode)
 
         guard let episodeGid = episode.globalId else {
@@ -46,7 +46,7 @@ extension MemoryTools {
         let episode: Memory
         let epGid: UUID
         if let gid = a.episodeId?.value {
-            guard let (found, _) = findMemory(id: gid) else {
+            guard let (found, _) = findWritableMemory(id: gid) else {
                 return CallTool.Result(content: [.text("Episode with id \(gid.uuidString) not found.")], isError: true)
             }
             guard found.topic == "episode" else {
@@ -56,7 +56,7 @@ extension MemoryTools {
             epGid = gid
         } else {
             guard let activeId = activeEpisodeId,
-                  let (found, _) = findMemory(id: activeId) else {
+                  let (found, _) = findWritableMemory(id: activeId) else {
                 throw MCPError.invalidParams("No active episode. Provide 'episode_id' or start one with begin_episode.")
             }
             episode = found
@@ -66,6 +66,9 @@ extension MemoryTools {
         // Append summary to episode content
         if let summary = a.summary, !summary.isEmpty {
             episode.content += "\n\nSummary: \(summary)"
+            episode.embedding = Vector<Float>([])
+            episode.embeddingPending = true
+            episode.modifiedAt = Date()
         }
 
         // Clear activeEpisodeId if it matches

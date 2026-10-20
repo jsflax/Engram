@@ -1,0 +1,7 @@
+Bundled embedding model: sentence-transformers/paraphrase-MiniLM-L6-v2
+https://huggingface.co/sentence-transformers/paraphrase-MiniLM-L6-v2
+Model and tokenizer: Apache License 2.0 (see Apache-2.0.txt).
+CoreML mean-pooling conversion is the existing Engram/SwiftLM embedding asset.
+The local tokenizer loading and CoreML input path is adapted from SwiftLM
+EmbeddingModel.swift, Copyright (c) 2025 Jason Flax, MIT (see SwiftLM-MIT.txt).
+No model or tokenizer downloads are performed by this product.

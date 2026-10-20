@@ -91,8 +91,15 @@ public protocol SceneDataProvider: AnyObject {
     var isSearchActive: Bool { get }
     /// Centroid position per project cluster.
     var projectCentroids: [String: SIMD3<Float>] { get }
-    /// Increments on topology change (node/edge add/remove).
+    /// Increments when node/edge identity, order, endpoints or LOD metadata
+    /// (importance and hub status) changes.
     var topologyVersion: UInt64 { get }
+
+    /// Revision of the published positions, including force, semantic and hub
+    /// overlays. A non-nil value guarantees unchanged positions/availability while
+    /// both this value and topologyVersion remain equal. Return nil when the
+    /// provider cannot make that guarantee; LOD then recomputes conservatively.
+    var positionRevision: UInt64? { get }
 
     /// Positions as a flat array indexed parallel to `nodes`. Avoids UUID dict lookups.
     var positionArray: [SIMD3<Float>] { get }
@@ -107,6 +114,8 @@ public protocol SceneDataProvider: AnyObject {
 }
 
 extension SceneDataProvider {
+    public var positionRevision: UInt64? { nil }
+
     public var positionArray: [SIMD3<Float>] {
         nodes.map { positions[$0.id] ?? .zero }
     }

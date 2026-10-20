@@ -2,7 +2,9 @@ import EngramMemoryCore
 import Lattice
 import MCP
 import Foundation
+#if canImport(NaturalLanguage)
 import NaturalLanguage
+#endif
 
 // MARK: - Direct Access (for hooks)
 
@@ -33,9 +35,12 @@ extension MemoryTools {
 extension MemoryTools {
     /// POS tags to drop from queries — function words that add noise to FTS5 search.
     /// Language-agnostic: NLTagger assigns these tags regardless of input language.
+    #if canImport(NaturalLanguage)
     private static let dropTags: Set<NLTag> = [
         .determiner, .pronoun, .preposition, .conjunction, .particle,
     ]
+
+    #endif
 
     /// Function words that NLTagger's lexical class KEEPS (copulas/auxiliaries
     /// are tagged `.verb`; interrogatives are tagged `.adverb`) but which carry
@@ -57,6 +62,7 @@ extension MemoryTools {
     public static func extractContentWords(from query: String) -> [String] {
         guard !query.isEmpty else { return [] }
 
+        #if canImport(NaturalLanguage)
         let tagger = NLTagger(tagSchemes: [.lexicalClass])
         tagger.string = query
 
@@ -84,6 +90,9 @@ extension MemoryTools {
             return query.split(separator: " ").map(String.init)
         }
         return contentWords
+        #else
+        return StopwordContentWordExtractor().extractContentWords(from: query)
+        #endif
     }
 }
 
@@ -122,10 +131,9 @@ extension MemoryTools {
         }
 
         log("[remember] calling embedder.embed()")
-        guard let floats = try await embedder.embed(text: content) else {
-            throw MCPError.internalError("Embedding model unavailable — cannot store memory without a vector. Check that the CoreML model is bundled correctly.")
-        }
+        let floats = try await embedding(for: content) ?? []
         let embeddingVec = Vector<Float>(floats)
+        lastRememberedEmbeddingPending = floats.isEmpty
         log("[remember] embedding done, \(floats.count) dims")
 
         // Conflict detection + auto-connect candidate gathering
@@ -135,7 +143,7 @@ extension MemoryTools {
         if !embeddingVec.isEmpty && topic != "episode" {
             log("[remember] starting conflict detection query")
             log("[remember] readLattice for project: \(project)")
-            let latticeRef = readLattice(for: project)
+            let latticeRef = writeLattice(for: project)
             log("[remember] got lattice ref, building query")
             let baseQuery = latticeRef.objects(Memory.self)
                 .distinct(by: \.globalId)
@@ -187,6 +195,11 @@ extension MemoryTools {
             autoConnectCandidates = Array(autoConnectCandidates.prefix(3))
         }
 
+        // Validate the parent before persisting anything, including in offline mode.
+        if let parent = a.parentId?.value, findWritableMemory(id: parent) == nil {
+            throw MCPError.invalidParams("parent_id is not in the writable memory graph")
+        }
+
         // Episode: end stale episodes on 30-min gap
         if activeEpisodeId != nil {
             let gap = Date().timeIntervalSince(lastMemoryTime)
@@ -197,7 +210,7 @@ extension MemoryTools {
         let isPrivate = a.isPrivate ?? false
 
         log("[remember] creating Memory object")
-        let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance, isPrivate: isPrivate, authorUserId: currentUserId, modifiedAt: Date())
+        let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, embeddingPending: floats.isEmpty, expiresAt: expiresAt, importance: importance, isPrivate: isPrivate, authorUserId: currentUserId, modifiedAt: Date())
         log("[remember] calling localLattice.add()")
         try localLattice.add(memory)
         log("[remember] add() complete")
@@ -213,7 +226,7 @@ extension MemoryTools {
         let parentGidValue: UUID? = a.parentId?.value
 
         if let parentGid = parentGidValue {
-            guard findMemory(id: parentGid) != nil else {
+            guard findWritableMemory(id: parentGid) != nil else {
                 throw MCPError.invalidParams("parent_id \(parentGid.uuidString) not found")
             }
         }
@@ -368,6 +381,8 @@ extension MemoryTools {
 
         var response = "Stored memory (id: \(memoryGlobalId.uuidString), project: \(project), topic: \(topic)\(parentNote)\(expiresNote)\(importanceNote)\(privateNote)\(autoLinkNote)): \(content.prefix(100))\(content.count > 100 ? "..." : "")"
 
+        if floats.isEmpty { response += "\nSaved offline; semantic indexing is pending. Text recall is available." }
+
         // Nudge toward atomic memories when content is complex
         let lines = content.components(separatedBy: "\n")
         let headers = lines.filter { $0.hasPrefix("## ") || $0.hasPrefix("### ") }
@@ -440,7 +455,7 @@ extension MemoryTools {
         // FTS5 is only used as a degraded fallback when the embedding model is unavailable.
         log("[recall] Embedding query text...")
         sessionLog("[recall] Embedding query text...")
-        if let queryEmbedding = try await embedder.embed(text: query) {
+        if !hasPendingEmbeddings(in: db), let queryEmbedding = try await embedding(for: query) {
             log("[recall] Embedding complete, dims=\(queryEmbedding.count)")
             sessionLog("[recall] Embedding complete")
             // Soft project boost: fetch wider net, then re-rank
@@ -725,10 +740,16 @@ extension MemoryTools {
             sessionLog("[recall] Bumping access stats (\(bumpTargets.count) memories)")
             let accessNow = Date()
             do {
-                try db.transaction {
+                try db.withTransaction {
                     for m in bumpTargets {
-                        m.lastAccessedAt = accessNow
-                        m.increment("accessCount")
+                        if privateGraphOnly {
+                            guard let id = m.globalId, let (writable, _) = findWritableMemory(id: id) else { continue }
+                            writable.lastAccessedAt = accessNow
+                            writable.increment("accessCount")
+                        } else {
+                            m.lastAccessedAt = accessNow
+                            m.increment("accessCount")
+                        }
                     }
                 }
             } catch {
@@ -839,7 +860,7 @@ extension MemoryTools {
 
         // Delete by UUID takes priority
         if let gid = a.id?.value {
-            guard let (mem, foundLattice) = findMemory(id: gid) else {
+            guard let (mem, foundLattice) = findWritableMemory(id: gid) else {
                 return CallTool.Result(content: [.text("Memory with id \(gid.uuidString) not found.")], isError: true)
             }
             let summary = mem.content.prefix(80)
@@ -873,7 +894,7 @@ extension MemoryTools {
         // rows (exactly the propagation the tombstone design exists to stop).
         switch (a.topic, a.project) {
         case let (topic?, project?):
-            let db = readLattice(for: project)
+            let db = writeLattice(for: project)
             let memories = db.objects(Memory.self)
                 .where { $0.topic == topic && $0.project == project && $0.deletedAt == nil }
                 .distinct(by: \.globalId).snapshot()
@@ -893,7 +914,7 @@ extension MemoryTools {
                 isError: false
             )
         case let (nil, project?):
-            let db = readLattice(for: project)
+            let db = writeLattice(for: project)
             let memories = db.objects(Memory.self)
                 .where { $0.project == project && $0.deletedAt == nil }
                 .distinct(by: \.globalId).snapshot()
@@ -938,18 +959,18 @@ extension MemoryTools {
         // 5. Locate memory
         let mem: Memory
         if let gid = a.id?.value {
-            guard let found = findMemory(id: gid) else {
+            guard let found = findWritableMemory(id: gid) else {
                 return CallTool.Result(content: [.text("Memory with id \(gid.uuidString) not found.")], isError: true)
             }
             mem = found.memory
         } else {
             let query = a.query!
-            let db = readLattice(for: a.project)
+            let db = writeLattice(for: a.project)
             var results = db.objects(Memory.self).distinct(by: \.globalId).where { $0.deletedAt == nil }
             if let projectFilter = a.project {
                 results = results.where { $0.project == projectFilter }
             }
-            guard let queryEmbedding = try await embedder.embed(text: query) else {
+            guard let queryEmbedding = try await embedding(for: query) else {
                 throw MCPError.internalError("Failed to generate embedding for query")
             }
             let nearest = results
@@ -995,10 +1016,10 @@ extension MemoryTools {
         // Pre-compute embedding if content will change
         var newEmbedding: [Float]? = nil
         if let content = a.content {
-            newEmbedding = try await embedder.embed(text: content)
+            newEmbedding = try await embedding(for: content)
         } else if a.append != nil || a.prepend != nil {
             let projected = a.append.map { oldContent + "\n" + $0 } ?? a.prepend.map { $0 + "\n" + oldContent }
-            if let projected { newEmbedding = try await embedder.embed(text: projected) }
+            if let projected { newEmbedding = try await embedding(for: projected) }
         } else if let find = a.find {
             let replace = a.replace!
             guard mem.content.contains(find) else {
@@ -1007,7 +1028,7 @@ extension MemoryTools {
                     isError: true
                 )
             }
-            newEmbedding = try await embedder.embed(text: oldContent.replacingOccurrences(of: find, with: replace))
+            newEmbedding = try await embedding(for: oldContent.replacingOccurrences(of: find, with: replace))
         }
 
         if let imp = a.importance?.value {
@@ -1081,8 +1102,9 @@ extension MemoryTools {
                 changes.append("undeleted (restored for all members)")
             }
 
-            if contentChanged, let emb = newEmbedding {
-                mem.embedding = Vector<Float>(emb)
+            if contentChanged {
+                mem.embedding = Vector<Float>(newEmbedding ?? [])
+                mem.embeddingPending = newEmbedding == nil
             }
 
             mem.lastAccessedAt = Date()
@@ -1131,7 +1153,7 @@ extension MemoryTools {
         // Fetch the source memories (may span both DBs)
         var sources: [(memory: Memory, lattice: Lattice)] = []
         for gid in gids {
-            guard let found = findMemory(id: gid) else {
+            guard let found = findWritableMemory(id: gid) else {
                 return CallTool.Result(content: [.text("Memory with id \(gid.uuidString) not found.")], isError: true)
             }
             sources.append(found)
@@ -1153,7 +1175,7 @@ extension MemoryTools {
         let project = a.project ?? sources[0].memory.project
 
         // Embed the merged content
-        guard let floats = try await embedder.embed(text: content) else {
+        guard let floats = try await embedding(for: content) else {
             throw MCPError.internalError("Embedding model unavailable — cannot merge memories without a vector. Check that the CoreML model is bundled correctly.")
         }
         let embeddingVec = Vector<Float>(floats)
@@ -1292,7 +1314,7 @@ extension MemoryTools {
         localLattice._vacuumVec0(Memory(), for: \.embedding)
         localLattice.vacuum()
         localLattice.checkpointBounded()
-        if let synced = syncedLattice {
+        if !privateGraphOnly, let synced = syncedLattice {
             synced.checkpoint()
             synced._vacuumVec0(Memory(), for: \.embedding)
             synced.vacuum()
@@ -1304,7 +1326,7 @@ extension MemoryTools {
         // arms with no vec table. Checkpoint + index rebuild only; never
         // tombstone GC (that's server/admin-owned).
         var spokeCount = 0
-        for spoke in liveGroupSpokes() {
+        for spoke in writableSpokes {
             spoke.lattice.checkpoint()
             spoke.lattice._vacuumVec0(Memory(), for: \.embedding)
             spoke.lattice.checkpointBounded()
@@ -1321,13 +1343,13 @@ extension MemoryTools {
         localLattice.checkpoint()
         let localCount = localLattice.objects(Memory.self).count
         var syncedCount = 0
-        if let synced = syncedLattice {
+        if !privateGraphOnly, let synced = syncedLattice {
             synced._vacuumVec0(Memory(), for: \.embedding)
             synced.checkpoint()
             syncedCount = synced.objects(Memory.self).count
         }
         var spokeTotal = 0
-        for spoke in liveGroupSpokes() {
+        for spoke in writableSpokes {
             spoke.lattice._vacuumVec0(Memory(), for: \.embedding)
             spoke.lattice.checkpoint()
             spokeTotal += spoke.lattice.objects(Memory.self).count

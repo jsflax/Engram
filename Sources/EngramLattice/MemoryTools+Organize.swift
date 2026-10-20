@@ -111,7 +111,7 @@ extension MemoryTools {
         // Verify memories exist and determine project
         var memories: [UUID: Memory] = [:]
         for gid in ids {
-            guard let (mem, _) = findMemory(id: gid) else {
+            guard let (mem, _) = findWritableMemory(id: gid) else {
                 return CallTool.Result(content: [.text("Memory [id:\(gid.uuidString)] not found.")], isError: true)
             }
             memories[gid] = mem
@@ -122,7 +122,7 @@ extension MemoryTools {
         // Create hub memory
         let hubContent = a.summary ?? "Hub: \(label)"
         var hubEmbedding = Vector<Float>([])
-        if let floats = try await embedder.embed(text: hubContent) {
+        if let floats = try await embedding(for: hubContent) {
             hubEmbedding = Vector<Float>(floats)
         }
         let hub = Memory(
@@ -130,7 +130,8 @@ extension MemoryTools {
             topic: label,
             project: project,
             source: "organize",
-            embedding: hubEmbedding
+            embedding: hubEmbedding, embeddingPending: hubEmbedding.isEmpty,
+            authorUserId: currentUserId, modifiedAt: Date()
         )
         try localLattice.add(hub)
 

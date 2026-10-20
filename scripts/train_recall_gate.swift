@@ -312,7 +312,7 @@ let examples: [Example] = [
 func loadEmbeddingModel() throws -> MLModel {
     // Look for the model in the EngramKit resources
     let modelPath = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        .appendingPathComponent("Sources/EngramKit/Resources/paraphrase-MiniLM-L6-v2_Embedding.mlmodelc")
+        .appendingPathComponent("Sources/EngramCoreML/Resources/paraphrase-MiniLM-L6-v2_Embedding.mlmodelc")
     guard FileManager.default.fileExists(atPath: modelPath.path) else {
         fatalError("MiniLM model not found at \(modelPath.path). Run from the Engram project root.")
     }

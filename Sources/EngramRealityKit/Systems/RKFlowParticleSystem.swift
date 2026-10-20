@@ -22,6 +22,7 @@ public final class RKFlowParticleSystem {
     private let maxEdges: Int = 30
 
     private var lastSelectedNode: UUID?
+    private var lastTopologyVersion: UInt64?
     private var connectedEdgeIndices: [Int] = []
 
     public init() {}
@@ -34,9 +35,10 @@ public final class RKFlowParticleSystem {
     ) {
         let selectedNode = dataProvider.selectedNode
 
-        // Recompute connected edges when selection changes
-        if selectedNode != lastSelectedNode {
+        // Filtering can remove or reorder edges without changing the selection.
+        if selectedNode != lastSelectedNode || dataProvider.topologyVersion != lastTopologyVersion {
             lastSelectedNode = selectedNode
+            lastTopologyVersion = dataProvider.topologyVersion
             connectedEdgeIndices.removeAll()
             particles.removeAll()
             spawnTimer = 0

@@ -1,7 +1,6 @@
 import CoreGraphics
 import CoreText
 import Foundation
-import AppKit
 
 /// Renders holo screen info card text into a CGImage using CoreText.
 ///
@@ -65,10 +64,10 @@ enum HoloTextureRenderer {
         ctx.scaleBy(x: CGFloat(scale), y: CGFloat(scale))
 
         // Fonts
-        let topicFont: CTFont = NSFont.monospacedSystemFont(ofSize: 18, weight: .bold) as CTFont
-        let metaFont: CTFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular) as CTFont
-        let sepFont: CTFont = NSFont.monospacedSystemFont(ofSize: 8, weight: .regular) as CTFont
-        let contentFont: CTFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular) as CTFont
+        let topicFont: CTFont = RKPlatform.font(size: 18, bold: true, monospaced: true)
+        let metaFont: CTFont = RKPlatform.font(size: 10, bold: false, monospaced: true)
+        let sepFont: CTFont = RKPlatform.font(size: 8, bold: false, monospaced: true)
+        let contentFont: CTFont = RKPlatform.font(size: 10, bold: false, monospaced: true)
 
         // Colors
         let topicColor = CGColor(red: 0.3, green: 0.9, blue: 1.0, alpha: 1.0)

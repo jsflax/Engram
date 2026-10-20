@@ -1,4 +1,5 @@
 import EngramModels
+import EngramLattice
 import Lattice
 import Foundation
 
@@ -35,7 +36,8 @@ public enum V1 {
 /// `SyncConfig.exposedTeams` column name is deliberately KEPT (renaming
 /// would skew the personal-sync wire format across the user's own app
 /// versions); new code uses the `exposedGroups` computed alias.
-public let currentSchemaVersion = 3
+/// v4 adds durable pending embeddings without losing legacy rows.
+public let currentSchemaVersion = AgentMemorySchema.currentVersion
 
 // MARK: - Migration Definitions
 
@@ -78,4 +80,4 @@ nonisolated(unsafe) public let engramMigrations: [Int: Migration] = [
             new.createdAt = old.createdAt
         }
     )
-]
+].merging(AgentMemorySchema.migrations) { _, portable in portable }

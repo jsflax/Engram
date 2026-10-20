@@ -5,22 +5,30 @@ import EngramSceneKit
 
 /// Instanced edge rendering — 6-sided cylinder per edge.
 ///
-/// Two code paths controlled by `#available(macOS 26, *)`:
+/// macOS selects the existing LowLevelMesh path for this candidate.
+/// iOS retains the following availability-based selection:
 /// - **macOS 26+**: `MeshInstanceCollection` — one unit cylinder template, N instance
 ///   transforms encoding position + rotation + scale. Visual data in `LowLevelTexture`.
 /// - **< macOS 26**: Single-buffer `LowLevelMesh` — full vertex data per edge (existing approach).
 ///   No two-buffer optimization here since edge cylinder geometry needs 48 bytes/vert anyway.
 @MainActor
 public final class EdgeBatchSystem {
+    // Candidate macOS containment: keep one native mesh backend for this scene.
+    // iOS retains its existing availability-based instancing selection.
+    #if os(macOS)
+    private static let usesMeshInstances = false
+    #else
+    private static let usesMeshInstances = true
+    #endif
+
     private static let sides = 6
     private static let vertsPerEdge = sides * 2  // 12
     private static let indicesPerEdge = sides * 6 // 36
 
     private var staging: [BatchVertex] = []
-    /// Pre-allocated staging buffer for texture blit (macOS 26+).
-    private var texStagingBuffer: MTLBuffer?
-    private var texStagingCapacity: Int = 0
-    private var lastInstanceCount: Int = -1
+    private let textureUploads = TextureUploadStagingPool()
+    private let instanceUploads = InstanceUploadState()
+    var instanceUploadStatistics: InstanceUploadState.Statistics { instanceUploads.statistics }
 
     // Stable instance-slot assignment — see NodeBatchSystem: keeps per-slot
     // color and transform associated per EDGE across frames of LOD churn.
@@ -51,7 +59,18 @@ public final class EdgeBatchSystem {
         scaleFactor: Float,
         commandBuffer: MTLCommandBuffer? = nil
     ) {
-        if #available(macOS 26, *) {
+        let hasVisibleItems = visibleSet.visibleEdgeIndices.count > 0
+        scene.edgeBatchEntity?.isEnabled = hasVisibleItems
+        if #available(macOS 26, iOS 26, *), Self.usesMeshInstances {
+            if !hasVisibleItems { scene.edgeTemplateEntity?.isEnabled = false }
+            if !hasVisibleItems, let data = scene.edgeInstanceData {
+                instanceUploads.hide(data)
+            }
+        }
+        // Preserve mesh/component ownership while an empty filter hides the batch.
+        // Returning without hiding it leaves the preceding frame on screen.
+        guard hasVisibleItems else { return }
+        if #available(macOS 26, iOS 26, *), Self.usesMeshInstances {
             updateWithMeshInstances(
                 scene: scene, dataProvider: dataProvider,
                 visibleSet: visibleSet, scaleFactor: scaleFactor,
@@ -68,7 +87,7 @@ public final class EdgeBatchSystem {
 
     // MARK: - < macOS 26: Single-buffer LowLevelMesh (existing approach)
 
-    private func updateCurrentApproach(
+    func updateCurrentApproach(
         scene: EngramRealityScene,
         dataProvider: SceneDataProvider,
         visibleSet: VisibleSet,
@@ -79,7 +98,7 @@ public final class EdgeBatchSystem {
         guard visibleCount > 0 else { return }
 
         LowLevelMeshFactory.ensureEdgeBatchMesh(scene: scene, capacity: visibleCount)
-        guard let mesh = scene.edgeBatchMesh else { return }
+        guard let mesh = scene.edgeBatchMesh, scene.edgeBatchCapacity >= visibleCount else { return }
 
         let edges = dataProvider.edges
         let positions = dataProvider.positions
@@ -112,87 +131,96 @@ public final class EdgeBatchSystem {
             ), count: totalVerts)
         }
 
-        var instanceIdx = 0
-        for edgeIdx in visibleSet.visibleEdgeIndices {
-            let edge = edges[edgeIdx]
-            let srcPos: SIMD3<Float>
-            let tgtPos: SIMD3<Float>
-            if let si = idToIndex[edge.sourceId], si < positionArray.count,
-               let ti = idToIndex[edge.targetId], ti < positionArray.count {
-                srcPos = positionArray[si]
-                tgtPos = positionArray[ti]
-            } else {
-                guard let sp = positions[edge.sourceId], let tp = positions[edge.targetId] else { continue }
-                srcPos = sp; tgtPos = tp
+        // One synchronous borrow avoids repeated array COW/exclusivity checks per vertex.
+        staging.withUnsafeMutableBufferPointer { destination in
+            precondition(totalVerts <= destination.count)
+            var instanceIdx = 0
+            for edgeIdx in visibleSet.visibleEdgeIndices {
+                let edge = edges[edgeIdx]
+                let srcPos: SIMD3<Float>
+                let tgtPos: SIMD3<Float>
+                if let si = idToIndex[edge.sourceId], si < positionArray.count,
+                   let ti = idToIndex[edge.targetId], ti < positionArray.count {
+                    srcPos = positionArray[si]
+                    tgtPos = positionArray[ti]
+                } else {
+                    guard let sp = positions[edge.sourceId], let tp = positions[edge.targetId] else { continue }
+                    srcPos = sp; tgtPos = tp
+                }
+
+                let src = srcPos * scaleFactor
+                let tgt = tgtPos * scaleFactor
+
+                let project = nodeProject[edge.sourceId]
+                var color = colorMap[project ?? ""] ?? SIMD3<Float>(0.6, 0.6, 0.6)
+                color = min(color * 1.4 + 0.15, SIMD3<Float>(repeating: 1.0))
+
+                var alpha: Float = 0.35
+                if let sel = selectedNode {
+                    if edge.sourceId == sel || edge.targetId == sel { alpha = 0.8 }
+                    else { alpha = 0.15 }
+                }
+                if isSearchActive {
+                    let srcMatch = searchMatchIds.contains(edge.sourceId)
+                    let tgtMatch = searchMatchIds.contains(edge.targetId)
+                    if !srcMatch && !tgtMatch { alpha *= 0.2 }
+                }
+
+                let dir = tgt - src
+                let length = simd_length(dir)
+                guard length > 0.0001 else { continue }
+                let axis = dir / length
+
+                let tempUp: SIMD3<Float> = abs(axis.y) < 0.99 ? SIMD3(0, 1, 0) : SIMD3(1, 0, 0)
+                let right = normalize(cross(axis, tempUp))
+                let up = cross(right, axis)
+                let radius: Float = 1.0 * scaleFactor
+
+                let baseVert = instanceIdx * Self.vertsPerEdge
+                for s in 0..<Self.sides {
+                    let (c, sn) = Self.sideAngles[s]
+                    let normal = right * c + up * sn
+                    let offset = normal * radius
+
+                    let botPos = src + offset
+                    destination[baseVert + s] = BatchVertex(
+                        px: botPos.x, py: botPos.y, pz: botPos.z,
+                        nx: normal.x, ny: normal.y, nz: normal.z,
+                        u: Float(s) / Float(Self.sides), v: 0,
+                        cr: color.x, cg: color.y, cb: color.z, ca: alpha
+                    )
+
+                    let topPos = tgt + offset
+                    destination[baseVert + Self.sides + s] = BatchVertex(
+                        px: topPos.x, py: topPos.y, pz: topPos.z,
+                        nx: normal.x, ny: normal.y, nz: normal.z,
+                        u: Float(s) / Float(Self.sides), v: 1,
+                        cr: color.x, cg: color.y, cb: color.z, ca: alpha
+                    )
+                }
+                instanceIdx += 1
             }
 
-            let src = srcPos * scaleFactor
-            let tgt = tgtPos * scaleFactor
-
-            let project = nodeProject[edge.sourceId]
-            var color = colorMap[project ?? ""] ?? SIMD3<Float>(0.6, 0.6, 0.6)
-            color = min(color * 1.4 + 0.15, SIMD3<Float>(repeating: 1.0))
-
-            var alpha: Float = 0.35
-            if let sel = selectedNode {
-                if edge.sourceId == sel || edge.targetId == sel { alpha = 0.8 }
-                else { alpha = 0.15 }
-            }
-            if isSearchActive {
-                let srcMatch = searchMatchIds.contains(edge.sourceId)
-                let tgtMatch = searchMatchIds.contains(edge.targetId)
-                if !srcMatch && !tgtMatch { alpha *= 0.2 }
-            }
-
-            let dir = tgt - src
-            let length = simd_length(dir)
-            guard length > 0.0001 else { continue }
-            let axis = dir / length
-
-            let tempUp: SIMD3<Float> = abs(axis.y) < 0.99 ? SIMD3(0, 1, 0) : SIMD3(1, 0, 0)
-            let right = normalize(cross(axis, tempUp))
-            let up = cross(right, axis)
-            let radius: Float = 1.0 * scaleFactor
-
-            let baseVert = instanceIdx * Self.vertsPerEdge
-            for s in 0..<Self.sides {
-                let (c, sn) = Self.sideAngles[s]
-                let normal = right * c + up * sn
-                let offset = normal * radius
-
-                let botPos = src + offset
-                staging[baseVert + s] = BatchVertex(
-                    px: botPos.x, py: botPos.y, pz: botPos.z,
-                    nx: normal.x, ny: normal.y, nz: normal.z,
-                    u: Float(s) / Float(Self.sides), v: 0,
-                    cr: color.x, cg: color.y, cb: color.z, ca: alpha
+            // Zero remaining
+            let usedVerts = instanceIdx * Self.vertsPerEdge
+            if usedVerts < totalVerts {
+                let zeroVertex = BatchVertex(
+                    px: 0, py: 0, pz: 0, nx: 0, ny: 0, nz: 0,
+                    u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0
                 )
-
-                let topPos = tgt + offset
-                staging[baseVert + Self.sides + s] = BatchVertex(
-                    px: topPos.x, py: topPos.y, pz: topPos.z,
-                    nx: normal.x, ny: normal.y, nz: normal.z,
-                    u: Float(s) / Float(Self.sides), v: 1,
-                    cr: color.x, cg: color.y, cb: color.z, ca: alpha
-                )
+                destination.baseAddress!.advanced(by: usedVerts).update(repeating: zeroVertex, count: totalVerts - usedVerts)
             }
-            instanceIdx += 1
         }
 
-        // Zero remaining
-        let usedVerts = instanceIdx * Self.vertsPerEdge
-        if usedVerts < totalVerts {
-            memset(&staging[usedVerts], 0, (totalVerts - usedVerts) * MemoryLayout<BatchVertex>.stride)
+        // CPU replacement owns writable storage only for this synchronous callback.
+        // replace(bufferIndex:using:) is reserved for GPU writes, not CPU contents().
+        mesh.replaceUnsafeMutableBytes(bufferIndex: 0) { destination in
+            staging.withUnsafeBytes { source in
+                let byteCount = totalVerts * MemoryLayout<BatchVertex>.stride
+                precondition(byteCount <= destination.count && byteCount <= source.count)
+                destination.baseAddress!.copyMemory(from: source.baseAddress!, byteCount: byteCount)
+            }
         }
-
-        // GPU-synchronized write
-        guard let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer() else { return }
-        let destBuffer = mesh.replace(bufferIndex: 0, using: cmdBuf)
-        let dest = destBuffer.contents().bindMemory(to: BatchVertex.self, capacity: totalVerts)
-        staging.withUnsafeBufferPointer { src in
-            dest.update(from: src.baseAddress!, count: totalVerts)
-        }
-        if commandBuffer == nil { cmdBuf.commit() }
     }
 
     // MARK: - macOS 26+: MeshInstanceCollection
@@ -200,7 +228,7 @@ public final class EdgeBatchSystem {
     /// MeshInstanceCollection path: one unit cylinder template, N instance transforms.
     /// Each transform encodes: translate(src) × rotate(Y→direction) × scale(radius, length, radius).
     /// Per-instance visual data (color, alpha) stored in a LowLevelTexture.
-    @available(macOS 26, *)
+    @available(macOS 26, iOS 26, *)
     private func updateWithMeshInstances(
         scene: EngramRealityScene,
         dataProvider: SceneDataProvider,
@@ -210,6 +238,14 @@ public final class EdgeBatchSystem {
     ) {
         let visibleCount = visibleSet.visibleEdgeIndices.count
         guard visibleCount > 0 else { return }
+
+        // Reserve before touching resources, stable slots, or transforms. The
+        // caller may supply an uncommitted frame command, so elapsed frames do
+        // not establish that its previous staging bytes are reusable.
+        guard let upload = textureUploads.reserve() else { return }
+        var submitted = false
+        defer { if !submitted { upload.release() } }
+        guard let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer() else { return }
 
         // Ensure cylinder template entity and instance texture exist
         scene.ensureEdgeInstanceResources(capacity: visibleCount)
@@ -242,11 +278,19 @@ public final class EdgeBatchSystem {
         let positionArray = dataProvider.positionArray
         let idToIndex = nodeIdToIndex
 
-        let texWidth = scene.edgeInstanceTextureWidth
-        var texData = [SIMD4<Float16>](repeating: .zero, count: texWidth)
+        let texWidth = instanceTexture.descriptor.width
+        let texHeight = instanceTexture.descriptor.height
+        var texData = [SIMD4<Float16>](repeating: .zero, count: texWidth * texHeight)
 
+        // Plan slot changes locally. Failed texture admission must not publish
+        // a new mapping or cache payload while the previous pair is still drawn.
+        var slotForEdge = self.slotForEdge
+        var slotHighWater = self.slotHighWater
+        var freeSlots = self.freeSlots
+        var slotsTopologyVersion = self.slotsTopologyVersion
         // --- Stable slot maintenance (see NodeBatchSystem) ---
-        if dataProvider.topologyVersion != slotsTopologyVersion {
+        if dataProvider.topologyVersion != slotsTopologyVersion
+            || !instanceUploads.matches(entity: entity, data: instanceData, texture: instanceTexture) {
             slotsTopologyVersion = dataProvider.topologyVersion
             slotForEdge.removeAll(keepingCapacity: true)
             freeSlots.removeAll(keepingCapacity: true)
@@ -285,104 +329,73 @@ public final class EdgeBatchSystem {
         let holes = occupied.enumerated().compactMap { $1 ? nil : $0 }
         let usedCount = min(slotHighWater, capacity)
 
-        instanceData.replaceMutableTransforms { transforms in
-            for (slot, edgeIdx) in slotWrites {
-                let instanceIdx = slot
-                guard instanceIdx < transforms.count, instanceIdx < texData.count else { continue }
-                let edge = edges[edgeIdx]
-                let srcPos: SIMD3<Float>
-                let tgtPos: SIMD3<Float>
-                if let si = idToIndex[edge.sourceId], si < positionArray.count,
-                   let ti = idToIndex[edge.targetId], ti < positionArray.count {
-                    srcPos = positionArray[si]
-                    tgtPos = positionArray[ti]
-                } else {
-                    guard let sp = positions[edge.sourceId], let tp = positions[edge.targetId] else { continue }
-                    srcPos = sp; tgtPos = tp
-                }
-
-                let src = srcPos * scaleFactor
-                let tgt = tgtPos * scaleFactor
-                let radius: Float = 1.0 * scaleFactor
-
-                let transform = Self.cylinderTransform(
-                    from: src, to: tgt, radius: radius
-                )
-                guard transform != matrix_identity_float4x4 else { continue }
-                transforms[instanceIdx] = transform
-
-                // Per-instance color
-                let project = nodeProject[edge.sourceId]
-                var color = colorMap[project ?? ""] ?? SIMD3<Float>(0.6, 0.6, 0.6)
-                color = min(color * 1.4 + 0.15, SIMD3<Float>(repeating: 1.0))
-
-                var alpha: Float = 0.35
-                if let sel = selectedNode {
-                    if edge.sourceId == sel || edge.targetId == sel { alpha = 0.8 }
-                    else { alpha = 0.15 }
-                }
-                if isSearchActive {
-                    let srcMatch = searchMatchIds.contains(edge.sourceId)
-                    let tgtMatch = searchMatchIds.contains(edge.targetId)
-                    if !srcMatch && !tgtMatch { alpha *= 0.2 }
-                }
-
-                texData[instanceIdx] = SIMD4<Float16>(
-                    Float16(color.x), Float16(color.y), Float16(color.z), Float16(alpha)
-                )
+        var transforms = [simd_float4x4](repeating:
+            simd_float4x4(diagonal: SIMD4<Float>(0, 0, 0, 1)), count: usedCount)
+        for (slot, edgeIdx) in slotWrites {
+            let instanceIdx = slot
+            guard instanceIdx < transforms.count, instanceIdx < texData.count else { continue }
+            // Replacement storage is unspecified. Even a skipped occupied
+            // slot needs a finite, collapsed transform for this frame.
+            transforms[instanceIdx] = simd_float4x4(diagonal: SIMD4<Float>(0, 0, 0, 1))
+            let edge = edges[edgeIdx]
+            let srcPos: SIMD3<Float>
+            let tgtPos: SIMD3<Float>
+            if let si = idToIndex[edge.sourceId], si < positionArray.count,
+               let ti = idToIndex[edge.targetId], ti < positionArray.count {
+                srcPos = positionArray[si]
+                tgtPos = positionArray[ti]
+            } else {
+                guard let sp = positions[edge.sourceId], let tp = positions[edge.targetId] else { continue }
+                srcPos = sp; tgtPos = tp
             }
 
-            // Zero departed slots (see NodeBatchSystem).
-            for slot in holes where slot < transforms.count {
-                transforms[slot] = matrix_identity_float4x4 * 0
-                if slot < texData.count { texData[slot] = .zero }
-            }
-        }
+            let src = srcPos * scaleFactor
+            let tgt = tgtPos * scaleFactor
+            let radius: Float = 1.0 * scaleFactor
 
-        instanceData.instanceCount = usedCount
-
-        // Update per-instance color texture
-        let bytesPerRow = texWidth * MemoryLayout<SIMD4<Float16>>.stride
-        if texStagingCapacity < bytesPerRow {
-            texStagingBuffer = scene.device.makeBuffer(length: bytesPerRow, options: .storageModeShared)
-            texStagingCapacity = bytesPerRow
-        }
-        if let stagingBuf = texStagingBuffer,
-           let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer() {
-            let texMTL = instanceTexture.replace(using: cmdBuf)
-            texData.withUnsafeBytes { ptr in
-                stagingBuf.contents().copyMemory(from: ptr.baseAddress!, byteCount: bytesPerRow)
-            }
-            let blit = cmdBuf.makeBlitCommandEncoder()!
-            blit.copy(
-                from: stagingBuf, sourceOffset: 0,
-                sourceBytesPerRow: bytesPerRow, sourceBytesPerImage: bytesPerRow,
-                sourceSize: MTLSize(width: texWidth, height: 1, depth: 1),
-                to: texMTL, destinationSlice: 0, destinationLevel: 0,
-                destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+            let transform = Self.cylinderTransform(
+                from: src, to: tgt, radius: radius
             )
-            blit.endEncoding()
-            if commandBuffer == nil { cmdBuf.commit() }
+            guard transform != matrix_identity_float4x4 else { continue }
+            transforms[instanceIdx] = transform
+
+            // Per-instance color
+            let project = nodeProject[edge.sourceId]
+            var color = colorMap[project ?? ""] ?? SIMD3<Float>(0.6, 0.6, 0.6)
+            color = min(color * 1.4 + 0.15, SIMD3<Float>(repeating: 1.0))
+
+            var alpha: Float = 0.35
+            if let sel = selectedNode {
+                if edge.sourceId == sel || edge.targetId == sel { alpha = 0.8 }
+                else { alpha = 0.15 }
+            }
+            if isSearchActive {
+                let srcMatch = searchMatchIds.contains(edge.sourceId)
+                let tgtMatch = searchMatchIds.contains(edge.targetId)
+                if !srcMatch && !tgtMatch { alpha *= 0.2 }
+            }
+
+            texData[instanceIdx] = SIMD4<Float16>(
+                Float16(color.x), Float16(color.y), Float16(color.z), Float16(alpha)
+            )
         }
 
-        // Create MeshInstancesComponent exactly ONCE. The component holds a
-        // reference to instanceData, whose mutable instanceCount (set above)
-        // already drives the drawn count — recreating on count change is
-        // redundant AND races RealityKit's render thread: components.set()
-        // swaps the component while re::encodeDrawCalls is encoding the old
-        // one (SIGSEGV, seen under near-camera orbit where the visible-edge
-        // count changes every frame).
-        if entity.components[MeshInstancesComponent.self] == nil {
-            guard let mesh = entity.model?.mesh else { return }
-            do {
-                let comp = try MeshInstancesComponent(
-                    mesh: mesh,
-                    instances: instanceData,
-                    bounds: LowLevelMeshFactory.batchMeshBounds
-                )
-                entity.components.set(comp)
-            } catch { return }
+        // Zero departed slots (see NodeBatchSystem).
+        for slot in holes where slot < transforms.count {
+            transforms[slot] = simd_float4x4(diagonal: SIMD4<Float>(0, 0, 0, 1))
+            if slot < texData.count { texData[slot] = .zero }
         }
+
+        guard let ownsLease = instanceUploads.publish(
+            transforms: transforms, colors: texData, entity: entity, data: instanceData,
+            texture: instanceTexture, device: scene.device, command: cmdBuf, upload: upload
+        ) else { return }
+        self.slotForEdge = slotForEdge
+        self.slotHighWater = slotHighWater
+        self.freeSlots = freeSlots
+        self.slotsTopologyVersion = slotsTopologyVersion
+        submitted = ownsLease
+        if ownsLease && commandBuffer == nil { cmdBuf.commit() }
     }
 
     /// Build a 4×4 transform that places a unit cylinder between `src` and `tgt`.

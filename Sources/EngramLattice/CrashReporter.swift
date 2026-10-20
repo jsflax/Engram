@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 // MARK: - Ring Buffer
 
@@ -58,10 +63,10 @@ public final class LogRingBuffer: @unchecked Sendable {
     /// Write buffer contents to fd using POSIX write() (async-signal-safe).
     func writeToFd(_ fd: Int32) {
         if !wrapped {
-            _ = Darwin.write(fd, storage, pos)
+            _ = write(fd, storage, pos)
         } else {
-            _ = Darwin.write(fd, storage + pos, capacity - pos)
-            _ = Darwin.write(fd, storage, pos)
+            _ = write(fd, storage + pos, capacity - pos)
+            _ = write(fd, storage, pos)
         }
     }
 }
@@ -122,11 +127,19 @@ public final class CrashReporter: @unchecked Sendable {
 
     private func installHandler(_ sig: Int32) {
         var action = sigaction()
+        #if canImport(Darwin)
         action.__sigaction_u.__sa_handler = { signal in
             CrashReporter.shared.writeCrashReport(signal: signal)
-            Foundation.signal(signal, SIG_DFL)
+            Darwin.signal(signal, SIG_DFL)
             raise(signal)
         }
+        #else
+        action.__sigaction_handler.sa_handler = { signal in
+            CrashReporter.shared.writeCrashReport(signal: signal)
+            Glibc.signal(signal, SIG_DFL)
+            raise(signal)
+        }
+        #endif
         sigemptyset(&action.sa_mask)
         action.sa_flags = 0
         sigaction(sig, &action, nil)
@@ -155,25 +168,25 @@ public final class CrashReporter: @unchecked Sendable {
 
         // 1. Header + signal name
         headerBytes.withUnsafeBufferPointer { ptr in
-            _ = Darwin.write(crashFd, ptr.baseAddress!, ptr.count)
+            _ = write(crashFd, ptr.baseAddress!, ptr.count)
         }
         writeSignalName(signal, to: crashFd)
 
         // 2. Engram log ring buffer
         let sep1: StaticString = "\n\n--- Recent Engram log entries ---\n"
-        sep1.withUTF8Buffer { buf in _ = Darwin.write(crashFd, buf.baseAddress!, buf.count) }
+        sep1.withUTF8Buffer { buf in _ = write(crashFd, buf.baseAddress!, buf.count) }
         ringBuffer.writeToFd(crashFd)
 
         // 3. Tail of LatticeCore log file
         let sep2: StaticString = "\n--- LatticeCore log (last 64KB) ---\n"
-        sep2.withUTF8Buffer { buf in _ = Darwin.write(crashFd, buf.baseAddress!, buf.count) }
+        sep2.withUTF8Buffer { buf in _ = write(crashFd, buf.baseAddress!, buf.count) }
         appendLatticeLogTail(crashFd)
 
         // 4. Footer
         let footer: StaticString = "\n--- End crash report ---\n"
-        footer.withUTF8Buffer { buf in _ = Darwin.write(crashFd, buf.baseAddress!, buf.count) }
+        footer.withUTF8Buffer { buf in _ = write(crashFd, buf.baseAddress!, buf.count) }
 
-        _ = Darwin.close(crashFd)
+        _ = close(crashFd)
     }
 
     /// Read the last N bytes of the LatticeCore log and write them to crashFd.
@@ -184,7 +197,7 @@ public final class CrashReporter: @unchecked Sendable {
         }
         guard logFd >= 0 else {
             let msg: StaticString = "(no lattice log file)\n"
-            msg.withUTF8Buffer { buf in _ = Darwin.write(crashFd, buf.baseAddress!, buf.count) }
+            msg.withUTF8Buffer { buf in _ = write(crashFd, buf.baseAddress!, buf.count) }
             return
         }
 
@@ -197,12 +210,12 @@ public final class CrashReporter: @unchecked Sendable {
         var buf = [UInt8](repeating: 0, count: 8192)
         buf.withUnsafeMutableBufferPointer { ptr in
             while true {
-                let n = Darwin.read(logFd, ptr.baseAddress!, ptr.count)
+                let n = read(logFd, ptr.baseAddress!, ptr.count)
                 if n <= 0 { break }
-                _ = Darwin.write(crashFd, ptr.baseAddress!, n)
+                _ = write(crashFd, ptr.baseAddress!, n)
             }
         }
-        _ = Darwin.close(logFd)
+        _ = close(logFd)
     }
 
     private func writeSignalName(_ sig: Int32, to fd: Int32) {
@@ -215,7 +228,7 @@ public final class CrashReporter: @unchecked Sendable {
         case SIGILL:   name = "4 (SIGILL)"
         default:       name = "unknown"
         }
-        name.withUTF8Buffer { buf in _ = Darwin.write(fd, buf.baseAddress!, buf.count) }
+        name.withUTF8Buffer { buf in _ = write(fd, buf.baseAddress!, buf.count) }
     }
 
 }

@@ -41,14 +41,23 @@ public final class LODSystem {
     private var distMinEMA: Float = 0
     private var distMaxEMA: Float = 5000
 
-    // Idle cache: the full O(nodes + edges) visible-set recompute is wasted
-    // when the camera is static and topology unchanged — the common case in
-    // real use (the graph sits still between interactions). Reuse the last
-    // result until the camera moves past a small threshold or topology bumps.
+    // Reuse only a complete, explicitly stable publication. Providers without a
+    // position revision cannot prove that a static camera means static geometry.
     private var cachedVisibleSet: VisibleSet?
     private var lastCameraPosition: SIMD3<Float> = .init(repeating: .greatestFiniteMagnitude)
     private var lastVisibleTopologyVersion: UInt64 = .max
+    private var lastPositionRevision: UInt64?
     private var lastSelectedNode: UUID?
+    private var lastGlowingNodeIDs: Set<UUID> = []
+    private var lastNodeCount = -1
+    private var lastEdgeCount = -1
+    private var lastNodeBudget = -1
+    private var lastEdgeBudget = -1
+    private var lastLabelBudget = -1
+    private var emaConverging = false
+    // Internal work evidence for regression tests: cache hits do not visit nodes/edges.
+    private(set) var visibilityComputationCount: UInt64 = 0
+    private var edgeNodeCount = -1
 
     /// Compute which nodes/edges/labels are visible this frame.
     ///
@@ -65,21 +74,28 @@ public final class LODSystem {
         selectedNode: UUID?,
         glowingNodes: [UUID: Float],
         hubs: Set<UUID>,
-        topologyVersion: UInt64 = 0
+        topologyVersion: UInt64 = 0,
+        positionRevision: UInt64? = nil
     ) -> VisibleSet {
         let n = nodes.count
         let useArray = positionArray.count == n
 
-        // Idle fast-path: identical camera (within ~0.5 world unit), same
-        // topology, same selection → the visible set can't have changed
-        // (glow/search only affect priority within an already-visible node's
-        // tier, not membership). Skip the whole recompute.
+        // Glow membership can change budget winners; elapsed glow time cannot.
+        let glowingNodeIDs = Set(glowingNodes.keys)
         if let cached = cachedVisibleSet,
+           let positionRevision, positionRevision == lastPositionRevision,
+           !emaConverging,
            topologyVersion == lastVisibleTopologyVersion,
+           n == lastNodeCount, edges.count == lastEdgeCount,
            selectedNode == lastSelectedNode,
-           simd_distance_squared(cameraPosition, lastCameraPosition) < 0.25 {
+           glowingNodeIDs == lastGlowingNodeIDs,
+           maxNodeInstances == lastNodeBudget,
+           maxEdgeInstances == lastEdgeBudget,
+           maxLabelInstances == lastLabelBudget,
+           cameraPosition == lastCameraPosition {
             return cached
         }
+        visibilityComputationCount &+= 1
 
         // Scale-relative thresholds. radiusEMA lags one frame — fine, it only
         // moves LOD boundaries. Scale 1.0 reproduces the historical tiers for
@@ -132,9 +148,17 @@ public final class LODSystem {
                 else if distSq < farTSq { farBuf.append((i, distSq, priority)) }
             }
         }
-        if frameMinSq < frameMaxSq {
-            distMinEMA = 0.8 * distMinEMA + 0.2 * frameMinSq.squareRoot()
-            distMaxEMA = 0.8 * distMaxEMA + 0.2 * frameMaxSq.squareRoot()
+        // Classification used the previous EMA. Keep recomputing until the
+        // update reaches a Float fixed point, even after geometry stops moving.
+        // This also handles one/equidistant nodes and eventually admits restored
+        // endpoints after a large force/camera/topology change.
+        emaConverging = false
+        if frameMinSq <= frameMaxSq, frameMaxSq.isFinite {
+            let nextMin = 0.8 * distMinEMA + 0.2 * frameMinSq.squareRoot()
+            let nextMax = 0.8 * distMaxEMA + 0.2 * frameMaxSq.squareRoot()
+            emaConverging = nextMin != distMinEMA || nextMax != distMaxEMA
+            distMinEMA = nextMin
+            distMaxEMA = nextMax
         }
 
         // Apply render budget. Sort a tier only when it overflows what's left
@@ -166,7 +190,7 @@ public final class LODSystem {
         // Edge endpoints as node indices, cached on topology. The UUID-Set
         // filter did 2 hashed lookups × edge count per frame (460k+ at 230k
         // edges); with int indices + a bit array it's two loads and two tests.
-        if edgeTopologyVersion != topologyVersion || edgeSrcIdx.count != edges.count {
+        if edgeTopologyVersion != topologyVersion || edgeSrcIdx.count != edges.count || edgeNodeCount != n {
             var idToIndex = [UUID: Int32](minimumCapacity: n)
             for i in 0..<n { idToIndex[nodes[i].id] = Int32(i) }
             edgeSrcIdx = [Int32](repeating: -1, count: edges.count)
@@ -176,6 +200,7 @@ public final class LODSystem {
                 edgeTgtIdx[e] = idToIndex[edges[e].targetId] ?? -1
             }
             edgeTopologyVersion = topologyVersion
+            edgeNodeCount = n
         }
 
         if visibleBits.count != n { visibleBits = [Bool](repeating: false, count: n) }
@@ -226,6 +251,12 @@ public final class LODSystem {
         lastCameraPosition = cameraPosition
         lastVisibleTopologyVersion = topologyVersion
         lastSelectedNode = selectedNode
+        lastPositionRevision = positionRevision
+        lastGlowingNodeIDs = glowingNodeIDs
+        lastNodeCount = n; lastEdgeCount = edges.count
+        lastNodeBudget = maxNodeInstances
+        lastEdgeBudget = maxEdgeInstances
+        lastLabelBudget = maxLabelInstances
         return result
     }
 }

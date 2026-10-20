@@ -1,3 +1,4 @@
+import EngramGraphUI
 import SwiftUI
 import Lattice
 import EngramKit
@@ -88,62 +89,10 @@ struct StatsOverlay: View, @MainActor Equatable {
 
             Divider().frame(width: 100).overlay(Color.white.opacity(0.2))
 
-            ScrollView(.vertical, showsIndicators: false) {
-                VStack(alignment: .trailing, spacing: 6) {
-                    // Project filters
-                    ForEach(projects, id: \.self) { project in
-                        HStack(spacing: 4) {
-                            if let driveToProject {
-                                Button {
-                                    driveToProject(project)
-                                } label: {
-                                    Image(systemName: "scope")
-                                        .font(.system(size: 10))
-                                }
-                                .buttonStyle(.plain)
-                                .opacity(hiddenProjects.contains(project) ? 0.3 : 0.6)
-                                .help("Fly to \(project)")
-                            }
-                            Button {
-                                toggleProject(project)
-                            } label: {
-                                HStack(spacing: 6) {
-                                    Circle()
-                                        .fill(GraphView.projectColor(for: project, in: colorMap))
-                                        .frame(width: 8, height: 8)
-                                        .opacity(hiddenProjects.contains(project) ? 0.3 : 1.0)
-                                    Text(project)
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .strikethrough(hiddenProjects.contains(project))
-                                }
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-
-                    // Edge type filters (use unfiltered counts so hidden types remain visible)
-                    if !allRelationCounts.isEmpty {
-                        Divider().frame(width: 100).overlay(Color.white.opacity(0.2))
-
-                        ForEach(allRelationCounts, id: \.key) { relation, count in
-                            Button {
-                                toggleRelation(relation)
-                            } label: {
-                                HStack(spacing: 6) {
-                                    Circle()
-                                        .fill(EdgeColors.relationColors[relation] ?? .white)
-                                        .frame(width: 8, height: 8)
-                                        .opacity(hiddenRelations.contains(relation) ? 0.3 : 1.0)
-                                    Text("\(relation.replacingOccurrences(of: "_", with: " ")) (\(count))")
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .strikethrough(hiddenRelations.contains(relation))
-                                }
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                }
-            }
+            EngramGraphFilterList(projects: projects, hiddenProjects: hiddenProjects,
+                hiddenRelations: hiddenRelations, relationCounts: Dictionary(uniqueKeysWithValues: allRelationCounts),
+                colorMap: colorMap, toggleProject: toggleProject, toggleRelation: toggleRelation,
+                driveToProject: driveToProject)
             .frame(maxHeight: 300)
         }
         .foregroundStyle(.white.opacity(0.7))
@@ -270,49 +219,15 @@ struct LayoutModePicker: View {
     let mode: LayoutMode
     let projectionState: ProjectionState
     let onModeChange: (LayoutMode) -> Void
-
+    private var progress: Double? {
+        if case .computing(let progress) = projectionState { return progress }
+        return nil
+    }
     var body: some View {
-        HStack(spacing: 0) {
-            ForEach(LayoutMode.allCases, id: \.rawValue) { m in
-                Button {
-                    onModeChange(m)
-                } label: {
-                    HStack(spacing: 4) {
-                        if m == .embedding, case .computing(let progress) = projectionState {
-                            // Circular progress indicator
-                            ZStack {
-                                Circle()
-                                    .stroke(.white.opacity(0.15), lineWidth: 1.5)
-                                Circle()
-                                    .trim(from: 0, to: progress)
-                                    .stroke(.cyan.opacity(0.8), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
-                                    .rotationEffect(.degrees(-90))
-                            }
-                            .frame(width: 10, height: 10)
-                        }
-                        Text(m.rawValue)
-                            .font(.system(size: 11, weight: mode == m ? .semibold : .regular, design: .monospaced))
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(
-                        RoundedRectangle(cornerRadius: 5)
-                            .fill(mode == m ? .white.opacity(0.12) : .clear)
-                    )
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.white.opacity(mode == m ? 0.9 : 0.4))
-            }
+        EngramGraphLayoutPicker(mode: mode == .embedding ? .embedding : .forceDirected,
+                               progress: progress) {
+            onModeChange($0 == .embedding ? .embedding : .forceDirected)
         }
-        .padding(2)
-        .background(
-            RoundedRectangle(cornerRadius: 7)
-                .fill(Color(red: 0.08, green: 0.1, blue: 0.14))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 7)
-                        .strokeBorder(.white.opacity(0.1), lineWidth: 1)
-                )
-        )
     }
 }
 

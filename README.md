@@ -25,8 +25,16 @@ Start a new Claude Code session — memory tools are immediately available.
 ### Engram Visualizer
 
 ```bash
-swift run -c release EngramVisualizer
+swift run --package-path Desktop --scratch-path .build -c release EngramVisualizer
 ```
+
+## Embedded memory library
+
+The root Swift package exports `EngramLattice` for macOS, iOS, and Linux hosts.
+Each agent can own a durable private graph and explicitly recall shared sources.
+Apple apps can add `EngramCoreML` for the bundled offline MiniLM embedder.
+See [per-agent memory](docs/agent-memory.md) for the API and package boundaries.
+Desktop executables and the visualizer build from `Desktop/Package.swift`.
 
 ## Why not MEMORY.md?
 
@@ -96,7 +104,7 @@ Claude Code has built-in memory via `MEMORY.md` files. Here's why Engram is bett
 
 ## Engram Visualizer
 
-An interactive force-directed graph visualization of your memory database, built with SwiftUI. Point it at a specific database with `CLAUDE_MEMORY_DB=~/path/to/memory.sqlite swift run -c release EngramVisualizer`.
+An interactive force-directed graph visualization of your memory database, built with SwiftUI. Point it at a specific database with `CLAUDE_MEMORY_DB=~/path/to/memory.sqlite swift run --package-path Desktop --scratch-path .build -c release EngramVisualizer`.
 
 **Features:**
 - Force-directed graph layout with project-colored nodes and inter-project repulsion

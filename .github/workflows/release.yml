@@ -58,7 +58,7 @@ jobs:
       # C++-heavy graph on slow hosted runners.
       - name: Build tests
         timeout-minutes: 75
-        run: swift build --build-tests
+        run: swift build --package-path Desktop --scratch-path .build --build-tests
       # Core correctness gate (the 0.13.0 release bar): sync/memory/organize/
       # relay + RealityKit system tests. EngramVisualizerTests' GPU-internal
       # suites are known debt (see CHANGELOG 0.13.0) and on-device
@@ -72,7 +72,7 @@ jobs:
       - name: Run tests
         timeout-minutes: 30
         run: >
-          swift test --skip-build --filter "EngramTests|EngramRealityKitTests"
+          swift test --package-path Desktop --scratch-path .build --skip-build --filter "EngramTests|EngramRealityKitTests|EngramCoreMLTests|EngramCoreMLParityTests"
           --skip "PerfTests"
           --skip "keyBERTKeywordExtraction"
           --skip "recall_semanticRelevanceOrdering"
@@ -94,11 +94,11 @@ jobs:
       - name: Run statement-budget regressions (serial)
         timeout-minutes: 10
         run: |
-          swift test --skip-build --filter "recall_statementBudget"
-          swift test --skip-build --filter "clusters_statementBudget"
+          swift test --package-path Desktop --scratch-path .build --skip-build --filter "recall_statementBudget"
+          swift test --package-path Desktop --scratch-path .build --skip-build --filter "clusters_statementBudget"
 
       - name: Build CLI release binaries
-        run: swift build -c release
+        run: swift build --package-path Desktop --scratch-path .build -c release
 
       - name: Import signing certificate
         if: env.DEVELOPER_ID_CERT_BASE64 != ''
@@ -181,6 +181,7 @@ jobs:
           cp .build/release/EngramHooks "$CLI_DIR/memory-hooks"
           cp .build/release/EngramDaemon "$CLI_DIR/memory-sync"
           cp -R .build/release/Engram_EngramKit.bundle "$CLI_DIR/"
+          cp -R .build/release/Engram_EngramCoreML.bundle "$CLI_DIR/"
           cp -R .build/release/swift-transformers_Hub.bundle "$CLI_DIR/"
           cp -R .build/release/SwiftLM_SwiftLM.bundle "$CLI_DIR/"
           cp agents/*.md "$AGENTS_DIR/"
@@ -230,6 +231,7 @@ jobs:
             cp .build/release/EngramDaemon staging/memory-sync
           fi
           cp -R .build/release/Engram_EngramKit.bundle staging/
+          cp -R .build/release/Engram_EngramCoreML.bundle staging/
           cp -R .build/release/swift-transformers_Hub.bundle staging/
           cp -R .build/release/SwiftLM_SwiftLM.bundle staging/
           cp agents/*.md staging/agents/

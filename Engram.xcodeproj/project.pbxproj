@@ -22,6 +22,7 @@
 		E5F60000000000000000008 /* CEngramSceneTypes in Frameworks */ = {isa = PBXBuildFile; productRef = E5F60000000000000000108 /* CEngramSceneTypes */; };
 		E5F60000000000000000009 /* EngramMetalShaders in Frameworks */ = {isa = PBXBuildFile; productRef = E5F60000000000000000109 /* EngramMetalShaders */; };
 		E5F6000000000000000000A /* EngramRealityKit in Frameworks */ = {isa = PBXBuildFile; productRef = E5F6000000000000000010A /* EngramRealityKit */; };
+		E5F6000000000000000000B /* EngramGraphUI in Frameworks */ = {isa = PBXBuildFile; productRef = E5F6000000000000000010B /* EngramGraphUI */; };
 		PREVIEW00000000000101 /* EngramRealityKit in Frameworks */ = {isa = PBXBuildFile; productRef = PREVIEW00000000000201 /* EngramRealityKit */; };
 		PREVIEW00000000000102 /* EngramSceneKit in Frameworks */ = {isa = PBXBuildFile; productRef = PREVIEW00000000000202 /* EngramSceneKit */; };
 		PREVIEW00000000000103 /* EngramMetalShaders in Frameworks */ = {isa = PBXBuildFile; productRef = PREVIEW00000000000203 /* EngramMetalShaders */; };
@@ -100,6 +101,7 @@
 				E5F60000000000000000008 /* CEngramSceneTypes in Frameworks */,
 				E5F60000000000000000009 /* EngramMetalShaders in Frameworks */,
 				E5F6000000000000000000A /* EngramRealityKit in Frameworks */,
+				E5F6000000000000000000B /* EngramGraphUI in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -200,6 +202,7 @@
 				E5F60000000000000000108 /* CEngramSceneTypes */,
 				E5F60000000000000000109 /* EngramMetalShaders */,
 				E5F6000000000000000010A /* EngramRealityKit */,
+				E5F6000000000000000010B /* EngramGraphUI */,
 			);
 			productName = Engram;
 			productReference = B2C3D4E500000000000002 /* Engram.app */;
@@ -751,7 +754,7 @@
 /* Begin XCLocalSwiftPackageReference section */
 		53DCFB6D2F55D76C0021613A /* XCLocalSwiftPackageReference "." */ = {
 			isa = XCLocalSwiftPackageReference;
-			relativePath = .;
+			relativePath = Desktop;
 		};
 /* End XCLocalSwiftPackageReference section */
 
@@ -829,6 +832,11 @@
 		E5F6000000000000000010A /* EngramRealityKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = EngramRealityKit;
+		};
+		E5F6000000000000000010B /* EngramGraphUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 53DCFB6D2F55D76C0021613A /* XCLocalSwiftPackageReference "Desktop" */;
+			productName = EngramGraphUI;
 		};
 		PREVIEW00000000000201 /* EngramRealityKit */ = {
 			isa = XCSwiftPackageProductDependency;

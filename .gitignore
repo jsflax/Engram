@@ -22,3 +22,6 @@ gpu-forces.log
 gpu_crash.txt
 vec0_logs.txt
 Packages/
+
+.build-desktop/
+.build-coreml-ios/
