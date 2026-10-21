@@ -4,6 +4,19 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.14] - 2026-10-21
+
+### Fixed
+- Reuse merged cross-galaxy edges during verified node appends when edge
+  visibility cannot change. Track missing endpoints so newly arriving nodes
+  still reveal the appropriate edges.
+- Preserve first-wins edge precedence and ordering, and rebuild after edge,
+  filter, node edit, removal, or galaxy changes. Add six integration regressions
+  covering incremental reuse and fallback behavior.
+
+This avoids repeated full edge merges during eligible appends. Live measurements
+are still required to establish startup or frame-rate improvement.
+
 ## [0.15.13] - 2026-10-19
 
 ### Fixed
