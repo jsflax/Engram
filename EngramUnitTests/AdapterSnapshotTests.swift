@@ -738,6 +738,297 @@ final class AdapterSnapshotTests: XCTestCase {
         XCTAssertNil(registry.galaxyForNode(b.id))
     }
 
+    func testCertifiedCrossGalaxyNodeAppendsReuseUnchangedEdges() async throws {
+        let (lattice, registry, group, groupGeneration, personal, personalGeneration, adapter) =
+            try await crossGalaxyStreamingFixture()
+        defer { lattice.close() }
+        let a = node(label: "Group"), b = node(label: "Personal"), c = node(label: "New group")
+        let d = node(label: "New personal"), e = node(label: "Later personal")
+        group.applyLoadChunk(nodes: [(1, a)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: [(1, b)], generation: personalGeneration)
+        let first = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "relates_to")
+        let second = EdgeData(id: UUID(), sourceId: b.id, targetId: a.id, relation: "supports")
+        group.applyLoadChunk(edges: [(1, first)], generation: groupGeneration)
+        personal.applyLoadChunk(edges: [(1, second)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        let edgeVersion = adapter.edgeVersion, nodeVersion = adapter.nodeVersion
+        let compared = adapter.edgePrefixComparisonCount, built = adapter.edgeSnapshotBuildCount
+        let groupAppend = group.renderStore.nodeAppendGeneration
+        let personalAppend = personal.renderStore.nodeAppendGeneration
+
+        // Several chunks may arrive before a frame, including a higher-priority
+        // copy of an already visible UUID. Its owner changes, not its visibility.
+        group.applyLoadChunk(nodes: [(2, c)], generation: groupGeneration)
+        let winner = node(id: b.id, label: "Group copy", topic: "New owner")
+        group.applyLoadChunk(nodes: [(3, winner)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: [(2, d)], generation: personalGeneration)
+        for (index, value) in [a, c, winner, d].enumerated() {
+            registry.unifiedSimulation.setPosition(value.id, to: SIMD3<Float>(Float(index + 1), 0, 0))
+        }
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, c.id, b.id, d.id])
+        XCTAssertEqual(adapter.nodes.map(\.label), [a.label, c.label, winner.label, d.label])
+        XCTAssertEqual(adapter.nodes[2].topic, winner.topic)
+        XCTAssertTrue(registry.galaxyForNode(b.id) === group)
+        XCTAssertEqual(adapter.positionArray, [1, 2, 3, 4].map { SIMD3<Float>(Float($0), 0, 0) })
+        XCTAssertNotEqual(adapter.nodeVersion, nodeVersion)
+        XCTAssertEqual(group.renderStore.nodeAppendGeneration, groupAppend)
+        XCTAssertEqual(personal.renderStore.nodeAppendGeneration, personalAppend)
+        XCTAssertEqual(adapter.edges.map(\.id), [first.id, second.id])
+        XCTAssertEqual(adapter.edges.map(\.sourceId), [a.id, b.id])
+        XCTAssertEqual(adapter.edges.map(\.targetId), [b.id, a.id])
+        XCTAssertEqual(adapter.edges.map(\.relation), [first.relation, second.relation])
+        XCTAssertEqual(adapter.edgeVersion, edgeVersion)
+        XCTAssertEqual(adapter.edgePrefixComparisonCount, compared)
+        XCTAssertEqual(adapter.edgeSnapshotBuildCount, built)
+
+        personal.applyLoadChunk(nodes: [(3, e)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, c.id, b.id, d.id, e.id])
+        XCTAssertEqual(adapter.edges.map(\.id), [first.id, second.id])
+        XCTAssertEqual(adapter.edgeVersion, edgeVersion)
+        XCTAssertEqual(adapter.edgePrefixComparisonCount, compared)
+        XCTAssertEqual(adapter.edgeSnapshotBuildCount, built)
+    }
+
+    func testCrossGalaxyMissingEndpointsArriveSeparatelyWithoutReorderingEdges() async throws {
+        let (lattice, registry, group, groupGeneration, personal, personalGeneration, adapter) =
+            try await crossGalaxyStreamingFixture()
+        defer { lattice.close() }
+        let synced = Galaxy(id: "synced", displayName: "Synced", lattice: lattice.sendableReference)
+        registry.register(synced)
+        let changes = await synced.loadChanges
+        let generation = changes.withLock { $0.begin() }
+        synced.loadStatus = .loading
+        let a = node(), b = node(), c = node(), d = node(), unrelated = node()
+        group.applyLoadChunk(nodes: [(1, a)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: [(1, b)], generation: personalGeneration)
+        let before = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "before")
+        let missing = EdgeData(id: UUID(), sourceId: c.id, targetId: d.id, relation: "bridge")
+        let after = EdgeData(id: UUID(), sourceId: b.id, targetId: a.id, relation: "after")
+        // One edge per precedence tier makes the exact full-merge order explicit.
+        group.applyLoadChunk(edges: [(1, before)], generation: groupGeneration)
+        synced.applyLoadChunk(edges: [(1, missing)], generation: generation)
+        personal.applyLoadChunk(edges: [(1, after)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [before.id, after.id])
+        let initialVersion = adapter.edgeVersion, compared = adapter.edgePrefixComparisonCount
+        group.applyLoadChunk(nodes: [(2, unrelated)], generation: groupGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edgeVersion, initialVersion)
+        XCTAssertEqual(adapter.edgePrefixComparisonCount, compared)
+        XCTAssertEqual(adapter.edges.map(\.id), [before.id, after.id])
+
+        group.applyLoadChunk(nodes: [(3, c)], generation: groupGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [before.id, after.id])
+        XCTAssertNotEqual(adapter.edgeVersion, initialVersion)
+        let firstEndpointVersion = adapter.edgeVersion
+        personal.applyLoadChunk(nodes: [(2, d)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertNotEqual(adapter.edgeVersion, firstEndpointVersion)
+        XCTAssertEqual(adapter.edges.map(\.id), [before.id, missing.id, after.id])
+        XCTAssertEqual(adapter.edges.map(\.sourceId), [a.id, c.id, b.id])
+        XCTAssertEqual(adapter.edges.map(\.targetId), [b.id, d.id, a.id])
+        XCTAssertEqual(adapter.edges.map(\.relation), ["before", "bridge", "after"])
+        XCTAssertTrue(synced.renderStore.edges.isEmpty,
+                      "Both bridge endpoints remain outside the edge's source galaxy")
+    }
+
+    func testCrossGalaxyHiddenAndDanglingWinnersSuppressVisibleDuplicates() async throws {
+        let (lattice, registry, group, groupGeneration, personal, personalGeneration, adapter) =
+            try await crossGalaxyStreamingFixture()
+        defer { lattice.close() }
+        let a = node(), b = node(), missing = node(), unrelated = node()
+        group.applyLoadChunk(nodes: [(1, a)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: [(1, a), (2, b)], generation: personalGeneration)
+        let high = EdgeData(id: UUID(), sourceId: a.id, targetId: missing.id, relation: "hidden")
+        let low = EdgeData(id: high.id, sourceId: a.id, targetId: b.id, relation: "visible")
+        group.applyLoadChunk(edges: [(1, high)], generation: groupGeneration)
+        personal.applyLoadChunk(edges: [(1, low)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertTrue(adapter.edges.isEmpty, "The dangling winner still claims its edge ID")
+        let danglingVersion = adapter.edgeVersion
+        personal.applyLoadChunk(nodes: [(3, unrelated)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertTrue(adapter.edges.isEmpty)
+        XCTAssertEqual(adapter.edgeVersion, danglingVersion)
+
+        registry.hiddenRelations = ["hidden"]
+        adapter.tick(dt: 1 / 60)
+        let hiddenVersion = adapter.edgeVersion
+        personal.applyLoadChunk(nodes: [(4, missing)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertTrue(adapter.edges.isEmpty, "A hidden winner also suppresses the visible lower copy")
+        XCTAssertEqual(adapter.edgeVersion, hiddenVersion,
+                       "An endpoint of a hidden edge cannot change rendered edges")
+        registry.hiddenRelations = []
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [high.id])
+        XCTAssertEqual(adapter.edges.first?.targetId, missing.id)
+        XCTAssertEqual(adapter.edges.first?.relation, high.relation)
+
+        registry.hiddenRelations = ["hidden"]
+        group.applyLoadChunk(removedEdges: [1], generation: groupGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [low.id])
+        XCTAssertEqual(adapter.edges.first?.sourceId, a.id)
+        XCTAssertEqual(adapter.edges.first?.targetId, b.id)
+        XCTAssertEqual(adapter.edges.first?.relation, low.relation)
+    }
+
+    func testCrossGalaxyAppendsWithEdgeEditsDeletesAndFiltersUseFullMerge() async throws {
+        let (lattice, registry, group, groupGeneration, personal, personalGeneration, adapter) =
+            try await crossGalaxyStreamingFixture()
+        defer { lattice.close() }
+        let a = node(), b = node(), c = node(), d = node(), e = node()
+        group.applyLoadChunk(nodes: [(1, a)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: [(1, b)], generation: personalGeneration)
+        let original = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "relates_to")
+        group.applyLoadChunk(edges: [(1, original)], generation: groupGeneration)
+        adapter.tick(dt: 1 / 60)
+        let initialVersion = adapter.edgeVersion
+        let edited = EdgeData(id: original.id, sourceId: a.id, targetId: c.id, relation: "part_of")
+        group.applyLoadChunk(nodes: [(2, c)], edges: [(1, edited)], generation: groupGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertNotEqual(adapter.edgeVersion, initialVersion)
+        XCTAssertEqual(adapter.edges.map(\.id), [edited.id])
+        XCTAssertEqual(adapter.edges.first?.sourceId, a.id)
+        XCTAssertEqual(adapter.edges.first?.targetId, c.id)
+        XCTAssertEqual(adapter.edges.first?.relation, edited.relation)
+        XCTAssertTrue(try XCTUnwrap(adapter.nodes.first { $0.id == c.id }).isHub)
+
+        personal.applyLoadChunk(nodes: [(2, d)], generation: personalGeneration)
+        group.applyLoadChunk(removedEdges: [1], generation: groupGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertTrue(adapter.edges.isEmpty)
+        XCTAssertFalse(try XCTUnwrap(adapter.nodes.first { $0.id == c.id }).isHub)
+        group.applyLoadChunk(edges: [(2, original)], generation: groupGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [original.id])
+        registry.hiddenRelations = [original.relation]
+        group.applyLoadChunk(nodes: [(3, e)], generation: groupGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertTrue(adapter.edges.isEmpty)
+        registry.hiddenRelations = []
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [original.id])
+        XCTAssertEqual(adapter.edges.first?.targetId, b.id)
+
+        personal.applyLoadChunk(nodes: [(3, node())], removedNodes: [1], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertTrue(adapter.edges.isEmpty)
+        XCTAssertNotNil(group.renderStore.allEdges[original.id],
+                        "The source edge survives deletion of its endpoint in another galaxy")
+    }
+
+    func testCrossGalaxyPrefixEditsReorderFilteringAndShrinkInvalidateReuse() async throws {
+        let (lattice, registry, group, groupGeneration, personal, personalGeneration, adapter) =
+            try await crossGalaxyStreamingFixture()
+        defer { lattice.close() }
+        let a = node(label: "Preview"), b = node(), c = node(label: "New")
+        group.applyLoadChunk(nodes: [(1, a)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: [(1, b)], generation: personalGeneration)
+        let edge = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "relates_to")
+        group.applyLoadChunk(edges: [(1, edge)], generation: groupGeneration)
+        adapter.tick(dt: 1 / 60)
+        let initialVersion = adapter.edgeVersion
+        let edited = node(id: a.id, label: "Reconciled", topic: "Changed")
+        group.applyLoadChunk(nodes: [(1, edited), (2, c)], generation: groupGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertNotEqual(adapter.edgeVersion, initialVersion)
+        XCTAssertEqual(adapter.nodes.map(\.label), [edited.label, c.label, b.label])
+        XCTAssertEqual(adapter.nodes.first?.topic, edited.topic)
+        XCTAssertEqual(adapter.edges.map(\.id), [edge.id])
+        let editedVersion = adapter.edgeVersion
+        group.renderStore.nodes.reverse()
+        adapter.tick(dt: 1 / 60)
+        XCTAssertNotEqual(adapter.edgeVersion, editedVersion)
+        XCTAssertEqual(adapter.nodes.map(\.id), [c.id, a.id, b.id])
+        XCTAssertEqual(adapter.edges.map(\.id), [edge.id])
+
+        let settings = VisualizerConfig()
+        settings.hiddenProjects = ["Blocked"]
+        registry.updateDrainConfig(from: settings, timeFilter: nil)
+        personal.applyLoadChunk(nodes: [(1, node(id: b.id, project: "Blocked")), (2, node())],
+                                generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertNil(registry.galaxyForNode(b.id))
+        XCTAssertTrue(adapter.edges.isEmpty)
+        settings.hiddenProjects = []
+        registry.updateDrainConfig(from: settings, timeFilter: nil)
+        personal.applyLoadChunk(nodes: [(1, b)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [edge.id])
+
+        // An arbitrary array mutation invalidates continuity even without an
+        // edge revision or a manually published topology revision.
+        let sourceVersion = group.renderStore.allEdgesVersion
+        group.renderStore.nodes.removeAll { $0.id == a.id }
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(group.renderStore.allEdgesVersion, sourceVersion)
+        XCTAssertNil(registry.galaxyForNode(a.id))
+        XCTAssertTrue(adapter.edges.isEmpty)
+    }
+
+    func testCrossGalaxyReplacementPrecedenceAndSingleGalaxyTransitionsResetReuse() async throws {
+        let (lattice, registry, group, groupGeneration, personal, personalGeneration, adapter) =
+            try await crossGalaxyStreamingFixture()
+        defer { lattice.close() }
+        let a = node(), b = node(), missing = node()
+        group.applyLoadChunk(nodes: [(1, a)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: [(1, a), (2, b)], generation: personalGeneration)
+        let high = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "group")
+        let low = EdgeData(id: high.id, sourceId: b.id, targetId: a.id, relation: "personal")
+        group.applyLoadChunk(edges: [(1, high)], generation: groupGeneration)
+        personal.applyLoadChunk(edges: [(1, low)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [high.id])
+        XCTAssertEqual(adapter.edges.first?.relation, high.relation)
+
+        let replacement = Galaxy(id: "group:team", displayName: "Replacement", lattice: lattice.sendableReference)
+        registry.register(replacement)
+        let changes = await replacement.loadChanges
+        let generation = changes.withLock { $0.begin() }
+        replacement.loadStatus = .loading
+        let replaced = EdgeData(id: high.id, sourceId: a.id, targetId: missing.id, relation: "replacement")
+        replacement.applyLoadChunk(nodes: [(1, a)], edges: [(1, replaced)], generation: generation)
+        XCTAssertEqual(replacement.renderStore.nodesVersion, group.renderStore.nodesVersion)
+        XCTAssertEqual(replacement.renderStore.allEdgesVersion, group.renderStore.allEdgesVersion)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertTrue(adapter.edges.isEmpty, "Equal counters cannot certify a replacement instance")
+        personal.applyLoadChunk(nodes: [(3, missing)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [replaced.id])
+        XCTAssertEqual(adapter.edges.first?.targetId, missing.id)
+        XCTAssertEqual(adapter.edges.first?.relation, replaced.relation)
+
+        let earlier = Galaxy(id: "group:aaa", displayName: "Earlier", lattice: lattice.sendableReference)
+        registry.register(earlier)
+        let earlierChanges = await earlier.loadChanges
+        let earlierGeneration = earlierChanges.withLock { $0.begin() }
+        earlier.loadStatus = .loading
+        let winner = EdgeData(id: high.id, sourceId: b.id, targetId: a.id, relation: "earlier")
+        earlier.applyLoadChunk(edges: [(1, winner)], generation: earlierGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [winner.id])
+        XCTAssertEqual(adapter.edges.first?.relation, winner.relation)
+        XCTAssertEqual(adapter.edges.first?.targetId, a.id)
+        registry.remove("group:aaa")
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [replaced.id])
+        XCTAssertEqual(adapter.edges.first?.relation, replaced.relation)
+        registry.remove("group:team")
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [low.id])
+        XCTAssertEqual(adapter.edges.first?.relation, low.relation)
+        XCTAssertEqual(adapter.edges.first?.targetId, a.id)
+        registry.remove("personal")
+        adapter.tick(dt: 1 / 60)
+        XCTAssertTrue(adapter.nodes.isEmpty)
+        XCTAssertTrue(adapter.edges.isEmpty)
+    }
+
     func testStreamingCompletedScanReconcilesPreviewMetadataAndAbsentRows() async throws {
         let lattice = try Lattice(Memory.self, MemoryEdge.self, configuration: .init(storage: .memory()))
         defer { lattice.close() }
@@ -1298,6 +1589,17 @@ final class AdapterSnapshotTests: XCTestCase {
         XCTAssertEqual(adapter.nodePrefixComparisonCount, compared)
         XCTAssertTrue(adapter.edges.isEmpty)
         XCTAssertTrue(registry.galaxyForNode(b.id) === group)
+    }
+
+    private func crossGalaxyStreamingFixture() async throws
+        -> (Lattice, GalaxyRegistry, Galaxy, UInt64, Galaxy, UInt64, GalaxyRegistryAdapter) {
+        let (lattice, registry, personal, personalGeneration, adapter) = try await streamingFixture()
+        let group = Galaxy(id: "group:team", displayName: "Team", lattice: lattice.sendableReference)
+        registry.register(group)
+        let changes = await group.loadChanges
+        let generation = changes.withLock { $0.begin() }
+        group.loadStatus = .loading
+        return (lattice, registry, group, generation, personal, personalGeneration, adapter)
     }
 
     private func streamingFixture() async throws

@@ -122,8 +122,17 @@ class HostPreparationTests(unittest.TestCase):
             'testLabelNumericRescanPreservesMissingPositionSemantics',
             'testLabelNumericSlotsFollowReorderAndTopicChanges')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 93)
+        self.assertEqual(len(inventory), 99)
         self.assertIn('AdapterSnapshotTests/testMascotVisibilityReachesSceneAndPreservesExistingEntities', inventory)
+        for name in (
+            'testCertifiedCrossGalaxyNodeAppendsReuseUnchangedEdges',
+            'testCrossGalaxyMissingEndpointsArriveSeparatelyWithoutReorderingEdges',
+            'testCrossGalaxyHiddenAndDanglingWinnersSuppressVisibleDuplicates',
+            'testCrossGalaxyAppendsWithEdgeEditsDeletesAndFiltersUseFullMerge',
+            'testCrossGalaxyPrefixEditsReorderFilteringAndShrinkInvalidateReuse',
+            'testCrossGalaxyReplacementPrecedenceAndSingleGalaxyTransitionsResetReuse',
+        ):
+            self.assertIn('AdapterSnapshotTests/' + name, inventory)
         self.assertEqual([name for name in inventory if name.startswith('FrameLookupInvalidationTests/')],
                          sorted(expected))
         self.assertEqual(M.CLASSES.count('FrameLookupInvalidationTests'), 1)
