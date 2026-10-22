@@ -382,8 +382,11 @@ final class PanelPerformanceTests: XCTestCase {
         try (prefix + "\n" + lines.joined(separator: "\n") + "\n").write(to: file, atomically: true, encoding: .utf8)
         let tail = LogTailReader.tailLines(path: file.path)
         XCTAssertEqual(tail.count, 500)
-        XCTAssertEqual(tail.first, lines[100])
-        XCTAssertEqual(tail.last, lines[599])
+        XCTAssertEqual(tail.first?.text, lines[100])
+        XCTAssertEqual(tail.last?.text, lines[599])
+        let first = try XCTUnwrap(tail.first)
+        XCTAssertEqual(try Data(contentsOf: file)[Int(first.offset)...].prefix(first.text.utf8.count), Data(first.text.utf8),
+                       "Offsets point at the line's start in the file")
         let entries = LogTailReader.read(sources: [LogSource(id: "hooks", label: "Hooks", path: file.path, icon: "", color: .cyan)])
         XCTAssertEqual(entries.count, 500)
         XCTAssertEqual(entries.first?.message, "Line 100 🌌")

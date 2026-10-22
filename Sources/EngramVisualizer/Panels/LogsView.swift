@@ -11,7 +11,13 @@ struct LogSource: Identifiable, Sendable {
 
 /// Parsed log entry from a log file.
 struct LogEntry: Identifiable, Equatable, Sendable {
-    let id: Int
+    /// Where the line starts in its file, so a line keeps its id as the tail moves.
+    struct ID: Hashable, Sendable {
+        let source: String
+        let offset: UInt64
+    }
+
+    let id: ID
     let timestamp: Date?
     let source: String
     let message: String
@@ -31,6 +37,11 @@ final class LogsStore {
     }
     var autoScroll = true
     private(set) var filteredEntries: [LogEntry] = []
+    /// Bumped whenever the displayed rows change; auto-scroll keys off it. The
+    /// last row isn't enough: untimestamped lines sort last and often stay put
+    /// while rows are added above them.
+    private(set) var displayRevision = 0
+    private var expandedEntries: Set<LogEntry.ID> = []
     @ObservationIgnored private var generation: UInt64 = 0
     @ObservationIgnored nonisolated(unsafe) private var worker: Task<Void, Never>?
     @ObservationIgnored nonisolated(unsafe) private var continuation: AsyncStream<Void>.Continuation?
@@ -76,6 +87,17 @@ final class LogsStore {
             result = result.filter { $0.raw.lowercased().contains(query) }
         }
         filteredEntries = result
+        displayRevision &+= 1
+    }
+
+    func isExpanded(_ entry: LogEntry) -> Bool {
+        expandedEntries.contains(entry.id)
+    }
+
+    func toggleExpanded(_ entry: LogEntry) {
+        if expandedEntries.remove(entry.id) == nil {
+            expandedEntries.insert(entry.id)
+        }
     }
 
     func loadLogs() {
@@ -110,7 +132,12 @@ final class LogsStore {
     }
 
     private func publish(_ entries: [LogEntry], generation: UInt64) {
-        guard generation == self.generation, self.entries != entries else { return }
+        guard generation == self.generation else { return }
+        replaceEntries(with: entries)
+    }
+
+    func replaceEntries(with entries: [LogEntry]) {
+        guard self.entries != entries else { return }
         self.entries = entries
     }
 
@@ -174,14 +201,16 @@ struct LogsContentView: View {
                             emptyState
                         } else {
                             ForEach(filtered) { entry in
-                                logRow(entry)
-                                    .id(entry.id)
+                                LogRow(entry: entry, isExpanded: store.isExpanded(entry)) {
+                                    store.toggleExpanded(entry)
+                                }
+                                .id(entry.id)
                             }
                         }
                     }
                     .padding(.vertical, 4)
                 }
-                .onChange(of: store.entries.last) { _, _ in
+                .onChange(of: store.displayRevision) { _, _ in
                     if store.autoScroll, let last = store.filteredEntries.last {
                         withAnimation(.easeOut(duration: 0.2)) {
                             proxy.scrollTo(last.id, anchor: .bottom)
@@ -267,32 +296,6 @@ struct LogsContentView: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - Log Row
-
-    private func logRow(_ entry: LogEntry) -> some View {
-        let source = LogsStore.sources.first { $0.id == entry.source }
-        let color = source?.color ?? .white
-        return HStack(alignment: .top, spacing: 6) {
-            if let ts = entry.timestamp {
-                Text(Self.timeFormatter.string(from: ts))
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.25))
-                    .frame(width: 42, alignment: .trailing)
-            }
-            Circle()
-                .fill(color)
-                .frame(width: 4, height: 4)
-                .padding(.top, 4)
-            Text(entry.message)
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.7))
-                .lineLimit(3)
-                .textSelection(.enabled)
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
-    }
-
     private var emptyState: some View {
         VStack(spacing: 8) {
             Image(systemName: "doc.text")
@@ -309,8 +312,54 @@ struct LogsContentView: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 40)
     }
+}
 
-    // MARK: - Formatters
+// MARK: - Log Row
+
+/// Clicking a row toggles it between three truncated lines and the full message.
+struct LogRow: View {
+    let entry: LogEntry
+    let isExpanded: Bool
+    let onToggle: () -> Void
+
+    var body: some View {
+        let source = LogsStore.sources.first { $0.id == entry.source }
+        let color = source?.color ?? .white
+        HStack(alignment: .top, spacing: 6) {
+            if let ts = entry.timestamp {
+                Text(Self.timeFormatter.string(from: ts))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.25))
+                    .fixedSize()
+            }
+            Circle()
+                .fill(color)
+                .frame(width: 4, height: 4)
+                .padding(.top, 4)
+            message
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.7))
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onToggle)
+    }
+
+    /// Selection is only enabled once expanded: on macOS, clicking selectable
+    /// text swaps in an AppKit text view that ignores `lineLimit` and draws the
+    /// whole message over the rows below. Clicks on selectable text also never
+    /// reach the tap gesture, so an expanded row collapses from its margins.
+    @ViewBuilder private var message: some View {
+        if isExpanded {
+            Text(entry.message)
+                .textSelection(.enabled)
+        } else {
+            Text(entry.message)
+                .lineLimit(3)
+        }
+    }
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
