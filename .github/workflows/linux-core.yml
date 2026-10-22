@@ -67,6 +67,14 @@ jobs:
             echo "PYTHONDONTWRITEBYTECODE=1"
           } >> "$GITHUB_ENV"
           swift --version > "$task_root/evidence/swift-version.txt"
+      - name: Install portable test Python runtime
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install --no-install-recommends -y python3
+          python3 --version
       - name: Build EngramMemoryCore (Linux)
         run: |
           swift build --package-path "$LINUX_ROOT/repo" --scratch-path "$LINUX_ROOT/root-build" \

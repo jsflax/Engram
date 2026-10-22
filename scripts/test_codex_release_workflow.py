@@ -311,6 +311,56 @@ os.execv(sys.executable,[sys.executable,*args])
                             self.assertEqual(calls[2]['args'], ['-B', '-'] + (
                                 [str(evidence / 'receipt.json')] if release else []))
 
+    def test_linux_installs_python_before_builds_and_propagates_tooling_failure(self):
+        name = 'Install portable test Python runtime'
+        workflow = (ROOT / '.github/workflows/linux-core.yml').read_text()
+        order = ['Prepare isolated Linux work and output paths', name,
+                 'Build EngramMemoryCore (Linux)', 'Compile its tests (Linux)',
+                 'Execute exact portable core tests (Linux)']
+        positions = [workflow.index('      - name: ' + step + '\n') for step in order]
+        self.assertEqual(positions, sorted(positions))
+        with tempfile.TemporaryDirectory(prefix='engram linux Python ') as temporary:
+            root = Path(temporary).resolve()
+            bin_dir = root / 'bin'; bin_dir.mkdir()
+            log, installed, continued = root / 'calls.jsonl', root / 'installed', root / 'continued'
+            fake = '#!' + sys.executable + '\n' + '''import json,os,sys
+from pathlib import Path
+tool,args=Path(sys.argv[0]).name,sys.argv[1:]
+with open(os.environ['CALL_LOG'],'a') as output:
+    output.write(json.dumps([tool,*args])+'\\n')
+phase = args[0] if tool == 'apt-get' else 'version'
+if phase == os.environ['FAIL_PHASE']:
+    raise SystemExit(29)
+if phase == 'install':
+    assert args == ['install','--no-install-recommends','-y','python3'],args
+    Path(os.environ['INSTALLED']).touch()
+elif tool == 'python3':
+    assert args == ['--version'] and Path(os.environ['INSTALLED']).is_file(),args
+    print('Python 3.12 fixture')
+else:
+    assert args == ['update'],args
+'''
+            for tool in ('apt-get', 'python3'):
+                command = bin_dir / tool
+                command.write_text(fake); command.chmod(0o700)
+            expected = [['apt-get', 'update'],
+                        ['apt-get', 'install', '--no-install-recommends', '-y', 'python3'],
+                        ['python3', '--version']]
+            for phase, count in (('update', 1), ('install', 2), ('version', 3), ('', 3)):
+                with self.subTest(phase=phase):
+                    for path in (log, installed, continued):
+                        path.unlink(missing_ok=True)
+                    result = subprocess.run(['/bin/bash', '-e', '-c', run_block('linux-core.yml', name)
+                        + 'printf continued > "$1"\n', 'tooling', str(continued)], cwd=root,
+                        env=dict(os.environ, PATH=str(bin_dir), CALL_LOG=str(log),
+                                 INSTALLED=str(installed), FAIL_PHASE=phase),
+                        capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 29 if phase else 0, result.stdout + result.stderr)
+                    self.assertEqual(continued.exists(), not phase)
+                    self.assertEqual([json.loads(line) for line in log.read_text().splitlines()], expected[:count])
+                    if not phase:
+                        self.assertEqual(result.stdout, 'Python 3.12 fixture\n')
+
     def test_linux_preparation_trusts_only_workspace_and_archives_exact_source(self):
         block = run_block('linux-core.yml', 'Prepare isolated Linux work and output paths')
         with tempfile.TemporaryDirectory(prefix='engram linux ownership ') as temporary:
