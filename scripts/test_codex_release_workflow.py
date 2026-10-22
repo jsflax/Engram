@@ -311,6 +311,67 @@ os.execv(sys.executable,[sys.executable,*args])
                             self.assertEqual(calls[2]['args'], ['-B', '-'] + (
                                 [str(evidence / 'receipt.json')] if release else []))
 
+    def test_linux_preparation_trusts_only_workspace_and_archives_exact_source(self):
+        block = run_block('linux-core.yml', 'Prepare isolated Linux work and output paths')
+        with tempfile.TemporaryDirectory(prefix='engram linux ownership ') as temporary:
+            root = Path(temporary).resolve()
+            checkout = root / 'checkout with spaces'; checkout.mkdir()
+            bin_dir = root / 'bin'; bin_dir.mkdir()
+            (bin_dir / 'git').symlink_to(shutil.which('git'))
+            swift = bin_dir / 'swift'
+            swift.write_text('#!/bin/sh\n[ "$#" = 1 ] && [ "$1" = --version ] || exit 99\n'
+                             'printf "fixture Swift version\\n"\n')
+            swift.chmod(0o700)
+            github_env = root / 'github-env'
+            # Isolate Git from user configuration and preserve the job's existing
+            # environment-based private dependency rewrite alongside per-command trust.
+            env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+            env.update(HOME=str(root / 'home'), PATH=f'{bin_dir}:/usr/bin:/bin',
+                GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_COUNT='1',
+                GIT_CONFIG_KEY_0='url.https://example.invalid/private/.insteadOf',
+                GIT_CONFIG_VALUE_0='https://example.invalid/source/',
+                GITHUB_WORKSPACE=str(checkout), GITHUB_ENV=str(github_env),
+                GITHUB_RUN_ID='987654321', GITHUB_RUN_ATTEMPT='2')
+
+            def git(*args, check=True):
+                return subprocess.run(['git', *args], cwd=checkout, env=env,
+                    capture_output=True, text=True, timeout=10, check=check)
+
+            git('init', '-q')
+            source = checkout / 'source.txt'; source.write_text('committed source\n')
+            git('add', 'source.txt')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                '-c', 'commit.gpgsign=false', 'commit', '-qm', 'fixture')
+            sha = git('rev-parse', 'HEAD').stdout.strip()
+            source.write_text('uncommitted source\n')
+            (checkout / 'untracked.txt').write_text('untracked\n')
+            env.update(SOURCE_SHA=sha, GIT_TEST_ASSUME_DIFFERENT_OWNER='1')
+            refused = git('rev-parse', 'HEAD', check=False)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn('dubious ownership', refused.stderr)
+            task_root = root / 'home/localdev/engram-linux-987654321-2'
+            for scenario, overrides in (
+                ('wrong-workspace', {'GITHUB_WORKSPACE': str(root)}),
+                ('wrong-source', {'SOURCE_SHA': '0' * 40}),
+                ('exact-source', {}),
+            ):
+                with self.subTest(scenario=scenario):
+                    result = subprocess.run(['/bin/bash', '-e', '-c', block], cwd=checkout,
+                        env=dict(env, **overrides), capture_output=True, text=True, timeout=10)
+                    if scenario != 'exact-source':
+                        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertFalse(task_root.exists())
+                        self.assertFalse(github_env.exists())
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual((task_root / 'repo/source.txt').read_text(), 'committed source\n')
+                        self.assertFalse((task_root / 'repo/untracked.txt').exists())
+                        self.assertIn('LINUX_ROOT=' + str(task_root) + '\n', github_env.read_text())
+            # Trust must not persist, and -c must not replace the existing rewrite.
+            self.assertIn('dubious ownership', git('rev-parse', 'HEAD', check=False).stderr)
+            rewrite = git('-c', 'safe.directory=' + str(checkout), 'config', '--get', env['GIT_CONFIG_KEY_0'])
+            self.assertEqual(rewrite.stdout.strip(), env['GIT_CONFIG_VALUE_0'])
+
     def test_linux_portable_gate_requires_each_lifetime_test_and_propagates_failure(self):
         required = [
             'detachedShellOwnsLeaseUntilProviderExitEvenWhenProviderClosesFD',
