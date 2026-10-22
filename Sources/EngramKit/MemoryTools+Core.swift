@@ -191,41 +191,21 @@ extension MemoryTools {
         let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance, isPrivate: isPrivate, authorUserId: authorID, modifiedAt: rememberedAt)
 
         // The Memory and its required graph/topic effects share one checked
-        // transaction. A failed BEGIN cannot execute the body in autocommit.
-        // Other errors still propagate without claiming that rollback settled.
-        var transactionBodyEntered = false
+        // transaction. A failed BEGIN cannot execute the body in autocommit
+        // and is retried a bounded number of times (LatticeBeginRetry); every
+        // other error still propagates without claiming that rollback settled.
         let effects: RememberCommitEffects
         do {
-            effects = try localLattice.withTransaction { () throws -> RememberCommitEffects in
-                transactionBodyEntered = true
-                return try commitRemember(memory, parentGidValue: parentGidValue,
-                                          episodeId: episodeId,
-                                          autoConnectCandidates: autoConnectCandidates,
-                                          authorID: authorID)
-            }
-        } catch {
-            // Only a failed BEGIN proves this attempt did not run any write.
-            // Identical text from a body, COMMIT, rollback, or notification
-            // failure must retain its unknown persistence outcome.
-            guard !transactionBodyEntered,
-                  case LatticeError.transactionError(let detail) = error,
-                  ["database is locked", "database is busy", "database table is locked",
-                   "database schema is locked"].contains(where: {
-                      detail == "Failed to begin transaction: " + $0
-                  }) else { throw error }
-            return CallTool.Result(
-                content: [.text("Memory was not stored: the database was busy before the write transaction started. Retry on a later turn.")],
-                structuredContent: .object([
-                    "engram_write_receipt": .object([
-                        "schema_version": .int(1),
-                        "tool": .string("remember"),
-                        "write_outcome": .string("not_stored_transaction_not_started"),
-                        "reason": .string("database_busy"),
-                        "memory_ids": .array([]),
-                    ]),
-                ]),
-                isError: true
-            )
+            effects = try LatticeBeginRetry.run(on: localLattice, log: { log("[remember] \($0)") }) {
+                try commitRemember(memory, parentGidValue: parentGidValue,
+                                   episodeId: episodeId,
+                                   autoConnectCandidates: autoConnectCandidates,
+                                   authorID: authorID)
+            }.value
+        } catch let contention as LatticeBeginRetry.Contention {
+            // Only failed BEGINs reach here: this attempt ran no write.
+            log("[remember] not stored: \(contention)")
+            return Self.busyReceipt(tool: "remember", verb: "stored", contention: contention)
         }
 
         let memoryGlobalId = effects.memoryID
@@ -500,6 +480,37 @@ extension MemoryTools {
         return CallTool.Result(content: [.text(text)], structuredContent: .object([
             "engram_recall": .object(["version": .int(1), "rows": .array(rows)]),
         ]), isError: false)
+    }
+
+    /// The receipt every write tool returns when a bounded BEGIN retry still
+    /// never admitted the transaction body. `write_outcome` stays
+    /// `not_stored_transaction_not_started`: nothing was written, a retry is
+    /// safe.
+    ///
+    /// The text and the receipt's key set are a FROZEN contract: the Codex
+    /// learner's memory proxy (scripts/codex_learner/memory_proxy.py,
+    /// `verified_begin_busy_response`) accepts this no-write receipt only when
+    /// the text matches byte for byte and the receipt has exactly these five
+    /// keys at schema_version 1. Attempt count and total wait therefore go to
+    /// the server log (`[tool] not stored: BEGIN contention after N
+    /// attempt(s), X s`), not into the receipt; a receipt-level field needs a
+    /// coordinated schema_version bump on both sides.
+    nonisolated static func busyReceipt(tool: String, verb: String,
+                                        contention: LatticeBeginRetry.Contention) -> CallTool.Result {
+        _ = contention
+        return CallTool.Result(
+            content: [.text("Memory was not \(verb): the database was busy before the write transaction started. Retry on a later turn.")],
+            structuredContent: .object([
+                "engram_write_receipt": .object([
+                    "schema_version": .int(1),
+                    "tool": .string(tool),
+                    "write_outcome": .string("not_stored_transaction_not_started"),
+                    "reason": .string("database_busy"),
+                    "memory_ids": .array([]),
+                ]),
+            ]),
+            isError: true
+        )
     }
 
     func handleRecall(_ args: [String: Value]?) async throws -> CallTool.Result {
@@ -1156,10 +1167,8 @@ extension MemoryTools {
             }
         }
 
-        var transactionBodyEntered = false
         do {
-            try writeLattice.withTransaction {
-                transactionBodyEntered = true
+            try LatticeBeginRetry.run(on: writeLattice, log: { log("[update] \($0)") }) {
                 if let content = a.content {
                     mem.content = content
                     contentChanged = true
@@ -1233,29 +1242,12 @@ extension MemoryTools {
                 // the original author, and the sync firewall keys on it.
                 mem.modifiedAt = Date()
             }
-        } catch {
-            // Only a failed BEGIN proves that this attempt wrote nothing.
-            // Setter, COMMIT, rollback and notification failures retain an
-            // unknown outcome; never turn those into a safe-retry receipt.
-            guard !transactionBodyEntered,
-                  case LatticeError.transactionError(let detail) = error,
-                  ["database is locked", "database is busy", "database table is locked",
-                   "database schema is locked"].contains(where: {
-                      detail == "Failed to begin transaction: " + $0
-                  }) else { throw error }
-            return CallTool.Result(
-                content: [.text("Memory was not updated: the database was busy before the write transaction started. Retry on a later turn.")],
-                structuredContent: .object([
-                    "engram_write_receipt": .object([
-                        "schema_version": .int(1),
-                        "tool": .string("update"),
-                        "write_outcome": .string("not_stored_transaction_not_started"),
-                        "reason": .string("database_busy"),
-                        "memory_ids": .array([]),
-                    ]),
-                ]),
-                isError: true
-            )
+        } catch let contention as LatticeBeginRetry.Contention {
+            // Only failed BEGINs reach here: this attempt wrote nothing.
+            // Setter, COMMIT, rollback and notification failures propagate
+            // with their unknown outcome; never a safe-retry receipt.
+            log("[update] not updated: \(contention)")
+            return Self.busyReceipt(tool: "update", verb: "updated", contention: contention)
         }
 
         // Restore graph connectivity alongside the memory: edges tombstoned
@@ -1340,7 +1332,8 @@ extension MemoryTools {
         var tombstonedCount = 0
         var edgeCount = 0
         let selfId = currentUserId
-        try localLattice.transaction {
+        do {
+            try LatticeBeginRetry.run(on: localLattice, log: { log("[merge] \($0)") }) {
             try localLattice.add(merged)
 
             guard let gid = merged.globalId else {
@@ -1363,6 +1356,10 @@ extension MemoryTools {
                     hardDeleted += 1
                 }
             }
+            }
+        } catch let contention as LatticeBeginRetry.Contention {
+            log("[merge] not merged: \(contention)")
+            return Self.busyReceipt(tool: "merge", verb: "merged", contention: contention)
         }
 
         var notes: [String] = []

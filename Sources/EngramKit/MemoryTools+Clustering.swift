@@ -393,23 +393,29 @@ extension MemoryTools {
             authorUserId: currentUserId,
             modifiedAt: Date()
         )
-        try localLattice.add(summary)
-
-        guard let summaryGlobalId = summary.globalId else {
-            throw MCPError.internalError("Failed to get summary globalId after persist")
-        }
-
-        // Deprioritize originals (importance → 0) and create summarized_by edges
+        // Summary, deprioritized originals (importance → 0) and summarized_by
+        // edges share one checked transaction with a bounded BEGIN retry.
         nonisolated(unsafe) let sourceMemories = sources.map(\.memory)
         let sourceGlobalIds = sourceMemories.compactMap(\.globalId)
-        try localLattice.transaction {
-            for mem in sourceMemories {
-                mem.importance = 0
-            }
-            for sourceGlobalId in sourceGlobalIds {
-                let edge = Edge(sourceGlobalId: sourceGlobalId, targetGlobalId: summaryGlobalId, relation: .summarizedBy, authorUserId: currentUserId)
-                try localLattice.add(edge)
-            }
+        let summaryGlobalId: UUID
+        do {
+            summaryGlobalId = try LatticeBeginRetry.run(on: localLattice, log: { log("[consolidate] \($0)") }) {
+                try localLattice.add(summary)
+                guard let summaryGid = summary.globalId else {
+                    throw MCPError.internalError("Failed to get summary globalId after persist")
+                }
+                for mem in sourceMemories {
+                    mem.importance = 0
+                }
+                for sourceGlobalId in sourceGlobalIds {
+                    let edge = Edge(sourceGlobalId: sourceGlobalId, targetGlobalId: summaryGid, relation: .summarizedBy, authorUserId: currentUserId)
+                    try localLattice.add(edge)
+                }
+                return summaryGid
+            }.value
+        } catch let contention as LatticeBeginRetry.Contention {
+            log("[consolidate] not consolidated: \(contention)")
+            return Self.busyReceipt(tool: "consolidate", verb: "consolidated", contention: contention)
         }
 
         let preview = String(a.content.prefix(120))
