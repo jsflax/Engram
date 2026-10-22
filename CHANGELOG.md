@@ -4,6 +4,53 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [Unreleased]
+
+Contention workstream (2026-10-21: `remember` answered "database was busy
+before the write transaction started" for most of an afternoon while the
+advise hook exceeded its 15 s budget, with many sessions, learners and the
+sync daemon writing to one hub).
+
+### Fixed
+- `remember`, `update`, `connect`, `merge`, `organize` and `consolidate` retry
+  a failed BEGIN up to three times (100/300/900 ms backoff with jitter, ~6.5 s
+  cap) through the shared `LatticeBeginRetry` helper. Retries happen only
+  while the transaction body has not run; the final failure keeps the
+  `not_stored_transaction_not_started` receipt byte for byte (the Codex
+  learner proxy verifies it exactly) and logs the attempt count and total
+  wait. `merge`, `organize` and `consolidate` move from unchecked
+  transactions (a failed BEGIN trapped the server) to checked ones with the
+  same receipt.
+- Hook recalls (`directRecall`: advise, on-start, pre-tool) no longer bump
+  `lastAccessedAt`/`accessCount`; the MCP `recall` tool bumps best-effort on a
+  dedicated hub handle with a 75 ms busy timeout and skips silently when the
+  hub is busy. Access stats are approximate ranking hints.
+- The sample gate treats a KNN search that returns no neighbor on a populated
+  store (the 1.000 "best distance") as degraded and skips the learner instead
+  of spawning one.
+- Recall `structuredContent` carries the rendered text (`engram_recall.text`)
+  and each row's `topic` and `content` (fenced for foreign rows), so clients
+  that render the structured result can read what was recalled and learners
+  can dedupe again. `id`/`project`/`isPrivate` are unchanged.
+
+### Changed
+- Detached `claude` subprocesses (learner, maintenance, reconciliation) pass
+  through `SpawnAdmission`: an `flock`ed state file under
+  `~/.claude/memory-hooks-state` refuses a spawn while another is live, within
+  10 minutes of the last one, or when the 1-minute load average exceeds 2× the
+  processor count; the child runs under `/usr/bin/nice -n 10`.
+- Maintenance trigger threshold 50 → 300 local Memory writes; cooldown 15 → 60
+  minutes; `clear-maintenance` re-anchors the audit watermark so the agent's
+  own writes never re-arm the trigger.
+- Advise hook budget shaping: the synced database and group spokes are not
+  attached when the hub open plus embedder load already consumed more than
+  40 % of the recall budget (local-only recall instead of none); the
+  maintenance check is skipped with under 2 s remaining or a load average over
+  2× ncpu; `ENGRAM_HOOK_RECALL_CEILING_S` (3…60) overrides the 15 s ceiling.
+- The sync daemon's hub handle uses a 2 s busy timeout
+  (`SyncService.daemonHubConfiguration`) instead of Lattice's 30 s default,
+  so it cannot outwait interactive writers. Takes effect on daemon restart.
+
 ## [0.15.14] - 2026-10-21
 
 ### Fixed
