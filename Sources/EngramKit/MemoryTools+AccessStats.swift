@@ -55,15 +55,11 @@ extension MemoryTools {
         }
         let started = ProcessInfo.processInfo.systemUptime
         do {
-            // Resolve rows on THIS handle: `increment` and the setter must run
-            // on objects owned by the connection whose transaction they join.
-            var rows: [Memory] = []
-            rows.reserveCapacity(gids.count)
-            for gid in gids {
-                if let row = handle.objects(Memory.self).where({ $0.globalId == gid }).first {
-                    rows.append(row)
-                }
-            }
+            // Resolve rows on THIS handle in ONE statement: `increment` and the
+            // setter must run on objects owned by the connection whose
+            // transaction they join (RecallPerfRegressionTests budgets the
+            // recall's total statement count).
+            let rows = handle.objects(Memory.self).where { $0.globalId.in(gids) }.snapshot()
             guard !rows.isEmpty else {
                 lastAccessStatBump = .skippedNothing
                 return
