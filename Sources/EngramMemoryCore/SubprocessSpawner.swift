@@ -35,6 +35,11 @@ public func rotateFileIfNeeded(_ path: String, maxBytes: Int = 256 * 1024) {
 ///     wedged tool call can't hold the process open either.
 ///   - learnerLogContext: Optional per-session launch/exit attribution. Child
 ///     exit status is not a memory-write or persistence receipt.
+///   - admission: Concurrency/cooldown/load gate (SpawnAdmission). The default
+///     is the shared on-disk gate; pass nil to bypass it (tests only).
+/// - Returns: `.spawned` or `.skipped(verdict)`. A refusal is not an error —
+///   callers log the verdict and move on.
+@discardableResult
 public func spawnClaudeSubprocess(
     prompt: String,
     systemPrompt: String,
@@ -47,8 +52,9 @@ public func spawnClaudeSubprocess(
     postCommand: String? = nil,
     maxTurns: Int = 15,
     wallClockSeconds: Int = 720,
-    learnerLogContext: LearnerLogContext? = nil
-) throws {
+    learnerLogContext: LearnerLogContext? = nil,
+    admission: SpawnAdmission? = .default
+) throws -> SpawnOutcome {
     rotateFileIfNeeded(logPath)
     let lifecycleLog = learnerLogContext.map { LearnerLifecycleLog(context: $0) }
     if let lifecycleLog {
@@ -79,8 +85,41 @@ public func spawnClaudeSubprocess(
     sh.standardOutput = FileHandle.nullDevice
     sh.standardError = FileHandle.nullDevice
 
-    try sh.run()
-    // Don't wait — fire and forget
+    // The wrapper shell `wait`s on claude, so its pid is a faithful liveness
+    // handle for the admission gate's concurrency check.
+    let launch: () throws -> Int32 = {
+        try sh.run()   // Don't wait — fire and forget
+        return sh.processIdentifier
+    }
+    guard let admission else {
+        return .spawned(pid: try launch())
+    }
+    let verdict = try admission.admit(kind: SpawnOutcome.kind(forEnvGuard: envGuard.key), spawn: launch)
+    if case .admitted(let pid) = verdict { return .spawned(pid: pid) }
+    return .skipped(verdict)
+}
+
+/// Result of `spawnClaudeSubprocess`.
+public enum SpawnOutcome: Equatable, Sendable, CustomStringConvertible {
+    case spawned(pid: Int32)
+    case skipped(SpawnAdmission.Verdict)
+
+    public var description: String {
+        switch self {
+        case .spawned(let pid): return "spawned (wrapper pid \(pid))"
+        case .skipped(let verdict): return verdict.description
+        }
+    }
+
+    /// The recursion-guard variable doubles as the subprocess kind.
+    static func kind(forEnvGuard key: String) -> SpawnAdmission.Kind {
+        switch key {
+        case "CLAUDE_MEMORY_LEARNER": return .learner
+        case "CLAUDE_MEMORY_MAINTENANCE": return .maintenance
+        case "CLAUDE_MEMORY_SYNC_RECONCILIATION": return .reconciliation
+        default: return .other
+        }
+    }
 }
 
 /// Pure command construction also lets the detached shell contract be tested
@@ -104,10 +143,12 @@ func claudeSubprocessShellCommand(
     // (POSIX precedence), which would leave $T set only inside the
     // backgrounded subshell and make the wall-clock kill hit the wrapper
     // instead of claude.
+    // `/usr/bin/nice -n 10`: a detached learner competes with the user's
+    // interactive sessions and their Swift builds for CPU; it should lose.
     return """
     T=$(mktemp) || exit 1; \
     echo '===== started at '\\''\(ISO8601DateFormatter().string(from: Date()))'\\'' =====' >> '\(logPath)'; \
-    claude -p '\(escapedPrompt)' \
+    /usr/bin/nice -n 10 claude -p '\(escapedPrompt)' \
       --model \(model) \
       --allowedTools '\(allowedTools)' \
       --max-turns \(maxTurns) \

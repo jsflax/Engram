@@ -82,7 +82,7 @@ struct SampleGate: AsyncParsableCommand {
         guard let lattice = openLattice() else {
             gateLog("sample-gate: no lattice database, falling through to spawn learner")
             // If we can't check novelty, spawn learner anyway (fail-open)
-            try spawnLearner(excerptHint: nil)
+            gateLog("sample-gate: learner \(try spawnLearner(excerptHint: nil))")
             return
         }
 
@@ -95,7 +95,7 @@ struct SampleGate: AsyncParsableCommand {
         // Fail-open if embedding model didn't load (missing CoreML model, etc.)
         guard await embedder.isLoaded else {
             gateLog("sample-gate: embedding model unavailable, falling through to spawn learner")
-            try spawnLearner(excerptHint: nil)
+            gateLog("sample-gate: learner \(try spawnLearner(excerptHint: nil))")
             return
         }
 
@@ -108,18 +108,31 @@ struct SampleGate: AsyncParsableCommand {
         )
         gateLog("sample-gate: sampler finished in \(String(format: "%.2f", Date().timeIntervalSince(sampleStart)))s, \(excerpts.count) excerpt(s)")
 
-        if excerpts.isEmpty {
-            gateLog("sample-gate: no novel excerpts found, skipping learner for project \(project)")
+        let novel: [TranscriptSampler.ScoredExcerpt]
+        switch SampleGateDecision.decide(excerpts) {
+        case .skip(let reason):
+            gateLog("sample-gate: skipping learner for project \(project) — \(reason)")
             return
+        case .spawn(let usable):
+            novel = usable
         }
 
-        gateLog("sample-gate: \(excerpts.count) novel excerpt(s) found (best distance: \(String(format: "%.3f", excerpts.first?.minDistance ?? 0)))")
+        gateLog("sample-gate: \(novel.count) novel excerpt(s) found (best distance: \(String(format: "%.3f", novel.first?.minDistance ?? 0)))")
 
         // Build hint from sampled excerpts
-        let hint = TranscriptSampler.formatForAssessment(excerpts)
+        let hint = TranscriptSampler.formatForAssessment(novel)
 
-        try spawnLearner(excerptHint: hint)
-        gateLog("sample-gate: spawned session-learner for project \(project)")
+        let outcome = try spawnLearner(excerptHint: hint)
+        switch outcome {
+        case .spawned:
+            gateLog("sample-gate: spawned session-learner for project \(project)")
+            // Visibility row for the visualizer/statusline; best effort, one
+            // tiny write per admitted spawn (at most every 10 minutes).
+            setHookState(lattice, key: .learnerLastSpawnAt,
+                         value: String(Date().timeIntervalSince1970))
+        case .skipped(let verdict):
+            gateLog("sample-gate: learner for project \(project) \(verdict)")
+        }
         #endif
     }
 
@@ -134,7 +147,7 @@ struct SampleGate: AsyncParsableCommand {
         }
         guard let verdicts = await RemoteMemory.sampleGate(remote, texts: candidates) else {
             gateLog("sample-gate(remote): /sample-gate unreachable — failing open to spawn learner")
-            try spawnLearner(excerptHint: nil)
+            gateLog("sample-gate(remote): learner \(try spawnLearner(excerptHint: nil))")
             return
         }
         let novel = verdicts.filter(\.novel).sorted { $0.distance > $1.distance }
@@ -146,15 +159,16 @@ struct SampleGate: AsyncParsableCommand {
         let hint = novel.prefix(5).enumerated()
             .map { i, verdict in "[\(i + 1)] \(candidates[verdict.index])" }
             .joined(separator: "\n\n")
-        try spawnLearner(excerptHint: hint)
-        gateLog("sample-gate(remote): spawned session-learner for project \(project)")
+        let outcome = try spawnLearner(excerptHint: hint)
+        gateLog("sample-gate(remote): session-learner for project \(project): \(outcome)")
     }
 
     // MARK: - Learner Spawning
 
-    private func spawnLearner(excerptHint: String?) throws {
+    @discardableResult
+    private func spawnLearner(excerptHint: String?) throws -> SpawnOutcome {
         let prompt = buildPrompt(excerptHint: excerptHint)
-        try spawnClaudeSubprocess(
+        return try spawnClaudeSubprocess(
             prompt: prompt,
             systemPrompt: Self.sessionLearnerSystemPrompt,
             allowedTools: Self.allowedTools,

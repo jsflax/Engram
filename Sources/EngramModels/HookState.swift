@@ -25,6 +25,9 @@ public final class HookState {
         /// key-filtered SQL-side, so an unknown enum value never reaches
         /// their decoder.
         case embeddingSpaceVersion = "embedding.spaceVersion"
+        /// Unix time of the last ADMITTED session-learner spawn (the
+        /// spawn gate itself is file-based: SpawnAdmission). Visibility only.
+        case learnerLastSpawnAt = "learner.lastSpawnAt"
     }
 
     /// The state key.

@@ -393,7 +393,7 @@ struct Advise: AsyncParsableCommand {
         let hooksBin = NSHomeDirectory() + "/.claude/bin/memory-hooks"
 
         do {
-            try spawnClaudeSubprocess(
+            let outcome = try spawnClaudeSubprocess(
                 prompt: prompt,
                 systemPrompt: Self.maintenanceSystemPrompt,
                 allowedTools: Self.maintenanceAllowedTools,
@@ -407,7 +407,16 @@ struct Advise: AsyncParsableCommand {
                 maxTurns: 40,
                 wallClockSeconds: 1800
             )
-            hookLog("Advise: spawned memory-maintenance subprocess (ops delta: \(delta))")
+            switch outcome {
+            case .spawned:
+                hookLog("Advise: spawned memory-maintenance subprocess (ops delta: \(delta))")
+            case .skipped(let verdict):
+                // The admission gate refused (a learner or maintenance is
+                // live, cooldown, or load). The active flag set above would
+                // otherwise sit at "1" for an hour with nothing running.
+                setHookState(lattice, key: .maintenanceActive, value: "0")
+                hookLog("Advise: memory-maintenance \(verdict) (ops delta: \(delta))")
+            }
         } catch {
             hookLog("Advise: failed to spawn memory-maintenance: \(error)")
         }

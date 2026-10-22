@@ -11,14 +11,20 @@ import Lattice
 public struct TranscriptSampler {
 
     /// A scored excerpt from the transcript.
-    public struct ScoredExcerpt: Sendable {
+    public struct ScoredExcerpt: Sendable, Equatable {
         public let text: String
         public let minDistance: Double  // distance to nearest existing memory
         public let charLength: Int
+        /// The store HAS memories but the vector search returned no neighbor
+        /// (or no distance) for this excerpt — a degraded index, not novelty.
+        /// `minDistance` is then the 1.0 sentinel and must not be read as a
+        /// measurement. An empty store is NOT degraded: everything is novel.
+        public let isDegraded: Bool
 
-        public init(text: String, minDistance: Double, charLength: Int) {
+        public init(text: String, minDistance: Double, charLength: Int, isDegraded: Bool = false) {
             self.text = text
             self.minDistance = minDistance
+            self.isDegraded = isDegraded
             self.charLength = charLength
         }
     }
@@ -71,6 +77,11 @@ public struct TranscriptSampler {
         // 3. Embed each block and score by novelty
         var scored: [ScoredExcerpt] = []
         let now = Date()
+        // A populated store that answers a KNN query with nothing is a
+        // degraded vector index (or a contended read), not "nothing similar
+        // exists" — the gate used to fail OPEN on it and spawn a learner per
+        // Stop while the database was already struggling.
+        let storeHasMemories = lattice.count(Memory.self) > 0
 
         for block in substantive {
             // Truncate before embedding to keep it focused
@@ -84,12 +95,14 @@ public struct TranscriptSampler {
                 .where { $0.expiresAt > now }
                 .nearest(to: embedding, on: \.embedding, limit: 1, distance: .l2)
 
-            let minDist = nearest.first.map { $0.distances["embedding"] ?? 1.0 } ?? 1.0
+            let measured = nearest.first?.distances["embedding"]
+            let minDist = measured ?? 1.0
 
             scored.append(ScoredExcerpt(
                 text: truncated,
                 minDistance: minDist,
-                charLength: truncated.count
+                charLength: truncated.count,
+                isDegraded: storeHasMemories && measured == nil
             ))
         }
 
@@ -135,5 +148,30 @@ public struct TranscriptSampler {
     /// shared with the remote/Linux hooks.
     public static func extractAssistantTextBlocks(from path: String) -> [String] {
         TranscriptExcerpts.assistantTextBlocks(from: path)
+    }
+}
+
+
+// MARK: - Gate decision
+
+/// What the sample gate should do with the sampler's output. Pure, so the
+/// fail-open/fail-closed policy is testable without a transcript or a model.
+public enum SampleGateDecision: Equatable, Sendable {
+    /// Spawn the learner with these (non-degraded) excerpts as hints.
+    case spawn(excerpts: [TranscriptSampler.ScoredExcerpt])
+    /// Do not spawn; `reason` is logged verbatim.
+    case skip(reason: String)
+
+    /// The sampler's 1.0 sentinel: a distance of exactly 1.000 is what an
+    /// excerpt reports when no neighbor was found at all.
+    static let sentinelDistance = 1.0
+
+    public static func decide(_ excerpts: [TranscriptSampler.ScoredExcerpt]) -> SampleGateDecision {
+        guard !excerpts.isEmpty else { return .skip(reason: "no novel excerpts") }
+        let usable = excerpts.filter { !$0.isDegraded && $0.minDistance != sentinelDistance }
+        guard !usable.isEmpty else {
+            return .skip(reason: "degraded: vector search returned no neighbors (best distance 1.000 sentinel) — not treating as novel")
+        }
+        return .spawn(excerpts: usable)
     }
 }

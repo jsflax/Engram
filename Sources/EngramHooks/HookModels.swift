@@ -151,11 +151,15 @@ struct HookOutput: Encodable {
 
 // MARK: - Maintenance Constants
 
-/// Trigger maintenance when this many CRUD operations have occurred since last run.
-let maintenanceThreshold = 50
+/// Trigger maintenance when this many local Memory writes have occurred since
+/// the last run. Was 50: with several sessions plus learners writing, that
+/// fired a maintenance agent (another `claude` + MCP server + writer) on
+/// nearly every cooldown expiry during the 2026-10-21 contention incident.
+let maintenanceThreshold = 300
 
-/// Minimum seconds between maintenance runs (prevents re-trigger from maintenance's own writes).
-let maintenanceCooldownSeconds: TimeInterval = 900  // 15 minutes
+/// Minimum seconds between maintenance runs. Was 900 (15 min); maintenance is
+/// hygiene, not a hot path, and the agent itself runs up to 30 min.
+let maintenanceCooldownSeconds: TimeInterval = 3600  // 60 minutes
 
 // MARK: - Helpers
 
