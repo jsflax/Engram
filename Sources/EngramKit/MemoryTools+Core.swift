@@ -477,16 +477,30 @@ extension MemoryTools {
     /// Recalled content is untrusted and must never supply target privacy. Keep
     /// text/row markers unchanged for existing consumers, and retain row order
     /// rather than collapsing potentially conflicting copies by ID.
-    nonisolated static func recallResult(_ text: String, hits: [RecallHit]) -> CallTool.Result {
+    ///
+    /// Clients that render `structuredContent` INSTEAD of the text block
+    /// (Claude Code does) saw only ids after the 0.15.9 metadata contract
+    /// landed — learners and maintenance could no longer read what they
+    /// recalled, so they could not dedupe and wrote duplicates. Each row now
+    /// also carries its `topic` and `content` (fenced for foreign rows when
+    /// the fence policy is on, exactly as the text block renders it), and
+    /// the envelope carries the rendered `text`. id/project/isPrivate stay
+    /// the authoritative native metadata; content remains untrusted data.
+    nonisolated static func recallResult(_ text: String, hits: [RecallHit],
+                                         fenceForeign: Bool = false) -> CallTool.Result {
         let rows: [Value] = hits.map { hit in
-            .object([
+            let content = (fenceForeign && hit.isForeign)
+                ? Self.fencedForeignContent(hit.memory.content) : hit.memory.content
+            return .object([
                 "id": .string(hit.memory.id.uuidString),
                 "project": hit.memory.project.map(Value.string) ?? .null,
                 "isPrivate": .bool(hit.memory.isPrivate),
+                "topic": hit.memory.topic.map(Value.string) ?? .null,
+                "content": .string(content),
             ])
         }
         return CallTool.Result(content: [.text(text)], structuredContent: .object([
-            "engram_recall": .object(["version": .int(1), "rows": .array(rows)]),
+            "engram_recall": .object(["version": .int(1), "text": .string(text), "rows": .array(rows)]),
         ]), isError: false)
     }
 
@@ -620,7 +634,7 @@ extension MemoryTools {
             if nearest.isEmpty {
                 log("[recall] No results, returning empty")
                 sessionLog("[recall] No results")
-                return Self.recallResult("No memories found.", hits: recalledHits)
+                return Self.recallResult("No memories found.", hits: recalledHits, fenceForeign: fenceForeignContent)
             }
 
             // Apply soft project boosting and reinforcement scoring on distances
@@ -682,7 +696,7 @@ extension MemoryTools {
             let topResults = Array(sorted.prefix(limit))
 
             if topResults.isEmpty {
-                return Self.recallResult("No memories found.", hits: recalledHits)
+                return Self.recallResult("No memories found.", hits: recalledHits, fenceForeign: fenceForeignContent)
             }
 
             // Filter out outliers: adaptive threshold anchored to best result.
@@ -888,7 +902,7 @@ extension MemoryTools {
 
             log("[recall] DONE, returning \(output.count) chars")
             sessionLog("[recall] DONE, returning \(output.count) chars")
-            return Self.recallResult(output, hits: recalledHits)
+            return Self.recallResult(output, hits: recalledHits, fenceForeign: fenceForeignContent)
         } else {
             recalledMode = .fullText
             log("[recall] No embedding available, falling back to FTS5")
@@ -937,9 +951,9 @@ extension MemoryTools {
                 output += "[\(m.project)/\(m.topic)]\(badge)\(via)\(ftsInfo)\(expires)\(created) \(body)"
             }
             if output.isEmpty {
-                return Self.recallResult("No memories found.", hits: recalledHits)
+                return Self.recallResult("No memories found.", hits: recalledHits, fenceForeign: fenceForeignContent)
             }
-            return Self.recallResult(output, hits: recalledHits)
+            return Self.recallResult(output, hits: recalledHits, fenceForeign: fenceForeignContent)
         }
     }
 
