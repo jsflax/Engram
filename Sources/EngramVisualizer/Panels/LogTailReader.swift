@@ -10,26 +10,25 @@ enum LogTailReader {
         var entries: [LogEntry] = []
         for source in sources {
             for line in tailLines(path: source.path) {
-                let parsed = parseLine(line, source: source.id, formatter: formatter)
-                entries.append(LogEntry(id: entries.count, timestamp: parsed.timestamp,
-                                        source: source.id, message: parsed.message, raw: line))
+                let parsed = parseLine(line.text, source: source.id, formatter: formatter)
+                entries.append(LogEntry(id: LogEntry.ID(source: source.id, offset: line.offset),
+                                        timestamp: parsed.timestamp, source: source.id,
+                                        message: parsed.message, raw: line.text))
             }
         }
-        entries.sort {
-            switch ($0.timestamp, $1.timestamp) {
-            case let (a?, b?): a == b ? $0.id < $1.id : a < b
+        // Ties keep read order; `sorted` is not stable.
+        return entries.enumerated().sorted { a, b in
+            switch (a.element.timestamp, b.element.timestamp) {
+            case let (x?, y?): x == y ? a.offset < b.offset : x < y
             case (_?, nil): true
             case (nil, _?): false
-            case (nil, nil): $0.id < $1.id
+            case (nil, nil): a.offset < b.offset
             }
-        }
-        return entries.enumerated().map { index, entry in
-            LogEntry(id: index, timestamp: entry.timestamp, source: entry.source,
-                     message: entry.message, raw: entry.raw)
-        }
+        }.map(\.element)
     }
 
-    static func tailLines(path: String) -> [String] {
+    /// Each line comes with the byte offset where it starts in the file.
+    static func tailLines(path: String) -> [(offset: UInt64, text: String)] {
         guard let handle = FileHandle(forReadingAtPath: path) else { return [] }
         defer { try? handle.close() }
         do {
@@ -37,17 +36,23 @@ enum LogTailReader {
             let start = end > UInt64(maximumTailBytes) ? end - UInt64(maximumTailBytes) : 0
             try handle.seek(toOffset: start)
             guard var data = try handle.read(upToCount: maximumTailBytes) else { return [] }
+            var dataOffset = start
             // The first bytes may be a partial line or UTF-8 code point. Discard
             // them before decoding; complete lines retain their original text.
             if start > 0 {
                 guard let newline = data.firstIndex(of: 10) else { return [] }
                 data = data.subdata(in: (newline + 1)..<data.count)
+                dataOffset += UInt64(newline + 1)
             }
-            return String(decoding: data, as: UTF8.self)
-                .split(whereSeparator: \.isNewline)
+            // Split bytes rather than decoded text so each line keeps its offset.
+            // Slices of `data` share its indices.
+            return data.split { $0 == 10 || $0 == 13 }
                 .suffix(maximumLines)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
+                .map { line in
+                    (offset: dataOffset + UInt64(line.startIndex),
+                     text: String(decoding: line, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
+                }
+                .filter { !$0.text.isEmpty }
         } catch {
             return []
         }
