@@ -295,8 +295,8 @@ struct DaemonHubContentionTests {
         let continuedCursor = try #require(continued.receiveCursor)
         try #require(thirdEventIDs.contains(continuedCursor), "Continued-traffic cursor must name the third barrier's event")
         try #require(continuedCursor != recoveredCursor)
-        try #require(matchingRow(warm, in: hub))
-        try #require(matchingRow(pending, in: hub))
+        try #require(try matchingRow(warm, in: hub))
+        try #require(try matchingRow(pending, in: hub))
         print("Daemon hub contention: real two-BEGIN failure, zero returned entries, unchanged ACK/cursor/receipts, automatic recovery and third barrier verified. Native log: \(logPath)")
         print(try #require(failedSpan))
     }

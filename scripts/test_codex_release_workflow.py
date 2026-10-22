@@ -311,6 +311,56 @@ os.execv(sys.executable,[sys.executable,*args])
                             self.assertEqual(calls[2]['args'], ['-B', '-'] + (
                                 [str(evidence / 'receipt.json')] if release else []))
 
+    def test_visualizer_build_scopes_ibtool_environment_and_preserves_gate_failure(self):
+        with tempfile.TemporaryDirectory(prefix='engram asset tool workflow ') as temporary:
+            root = Path(temporary).resolve()
+            validation = root / 'validation'
+            scripts = validation / 'repo/scripts'; scripts.mkdir(parents=True)
+            bin_dir = root / 'bin'; bin_dir.mkdir()
+            (bin_dir / 'python3').symlink_to(sys.executable)
+            log, continued = root / 'calls.jsonl', root / 'continued'
+            record = '''import json,os,sys
+with open(os.environ['CALL_LOG'],'a') as output:
+    output.write(json.dumps({'tool':TOOL,'args':sys.argv[1:],
+        'ibtool_mode':os.environ.get('IBToolNeverDeque')})+'\\n')
+'''
+            # Execute a real child from the fake supervisor so the test observes
+            # environment inheritance through the same shell/Python boundary.
+            (scripts / 'run_native_tests.py').write_text("TOOL='supervisor'\n" + record + '''import subprocess
+command=sys.argv[sys.argv.index('--')+1:]
+code=subprocess.run(command,check=False).returncode
+raise SystemExit(code or (int(os.environ['FAKE_WRAPPER_EXIT']) if command[1]=='build-for-testing' else 0))
+''')
+            (scripts / 'prepare_visualizer_tests.py').write_text("TOOL='prepare'\n" + record)
+            xcode = bin_dir / 'xcodebuild'
+            xcode.write_text('#!' + sys.executable + '\nTOOL="xcodebuild"\n' + record +
+                "raise SystemExit(int(os.environ['FAKE_CHILD_EXIT']))\n")
+            xcode.chmod(0o700)
+            build = run_block('visualizer-validation.yml', 'Full app and unit target build for testing')
+            tests = run_block('visualizer-validation.yml', 'Bind isolated test host and run focused Galaxy regressions')
+            for child_exit, wrapper_exit, expected in ((0, 0, 0), (7, 0, 7), (0, 125, 125)):
+                with self.subTest(child_exit=child_exit, wrapper_exit=wrapper_exit):
+                    log.unlink(missing_ok=True); continued.unlink(missing_ok=True)
+                    result = subprocess.run(['/bin/bash', '-e', '-c', build + tests
+                        + 'printf continued > "$1"\n', 'gate', str(continued)], cwd=root,
+                        env=dict(os.environ, PATH=str(bin_dir), VALIDATION_ROOT=str(validation),
+                            CALL_LOG=str(log), IBToolNeverDeque='inherited-value',
+                            FAKE_CHILD_EXIT=str(child_exit), FAKE_WRAPPER_EXIT=str(wrapper_exit)),
+                        capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    self.assertEqual(continued.exists(), expected == 0)
+                    calls = [json.loads(line) for line in log.read_text().splitlines()]
+                    self.assertEqual([call['tool'] for call in calls[:2]], ['supervisor', 'xcodebuild'])
+                    self.assertEqual([call['ibtool_mode'] for call in calls[:2]], ['1', '1'])
+                    self.assertEqual(calls[1]['args'][:2], ['build-for-testing', '-project'])
+                    if expected:
+                        self.assertEqual(len(calls), 2)
+                    else:
+                        self.assertEqual([call['tool'] for call in calls[2:]],
+                            ['prepare', 'supervisor', 'xcodebuild', 'prepare', 'prepare'])
+                        self.assertTrue(all(call['ibtool_mode'] == 'inherited-value' for call in calls[2:]))
+                        self.assertEqual(calls[4]['args'][0], 'test-without-building')
+
     def test_linux_installs_python_before_builds_and_propagates_tooling_failure(self):
         name = 'Install portable test Python runtime'
         workflow = (ROOT / '.github/workflows/linux-core.yml').read_text()

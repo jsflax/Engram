@@ -68,6 +68,13 @@ extension MemoryTools {
             sessionLog("[recall] access-stat bump skipped (no dedicated handle)")
             return
         }
+        // This request-scoped snapshot can pin a WAL reader on the separate
+        // stats connection. Retire it on every exit, including empty, busy,
+        // and failed bumps, so an idle caller cannot block checkpointing.
+        // Retirement latches future reads on this cached handle to unpinned
+        // live reads, matching the request/response MCP handle policy.
+        // Keep this here as direct service callers need the same cleanup as MCP.
+        defer { handle.retireAllGenerations() }
         let started = ProcessInfo.processInfo.systemUptime
         do {
             // Resolve rows on THIS handle in ONE statement: `increment` and the

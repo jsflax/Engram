@@ -40,6 +40,8 @@ private extension MemoryTools {
 
     func bumpFixtureRowsWithDuplicates() {
         let rows = localLattice.objects(Memory.self).snapshot()
+        // Isolate the stats handle's lifecycle from this fixture's own read.
+        localLattice.retireAllGenerations()
         bumpAccessStatsBestEffort(rows + rows, now: Date())
     }
 }
@@ -156,9 +158,18 @@ struct AccessStatBumpTests {
                 try f.lattice.add(Memory(content: "bounded stats fixture"))
             }
         }
-        await f.tools.bumpFixtureRowsWithDuplicates()
         let raw = try RawWriteLock(path: f.path.path)
         defer { raw.close() }
+        // Prove the raw checkpoint observes a real pinned reader before
+        // checking that the separate stats connection releases its own one.
+        let pinned = f.lattice.objects(Memory.self).snapshot()
+        #expect(pinned.count == MemoryTools.accessStatTargetLimit + 1)
+        #expect(try raw.integer("PRAGMA wal_checkpoint(TRUNCATE)") == 1)
+        f.lattice.retireAllGenerations()
+        #expect(try raw.integer("PRAGMA wal_checkpoint(TRUNCATE)") == 0)
+        await f.tools.bumpFixtureRowsWithDuplicates()
+        #expect(try raw.integer("PRAGMA wal_checkpoint(TRUNCATE)") == 0,
+                "a completed direct bump must not leave its dedicated reader pinned")
         let bumped = try raw.integer("SELECT COUNT(*) FROM Memory WHERE accessCount = 1")
         #expect(bumped == MemoryTools.accessStatTargetLimit)
         #expect(try raw.integer("SELECT COUNT(*) FROM Memory WHERE accessCount > 1") == 0)
@@ -268,6 +279,9 @@ struct AccessStatBumpTests {
         let f = try fixture()
         defer { f.close() }
         let auditBefore = f.memoryAuditRows()
+        // The test's audit read must not keep a separate reader pinned while
+        // checking the MCP request's cleanup.
+        f.lattice.retireAllGenerations()
 
         let result = try await f.tools.handle(CallTool.Parameters(name: "recall", arguments: [
             "query": .string("access-stat fixture"), "project": .string("AccessStat"),
@@ -278,6 +292,10 @@ struct AccessStatBumpTests {
         let auditAfter = f.memoryAuditRows()
         #expect(auditAfter > auditBefore && auditAfter <= auditBefore + 2,
                 "one bump transaction: at most the setter and the increment as audit rows (\(auditAfter - auditBefore))")
+        let raw = try RawWriteLock(path: f.path.path)
+        defer { raw.close() }
+        #expect(try raw.integer("PRAGMA wal_checkpoint(TRUNCATE)") == 0,
+                "an idle MCP request must release read marks from the stats handle too")
     }
 
     @Test func firstStatsOpenUnderAWriteLockKeepsTheRecallResult() async throws {

@@ -1360,9 +1360,10 @@ public actor MemoryTools {
     }
 
     /// Every lattice this instance can hold a read generation on: the hub,
-    /// the personal synced mirror, the group spokes, and the attach-cache
-    /// union handles built over them.
+    /// the dedicated access-stat handle, the personal synced mirror, the
+    /// group spokes, and the attach-cache union handles built over them.
     func retireAllReadMarks() {
+        accessStatLattice?.retireAllGenerations()
         // A failed first open has no published handles to retire. Cleanup
         // must never retry that open through the nonthrowing accessors.
         guard let databases = resolvedDatabases else { return }
