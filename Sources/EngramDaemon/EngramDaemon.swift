@@ -251,11 +251,7 @@ struct EngramDaemon: AsyncParsableCommand {
             log("Personal sync disabled (no active personal subscription) — running GROUP-ONLY with \(memberships.count) spoke(s)")
         }
 
-        // Now open with IPC — replication slot cursor will be 0 after nuclear compact
-        var localConfig = Lattice.Configuration(
-            fileURL: URL(fileURLWithPath: dbPath),
-            migration: engramMigrations
-        )
+        // Now open with IPC — replication slot cursor will be 0 after nuclear compact.
         // One IPC target per sync destination: the personal spoke plus one
         // per group. Every filter is set HERE, at configuration time — a
         // spoke that connects before its filter arrives would run
@@ -273,7 +269,10 @@ struct EngramDaemon: AsyncParsableCommand {
                 // Stage A4: un-exposing must not delete what the group has.
                 narrowingEmitsRemovals: false))
         }
-        localConfig.ipcTargets = hubTargets
+        // Hub handle with the interactive-parity busy timeout (2 s) — see
+        // SyncService.daemonHubBusyTimeoutMs for why the 30 s default made
+        // the daemon outwait every user write on a contended hub.
+        let localConfig = SyncService.daemonHubConfiguration(dbPath: dbPath, ipcTargets: hubTargets)
 
         let localLattice: Lattice
         do {

@@ -60,6 +60,27 @@ public enum SyncService {
         return filter
     }
 
+    /// Busy timeout for the sync daemon's HUB handle.
+    ///
+    /// Lattice's default is 30 s. The daemon is the one long-lived writer on
+    /// the hub (relay applies, hourly compaction deletes, checkpoints); with
+    /// the default it could sit on a lock wait for 30 s while every
+    /// interactive writer (MCP `remember`, hooks) gives up after 2 s — the
+    /// daemon always won and the user always lost. Same budget as the MCP
+    /// server (`mcpBusyTimeoutMs`): a daemon write that loses BEGIN is
+    /// retried by the synchronizer; a user write that loses is a failed turn.
+    public static let daemonHubBusyTimeoutMs = 2_000
+
+    /// The daemon's hub configuration: schema migrations, the per-destination
+    /// IPC targets, and the interactive-parity busy timeout above.
+    public static func daemonHubConfiguration(dbPath: String,
+                                              ipcTargets: [Lattice.IPCSyncTarget]) -> Lattice.Configuration {
+        var config = Lattice.Configuration(fileURL: URL(fileURLWithPath: dbPath), migration: engramMigrations)
+        config.busyTimeoutMs = daemonHubBusyTimeoutMs
+        config.ipcTargets = ipcTargets
+        return config
+    }
+
     /// Compact history before sync to reduce AuditLog entries.
     /// Uses slot-aware compaction — only deletes entries all synchronizers have confirmed.
     public static func compactBeforeSync(_ lattice: Lattice) {
