@@ -75,14 +75,46 @@ func openLattice(sessionId: String? = nil) -> Lattice? {
 }
 
 /// Initialize MemoryTools (Lattice + embedding model).
-func initMemoryTools(sessionId: String? = nil) async -> MemoryTools? {
+///
+/// `budget` (hook start + recall budget) enables budget shaping: the hub open
+/// and the embedder load are timed, and when together they have consumed more
+/// than `HookBudget.secondaryAttachFraction` of the budget the personal synced
+/// DB and group spokes are NOT attached. Under contention those extra opens
+/// were the difference between a slow local-only recall and no recall at all
+/// ("exceeded its 15s budget"). Degradation is logged, never silent.
+func initMemoryTools(sessionId: String? = nil,
+                     budget: (start: Date, seconds: Double)? = nil) async -> MemoryTools? {
+    let phaseStart = Date()
     sessionLog("initMemoryTools: opening lattice at \(defaultDbPath)", sessionId: sessionId)
     guard let lattice = openLattice() else {
         sessionLog("initMemoryTools: FAILED — no database at \(defaultDbPath)", sessionId: sessionId)
         hookLog("No memory database at \(defaultDbPath)")
         return nil
     }
+    let hubOpenSeconds = Date().timeIntervalSince(phaseStart)
     sessionLog("initMemoryTools: lattice opened", sessionId: sessionId)
+
+    // Embedder BEFORE the secondary attaches: it is the other big fixed
+    // cost, and the attach decision below wants to see both.
+    let modelPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_MODEL"]
+    sessionLog("initMemoryTools: loading embedder (modelPath=\(modelPath ?? "bundled"))", sessionId: sessionId)
+    let embedderStart = Date()
+    let embedder = EmbeddingService(modelPath: modelPath)
+    await embedder.load()
+    let embedderSeconds = Date().timeIntervalSince(embedderStart)
+    sessionLog("initMemoryTools: embedder loaded", sessionId: sessionId)
+
+    var attachSecondary = true
+    if let budget {
+        let elapsed = Date().timeIntervalSince(budget.start)
+        attachSecondary = HookBudget.shouldAttachSecondary(elapsed: elapsed, budget: budget.seconds)
+        hookLog(String(format: "initMemoryTools phases: hub open %.2fs, embedder %.2fs, %.2fs of %.1fs budget elapsed",
+                       hubOpenSeconds, embedderSeconds, elapsed, budget.seconds))
+        if !attachSecondary {
+            hookLog("initMemoryTools: degraded: skipping synced/spokes (hub open + embedder consumed > "
+                + "\(Int(HookBudget.secondaryAttachFraction * 100))% of the recall budget)")
+        }
+    }
 
     // Synced DB — same open the MCP server does (main.swift). Without it,
     // hook recall (advise/on-start/pre-tool) was blind to cross-device
@@ -99,7 +131,7 @@ func initMemoryTools(sessionId: String? = nil) async -> MemoryTools? {
     var syncedRef: LatticeThreadSafeReference?
     let claudeDir = (defaultDbPath as NSString).deletingLastPathComponent
     let syncedDbPath = SyncService.syncedDbPath(claudeDir: claudeDir)
-    if FileManager.default.fileExists(atPath: syncedDbPath) {
+    if attachSecondary, FileManager.default.fileExists(atPath: syncedDbPath) {
         let syncPolicyInPlay = lattice.objects(SyncConfig.self)
             .where { $0.policy == .sync }
             .first != nil
@@ -125,7 +157,7 @@ func initMemoryTools(sessionId: String? = nil) async -> MemoryTools? {
     // the whole point of group sync missing from the surface where teammates'
     // knowledge is supposed to show up unprompted.
     var groupRefs: [MemoryTools.GroupSpokeRef] = []
-    for spoke in SyncService.discoverGroupSpokes(claudeDir: claudeDir) {
+    for spoke in attachSecondary ? SyncService.discoverGroupSpokes(claudeDir: claudeDir) : [] {
         guard let lattice = try? Lattice(
             Memory.self, Edge.self, GroupProjectMap.self,
             configuration: .init(fileURL: URL(fileURLWithPath: spoke.path),
@@ -139,12 +171,6 @@ func initMemoryTools(sessionId: String? = nil) async -> MemoryTools? {
                                ref: lattice.sendableReference))
     }
     sessionLog("initMemoryTools: \(groupRefs.count) group spoke(s) attached", sessionId: sessionId)
-
-    let modelPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_MODEL"]
-    sessionLog("initMemoryTools: loading embedder (modelPath=\(modelPath ?? "bundled"))", sessionId: sessionId)
-    let embedder = EmbeddingService(modelPath: modelPath)
-    await embedder.load()
-    sessionLog("initMemoryTools: embedder loaded", sessionId: sessionId)
 
     let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: syncedRef,
                             groupRefs: groupRefs, embedder: embedder)

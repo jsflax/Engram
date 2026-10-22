@@ -126,7 +126,8 @@ struct Advise: AsyncParsableCommand {
             let outcome = try await HookBudget.race(
                 seconds: max(0, deadline.timeIntervalSinceNow)
             ) { () -> (result: String, query: String)? in
-                guard let tools = await initMemoryTools(sessionId: sid) else {
+                guard let tools = await initMemoryTools(sessionId: sid,
+                                                        budget: (start: hookStart, seconds: budget)) else {
                     hookLog("Advise: failed to initialize memory tools")
                     return nil
                 }
@@ -186,8 +187,13 @@ struct Advise: AsyncParsableCommand {
             hookLog("Advise: recall blew its budget — skipping the maintenance check")
         } else {
             let remaining = deadline.timeIntervalSinceNow
-            if remaining <= 0 {
-                hookLog("Advise: no budget left for the maintenance check — skipping")
+            let load = HookBudget.loadAverage1m()
+            let ncpu = ProcessInfo.processInfo.activeProcessorCount
+            if !HookBudget.shouldRunMaintenanceCheck(remaining: remaining, loadAverage: load,
+                                                     processorCount: ncpu) {
+                hookLog(String(format: "Advise: skipping the maintenance check (remaining %.1fs < %.0fs, or load %.1f > %.0fx%d)",
+                               remaining, HookBudget.maintenanceMinimumRemainingSeconds,
+                               load ?? -1, HookBudget.loadFactor, ncpu))
             } else {
                 let outcome = try? await HookBudget.race(seconds: remaining) {
                     spawnMaintenanceIfNeeded(project: proj, cwd: input.cwd)
