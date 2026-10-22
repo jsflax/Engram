@@ -43,8 +43,10 @@ def fixture_spawn_gate(module, directory):
     Fixtures have no provider load/cooldown clock: retain actual flock/fsync/FD
     behavior while isolating their state. Dedicated spawn-admission tests use
     the production cooldown and deliberately exercise refusals and crashes.
+    A fixed clock also isolates this shared fixture from tests that patch the
+    stdlib time module into the future to exercise session retry deadlines.
     """
     from unittest import mock
     production = module.lease
     return mock.patch.object(module, "lease", side_effect=lambda: production(
-        directory=directory, load=lambda: 0, cooldown=0))
+        directory=directory, now=10_000, load=lambda: 0, cooldown=0))

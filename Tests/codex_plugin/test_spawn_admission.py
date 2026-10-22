@@ -28,6 +28,21 @@ class SpawnAdmissionTests(unittest.TestCase):
     def lease(self, **kwargs):
         return G.lease(directory=self.directory, now=10_000, load=lambda: 0, **kwargs)
 
+    def test_fixture_future_session_clock_does_not_poison_later_admission(self):
+        from suite_support import fixture_spawn_gate
+        with fixture_spawn_gate(G, self.directory):
+            with mock.patch.object(G.time, "time", return_value=4_000_000_000_000):
+                with G.lease() as first:
+                    self.assertTrue(first.admitted)
+                    with G.lease() as competing:
+                        self.assertEqual(competing.reason, "concurrency")
+            # Real flock and fsync stay enabled. Returning to the ordinary
+            # session clock must not defer later tests sharing this fixture.
+            with G.lease() as later:
+                self.assertTrue(later.admitted)
+            self.assertEqual(json.loads((self.directory / "spawn-state.json").read_bytes()),
+                             {"version": 1, "lastSpawnAt": 10_000})
+
     def test_lifetime_outlasts_clock_cooldown_and_refusal_does_not_rewrite(self):
         with self.lease() as first:
             self.assertTrue(first.admitted)
