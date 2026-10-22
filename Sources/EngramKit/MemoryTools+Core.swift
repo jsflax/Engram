@@ -9,7 +9,15 @@ import NaturalLanguage
 extension MemoryTools {
     /// Perform a recall and return the text result directly, without MCP framing.
     /// Used by the hooks binary to inject recalled memories as context.
-    public func directRecall(query: String, project: String?, depth: Int = 1, limit: Int = 5) async throws -> String? {
+    ///
+    /// `bumpAccessStats` defaults to FALSE on this path: hooks run inside the
+    /// user's prompt latency on every turn, and the access-stat bump is a
+    /// write transaction on the hub — under contention it waited the full
+    /// busy timeout (2 s) per prompt per session and was itself one more
+    /// writer competing with `remember`. lastAccessedAt/accessCount are
+    /// ranking hints, so the MCP `recall` tool's best-effort bump is enough.
+    public func directRecall(query: String, project: String?, depth: Int = 1, limit: Int = 5,
+                             bumpAccessStats: Bool = false) async throws -> String? {
         try prepareStorage()
         var args: [String: Value] = ["query": .string(query)]
         if let project {
@@ -17,7 +25,7 @@ extension MemoryTools {
         }
         args["depth"] = .int(depth)
         args["limit"] = .int(limit)
-        let result = try await handleRecall(args)
+        let result = try await handleRecall(args, bumpAccessStats: bumpAccessStats)
         // Extract text from the CallTool.Result
         guard let textContent = result.content.first else { return nil }
         switch textContent {
@@ -513,7 +521,7 @@ extension MemoryTools {
         )
     }
 
-    func handleRecall(_ args: [String: Value]?) async throws -> CallTool.Result {
+    func handleRecall(_ args: [String: Value]?, bumpAccessStats: Bool = true) async throws -> CallTool.Result {
         lastRecallHits = []
         lastRecallMode = .vector
         lastRecallRows = []
@@ -865,18 +873,17 @@ extension MemoryTools {
             // `increment` is a SQL-side atomic `SET c = c + 1` (no
             // read-modify-write race, no stale-snapshot hazard). Non-fatal:
             // a busy synced DB must not throw away a composed recall result.
-            sessionLog("[recall] Bumping access stats (\(bumpTargets.count) memories)")
-            let accessNow = Date()
-            do {
-                try db.withTransaction {
-                    for m in bumpTargets {
-                        m.lastAccessedAt = accessNow
-                        m.increment("accessCount")
-                    }
-                }
-            } catch {
-                log("[recall] access-stat bump skipped: \(error)")
-                sessionLog("[recall] access-stat bump skipped (non-fatal)")
+            //
+            // The bump runs OFF the recall's own handle: a dedicated hub
+            // connection with a ~75 ms busy timeout (MemoryTools+AccessStats),
+            // so a contended hub costs the caller tens of milliseconds, not
+            // the 2 s MCP busy timeout. Hook callers opt out entirely.
+            if bumpAccessStats {
+                sessionLog("[recall] Bumping access stats (\(bumpTargets.count) memories)")
+                bumpAccessStatsBestEffort(bumpTargets, now: Date())
+            } else {
+                lastAccessStatBump = .skippedOptOut
+                sessionLog("[recall] access-stat bump skipped (caller opted out)")
             }
 
             log("[recall] DONE, returning \(output.count) chars")

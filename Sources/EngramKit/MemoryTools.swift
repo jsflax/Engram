@@ -119,6 +119,14 @@ public actor MemoryTools {
     private let syncedReference: LatticeThreadSafeReference?
     private let groupReferences: [GroupSpokeRef]
 
+    /// Dedicated short-busy-timeout hub handle for the recall access-stat
+    /// bump (MemoryTools+AccessStats). Opened lazily on first MCP recall;
+    /// nil until then or after repeated open failures.
+    var accessStatLattice: Lattice?
+    var accessStatOpenFailures = 0
+    /// What the last recall did about access stats (diagnostics + tests).
+    var lastAccessStatBump: AccessStatBumpOutcome = .none
+
     private struct ResolvedDatabases {
         let local: Lattice
         let synced: Lattice?
