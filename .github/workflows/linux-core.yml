@@ -4,11 +4,9 @@ name: Linux — EngramMemoryCore
 # agents deployment consumes on Linux. This gate keeps it Linux-clean —
 # no CoreML, no NaturalLanguage, no Lattice, no MCP may creep in.
 #
-# Build-only by design: `swift test` would build the entire test graph
-# (EngramKit → CoreML → fails on Linux). Test EXECUTION on Linux happens in
-# engram-server's CI, which depends on EngramMemoryCore as a product and
-# runs the contract suite there (increment 5). Compiling the test target
-# here still type-checks every test.
+# The root test graph includes Apple-only targets. Keep the root product/test
+# compilation checks, then execute exact copied portable sources and tests in
+# a dependency-free package, including real lifetime-lock subprocess cases.
 
 on:
   workflow_call:
@@ -20,6 +18,8 @@ on:
     paths:
       - "Sources/EngramMemoryCore/**"
       - "Tests/EngramMemoryCoreTests/**"
+      - "Tests/Fixtures/ProcessGuard/**"
+      - "scripts/prepare_portable_core_tests.py"
       - "Package.swift"
       - "Package.resolved"
       - ".github/workflows/linux-core.yml"
@@ -28,6 +28,8 @@ on:
     paths:
       - "Sources/EngramMemoryCore/**"
       - "Tests/EngramMemoryCoreTests/**"
+      - "Tests/Fixtures/ProcessGuard/**"
+      - "scripts/prepare_portable_core_tests.py"
       - "Package.swift"
       - "Package.resolved"
       - ".github/workflows/linux-core.yml"
@@ -36,16 +38,85 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Engram requires 6.2; its locked Lattice 2.0.0 dependency requires 6.3.
+    # Engram requires 6.2; its locked Lattice dependency requires 6.3.
     container: swift:6.3-noble
     timeout-minutes: 20
     env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       GIT_CONFIG_COUNT: 1
       GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.SWIFTLM_CLONE_TOKEN }}@github.com/jsflax/SwiftLM.insteadOf
       GIT_CONFIG_VALUE_0: https://github.com/jsflax/SwiftLM
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Prepare isolated Linux work and output paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          task_root="$HOME/localdev/engram-linux-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 700 -p "$task_root"/{repo,tmp,cache,config,security,module-cache,evidence}
+          git archive HEAD | tar -x -C "$task_root/repo"
+          {
+            echo "LINUX_ROOT=$task_root"
+            echo "TMPDIR=$task_root/tmp"
+            echo "ENGRAM_TEST_TMPDIR=$task_root/tmp"
+            echo "CLANG_MODULE_CACHE_PATH=$task_root/module-cache"
+            echo "SWIFTPM_MODULECACHE_OVERRIDE=$task_root/module-cache"
+            echo "PYTHONDONTWRITEBYTECODE=1"
+          } >> "$GITHUB_ENV"
+          swift --version > "$task_root/evidence/swift-version.txt"
       - name: Build EngramMemoryCore (Linux)
-        run: swift build --force-resolved-versions --target EngramMemoryCore
+        run: |
+          swift build --package-path "$LINUX_ROOT/repo" --scratch-path "$LINUX_ROOT/root-build" \
+            --cache-path "$LINUX_ROOT/cache" --config-path "$LINUX_ROOT/config" --security-path "$LINUX_ROOT/security" \
+            --force-resolved-versions --target EngramMemoryCore
       - name: Compile its tests (Linux)
-        run: swift build --force-resolved-versions --target EngramMemoryCoreTests
+        run: |
+          swift build --package-path "$LINUX_ROOT/repo" --scratch-path "$LINUX_ROOT/root-build" \
+            --cache-path "$LINUX_ROOT/cache" --config-path "$LINUX_ROOT/config" --security-path "$LINUX_ROOT/security" \
+            --force-resolved-versions --target EngramMemoryCoreTests
+      - name: Execute exact portable core tests (Linux)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B "$LINUX_ROOT/repo/scripts/prepare_portable_core_tests.py" \
+            --repository "$LINUX_ROOT/repo" --destination "$LINUX_ROOT/portable" --source-sha "$SOURCE_SHA"
+          guard_bin="$(swift build --package-path "$LINUX_ROOT/portable" --scratch-path "$LINUX_ROOT/portable-build" \
+            --cache-path "$LINUX_ROOT/cache" --config-path "$LINUX_ROOT/config" --security-path "$LINUX_ROOT/security" \
+            --show-bin-path)/EngramProcessGuardFixture"
+          export ENGRAM_TEST_PROCESS_GUARD="$guard_bin"
+          swift test --package-path "$LINUX_ROOT/portable" --scratch-path "$LINUX_ROOT/portable-build" \
+            --cache-path "$LINUX_ROOT/cache" --config-path "$LINUX_ROOT/config" --security-path "$LINUX_ROOT/security" \
+            --no-parallel 2>&1 | tee "$LINUX_ROOT/evidence/portable-tests.log"
+          python3 -B - <<'PY'
+          import os, pathlib, re
+          root = pathlib.Path(os.environ['LINUX_ROOT'])
+          output = (root / 'evidence/portable-tests.log').read_text()
+          output = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', output)
+          required = {
+              'detachedShellOwnsLeaseUntilProviderExitEvenWhenProviderClosesFD',
+              'unavailableAndSaturatedLoadRefuseWithoutCooldown',
+              'overridesCannotOutliveRegisteredHostOrWatchdog',
+              'exactReapedNormalAndSignalStatuses',
+              'queuedCancellationDoesNotCreateProvider',
+              'deadlineReapsProviderAfterItMovesProcessGroup',
+              'timeoutReapsTermIgnoringProviderBeforeReleasingLease',
+              'cancellationEscalatesWithoutDroppingProviderLease',
+              'wrapperDeathAndProviderFDClosureDoNotReleaseGuardLease',
+          }
+          passed = set(re.findall(r'^✔ Test (\w+)\(\) passed after ', output, re.M))
+          assert required <= passed, f'Missing required runtime passes: {required - passed}'
+          assert re.search(r'^✔ Test run with [1-9]\d* tests? .*passed after ', output, re.M)
+          assert not re.search(r'^.*(?:Test|Suite) .+ (?:failed|skipped)\b', output, re.M)
+          PY
+      - name: Upload portable qualification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-portable-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.LINUX_ROOT }}/evidence/
+            ${{ env.LINUX_ROOT }}/portable/source-identity.json
+          if-no-files-found: error

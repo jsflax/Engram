@@ -486,11 +486,21 @@ extension MemoryTools {
     /// the fence policy is on, exactly as the text block renders it), and
     /// the envelope carries the rendered `text`. id/project/isPrivate stay
     /// the authoritative native metadata; content remains untrusted data.
+    /// The structured row must not expand a connected preview into a full
+    /// memory body. Keep the text and structured rendering on the same policy.
+    nonisolated static func recallContent(_ content: String, depth: Int,
+                                          isForeign: Bool, fenceForeign: Bool) -> String {
+        if fenceForeign && isForeign { return fencedForeignContent(content) }
+        guard depth > 0, content.count > 500 else { return content }
+        let firstLine = content.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? content
+        return String(firstLine.prefix(120)) + "..."
+    }
+
     nonisolated static func recallResult(_ text: String, hits: [RecallHit],
                                          fenceForeign: Bool = false) -> CallTool.Result {
         let rows: [Value] = hits.map { hit in
-            let content = (fenceForeign && hit.isForeign)
-                ? Self.fencedForeignContent(hit.memory.content) : hit.memory.content
+            let content = Self.recallContent(hit.memory.content, depth: hit.depth,
+                                             isForeign: hit.isForeign, fenceForeign: fenceForeign)
             return .object([
                 "id": .string(hit.memory.id.uuidString),
                 "project": hit.memory.project.map(Value.string) ?? .null,
@@ -542,12 +552,14 @@ extension MemoryTools {
         var recalledHits: [RecallHit] = []
         var recalledMode: RecallMode = .vector
         var renderedRows: [RecallRowBoundary] = []
+        var accessStatOutcome: AccessStatBumpOutcome = bumpAccessStats ? .skippedNothing : .skippedOptOut
         // Keep capture local across embedding awaits, then publish it with
         // this invocation's result, including empty/error returns.
         defer {
             lastRecallHits = recalledHits
             lastRecallMode = recalledMode
             lastRecallRows = renderedRows
+            lastAccessStatBump = accessStatOutcome
         }
         let a = try args.decode(RecallArgs.self)
         guard !a.query.isEmpty else {
@@ -733,8 +745,8 @@ extension MemoryTools {
             // group DB, which the daemon relays over WSS to every member —
             // an O(members) write fan-out per recall, and those remote
             // entries would perpetually re-trip the reconciliation trigger.
-            // Access stats are personal ranking metadata, so only the copies
-            // that live in the hub or the personal mirror get bumped.
+            // The dedicated bump handle writes only hub copies; a personal
+            // mirror-only result is deliberately left unchanged.
             var bumpTargets: [Memory] = filtered.map(\.object).filter { m in
                 guard !groupSpokes.isEmpty else { return true }
                 guard let gid = m.globalId else { return false }
@@ -869,34 +881,34 @@ extension MemoryTools {
                         } else if m.content.count <= 500 {
                             output += "[\(m.project)/\(m.topic)]\(connBadge)\(connVia)\(expires)\(edgeInfo) \(m.content)"
                         } else {
-                            let firstLine = m.content.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? m.content
-                            let preview = String(firstLine.prefix(120))
+                            let preview = Self.recallContent(m.content, depth: mem.depth,
+                                                            isForeign: false, fenceForeign: false)
                             let charCount = m.content.count
                             let sectionCount = m.content.components(separatedBy: "\n").filter { $0.hasPrefix("## ") || $0.hasPrefix("### ") }.count
                             let sizeInfo = sectionCount > 0 ? "\(sectionCount) sections, \(charCount) chars" : "\(charCount) chars"
-                            output += "[\(m.project)/\(m.topic)]\(connBadge)\(connVia) (\(sizeInfo)\(expires))\(edgeInfo) \(preview)\(charCount > 120 ? "..." : "")"
+                            output += "[\(m.project)/\(m.topic)]\(connBadge)\(connVia) (\(sizeInfo)\(expires))\(edgeInfo) \(preview)"
                         }
                     }
                 }
             }
 
             // Access-stat bumps: best-effort ranking metadata, batched into
-            // ONE transaction on `db` — the handle the recalled objects
-            // actually belong to (for synced projects that's the attaching
-            // lattice; a localLattice txn silently wrapped nothing).
+            // ONE transaction on a dedicated hub handle, resolving rows on
+            // that same handle so no setter autocommits on an attachment.
             // `increment` is a SQL-side atomic `SET c = c + 1` (no
             // read-modify-write race, no stale-snapshot hazard). Non-fatal:
-            // a busy synced DB must not throw away a composed recall result.
+            // a busy hub must not throw away a composed recall result.
             //
             // The bump runs OFF the recall's own handle: a dedicated hub
             // connection with a ~75 ms busy timeout (MemoryTools+AccessStats),
-            // so a contended hub costs the caller tens of milliseconds, not
-            // the 2 s MCP busy timeout. Hook callers opt out entirely.
+            // rather than the 2 s MCP busy timeout. This work is synchronous;
+            // 75 ms is a lock-wait budget, not an overall latency guarantee.
+            // Hook callers opt out entirely.
             if bumpAccessStats {
                 sessionLog("[recall] Bumping access stats (\(bumpTargets.count) memories)")
                 bumpAccessStatsBestEffort(bumpTargets, now: Date())
+                accessStatOutcome = lastAccessStatBump
             } else {
-                lastAccessStatBump = .skippedOptOut
                 sessionLog("[recall] access-stat bump skipped (caller opted out)")
             }
 

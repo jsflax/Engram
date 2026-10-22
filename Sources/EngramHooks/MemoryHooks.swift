@@ -16,6 +16,7 @@ struct MemoryHooks: AsyncParsableCommand {
             ClearMaintenance.self,
             SampleGate.self,
             GroupAdvise.self,
+            InternalProcessGuard.self,
         ]
     )
 }

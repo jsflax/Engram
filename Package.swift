@@ -78,7 +78,12 @@ let package = Package(
         ),
         .testTarget(
             name: "EngramMemoryCoreTests",
-            dependencies: ["EngramMemoryCore"]
+            dependencies: ["EngramMemoryCore", "EngramProcessGuardFixture"]
+        ),
+        .executableTarget(
+            name: "EngramProcessGuardFixture",
+            dependencies: ["EngramMemoryCore"],
+            path: "Tests/Fixtures/ProcessGuard"
         ),
         // The MemoryService contract: one executable spec both backends must
         // pass — Lattice in-proc (EngramTests) and Postgres (engram-server's

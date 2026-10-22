@@ -84,6 +84,12 @@ struct BeginRetryTests {
             LatticeError.transactionError("Failed to commit transaction: database is locked")))
         #expect(!LatticeBeginRetry.isBeginContention(
             LatticeError.transactionError("Nested checked transactions are not supported")))
+        #expect(!LatticeBeginRetry.isBeginContention(
+            LatticeError.transactionError("Failed to begin transaction: disk I/O error")))
+        #expect(!LatticeBeginRetry.isBeginContention(
+            LatticeError.transactionError("Failed to begin transaction: database is locked (unknown detail)")))
+        #expect(!LatticeBeginRetry.isBeginContention(
+            LatticeError.transactionError("Failed to rollback transaction: database is locked")))
         #expect(!LatticeBeginRetry.isBeginContention(LatticeError.addFailed("database is locked")))
         #expect(!LatticeBeginRetry.isBeginContention(MCPError.internalError("database is locked")))
     }
@@ -98,7 +104,6 @@ struct BeginRetryTests {
         var bodyEntered = 0
         var logged: [String] = []
         var sleeps: [TimeInterval] = []
-        let started = ProcessInfo.processInfo.systemUptime
         do {
             _ = try LatticeBeginRetry.run(on: f.lattice, jitter: false,
                                           sleep: { sleeps.append($0) },
@@ -111,13 +116,10 @@ struct BeginRetryTests {
             #expect(contention.attempts == 3)
             #expect(contention.detail == "database is locked")
             #expect(contention.totalWaitSeconds >= 0.3)
-            #expect(contention.totalWaitSeconds <= LatticeBeginRetry.defaultTotalCapSeconds)
         }
-        let wall = ProcessInfo.processInfo.systemUptime - started
         #expect(bodyEntered == 0)
         #expect(sleeps == [0.1, 0.3], "backoff schedule between the three attempts")
         #expect(logged.count == 2, "one log line per retried attempt")
-        #expect(wall < LatticeBeginRetry.defaultTotalCapSeconds)
         holder.release()
         #expect(f.lattice.count(Memory.self) == 0)
     }
@@ -131,9 +133,10 @@ struct BeginRetryTests {
 
         var sleeps: [TimeInterval] = []
         do {
-            // elapsed (≥0.1) + backoff 0.1 + timeout 0.1 > cap 0.25 → no second attempt.
-            _ = try LatticeBeginRetry.run(on: f.lattice, totalCapSeconds: 0.25, jitter: false,
-                                          sleep: { sleeps.append($0) }) {
+            // Even with zero recorded elapsed time, 0.1 backoff + 0.1 timeout
+            // cannot fit in a 0.15 cap. No wall-clock scheduling assumption.
+            _ = try LatticeBeginRetry.run(on: f.lattice, totalCapSeconds: 0.15, jitter: false,
+                                          sleep: { sleeps.append($0) }, now: { 0 }) {
                 try f.lattice.add(Memory(content: "never", project: "BeginRetry"))
             }
             Issue.record("expected contention")
@@ -142,6 +145,102 @@ struct BeginRetryTests {
         }
         #expect(sleeps.isEmpty)
         holder.release()
+    }
+
+    @Test func emptyBackoffRetriesWithoutSleepingOrEnteringTheBody() async throws {
+        let f = try await fixture(busyTimeoutMs: 100)
+        defer { f.close() }
+        let holder = try RawWriteLock(path: f.path.path)
+        defer { holder.close() }
+        try holder.acquire()
+
+        var entries = 0
+        var sleeps: [TimeInterval] = []
+        do {
+            _ = try LatticeBeginRetry.run(on: f.lattice, backoffMs: [], jitter: false,
+                                          sleep: { sleeps.append($0) }, now: { 0 }) {
+                entries += 1
+                try f.lattice.add(Memory(content: "never", project: "BeginRetry"))
+            }
+            Issue.record("expected contention")
+        } catch let contention as LatticeBeginRetry.Contention {
+            #expect(contention.attempts == 3)
+        }
+        #expect(entries == 0)
+        #expect(sleeps.isEmpty)
+        holder.release()
+        #expect(f.lattice.count(Memory.self) == 0)
+    }
+
+    @Test func negativeBackoffCannotCreateExtraAdmissionBudget() async throws {
+        let f = try await fixture(busyTimeoutMs: 100)
+        defer { f.close() }
+        let holder = try RawWriteLock(path: f.path.path)
+        defer { holder.close() }
+        try holder.acquire()
+
+        var entries = 0
+        var sleeps: [TimeInterval] = []
+        do {
+            _ = try LatticeBeginRetry.run(on: f.lattice, backoffMs: [-1_000],
+                                          totalCapSeconds: 0.05, jitter: false,
+                                          sleep: { sleeps.append($0) }, now: { 0 }) {
+                entries += 1
+            }
+            Issue.record("expected contention")
+        } catch let contention as LatticeBeginRetry.Contention {
+            #expect(contention.attempts == 1)
+        }
+        #expect(entries == 0)
+        #expect(sleeps.isEmpty)
+    }
+
+    @Test func delayedBackoffCannotStartAnAttemptAfterItsBudgetExpires() async throws {
+        let f = try await fixture(busyTimeoutMs: 100)
+        defer { f.close() }
+        let holder = try RawWriteLock(path: f.path.path)
+        defer { holder.close() }
+        try holder.acquire()
+
+        var clock = 0.0
+        var entries = 0
+        var sleeps: [TimeInterval] = []
+        do {
+            _ = try LatticeBeginRetry.run(on: f.lattice, totalCapSeconds: 0.25, jitter: false,
+                                          sleep: { delay in
+                                              sleeps.append(delay)
+                                              clock = 0.3
+                                              // A wrongly admitted retry would now succeed.
+                                              holder.release()
+                                          }, now: { clock }) {
+                entries += 1
+                try f.lattice.add(Memory(content: "too late", project: "BeginRetry"))
+            }
+            Issue.record("expected contention")
+        } catch let contention as LatticeBeginRetry.Contention {
+            #expect(contention.attempts == 1)
+            #expect(contention.totalWaitSeconds == 0.3)
+        }
+        #expect(sleeps == [0.1])
+        #expect(entries == 0)
+        #expect(f.lattice.count(Memory.self) == 0)
+    }
+
+    @Test func admissionCapDoesNotInterruptTheFirstSuccessfulBody() async throws {
+        let f = try await fixture(busyTimeoutMs: 100)
+        defer { f.close() }
+        var clock = 0.0
+        var entries = 0
+        let success = try LatticeBeginRetry.run(on: f.lattice, totalCapSeconds: 0,
+                                               now: { clock }) {
+            entries += 1
+            clock = 10
+            try f.lattice.add(Memory(content: "first attempt", project: "BeginRetry"))
+        }
+        #expect(success.attempts == 1)
+        #expect(success.totalWaitSeconds == 10)
+        #expect(entries == 1)
+        #expect(f.lattice.count(Memory.self) == 1)
     }
 
     @Test func bodyFailureIsNeverRetried() async throws {
@@ -162,23 +261,48 @@ struct BeginRetryTests {
         #expect(f.lattice.count(Memory.self) == 0, "the checked transaction rolled the add back")
     }
 
+    @Test func beginLikeBodyFailureIsNeverRetried() async throws {
+        let f = try await fixture(busyTimeoutMs: 100)
+        defer { f.close() }
+        let message = "Failed to begin transaction: database is locked"
+        var entries = 0
+        var sleeps: [TimeInterval] = []
+        do {
+            _ = try LatticeBeginRetry.run(on: f.lattice, sleep: { sleeps.append($0) }) {
+                entries += 1
+                try f.lattice.add(Memory(content: "rolled back once", project: "BeginRetry"))
+                throw LatticeError.transactionError(message)
+            }
+            Issue.record("expected the original body error")
+        } catch let error as LatticeError {
+            guard case .transactionError(let detail) = error else {
+                Issue.record("expected the original transaction error")
+                return
+            }
+            #expect(detail == message)
+        }
+        #expect(entries == 1)
+        #expect(sleeps.isEmpty)
+        #expect(f.lattice.count(Memory.self) == 0)
+    }
+
     @Test func releasedLockLetsALaterAttemptSucceed() async throws {
-        let f = try await fixture(busyTimeoutMs: 1_000)
+        let f = try await fixture(busyTimeoutMs: 100)
         defer { f.close() }
         let holder = try RawWriteLock(path: f.path.path)
         defer { holder.close() }
-        try holder.hold(for: 1.5)
+        try holder.acquire()
 
-        let success = try LatticeBeginRetry.run(on: f.lattice, jitter: false) {
+        var entries = 0
+        let success = try LatticeBeginRetry.run(on: f.lattice, jitter: false,
+                                               sleep: { _ in holder.release() }, now: { 0 }) {
+            entries += 1
             try f.lattice.add(Memory(content: "landed on a retry", project: "BeginRetry"))
             return true
         }
         #expect(success.value)
-        // Attempt 1 spends its full 1 s budget; attempt 2 begins at ~1.1 s and
-        // is admitted when the holder lets go at 1.5 s. Under heavy machine
-        // load the holder's release can slip past attempt 2, so 3 is tolerated.
-        #expect((2...3).contains(success.attempts), "attempts: \(success.attempts)")
-        #expect(success.totalWaitSeconds >= 1.0)
+        #expect(success.attempts == 2)
+        #expect(entries == 1)
         #expect(f.lattice.count(Memory.self) == 1)
     }
 
@@ -225,9 +349,9 @@ struct BeginRetryTests {
         #expect(r["write_outcome"] == .string("not_stored_transaction_not_started"))
         #expect(r["reason"] == .string("database_busy"))
         #expect(r["memory_ids"] == .array([]))
-        // Three 200 ms busy waits plus 100 + 300 ms of backoff, well under the cap.
+        // Three 200 ms busy waits plus backoff. Admission is bounded, but
+        // scheduler delays and the tool's other work have no hard wall cap.
         #expect(wall >= 0.6, "wall \(wall) s")
-        #expect(wall <= LatticeBeginRetry.defaultTotalCapSeconds + 1.0)
         // The body never ran: no row through the still-held writer's view either.
         #expect(try holder.integer("SELECT COUNT(*) FROM Memory") == 0)
         holder.release()

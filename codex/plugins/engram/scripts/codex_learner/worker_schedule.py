@@ -54,7 +54,7 @@ def _decode(raw):
     return value
 
 
-def _quarantine_oversize(path):
+def _quarantine_oversize(path, *, read_only=False):
     """Move an owned oversized hint aside without reading or copying its bytes."""
     durable._directory(path.parent)
     try:
@@ -65,6 +65,8 @@ def _quarantine_oversize(path):
              and before.st_nlink == 1 and not before.st_mode & 0o077, "unsafe_metadata")
     if before.st_size <= MAX_BYTES:
         return False
+    if read_only:
+        return True
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     try:
         identity = durable._identity(before)
@@ -92,9 +94,13 @@ def _quarantine_oversize(path):
 
 
 class Schedule:
-    def __init__(self, root):
+    def __init__(self, root, *, read_only=False):
         self.path = root / NAME
-        self.reset = _quarantine_oversize(self.path)
+        self.read_only = read_only
+        self.reset = _quarantine_oversize(self.path, read_only=read_only)
+        if self.reset and read_only:
+            self.raw, self.value = None, _empty()
+            return
         self.raw, _ = durable._read(self.path, absent=True, maximum=MAX_BYTES)
         if self.raw is None:
             self.value = _empty()
@@ -107,6 +113,9 @@ class Schedule:
             # A unique archive prevents an interrupted evidence write from
             # becoming a conflicting authority file on the next reset attempt.
             # Unsafe paths fail in _read, outside this reset branch.
+            if read_only:
+                self.value, self.reset = _empty(), True
+                return
             digest = hashlib.sha256(self.raw).hexdigest()
             archive = root / ("worker-schedule-invalid-" + digest + "-" + uuid.uuid4().hex + ".json")
             durable._new(archive, self.raw)
@@ -115,6 +124,7 @@ class Schedule:
             self.reset = True
 
     def _save(self, value):
+        _require(not self.read_only, "read_only")
         raw = durable.encode(value)
         _require(len(raw) <= MAX_BYTES, "metadata_too_large")
         temp = self.path.with_name(".worker-schedule-" + uuid.uuid4().hex + ".tmp")

@@ -105,7 +105,7 @@ struct LearnerLifecycleLoggingTests {
         }
     }
 
-    @Test func watchdogStillTerminatesChildAndRetainsObservedStatus() throws {
+    @Test func guardTerminatesChildAndRetainsObservedStatus() throws {
         let f = try LifecycleFixture()
         defer { f.remove() }
         let log = try f.log()
@@ -136,8 +136,10 @@ struct LearnerLifecycleLoggingTests {
 
 private struct LifecycleFixture {
     let root: URL
+    let guardExecutable: String
 
     init() throws {
+        guardExecutable = try #require(ProcessInfo.processInfo.environment["ENGRAM_TEST_PROCESS_GUARD"])
         let base = ProcessInfo.processInfo.environment["ENGRAM_TEST_TMPDIR"].map { URL(fileURLWithPath: $0) }
             ?? FileManager.default.temporaryDirectory
         root = base.appendingPathComponent("learner-lifecycle-\(UUID().uuidString)")
@@ -159,7 +161,7 @@ private struct LifecycleFixture {
             prompt: "fake prompt", systemPrompt: "fake system", allowedTools: "Read", model: "fake",
             logPath: root.appendingPathComponent("shared.log").path,
             postCommand: "touch '\(root.appendingPathComponent("post-command").path)'",
-            wallClockSeconds: wallClockSeconds, lifecycleLog: log)
+            wallClockSeconds: wallClockSeconds, lifecycleLog: log, guardExecutable: guardExecutable)
     }
 
     func start(log: LearnerLifecycleLog?, code: Int, sleep: Int = 0,

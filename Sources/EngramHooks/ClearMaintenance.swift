@@ -8,12 +8,11 @@ import Lattice
 /// Clears the maintenance-active flag. Called by the shell wrapper after
 /// the maintenance subprocess finishes.
 ///
-/// Also re-anchors the maintenance audit watermark at the current head, so
-/// the agent's OWN writes (consolidate/organize/merge produce dozens of
-/// Memory audit rows) never count toward the next trigger. Before this the
-/// cooldown was the only thing standing between one maintenance run and the
-/// next; with a 15-minute cooldown and a threshold of 50 the agent's output
-/// re-armed the trigger by itself.
+/// Also best-effort re-anchors the maintenance audit watermark at the current
+/// head. This excludes maintenance's own writes and any concurrent writes
+/// observed through that head from the next trigger. AuditLog does not carry
+/// a writer origin, so this is an approximate baseline, not attribution.
+/// A failed head query preserves the old watermark for a later evaluation.
 struct ClearMaintenance: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "clear-maintenance",
@@ -30,8 +29,12 @@ struct ClearMaintenance: ParsableCommand {
         let headId = lattice.objects(AuditLog.self)
             .sortedBy(\.primaryKey, order: .reverse)
             .first?.primaryKey ?? 0
+        if let error = lattice.lastQueryError() {
+            hookLog("ClearMaintenance: attempted active-flag cleanup; preserved audit watermark after query failure: \(error)")
+            return
+        }
         setHookState(lattice, key: .maintenanceAuditWatermark, value: String(headId))
-        hookLog("ClearMaintenance: set maintenanceActive=0, re-anchored audit watermark at \(headId)")
+        hookLog("ClearMaintenance: attempted active-flag cleanup and audit-watermark update to \(headId)")
         #else
         hookLog("ClearMaintenance: no-op (remote backend — server owns maintenance)")
         #endif

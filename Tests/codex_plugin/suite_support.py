@@ -35,3 +35,16 @@ TEST_CODEX_HOME.mkdir(mode=0o700)
 (TEST_CODEX_HOME / "config.toml").write_text("")
 os.environ["HOME"] = str(TEST_HOME)
 os.environ["CODEX_HOME"] = str(TEST_CODEX_HOME)
+
+
+def fixture_spawn_gate(module, directory):
+    """Real kernel admission for unrelated synthetic worker regressions.
+
+    Fixtures have no provider load/cooldown clock: retain actual flock/fsync/FD
+    behavior while isolating their state. Dedicated spawn-admission tests use
+    the production cooldown and deliberately exercise refusals and crashes.
+    """
+    from unittest import mock
+    production = module.lease
+    return mock.patch.object(module, "lease", side_effect=lambda: production(
+        directory=directory, load=lambda: 0, cooldown=0))

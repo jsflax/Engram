@@ -29,7 +29,7 @@ import uuid
 from .transcript import inspect_rollout, read_excerpt
 from .memory_proxy import verified_no_write_receipt, audit_planning_tools, PLANNING_MODE, read_startup_failure
 from . import admission, memory_config, host_admission, operation_gateway, learner_settings
-from . import runner_publication, settlement, worker_schedule, runtime_routing
+from . import runner_publication, settlement, worker_schedule, runtime_routing, spawn_admission
 
 EVENTS = {"Stop", "SubagentStop", "PreCompact", "SessionEnd"}
 GUARD = "ENGRAM_CODEX_LEARNER"
@@ -964,9 +964,11 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict, *
         if execution is not None:
             settlement.record_provider_dispatch(run_dir, execution.context.manifest_sha256,
                 lambda manifest, _phase: execution.context.validate_inputs(manifest, "before_intent"))
-        proc = subprocess.Popen(argv, stdin=prompt_input, stdout=output, stderr=error,
+        guarded_provider = bool(spawn_admission.pass_fds())
+        proc = subprocess.Popen(spawn_admission.provider_argv(argv, config["wall_seconds"]), stdin=prompt_input, stdout=output, stderr=error,
                                 cwd=run_dir / "workspace", env=env, start_new_session=True,
-                                pass_fds=(() if _PROVIDER_LOCK_FD.get() is None else (_PROVIDER_LOCK_FD.get(),)))
+                                pass_fds=spawn_admission.pass_fds() +
+                                (() if _PROVIDER_LOCK_FD.get() is None else (_PROVIDER_LOCK_FD.get(),)))
         _PROVIDER_STARTED.set(True)
         deadline = time.monotonic() + config["wall_seconds"]
         try:
@@ -1004,14 +1006,7 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict, *
                         reason = "unexpected_tool"
                     if reason:
                         if not finished:
-                            with contextlib.suppress(ProcessLookupError):
-                                os.killpg(proc.pid, signal.SIGTERM)
-                            try:
-                                proc.wait(timeout=3)
-                            except subprocess.TimeoutExpired:
-                                with contextlib.suppress(ProcessLookupError):
-                                    os.killpg(proc.pid, signal.SIGKILL)
-                                proc.wait()
+                            spawn_admission.stop_provider(proc, guarded=guarded_provider)
                         break
                     if finished_before_read and not batch_exhausted:
                         # Any partial final frame is invalid. A process that
@@ -1024,13 +1019,11 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict, *
                     time.sleep(0.1)
         finally:
             if proc.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
+                spawn_admission.stop_provider(proc, guarded=guarded_provider)
     observed.pop("seen")
     if execution is not None:
         settlement.persist_observation(run_dir, {
-            "started": True, "terminated": proc.poll() is not None,
+            "started": True, "terminated": spawn_admission.provider_terminated(proc, guarded=guarded_provider),
             "returncode": proc.returncode, "turn_completed": observed["turn_completed"],
             "provider_error": observed["provider_error"], "unexpected_tool": observed["unexpected_tool"],
             "tool_errors": observed["tool_errors"], "reason": reason})
@@ -1365,6 +1358,13 @@ def worker(root: Path) -> int:
                     invalid_pending.add(p)
                 elif (r.get("paused_request_id") != r.get("request_id")
                       and not recoverable(sid)):
+                    state = load_json(root / "sessions" / (sid + ".json"))
+                    retry = state.get("retry_after", 0)
+                    # A new lifecycle event may replace the paused pending
+                    # request during backoff. Read eligibility before spending
+                    # shared cooldown; process_request revalidates it later.
+                    if type(retry) not in (int, float) or not 0 <= retry <= time.time():
+                        continue
                     values.append((p.stat().st_mtime_ns, p, r))
             except (OSError, ValueError):
                 continue
@@ -1398,13 +1398,14 @@ def worker(root: Path) -> int:
         return None
 
     more = {}
-    with lock_file(root / "worker.lock", blocking=False) as acquired:
+    with lock_file(root / "worker.lock", blocking=False) as acquired, contextlib.ExitStack() as shared_slot:
         if not acquired:
             return 0
+        shared_lease = None
         config = settings(root)
-        schedule = worker_schedule.Schedule(root)
-        if schedule.reset:
-            event_log(root, "worker_schedule_reset", reason="invalid_advisory_metadata_preserved")
+        # Selection before admission is read-only, including corrupt/oversized
+        # advisory metadata. Repair only after the lifetime lease is admitted.
+        schedule = worker_schedule.Schedule(root, read_only=True)
         handled = 0
         pending_dir = private_dir(root / "pending")
         while handled < config["max_runs_per_worker"]:
@@ -1412,6 +1413,18 @@ def worker(root: Path) -> int:
                 choice = select_work(schedule)
             if choice is None:
                 break
+            if shared_lease is None:
+                shared_lease = shared_slot.enter_context(spawn_admission.lease())
+                if not shared_lease.admitted:
+                    event_log(root, "worker_admission_deferred", reason=shared_lease.reason)
+                    return 0  # Pending/cursor/holds and schedule bytes untouched.
+                schedule = worker_schedule.Schedule(root)
+                if schedule.reset:
+                    event_log(root, "worker_schedule_reset", reason="invalid_advisory_metadata_preserved")
+                with lock_file(root / "enqueue.lock"):
+                    choice = select_work(schedule)
+                if choice is None:
+                    break
             lane, sid, pending_work = choice
             # Scheduler publication is outside enqueue.lock and grants no
             # execution authority. Existing operation checks still run below.

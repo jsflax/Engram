@@ -33,7 +33,8 @@ class HostPreparationTests(unittest.TestCase):
         targets = value['TestConfigurations'][0]['TestTargets']
         self.assertEqual(len(targets), 1)
         self.assertEqual(targets[0]['EnvironmentVariables'], self.environment)
-        self.assertEqual(targets[0]['OnlyTestIdentifiers'], list(M.CLASSES))
+        self.assertEqual(targets[0]['OnlyTestIdentifiers'], M.test_identifiers())
+        self.assertNotIn('PanelPerformanceTests', targets[0]['OnlyTestIdentifiers'])
         self.assertFalse(targets[0]['ParallelizationEnabled'])
         self.assertEqual(targets[0]['TestingEnvironmentVariables'], self.host['TestingEnvironmentVariables'])
         self.assertEqual(self.original, before)
@@ -73,6 +74,9 @@ class HostPreparationTests(unittest.TestCase):
                 (root / name).mkdir(parents=True, exist_ok=True)
             for name in M.CLASSES:
                 (root / 'repo/EngramUnitTests' / (name + '.swift')).write_text('    func testFixture() {}\n')
+            for name, methods in M.METHODS.items():
+                (root / 'repo/EngramUnitTests' / (name + '.swift')).write_text(
+                    ''.join('    func ' + method + '() {}\n' for method in methods))
             products = root / 'derived/Build/Products'
             app = products / 'Debug/Engram.app'
             native = app / 'Contents/MacOS/Engram'
@@ -83,7 +87,7 @@ class HostPreparationTests(unittest.TestCase):
             original = products / 'Engram.xctestrun'
             original.write_bytes(plistlib.dumps(self.original))
             result = M.prepare(root)
-            self.assertEqual(result['expected_tests'], 6)
+            self.assertEqual(result['expected_tests'], 9)
             output = plistlib.loads(Path(result['prepared']).read_bytes())
             environment = output['TestConfigurations'][0]['TestTargets'][0]['EnvironmentVariables']
             self.assertEqual(environment['CLAUDE_MEMORY_DB'], str(root / 'fixtures/app-memory.sqlite'))
@@ -93,6 +97,15 @@ class HostPreparationTests(unittest.TestCase):
             self.assertFalse((root / 'fixtures/app-memory.sqlite').exists(), 'preparation must never launch a host')
             with self.assertRaisesRegex(ValueError, 'path outside'):
                 M.owned(root, root.parent)
+            sidebar = root / 'repo/EngramUnitTests/PanelPerformanceTests.swift'
+            original_source = sidebar.read_text()
+            selected = M.METHODS['PanelPerformanceTests'][0]
+            sidebar.write_text(original_source.replace('    func ' + selected + '() {}\n', ''))
+            with self.assertRaisesRegex(ValueError, 'selected test missing'):
+                M.inventory(root / 'repo')
+            sidebar.write_text(original_source + '    func ' + selected + '() {}\n')
+            with self.assertRaisesRegex(ValueError, 'invalid test source inventory'):
+                M.inventory(root / 'repo')
 
     def test_frame_lookup_controls_are_mirrored_and_selected_in_exact_app_census(self):
         repo = Path(__file__).parents[1]
@@ -122,7 +135,7 @@ class HostPreparationTests(unittest.TestCase):
             'testLabelNumericRescanPreservesMissingPositionSemantics',
             'testLabelNumericSlotsFollowReorderAndTopicChanges')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 99)
+        self.assertEqual(len(inventory), 102)
         self.assertIn('AdapterSnapshotTests/testMascotVisibilityReachesSceneAndPreservesExistingEntities', inventory)
         for name in (
             'testCertifiedCrossGalaxyNodeAppendsReuseUnchangedEdges',
@@ -147,6 +160,33 @@ class HostPreparationTests(unittest.TestCase):
         self.assertEqual([name for name in inventory if name.startswith('SceneMetadataDomainTests/')],
                          sorted(domain_controls))
         self.assertEqual(M.CLASSES.count('SceneMetadataDomainTests'), 1)
+
+    def test_sidebar_selection_requires_exact_functional_methods_without_performance_class(self):
+        expected = ['PanelPerformanceTests/' + name for name in (
+            'testSidebarPresentationDoesNotReevaluateItsGraphParent',
+            'testSidebarHoverDismissalCanBeCancelledByReentryAndPinning',
+            'testPanelSnapshotTracksInitialAndLiveChangesWithoutSidebarAppearance')]
+        self.assertEqual(sorted(name for name in M.inventory(Path(__file__).parents[1])
+                                if name.startswith('PanelPerformanceTests/')), sorted(expected))
+        selection = M.test_identifiers()
+        self.assertNotIn('PanelPerformanceTests', selection)
+        self.assertEqual(sorted(name for name in selection if name.startswith('PanelPerformanceTests/')),
+                         sorted(expected))
+
+    def test_focused_pass_audit_rejects_missing_duplicate_skipped_and_unselected_sidebar_cases(self):
+        expected = M.inventory(Path(__file__).parents[1])
+        def line(identifier, result='passed'):
+            name, method = identifier.split('/')
+            return f"Test Case '-[EngramUnitTests.{name} {method}]' {result} (0.001 seconds).\n"
+        log = ''.join(line(identifier) for identifier in expected)
+        self.assertEqual(M.audit_passes(log, expected), expected)
+        sidebar = 'PanelPerformanceTests/testSidebarPresentationDoesNotReevaluateItsGraphParent'
+        for altered in (log.replace(line(sidebar), ''), log + line(sidebar),
+                        log.replace(line(sidebar), line(sidebar, 'skipped')),
+                        log + line(sidebar, 'skipped'),
+                        log + line('PanelPerformanceTests/testUnexpectedPerformanceBudget')):
+            with self.subTest(log=altered[-180:]), self.assertRaises(ValueError):
+                M.audit_passes(altered, expected)
 
 class DependencyPreparationTests(unittest.TestCase):
     def setUp(self):

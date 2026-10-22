@@ -28,6 +28,8 @@ class WorkerFairnessTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="worker-fairness-", dir=fixture_root)
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        from suite_support import fixture_spawn_gate
+        self.enterContext(fixture_spawn_gate(R.spawn_admission, self.root / "gate"))
         for name in ("pending", "sessions", "admissions", "enrollments"):
             (self.root / name).mkdir(mode=0o700)
         self.ids, self.recoverable, self.failed = [], set(), set()

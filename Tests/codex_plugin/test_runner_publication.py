@@ -28,6 +28,9 @@ class RunnerPublicationTests(unittest.TestCase):
         self.f.setUp()
         self.addCleanup(self.f.doCleanups)
         self.f.fence.close()
+        from suite_support import fixture_spawn_gate
+        gate = importlib.import_module("codex_learner.spawn_admission")
+        self.enterContext(fixture_spawn_gate(gate, self.f.root / "gate"))
         (self.f.root / "runs").chmod(0o700)
         self.config = {"max_chars": 2000, "max_scan_bytes": 4096, "retry_seconds": 60}
         self.pending = self.f.root / "pending" / (SID + ".json")

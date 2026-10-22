@@ -117,7 +117,40 @@ jobs:
       # C++-heavy graph on slow hosted runners.
       - name: Build tests
         timeout-minutes: 75
-        run: swift build --force-resolved-versions --build-tests
+        run: |
+          set -euo pipefail
+          swift build --force-resolved-versions --build-tests
+          guard_bin="$(swift build --show-bin-path)/EngramProcessGuardFixture"
+          test -x "$guard_bin"
+          echo "ENGRAM_TEST_PROCESS_GUARD=$guard_bin" >> "$GITHUB_ENV"
+      - name: Validate packaged process guard command
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          guard_evidence="$HOME/localdev/engram-process-guard-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "ENGRAM_PROCESS_GUARD_EVIDENCE=$guard_evidence" >> "$GITHUB_ENV"
+          hooks_bin="$(swift build --show-bin-path)/EngramHooks"
+          status=0
+          python3 -B scripts/run_native_tests.py --diagnostics-dir "$guard_evidence" \
+            --timeout-seconds 20 --silence-seconds 10 -- \
+            "$hooks_bin" internal-process-guard --wall-seconds 2 -- /bin/sh -c 'exit 7' || status=$?
+          test "$status" -eq 7
+          python3 -B - "$guard_evidence/receipt.json" <<'PY'
+          import json, pathlib, sys
+          receipt = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert receipt['reason'] == 'exit' and receipt['child_exit_code'] == 7 and receipt['exit_code'] == 7
+          assert receipt['reader_complete'] and not receipt['reader_error'] and not receipt['errors']
+          assert not receipt['signals_received'] and not receipt['log_truncated']
+          assert not receipt['cleanup']['remaining'] and not receipt['cleanup']['errors'] and not receipt['cleanup']['signals']
+          PY
+      - name: Upload process guard command diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: process-guard-command-diagnostics
+          path: ${{ env.ENGRAM_PROCESS_GUARD_EVIDENCE }}
+          if-no-files-found: warn
       # Core correctness gate (the 0.13.0 release bar): sync/memory/organize/
       # relay + RealityKit system tests. The three ForceEngine preparation tests
       # have a required Metal gate below; the remaining historical GPU-internal
@@ -194,6 +227,32 @@ jobs:
             --timeout-seconds 120 --silence-seconds 60 -- \
             swift test --force-resolved-versions --skip-build \
             --filter busyBeginDoesNotInvokeBodyOrPublishReceipt
+
+      - name: Run daemon hub contention and recovery (isolated)
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture_root="$HOME/localdev/dh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 700 -p "$fixture_root/tmp"
+          export ENGRAM_TEST_ROOT="$fixture_root"
+          export TMPDIR="$fixture_root/tmp"
+          ENGRAM_DAEMON_CONTENTION_ISOLATED=1 LATTICE_LOG_LEVEL=3 \
+            ENGRAM_DAEMON_CONTENTION_LOG="$fixture_root/diagnostics/core.log" \
+            python3 -B scripts/run_native_tests.py --diagnostics-dir "$fixture_root/diagnostics/runner" \
+            --timeout-seconds 210 --silence-seconds 180 \
+            --require-swift-test realHubBeginContentionPreservesUnacknowledgedWorkAndRecovers -- \
+            swift test --force-resolved-versions --skip-build --no-parallel \
+            --filter 'EngramTests.DaemonHubContentionTests'
+
+      - name: Upload daemon contention diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-contention-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ~/localdev/dh-${{ github.run_id }}-${{ github.run_attempt }}/diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload native test diagnostics
         if: ${{ (failure() || cancelled()) && steps.native_tests.outcome != 'skipped' }}

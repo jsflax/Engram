@@ -62,13 +62,13 @@ public enum SyncService {
 
     /// Busy timeout for the sync daemon's HUB handle.
     ///
-    /// Lattice's default is 30 s. The daemon is the one long-lived writer on
-    /// the hub (relay applies, hourly compaction deletes, checkpoints); with
-    /// the default it could sit on a lock wait for 30 s while every
-    /// interactive writer (MCP `remember`, hooks) gives up after 2 s — the
-    /// daemon always won and the user always lost. Same budget as the MCP
-    /// server (`mcpBusyTimeoutMs`): a daemon write that loses BEGIN is
-    /// retried by the synchronizer; a user write that loses is a failed turn.
+    /// Match the MCP server's 2 s acquisition wait instead of inheriting
+    /// Lattice's 30 s default. This bounds each BEGIN's lock acquisition;
+    /// it does not set writer priority, lock-holding time or a whole-delivery
+    /// deadline. The pinned Core retries a failed apply chunk once and
+    /// acknowledges only committed entries. Cold-apply initialization runs
+    /// before that chunk retry, so its failure behavior needs separate
+    /// coverage from the warmed relay's BEGIN contention path.
     public static let daemonHubBusyTimeoutMs = 2_000
 
     /// The daemon's hub configuration: schema migrations, the per-destination
@@ -83,13 +83,38 @@ public enum SyncService {
 
     /// Compact history before sync to reduce AuditLog entries.
     /// Uses slot-aware compaction — only deletes entries all synchronizers have confirmed.
-    public static func compactBeforeSync(_ lattice: Lattice) {
-        lattice.compactHistory()
-        // Bounded, not the 30s-writer-gate variant: this runs at daemon
-        // startup on databases that may still have live readers (MCP
-        // servers, the visualizer). On a repaired/healthy database it is a
-        // no-op; on a bloated one it caps the WAL instead of stalling.
-        lattice.checkpointBounded()
+    public static func compactBeforeSync(_ lattice: Lattice, log: (String) -> Void = { _ in }) {
+        compactAndCheckpoint(lattice, context: "Startup compaction", log: log)
+    }
+
+    /// Preserve a sealed compaction failure before the next native call clears
+    /// the thread-local error slot. A failed compaction returns nil, not a
+    /// successful zero-row count. Lattice's -1 no-writer-slots result remains
+    /// distinct; this helper never changes the compaction floor or retries it.
+    @discardableResult
+    public static func compactAndCheckpoint(_ lattice: Lattice, context: String,
+                                             log: (String) -> Void = { _ in }) -> Int64? {
+        let deleted = lattice.compactHistory()
+        let compactionError = lattice.lastQueryError()
+        // Keep the existing checkpoint attempt even if compaction failed.
+        // Its bounded busy wait is appropriate while MCP and visualizer
+        // readers are active; pinned frames can remain for a later pass.
+        let checkpointed = lattice.checkpointBounded()
+        let checkpointError = lattice.lastQueryError()
+
+        if let compactionError {
+            log("\(context): compaction failed: \(compactionError)")
+        } else if deleted > 0 {
+            log("\(context): compacted \(deleted) audit rows")
+        } else if deleted < 0 {
+            log("\(context): compaction skipped (no writer slots)")
+        }
+        if let checkpointError {
+            log("\(context): bounded checkpoint failed: \(checkpointError)")
+        } else if checkpointed < 0 {
+            log("\(context): bounded checkpoint deferred (no frames checkpointed)")
+        }
+        return compactionError == nil ? deleted : nil
     }
 
     /// Self-heal for machines carrying the Aug 2026 audit-log explosion
@@ -106,11 +131,19 @@ public enum SyncService {
     /// the tool for people who want the disk back.
     public static func healAuditLog(_ lattice: Lattice, log: (String) -> Void = { _ in }) {
         let before = lattice.objects(AuditLog.self).count
+        if let error = lattice.lastQueryError() {
+            log("Audit heal: could not count audit rows: \(error)")
+            return
+        }
         guard before > auditHealThreshold else { return }
         let normalized = lattice.normalizeAuditTimestamps()
-        let deleted = lattice.compactHistory()
-        lattice.checkpointBounded()
-        log("Audit heal: \(before) rows → compacted \(deleted), normalized \(normalized) timestamps")
+        let normalizationError = lattice.lastQueryError()
+        compactAndCheckpoint(lattice, context: "Audit heal", log: log)
+        if let normalizationError {
+            log("Audit heal: timestamp normalization failed: \(normalizationError)")
+        } else {
+            log("Audit heal: \(before) rows, normalized \(normalized) timestamps")
+        }
     }
 
     /// Above this many audit rows, a database is carrying more history than

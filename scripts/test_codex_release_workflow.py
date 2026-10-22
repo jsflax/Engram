@@ -95,10 +95,15 @@ assert os.environ['ENGRAM_ADOPTION_TEST_ROOT'] == str(
     Path(os.environ['HOME']) / 'localdev/engram-native-tests-987654321-2')
 assert os.environ['ENGRAM_TEST_ROOT'] == os.environ['ENGRAM_ADOPTION_TEST_ROOT']
 assert os.environ['TMPDIR'] == str(Path(os.environ['ENGRAM_ADOPTION_TEST_ROOT']) / 'tmp')
+assert os.environ['ENGRAM_TEST_PROCESS_GUARD'] == str(Path(os.environ['FAKE_SWIFT_BIN']) / 'EngramProcessGuardFixture')
 raise SystemExit(subprocess.run(args.command[1:], check=False).returncode)
 ''')
             bin_dir = root / 'bin'
             bin_dir.mkdir()
+            swift_bin = root / 'swift debug products'; swift_bin.mkdir()
+            guard = swift_bin / 'EngramProcessGuardFixture'
+            guard.write_text('#!/bin/sh\nexit 99\n'); guard.chmod(0o700)
+            github_env = root / 'github-env'
             log = root / 'calls.jsonl'
             fake = '#!' + sys.executable + '\n' + '''import json,os,sys
 from pathlib import Path
@@ -109,7 +114,10 @@ if kind=='mkdir':
     fixture = Path(os.environ['HOME'])/'localdev/engram-native-tests-987654321-2'
     assert args == ['-m','700','-p',str(fixture),str(fixture/'tmp')],args
 elif kind=='swift':
-    assert '--force-resolved-versions' in args,args
+    if args == ['build','--show-bin-path']:
+        print(os.environ['FAKE_SWIFT_BIN'])
+    else:
+        assert '--force-resolved-versions' in args,args
 else:
     assert '-disableAutomaticPackageResolution' in args,args
     assert '-onlyUsePackageVersionsFromResolvedFile' in args,args
@@ -126,7 +134,8 @@ with open(os.environ['CALL_LOG'],'a') as output:
             (root / 'appcast.xml').write_text('<sparkle:version>14</sparkle:version>\n')
             env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
                        RELEASE_TAG='v0.14.8', APPLE_TEAM_ID='ABCDEFGHIJ', RUNNER_TEMP=str(root),
-                       GITHUB_RUN_ID='987654321', GITHUB_RUN_ATTEMPT='2')
+                       GITHUB_RUN_ID='987654321', GITHUB_RUN_ATTEMPT='2',
+                       GITHUB_ENV=str(github_env), FAKE_SWIFT_BIN=str(swift_bin), LINUX_ROOT=str(root / 'linux'))
             steps = {
                 'release.yml': ['Resolve dependencies', 'Build tests', 'Run tests',
                                 'Run statement-budget regressions (serial)',
@@ -139,10 +148,18 @@ with open(os.environ['CALL_LOG'],'a') as output:
                         result = subprocess.run(['/bin/bash', '-e', '-c', run_block(workflow, name)],
                                                 cwd=root, env=env, capture_output=True, text=True, timeout=20)
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        if name == 'Build tests':
+                            self.assertEqual(github_env.read_text(), 'ENGRAM_TEST_PROCESS_GUARD=' + str(guard) + '\n')
+                            env['ENGRAM_TEST_PROCESS_GUARD'] = str(guard)
             calls = [json.loads(line) for line in log.read_text().splitlines()]
-            self.assertEqual(sum(call[0] == 'swift' for call in calls), 8)
+            self.assertEqual(sum(call[0] == 'swift' for call in calls), 9)
             self.assertEqual(sum(call[0] == 'xcodebuild' for call in calls), 1)
             self.assertEqual(sum(call[0] == 'mkdir' for call in calls), 1)
+            for target in ('EngramMemoryCore', 'EngramMemoryCoreTests'):
+                self.assertIn(['swift', 'build', '--package-path', str(root / 'linux/repo'),
+                    '--scratch-path', str(root / 'linux/root-build'), '--cache-path', str(root / 'linux/cache'),
+                    '--config-path', str(root / 'linux/config'), '--security-path', str(root / 'linux/security'),
+                    '--force-resolved-versions', '--target', target], calls)
             tests = [call for call in calls if call[:2] == ['swift', 'test']]
             self.assertEqual(len(tests), 3)
             self.assertTrue(any('recall_statementBudget' in call for call in tests))
@@ -157,6 +174,217 @@ with open(os.environ['CALL_LOG'],'a') as output:
                 '--skip', 'recall_statementBudget', '--skip', 'clusters_statementBudget',
                 '--skip', 'busyBeginDoesNotInvokeBodyOrPublishReceipt',
             ])
+
+    def test_build_exports_only_an_executable_guard_after_success(self):
+        for workflow, name in (('release.yml', 'Build tests'), ('native-validation.yml', 'Build native tests')):
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory(prefix='engram guard build ') as temporary:
+                root = Path(temporary).resolve()
+                bin_dir = root / 'bin'; bin_dir.mkdir()
+                products = root / 'swift debug products'; products.mkdir()
+                guard = products / 'EngramProcessGuardFixture'
+                github_env, log = root / 'github-env', root / 'calls.jsonl'
+                fake = '#!' + sys.executable + '\n' + """import json,os,sys
+with open(os.environ['CALL_LOG'],'a') as output:
+    output.write(json.dumps(sys.argv[1:])+'\\n')
+if sys.argv[1:]==['build','--show-bin-path']:
+    print(os.environ['FAKE_SWIFT_BIN'])
+else:
+    raise SystemExit(int(os.environ['FAKE_BUILD_EXIT']))
+"""
+                for tool in ('swift', 'swift-validation'):
+                    executable = bin_dir / tool
+                    executable.write_text(fake); executable.chmod(0o700)
+                env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
+                    VALIDATION_ROOT=str(root), GITHUB_ENV=str(github_env), FAKE_SWIFT_BIN=str(products))
+                build = ['build', '--force-resolved-versions']
+                if workflow == 'native-validation.yml':
+                    build += ['--disable-index-store']
+                build += ['--build-tests']
+                for state, build_exit in (('executable', 0), ('missing', 0), ('nonexecutable', 0), ('executable', 29)):
+                    with self.subTest(state=state, build_exit=build_exit):
+                        github_env.unlink(missing_ok=True); log.unlink(missing_ok=True); guard.unlink(missing_ok=True)
+                        if state != 'missing':
+                            guard.write_text('#!/bin/sh\nexit 99\n')
+                            guard.chmod(0o700 if state == 'executable' else 0o600)
+                        result = subprocess.run(['/bin/bash', '-e', '-c', run_block(workflow, name)],
+                            cwd=root, env=dict(env, FAKE_BUILD_EXIT=str(build_exit)),
+                            capture_output=True, text=True, timeout=10)
+                        expected = build_exit or (0 if state == 'executable' else 1)
+                        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                        self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
+                            [build] + ([] if build_exit else [['build', '--show-bin-path']]))
+                        if expected:
+                            self.assertFalse(github_env.exists())
+                        else:
+                            self.assertEqual(github_env.read_text(), 'ENGRAM_TEST_PROCESS_GUARD=' + str(guard) + '\n')
+
+    def test_packaged_guard_smoke_requires_exact_command_status_and_clean_receipt(self):
+        name = 'Validate packaged process guard command'
+        good = {
+            'reason': 'exit', 'child_exit_code': 7, 'exit_code': 7,
+            'reader_complete': True, 'reader_error': None, 'errors': [],
+            'signals_received': [], 'log_truncated': False,
+            'cleanup': {'remaining': [], 'errors': [], 'signals': []},
+        }
+        changes = [
+            ('reason', 'timeout'), ('child_exit_code', 0), ('exit_code', 0),
+            ('reader_complete', False), ('reader_error', 'read failed'), ('errors', ['error']),
+            ('signals_received', [15]), ('log_truncated', True),
+            ('cleanup.remaining', [123]), ('cleanup.errors', ['error']), ('cleanup.signals', [15]),
+        ]
+        scenarios = [('clean', 7, good), ('wrong-zero-status', 0, good), ('wrong-failure-status', 29, good)]
+        for key, value in changes:
+            receipt = json.loads(json.dumps(good))
+            target = receipt
+            parts = key.split('.')
+            for part in parts[:-1]:
+                target = target[part]
+            target[parts[-1]] = value
+            scenarios.append((key, 7, receipt))
+        for workflow in ('release.yml', 'native-validation.yml'):
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory(prefix='engram guard smoke ') as temporary:
+                root = Path(temporary).resolve()
+                validation = root / 'validation'; (validation / 'repo').mkdir(parents=True)
+                bin_dir = root / 'bin'; bin_dir.mkdir()
+                (validation / 'bin').mkdir()
+                products = root / 'swift debug products'; products.mkdir()
+                log, continued = root / 'calls.jsonl', root / 'continued'
+                receipt_path = validation / 'evidence/process-guard-command/receipt.json'
+                receipt_path.parent.mkdir(parents=True)
+                swift = '#!' + sys.executable + '\n' + """import json,os,sys
+assert sys.argv[1:]==['build','--show-bin-path'],sys.argv
+with open(os.environ['CALL_LOG'],'a') as output:
+    output.write(json.dumps({'tool':'swift','args':sys.argv[1:]})+'\\n')
+print(os.environ['FAKE_SWIFT_BIN'])
+"""
+                for executable in (bin_dir / 'swift', validation / 'bin/swift-validation'):
+                    executable.write_text(swift); executable.chmod(0o700)
+                # The fake supervisor records the original command and emits
+                # only a configured receipt. Real inline receipt validation
+                # still runs. Map the release receipt argument to this private
+                # fixture so no fake tool writes into the real user's home.
+                python = bin_dir / 'python3'
+                python.write_text('#!' + sys.executable + '\n' + """import json,os,sys
+from pathlib import Path
+args=sys.argv[1:]
+with open(os.environ['CALL_LOG'],'a') as output:
+    output.write(json.dumps({'tool':'python3','args':args,'cwd':str(Path.cwd())})+'\\n')
+if args[:2]==['-B','scripts/run_native_tests.py']:
+    Path(os.environ['FAKE_RECEIPT_PATH']).write_text(os.environ['FAKE_RECEIPT'])
+    raise SystemExit(int(os.environ['FAKE_GATE_EXIT']))
+assert args[:2]==['-B','-'],args
+if len(args)==3:
+    args[2]=os.environ['FAKE_RECEIPT_PATH']
+os.execv(sys.executable,[sys.executable,*args])
+""")
+                python.chmod(0o700)
+                env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
+                    VALIDATION_ROOT=str(validation), GITHUB_ENV=str(root / 'github-env'),
+                    GITHUB_RUN_ID='987654321', GITHUB_RUN_ATTEMPT='2', FAKE_SWIFT_BIN=str(products),
+                    FAKE_RECEIPT_PATH=str(receipt_path))
+                release = workflow == 'release.yml'
+                evidence = (Path(env['HOME']) / 'localdev/engram-process-guard-987654321-2'
+                            if release else receipt_path.parent)
+                expected = ['-B', 'scripts/run_native_tests.py', '--diagnostics-dir', str(evidence),
+                    '--timeout-seconds', '20', '--silence-seconds', '10', '--',
+                    str(products / 'EngramHooks'), 'internal-process-guard', '--wall-seconds', '2',
+                    '--', '/bin/sh', '-c', 'exit 7']
+                section = step_section(workflow, name)
+                self.assertIn('timeout-minutes: 2', section)
+                self.assertNotIn('continue-on-error', section)
+                for scenario, code, receipt in scenarios:
+                    with self.subTest(scenario=scenario):
+                        log.unlink(missing_ok=True); continued.unlink(missing_ok=True)
+                        result = subprocess.run(['/bin/bash', '-e', '-c',
+                            run_block(workflow, name) + 'printf continued > "$1"\n', 'gate', str(continued)],
+                            cwd=root, env=dict(env, FAKE_GATE_EXIT=str(code), FAKE_RECEIPT=json.dumps(receipt)),
+                            capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode, 0 if scenario == 'clean' else 1,
+                                         result.stdout + result.stderr)
+                        self.assertEqual(continued.exists(), scenario == 'clean')
+                        calls = [json.loads(line) for line in log.read_text().splitlines()]
+                        self.assertEqual(calls[0], {'tool': 'swift', 'args': ['build', '--show-bin-path']})
+                        self.assertEqual(calls[1], {'tool': 'python3', 'args': expected,
+                                                   'cwd': str(root if release else validation / 'repo')})
+                        self.assertEqual(len(calls), 3 if code == 7 else 2)
+                        if code == 7:
+                            self.assertEqual(calls[2]['args'], ['-B', '-'] + (
+                                [str(evidence / 'receipt.json')] if release else []))
+
+    def test_linux_portable_gate_requires_each_lifetime_test_and_propagates_failure(self):
+        required = [
+            'detachedShellOwnsLeaseUntilProviderExitEvenWhenProviderClosesFD',
+            'unavailableAndSaturatedLoadRefuseWithoutCooldown',
+            'overridesCannotOutliveRegisteredHostOrWatchdog',
+            'exactReapedNormalAndSignalStatuses',
+            'queuedCancellationDoesNotCreateProvider',
+            'deadlineReapsProviderAfterItMovesProcessGroup',
+            'timeoutReapsTermIgnoringProviderBeforeReleasingLease',
+            'cancellationEscalatesWithoutDroppingProviderLease',
+            'wrapperDeathAndProviderFDClosureDoNotReleaseGuardLease',
+        ]
+        lines = ['✔ Test ' + name + '() passed after 0.001 seconds.' for name in required]
+        summary = '✔ Test run with 9 tests passed after 0.100 seconds.\n'
+        complete = '\n'.join(lines) + '\n' + summary
+        scenarios = [('complete', complete, 0)]
+        scenarios += [(name, '\n'.join(line for line in lines if name + '()' not in line) + '\n' + summary, 0)
+                      for name in required]
+        scenarios += [
+            ('no-summary', '\n'.join(lines) + '\n', 0),
+            ('skipped', complete + '✘ Test additionalCase() skipped.\n', 0),
+            ('failed', complete + '✘ Suite Additional failed.\n', 0),
+            ('process-failed', complete, 29),
+        ]
+        with tempfile.TemporaryDirectory(prefix='engram portable gate ') as temporary:
+            root = Path(temporary).resolve()
+            scripts = root / 'repo/scripts'; scripts.mkdir(parents=True)
+            bin_dir = root / 'bin'; bin_dir.mkdir()
+            (root / 'evidence').mkdir()
+            (bin_dir / 'python3').symlink_to(sys.executable)
+            log, continued = root / 'calls.jsonl', root / 'continued'
+            (scripts / 'prepare_portable_core_tests.py').write_text("""import json,os,sys
+with open(os.environ['CALL_LOG'],'a') as output:
+    output.write(json.dumps({'tool':'prepare','args':sys.argv[1:]})+'\\n')
+""")
+            swift = bin_dir / 'swift'
+            swift.write_text('#!' + sys.executable + '\n' + """import json,os,sys
+from pathlib import Path
+root=Path(os.environ['LINUX_ROOT'])
+args=sys.argv[1:]
+with open(os.environ['CALL_LOG'],'a') as output:
+    output.write(json.dumps({'tool':'swift','args':args})+'\\n')
+if args[0]=='build':
+    assert args[-1]=='--show-bin-path',args
+    print(root/'portable-build/debug')
+else:
+    assert args[0]=='test' and args[-1]=='--no-parallel',args
+    assert os.environ['ENGRAM_TEST_PROCESS_GUARD']==str(root/'portable-build/debug/EngramProcessGuardFixture')
+    print(os.environ['FAKE_TEST_OUTPUT'],end='')
+    raise SystemExit(int(os.environ['FAKE_TEST_EXIT']))
+""")
+            swift.chmod(0o700)
+            env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
+                       LINUX_ROOT=str(root), SOURCE_SHA='a' * 40)
+            options = ['--package-path', str(root / 'portable'), '--scratch-path', str(root / 'portable-build'),
+                       '--cache-path', str(root / 'cache'), '--config-path', str(root / 'config'),
+                       '--security-path', str(root / 'security')]
+            for scenario, output, code in scenarios:
+                with self.subTest(scenario=scenario):
+                    log.unlink(missing_ok=True); continued.unlink(missing_ok=True)
+                    result = subprocess.run(['/bin/bash', '-e', '-c',
+                        run_block('linux-core.yml', 'Execute exact portable core tests (Linux)')
+                        + 'printf continued > "$1"\n', 'gate', str(continued)],
+                        cwd=root, env=dict(env, FAKE_TEST_OUTPUT=output, FAKE_TEST_EXIT=str(code)),
+                        capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, code or (0 if scenario == 'complete' else 1),
+                                     result.stdout + result.stderr)
+                    self.assertEqual(continued.exists(), scenario == 'complete')
+                    self.assertEqual([json.loads(line) for line in log.read_text().splitlines()], [
+                        {'tool': 'prepare', 'args': ['--repository', str(root / 'repo'),
+                            '--destination', str(root / 'portable'), '--source-sha', 'a' * 40]},
+                        {'tool': 'swift', 'args': ['build', *options, '--show-bin-path']},
+                        {'tool': 'swift', 'args': ['test', *options, '--no-parallel']},
+                    ])
 
     def test_begin_timing_skip_has_mandatory_isolated_gate_and_propagates_failure(self):
         selected = 'busyBeginDoesNotInvokeBodyOrPublishReceipt'
@@ -295,10 +523,12 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
         for name, step_id in ids.items():
             self.assertEqual(re.findall(r'^        id: (.*)$', step_section(workflow, name), re.M), [step_id])
         prerequisites = {
+            'Validate packaged process guard command': 'native_build',
             'Run full native release filter': 'native_build',
             'Run force preparation regressions (serial)': 'native_build',
             'Run ledger BEGIN timing regression (serial)': 'native_build',
             'Collect ledger BEGIN contention diagnostics (serial)': 'native_build',
+            'Run daemon hub contention and recovery (isolated)': 'native_build',
             'Run both statement budgets in separate serial processes': 'native_build',
             'Validate Python MCP harness fixtures': 'checkout_source',
             'Build release Engram native product': 'dependencies',

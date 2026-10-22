@@ -20,6 +20,26 @@ public enum HookBudgetPolicy {
     public static let defaultCeilingSeconds = 15.0
     /// `ENGRAM_HOOK_RECALL_CEILING_S` is clamped to this range.
     public static let ceilingRange: ClosedRange<Double> = 3.0...60.0
+    /// Recall and its watchdog must both finish before the registered host
+    /// timeout. A tiny registration takes precedence over the usual 3s floor.
+    public static func registeredSeconds(_ value: Double?) -> Double {
+        guard let value, value.isFinite, value > 0 else { return 60 }
+        return value
+    }
+
+    public static func recallSeconds(registeredTimeout: Double?, environment: [String: String]) -> Double {
+        let registered = registeredSeconds(registeredTimeout)
+        let hostCap = min(registered * 0.6, max(registered * 0.5, registered - 2.5))
+        let normal = min(max(registered * 0.6, 3), ceilingSeconds(environment: environment))
+        let override = environment["ENGRAM_HOOK_RECALL_BUDGET_MS"].flatMap(Double.init)
+        let requested = override.flatMap { $0.isFinite && $0 > 0 ? $0 / 1000 : nil } ?? normal
+        return min(requested, ceilingSeconds(environment: environment), hostCap)
+    }
+
+    public static func watchdogSeconds(recallBudget: Double, registeredTimeout: Double?) -> Double {
+        min(recallBudget + 2, registeredSeconds(registeredTimeout) * 0.9)
+    }
+
     /// Fraction of the budget the hub open + embedder load may consume before
     /// the secondary attaches (synced DB, group spokes) are skipped.
     public static let secondaryAttachFraction = 0.4
@@ -44,16 +64,16 @@ public enum HookBudgetPolicy {
     /// Whether to attach the synced DB and group spokes after `elapsed`
     /// seconds of a `budget`-second recall budget have gone to the fixed costs.
     public static func shouldAttachSecondary(elapsed: Double, budget: Double) -> Bool {
-        guard budget > 0, elapsed.isFinite else { return false }
+        guard budget.isFinite, budget > 0, elapsed.isFinite, elapsed >= 0 else { return false }
         return elapsed <= budget * secondaryAttachFraction
     }
 
     /// Whether the post-recall maintenance check may run at all.
     public static func shouldRunMaintenanceCheck(remaining: Double, loadAverage: Double?,
                                                  processorCount: Int) -> Bool {
-        guard remaining >= maintenanceMinimumRemainingSeconds else { return false }
-        if let loadAverage, loadAverage > loadFactor * Double(max(1, processorCount)) { return false }
-        return true
+        guard remaining.isFinite, remaining >= maintenanceMinimumRemainingSeconds,
+              let loadAverage, loadAverage.isFinite, loadAverage >= 0 else { return false }
+        return loadAverage <= loadFactor * Double(max(1, processorCount))
     }
 
     /// 1-minute load average, nil when the platform cannot report it.

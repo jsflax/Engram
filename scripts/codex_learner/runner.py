@@ -24,6 +24,7 @@ import uuid
 
 from .transcript import inspect_rollout, read_excerpt
 from .memory_proxy import verified_no_write_receipt
+from . import spawn_admission
 
 EVENTS = {"Stop", "PreCompact", "SessionEnd"}
 GUARD = "ENGRAM_CODEX_LEARNER"
@@ -406,8 +407,10 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict) -
     with stdout_path.open("wb") as output, stderr_path.open("wb") as error, prompt_path.open("rb") as prompt_input:
         stdout_path.chmod(0o600)
         stderr_path.chmod(0o600)
-        proc = subprocess.Popen(argv, stdin=prompt_input, stdout=output, stderr=error,
-                                cwd=run_dir / "workspace", env=env, start_new_session=True)
+        guarded_provider = bool(spawn_admission.pass_fds())
+        proc = subprocess.Popen(spawn_admission.provider_argv(argv, config["wall_seconds"]), stdin=prompt_input, stdout=output, stderr=error,
+                                cwd=run_dir / "workspace", env=env, start_new_session=True,
+                                pass_fds=spawn_admission.pass_fds())
         deadline = time.monotonic() + config["wall_seconds"]
         try:
             with stdout_path.open("r", encoding="utf-8", errors="replace") as stream:
@@ -433,14 +436,7 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict) -
                         reason = "unexpected_tool"
                     if reason:
                         if not finished:
-                            with contextlib.suppress(ProcessLookupError):
-                                os.killpg(proc.pid, signal.SIGTERM)
-                            try:
-                                proc.wait(timeout=3)
-                            except subprocess.TimeoutExpired:
-                                with contextlib.suppress(ProcessLookupError):
-                                    os.killpg(proc.pid, signal.SIGKILL)
-                                proc.wait()
+                            spawn_admission.stop_provider(proc, guarded=guarded_provider)
                         break
                     if finished:
                         # The child can finish between the previous read and poll.
@@ -453,9 +449,7 @@ def run_codex(root: Path, run_dir: Path, request: dict, excerpt, config: dict) -
                     time.sleep(0.1)
         finally:
             if proc.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
+                spawn_admission.stop_provider(proc, guarded=guarded_provider)
     observed.pop("seen")
     # Completed MCP calls have their own receipts even when Codex wraps them in
     # code-mode events. Never accept a claimed write without an Engram response.
@@ -566,15 +560,20 @@ def worker(root: Path) -> int:
             try:
                 r = load_json(p)
                 if r and r.get("paused_request_id") != r.get("request_id"):
+                    state = load_json(root / "sessions" / (p.stem + ".json"))
+                    retry = state.get("retry_after", 0)
+                    if type(retry) not in (int, float) or not 0 <= retry <= time.time():
+                        continue
                     values.append((p.stat().st_mtime_ns, p, r))
             except (OSError, ValueError):
                 continue
         return sorted(values, key=lambda v: v[0])
 
     more = {}
-    with lock_file(root / "worker.lock", blocking=False) as acquired:
+    with lock_file(root / "worker.lock", blocking=False) as acquired, contextlib.ExitStack() as shared_slot:
         if not acquired:
             return 0
+        shared_lease = None
         config = settings(root)
         handled = 0
         pending_dir = private_dir(root / "pending")
@@ -582,6 +581,11 @@ def worker(root: Path) -> int:
             candidates = ready_pending()
             if not candidates:
                 break
+            if shared_lease is None:
+                shared_lease = shared_slot.enter_context(spawn_admission.lease())
+                if not shared_lease.admitted:
+                    event_log(root, "worker_admission_deferred", reason=shared_lease.reason)
+                    return 0
             _, pending, request = candidates[0]
             try:
                 outcome = process_request(root, request, config)

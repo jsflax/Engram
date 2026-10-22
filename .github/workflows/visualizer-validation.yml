@@ -5,6 +5,9 @@ on:
   pull_request:
     paths:
       - 'Sources/EngramVisualizer/**'
+      - 'Sources/EngramKit/**'
+      - 'Sources/EngramModels/**'
+      - 'Sources/EngramMemoryCore/**'
       - 'EngramUnitTests/**'
       - 'Engram.xcodeproj/**'
       - 'Package.swift'

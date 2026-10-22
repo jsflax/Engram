@@ -3,38 +3,33 @@ import Lattice
 
 /// Bounded retry around a checked write transaction's BEGIN.
 ///
-/// Every interactive writer (MCP server, hooks) opens its Lattice with a short
-/// statement-level busy timeout (2 s) so a locked hub fails fast instead of
-/// riding the MCP handshake or a hook budget. The cost of that choice showed
-/// up on 2026-10-21: with many sessions, learners and the sync daemon writing
-/// to one hub, a single 2 s BEGIN attempt lost often enough that `remember`
-/// failed for whole afternoons ("database was busy before the write
-/// transaction started").
-///
-/// This helper keeps the fail-fast open-time contract and adds a small,
-/// bounded number of BEGIN attempts per tool call:
+/// The interactive MCP writer uses a 2 s busy timeout. This helper retains
+/// that per-attempt timeout and adds a bounded number of BEGIN attempts:
 ///
 /// - BEGIN is retried ONLY while the transaction body has not been entered,
 ///   and only for the exact Core contention messages. A body, COMMIT,
 ///   rollback or notification failure propagates unchanged — nothing is
 ///   ever replayed after a write may have happened.
-/// - Backoff is `backoffMs[attempt]` plus up to 25 % jitter, so colliding
-///   sessions desynchronize instead of re-colliding on the next BEGIN.
-/// - No attempt starts unless the configured busy timeout still fits inside
-///   `totalCapSeconds`; worst case with the 2 s MCP timeout and the default
-///   schedule is three attempts, ~6.5 s wall.
-/// - A lattice whose busy timeout is unset (Core's 30 s default) or above
-///   2 s gets exactly one attempt: each attempt already waits far longer
-///   than any interactive budget allows.
+/// - The three default attempts use 100/300 ms backoffs plus up to 25 %
+///   jitter. Longer attempt bounds use the rest of the supplied schedule,
+///   repeating its final entry. Empty schedules and negative entries mean
+///   zero delay.
+/// - The first attempt always runs. Each retry is admitted only if its
+///   configured busy timeout fits inside `totalCapSeconds`, checked both
+///   before and after backoff. This is not an execution deadline: scheduling,
+///   BEGIN overhead, the body, COMMIT and notifications can exceed the cap.
+/// - A lattice whose busy timeout is nonpositive (Core's 30 s fallback) or
+///   above 2 s gets exactly one attempt, without an interactive time bound.
 ///
-/// The same policy lived privately in `MemoryOperationLedger`; it is lifted
-/// here so `remember`, `update`, `connect`, `merge`, `organize` and
-/// `consolidate` share one implementation.
+/// `remember`, `update`, new-edge `connect`, `merge`, `organize` and
+/// `consolidate` share this implementation. `MemoryOperationLedger` retains
+/// its separate policy: a 6.25 s admission cap, 25/50 ms backoffs, and refusal
+/// before the first attempt when the configured timeout is unsupported.
 public enum LatticeBeginRetry {
 
-    /// Default backoff schedule between attempts (milliseconds).
+    /// Backoffs in milliseconds; the default three attempts use only 100/300.
     public static let defaultBackoffMs: [Int] = [100, 300, 900]
-    /// Default admission cap for the whole retry loop (seconds).
+    /// Default elapsed-time cap for admitting retries, not a body deadline.
     public static let defaultTotalCapSeconds: Double = 6.5
     /// Default attempt bound.
     public static let defaultMaxAttempts = 3
@@ -48,7 +43,7 @@ public enum LatticeBeginRetry {
         /// Wall-clock seconds from the first BEGIN to giving up: includes the
         /// busy-timeout waits inside each attempt and the backoff sleeps.
         public let totalWaitSeconds: Double
-        /// The Core message of the final failed BEGIN.
+        /// The SQLite detail from the Core message of the final failed BEGIN.
         public let detail: String
 
         public var description: String {
@@ -60,12 +55,14 @@ public enum LatticeBeginRetry {
     public struct Success<T> {
         public let value: T
         public let attempts: Int
+        /// Total elapsed time, including the successful body and COMMIT.
         public let totalWaitSeconds: Double
     }
 
     /// Exact Core contention messages for a failed BEGIN. Unknown failures
     /// fail closed: broad substring matching could retry an indeterminate
-    /// error from a later phase.
+    /// error from a later phase. This classifier alone does not prove the
+    /// phase: `run` must also establish that the body was never entered.
     public static func isBeginContention(_ error: any Error) -> Bool {
         guard case LatticeError.transactionError(let message) = error else { return false }
         return contentionDetail(message) != nil
@@ -89,7 +86,8 @@ public enum LatticeBeginRetry {
     ///
     /// `sleep` and `now` are injectable for tests; production uses
     /// `Thread.sleep` (the actor is already blocked on a synchronous SQLite
-    /// write path, and the sleeps are at most ~1.1 s).
+    /// write path). The default sleeps are at most 125/375 ms; an explicit
+    /// longer schedule is still subject to retry admission.
     @discardableResult
     public static func run<T>(
         isolation: isolated (any Actor)? = #isolation,
@@ -134,8 +132,8 @@ public enum LatticeBeginRetry {
                 guard attempt < attemptBound else {
                     throw Contention(attempts: attempt, totalWaitSeconds: elapsed, detail: detail)
                 }
-                var delay = Double(backoffMs[min(attempt - 1, max(backoffMs.count - 1, 0))]) / 1_000
-                if backoffMs.isEmpty { delay = 0 }
+                let backoff = backoffMs.isEmpty ? 0 : backoffMs[min(attempt - 1, backoffMs.count - 1)]
+                var delay = Double(max(0, backoff)) / 1_000
                 if jitter, delay > 0 {
                     delay += Double.random(in: 0...(delay * 0.25))
                 }
@@ -147,6 +145,12 @@ public enum LatticeBeginRetry {
                 }
                 log?("BEGIN contention on attempt \(attempt) (\(detail)); retrying in \(Int(delay * 1_000)) ms")
                 if delay > 0 { sleep(delay) }
+                // Sleep and logging can take longer than requested. Recheck
+                // immediately before allowing the loop to start another BEGIN.
+                let afterBackoff = now() - started
+                guard afterBackoff + timeoutSeconds <= totalCapSeconds else {
+                    throw Contention(attempts: attempt, totalWaitSeconds: afterBackoff, detail: detail)
+                }
             }
         }
     }

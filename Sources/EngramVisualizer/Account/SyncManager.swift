@@ -520,13 +520,15 @@ final class SyncManager {
         """
 
         do {
+            guard let guardPath = Bundle.main.resourceURL?.appendingPathComponent("cli/memory-hooks").path else { return }
             try spawnClaudeSubprocess(
                 prompt: prompt,
                 systemPrompt: reconciliationSystemPrompt,
                 allowedTools: "mcp__memory__*",
                 model: "sonnet",
                 envGuard: (key: "CLAUDE_MEMORY_SYNC_RECONCILIATION", value: "1"),
-                logPath: reconciliationLogPath
+                logPath: reconciliationLogPath,
+                guardExecutable: guardPath
             )
         } catch {
             // Best-effort — don't block the UI for reconciliation failures

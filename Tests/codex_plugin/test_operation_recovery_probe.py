@@ -171,6 +171,27 @@ class RecoveryProbeTests(unittest.TestCase):
         self.assertTrue(all(c.poll() is not None for c in self.children))
         self.assertEqual(self.kinds(),['dispatch'])
 
+    def test_recovery_child_inherits_only_spawn_lease_while_exclusive_fence_stays_parent(self):
+        from codex_learner import spawn_admission
+        lease_dir = self.run / "spawn-gate"
+        # The existing server already rejects the exclusive writer FD. Also
+        # require the admission inode in its actual inherited descriptor table.
+        proof = """
+spawn_identity = os.stat(root / 'spawn-gate' / 'spawn.lock')
+found = False
+for candidate in range(3, 256):
+    try: item = os.fstat(candidate)
+    except OSError: continue
+    if (item.st_dev, item.st_ino) == (spawn_identity.st_dev, spawn_identity.st_ino): found = True
+assert found, 'actual recovery child lost admission lease'
+"""
+        self.script.write_text(SERVER.replace("def read():", proof + "\ndef read():"))
+        with spawn_admission.lease(directory=lease_dir, load=lambda: 0) as held:
+            self.assertTrue(held.admitted)
+            result = self.probe()
+            self.assertIsNotNone(result)
+        self.assertTrue(self.children)
+
     def test_scope_id_mutation_and_receipt_shape_must_match(self):
         operation = self.requests[0]['operationID']
         valid = copy.deepcopy(self.responses[operation])

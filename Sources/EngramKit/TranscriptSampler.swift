@@ -15,10 +15,10 @@ public struct TranscriptSampler {
         public let text: String
         public let minDistance: Double  // distance to nearest existing memory
         public let charLength: Int
-        /// The store HAS memories but the vector search returned no neighbor
-        /// (or no distance) for this excerpt — a degraded index, not novelty.
-        /// `minDistance` is then the 1.0 sentinel and must not be read as a
-        /// measurement. An empty store is NOT degraded: everything is novel.
+        /// A query failed, or eligible memories exist without a usable vector
+        /// distance. The fallback distance must not be read as a measurement.
+        /// A successfully read empty search scope is novel, not degraded;
+        /// a measured distance of exactly 1.0 is also valid.
         public let isDegraded: Bool
 
         public init(text: String, minDistance: Double, charLength: Int, isDegraded: Bool = false) {
@@ -77,11 +77,7 @@ public struct TranscriptSampler {
         // 3. Embed each block and score by novelty
         var scored: [ScoredExcerpt] = []
         let now = Date()
-        // A populated store that answers a KNN query with nothing is a
-        // degraded vector index (or a contended read), not "nothing similar
-        // exists" — the gate used to fail OPEN on it and spawn a learner per
-        // Stop while the database was already struggling.
-        let storeHasMemories = lattice.count(Memory.self) > 0
+        let search = NoveltySearch(lattice: lattice, now: now)
 
         for block in substantive {
             // Truncate before embedding to keep it focused
@@ -90,19 +86,13 @@ public struct TranscriptSampler {
             guard let floats = try? await embedder.embed(text: truncated) else { continue }
             let embedding = Vector<Float>(floats)
 
-            // Find nearest existing memory
-            let nearest = lattice.objects(Memory.self)
-                .where { $0.expiresAt > now }
-                .nearest(to: embedding, on: \.embedding, limit: 1, distance: .l2)
-
-            let measured = nearest.first?.distances["embedding"]
-            let minDist = measured ?? 1.0
+            let score = search.score(embedding)
 
             scored.append(ScoredExcerpt(
                 text: truncated,
-                minDistance: minDist,
+                minDistance: score.distance,
                 charLength: truncated.count,
-                isDegraded: storeHasMemories && measured == nil
+                isDegraded: score.isDegraded
             ))
         }
 
@@ -134,6 +124,42 @@ public struct TranscriptSampler {
         return result
     }
 
+    /// Reuse the eligible-count observation for this advisory sampling pass.
+    /// The count and nearest query have the same visibility predicate. Check
+    /// each sealed error immediately: another query can clear its thread-local
+    /// slot, and an empty failure result must never bootstrap a learner.
+    struct NoveltySearch {
+        let lattice: Lattice
+        let now: Date
+        let eligibleCount: Int?
+
+        init(lattice: Lattice, now: Date) {
+            self.lattice = lattice
+            self.now = now
+            let count = lattice.count(Memory.self, where: {
+                $0.expiresAt > now && $0.deletedAt == nil
+            })
+            self.eligibleCount = lattice.lastQueryError() == nil ? count : nil
+        }
+
+        func score(_ embedding: Vector<Float>) -> (distance: Double, isDegraded: Bool) {
+            guard !embedding.isEmpty, embedding.elements.allSatisfy(\.isFinite),
+                  let eligibleCount else { return (1.0, true) }
+            // Avoid initializing a vector index just to discover an already
+            // verified empty scope. This also lets a new store start learning.
+            if eligibleCount == 0 { return (1.0, false) }
+            let matches = lattice.objects(Memory.self)
+                .where { $0.expiresAt > now && $0.deletedAt == nil }
+                .nearest(to: embedding, on: \.embedding, limit: 1, distance: .l2)
+                .snapshot()
+            let queryFailed = lattice.lastQueryError() != nil
+            guard !queryFailed,
+                  let distance = matches.first?.distances["embedding"],
+                  distance.isFinite, distance >= 0 else { return (1.0, true) }
+            return (distance, false)
+        }
+    }
+
     /// Format scored excerpts into a string suitable for FM assessment.
     public static func formatForAssessment(_ excerpts: [ScoredExcerpt]) -> String {
         excerpts.enumerated().map { i, e in
@@ -162,15 +188,11 @@ public enum SampleGateDecision: Equatable, Sendable {
     /// Do not spawn; `reason` is logged verbatim.
     case skip(reason: String)
 
-    /// The sampler's 1.0 sentinel: a distance of exactly 1.000 is what an
-    /// excerpt reports when no neighbor was found at all.
-    static let sentinelDistance = 1.0
-
     public static func decide(_ excerpts: [TranscriptSampler.ScoredExcerpt]) -> SampleGateDecision {
         guard !excerpts.isEmpty else { return .skip(reason: "no novel excerpts") }
-        let usable = excerpts.filter { !$0.isDegraded && $0.minDistance != sentinelDistance }
+        let usable = excerpts.filter { !$0.isDegraded && $0.minDistance.isFinite && $0.minDistance >= 0 }
         guard !usable.isEmpty else {
-            return .skip(reason: "degraded: vector search returned no neighbors (best distance 1.000 sentinel) — not treating as novel")
+            return .skip(reason: "degraded: no usable novelty measurement or verified empty search scope")
         }
         return .spawn(excerpts: usable)
     }

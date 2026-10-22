@@ -12,7 +12,6 @@ extension SidebarView {
         if accountService.isSignedIn {
             signedInContent
                 .onAppear {
-                    refreshProjectCounts()
                     syncManager.refreshDaemonHealth()
                 }
         } else {
