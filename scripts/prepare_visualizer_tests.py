@@ -11,13 +11,14 @@ import re
 import subprocess
 
 CLASSES = ('GalaxyLoadChangesTests', 'GalaxyDrainTests', 'VisualizerHostIsolationTests', 'AdapterSnapshotTests',
-           'FrameLookupInvalidationTests', 'SceneMetadataDomainTests')
+           'FrameLookupInvalidationTests', 'SceneMetadataDomainTests', 'LogsViewTests')
 # These functional regressions share a class with device-dependent performance
 # budgets. Select their methods explicitly rather than widening that class.
 METHODS = {'PanelPerformanceTests': (
     'testSidebarPresentationDoesNotReevaluateItsGraphParent',
     'testSidebarHoverDismissalCanBeCancelledByReentryAndPinning',
     'testPanelSnapshotTracksInitialAndLiveChangesWithoutSidebarAppearance',
+    'testLogTailBoundsBytesAndLinesWithoutBreakingUnicode',
 )}
 
 def test_identifiers():

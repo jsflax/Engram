@@ -87,7 +87,7 @@ class HostPreparationTests(unittest.TestCase):
             original = products / 'Engram.xctestrun'
             original.write_bytes(plistlib.dumps(self.original))
             result = M.prepare(root)
-            self.assertEqual(result['expected_tests'], 9)
+            self.assertEqual(result['expected_tests'], 11)
             output = plistlib.loads(Path(result['prepared']).read_bytes())
             environment = output['TestConfigurations'][0]['TestTargets'][0]['EnvironmentVariables']
             self.assertEqual(environment['CLAUDE_MEMORY_DB'], str(root / 'fixtures/app-memory.sqlite'))
@@ -135,7 +135,7 @@ class HostPreparationTests(unittest.TestCase):
             'testLabelNumericRescanPreservesMissingPositionSemantics',
             'testLabelNumericSlotsFollowReorderAndTopicChanges')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 102)
+        self.assertEqual(len(inventory), 107)
         self.assertIn('AdapterSnapshotTests/testMascotVisibilityReachesSceneAndPreservesExistingEntities', inventory)
         for name in (
             'testCertifiedCrossGalaxyNodeAppendsReuseUnchangedEdges',
@@ -161,11 +161,12 @@ class HostPreparationTests(unittest.TestCase):
                          sorted(domain_controls))
         self.assertEqual(M.CLASSES.count('SceneMetadataDomainTests'), 1)
 
-    def test_sidebar_selection_requires_exact_functional_methods_without_performance_class(self):
+    def test_panel_selection_requires_exact_functional_methods_without_performance_class(self):
         expected = ['PanelPerformanceTests/' + name for name in (
             'testSidebarPresentationDoesNotReevaluateItsGraphParent',
             'testSidebarHoverDismissalCanBeCancelledByReentryAndPinning',
-            'testPanelSnapshotTracksInitialAndLiveChangesWithoutSidebarAppearance')]
+            'testPanelSnapshotTracksInitialAndLiveChangesWithoutSidebarAppearance',
+            'testLogTailBoundsBytesAndLinesWithoutBreakingUnicode')]
         self.assertEqual(sorted(name for name in M.inventory(Path(__file__).parents[1])
                                 if name.startswith('PanelPerformanceTests/')), sorted(expected))
         selection = M.test_identifiers()
@@ -173,20 +174,34 @@ class HostPreparationTests(unittest.TestCase):
         self.assertEqual(sorted(name for name in selection if name.startswith('PanelPerformanceTests/')),
                          sorted(expected))
 
-    def test_focused_pass_audit_rejects_missing_duplicate_skipped_and_unselected_sidebar_cases(self):
+    def test_logs_view_selection_requires_all_four_regressions(self):
+        expected = ['LogsViewTests/' + name for name in (
+            'testEntryIdsSurviveTheTailMoving',
+            'testAutoScrollFiresWhenRowsArriveAboveAnUnchangedLastRow',
+            'testTimestampStaysOnOneLine',
+            'testClickingTruncatedEntryPushesNextRowDownInsteadOfDrawingOverIt')]
+        self.assertEqual([name for name in M.inventory(Path(__file__).parents[1])
+                          if name.startswith('LogsViewTests/')], sorted(expected))
+        self.assertEqual(M.test_identifiers().count('LogsViewTests'), 1)
+
+    def test_focused_pass_audit_rejects_missing_duplicate_skipped_and_unselected_cases(self):
         expected = M.inventory(Path(__file__).parents[1])
         def line(identifier, result='passed'):
             name, method = identifier.split('/')
             return f"Test Case '-[EngramUnitTests.{name} {method}]' {result} (0.001 seconds).\n"
         log = ''.join(line(identifier) for identifier in expected)
         self.assertEqual(M.audit_passes(log, expected), expected)
-        sidebar = 'PanelPerformanceTests/testSidebarPresentationDoesNotReevaluateItsGraphParent'
-        for altered in (log.replace(line(sidebar), ''), log + line(sidebar),
-                        log.replace(line(sidebar), line(sidebar, 'skipped')),
-                        log + line(sidebar, 'skipped'),
-                        log + line('PanelPerformanceTests/testUnexpectedPerformanceBudget')):
-            with self.subTest(log=altered[-180:]), self.assertRaises(ValueError):
-                M.audit_passes(altered, expected)
+        for identifier in (
+                'PanelPerformanceTests/testSidebarPresentationDoesNotReevaluateItsGraphParent',
+                'PanelPerformanceTests/testLogTailBoundsBytesAndLinesWithoutBreakingUnicode',
+                'LogsViewTests/testClickingTruncatedEntryPushesNextRowDownInsteadOfDrawingOverIt'):
+            for altered in (log.replace(line(identifier), ''), log + line(identifier),
+                            log.replace(line(identifier), line(identifier, 'skipped')),
+                            log + line(identifier, 'skipped'), log + line(identifier, 'failed')):
+                with self.subTest(identifier=identifier, log=altered[-180:]), self.assertRaises(ValueError):
+                    M.audit_passes(altered, expected)
+        with self.assertRaises(ValueError):
+            M.audit_passes(log + line('PanelPerformanceTests/testUnexpectedPerformanceBudget'), expected)
 
 class DependencyPreparationTests(unittest.TestCase):
     def setUp(self):
