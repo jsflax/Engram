@@ -50,7 +50,7 @@ Claude and Codex background workers share a per-device lifetime lease and a
 10-minute cooldown between worker starts. High load, unavailable load readings, or
 invalid admission state can defer work without removing it from the queue; a
 later lifecycle event can retry it. There is no automatic cooldown wakeup timer.
-Separately, each learner provider has a default 10-minute deadline, at most
+Separately, each Codex learner provider has a default 10-minute deadline, at most
 12 memory calls and five writes per batch. An independent MCP gateway enforces the limits and checks
 write receipts. Successful transcript ranges are checkpointed so repeated hooks
 do not learn them again. Failures preserve the cursor and impose a five-minute
