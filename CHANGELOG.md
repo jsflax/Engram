@@ -7,6 +7,10 @@ All notable changes to Engram are documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- Background Claude launches reset inherited signal masks in their dedicated
+  child before starting the shell. This prevents Linux shell waits from hanging
+  after provider exit while preserving the calling app's signal state and the
+  provider admission lease.
 - Visualizer drawer presentation now updates a child view instead of the graph
   root. Opening reuses the panel summaries maintained by graph publications
   instead of requesting another full rebuild. Hover, pin and hide behavior are

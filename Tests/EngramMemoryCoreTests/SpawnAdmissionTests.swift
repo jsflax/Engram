@@ -142,7 +142,7 @@ struct SpawnAdmissionTests {
             if process.isRunning { process.terminate(); process.waitUntilExit() }
         }
         let verdict = try gate(dir).admit(kind: .learner) { fd in
-            try launchClaudeShell(process, lease: fd) {
+            try launchClaudeShell(process, lease: fd, guardExecutable: guardPath) {
                 try "before launch".write(toFile: dir + "/callback", atomically: true, encoding: .utf8)
             }
         }

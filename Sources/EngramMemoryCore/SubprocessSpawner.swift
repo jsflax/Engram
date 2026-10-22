@@ -97,7 +97,7 @@ public func spawnClaudeSubprocess(
     // the lease to fd 3 before replacing stdin. The native guard retains it
     // and explicitly closes it in the provider child before exec.
     let launch: (Int32?) throws -> Int32 = { lease in
-        try launchClaudeShell(sh, lease: lease, beforeLaunch: beforeLaunch)
+        try launchClaudeShell(sh, lease: lease, guardExecutable: guardPath, beforeLaunch: beforeLaunch)
     }
     guard let admission else {
         return .spawned(pid: try launch(nil))
@@ -110,10 +110,10 @@ public func spawnClaudeSubprocess(
 /// Only the running hooks executable or an explicit packaged path may act as
 /// the guard. In particular, an installed older memory-hooks on PATH cannot
 /// silently supply an incompatible internal command to an updated app.
-func processGuardExecutable(explicit: String?) throws -> String {
+public func processGuardExecutable(explicit: String?) throws -> String {
     let candidate: URL
     if let explicit {
-        guard explicit.hasPrefix("/") else { throw OwnedProcessGuard.Failure.invalidArguments }
+        guard explicit.hasPrefix("/"), !explicit.utf8.contains(0) else { throw OwnedProcessGuard.Failure.invalidArguments }
         candidate = URL(fileURLWithPath: explicit)
     } else {
         guard let current = Bundle.main.executableURL,
@@ -130,10 +130,19 @@ func processGuardExecutable(explicit: String?) throws -> String {
 }
 
 /// Foundation's inherited stdin mapping is shared by production and stand-in
-/// tests. The callback runs only after admission and before the child can exit.
-func launchClaudeShell(_ process: Process, lease: Int32?, beforeLaunch: (() throws -> Void)? = nil) throws -> Int32 {
+/// tests. The same-release child resets its own signal mask before becoming the
+/// shell; the embedding caller's mask and pending signals remain untouched.
+/// The callback runs only after admission and before the child can exit.
+func launchClaudeShell(_ process: Process, lease: Int32?, guardExecutable: String,
+                       beforeLaunch: (() throws -> Void)? = nil) throws -> Int32 {
+    guard process.executableURL?.path == "/bin/sh", let arguments = process.arguments,
+          arguments.count == 2, arguments[0] == "-c", !arguments[1].isEmpty,
+          !arguments[1].utf8.contains(0) else { throw OwnedProcessGuard.Failure.invalidArguments }
+    let guardPath = try processGuardExecutable(explicit: guardExecutable)
     process.standardInput = lease.map { FileHandle(fileDescriptor: $0, closeOnDealloc: false) } ?? .nullDevice
     try beforeLaunch?()
+    process.executableURL = URL(fileURLWithPath: guardPath)
+    process.arguments = ["internal-process-guard", "--exec-shell", arguments[1]]
     try process.run()
     return process.processIdentifier
 }

@@ -9,6 +9,91 @@ import Glibc
 
 @Suite("OwnedProcessGuard")
 struct OwnedProcessGuardTests {
+    @Test func shellLaunchClearsChildMaskWithoutChangingPendingCallerSignals() throws {
+        let fixture = try GuardFixture()
+        defer { fixture.remove() }
+        var blocked = sigset_t(), original = sigset_t()
+        sigemptyset(&blocked)
+        for value in [SIGCHLD, SIGTERM, SIGINT, SIGHUP, SIGUSR2] { sigaddset(&blocked, value) }
+        try #require(pthread_sigmask(SIG_BLOCK, &blocked, &original) == 0)
+        var queuedOwnSignal = false
+        defer {
+            var pending = sigset_t(); sigpending(&pending)
+            if queuedOwnSignal, sigismember(&pending, SIGUSR2) == 1 {
+                var selected = sigset_t(); sigemptyset(&selected); sigaddset(&selected, SIGUSR2)
+                var consumed: Int32 = 0
+                #expect(sigwait(&selected, &consumed) == 0)
+                #expect(consumed == SIGUSR2)
+            }
+            #expect(pthread_sigmask(SIG_SETMASK, &original, nil) == 0)
+        }
+        var expectedMask = sigset_t(), beforePending = sigset_t()
+        #expect(pthread_sigmask(SIG_SETMASK, nil, &expectedMask) == 0)
+        #expect(sigpending(&beforePending) == 0)
+        try #require(sigismember(&beforePending, SIGUSR2) == 0)
+        let queued = pthread_kill(pthread_self(), SIGUSR2)
+        queuedOwnSignal = queued == 0
+        try #require(queued == 0)
+        func callerUnchanged() {
+            var actual = sigset_t(), pending = sigset_t()
+            #expect(pthread_sigmask(SIG_SETMASK, nil, &actual) == 0)
+            for value: Int32 in 1...31 {
+                #expect(sigismember(&actual, value) == sigismember(&expectedMask, value))
+            }
+            #expect(sigpending(&pending) == 0)
+            #expect(sigismember(&pending, SIGUSR2) == 1)
+        }
+        func shell(_ body: String) -> Process {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = ["-c", body]
+            process.currentDirectoryURL = fixture.root
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            return process
+        }
+        let process = shell("printf '%s' \"$$\" > shell.pid; /bin/sleep 0.01 & wait $!; exit 7")
+        _ = try launchClaudeShell(process, lease: nil, guardExecutable: fixture.guardPath)
+        defer { fixture.finish(process) }
+        callerUnchanged()
+        try fixture.wait(process)
+        #expect(process.terminationStatus == 7)
+        #expect(try String(contentsOf: fixture.root.appendingPathComponent("shell.pid"), encoding: .utf8) == String(process.processIdentifier))
+        #if os(Linux)
+        // Linux Foundation inherits the blocked mask. Deliberately bypass
+        // exec-shell and carry pending TERM across exec: handlers must be installed
+        // before unblocking, and cancellation must prevent provider creation.
+        let quote = { (value: String) in "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+        let pendingGuard = shell("kill -TERM $$; exec " + quote(fixture.guardPath)
+            + " internal-process-guard --wall-seconds 2 -- /usr/bin/touch "
+            + quote(fixture.root.appendingPathComponent("must-not-launch").path))
+        try pendingGuard.run()
+        defer { fixture.finish(pendingGuard) }
+        try fixture.wait(pendingGuard)
+        #expect(pendingGuard.terminationReason == .exit)
+        #expect(pendingGuard.terminationStatus == 143)
+        #expect(!FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("must-not-launch").path))
+        #endif
+        callerUnchanged()
+        #expect(throws: OwnedProcessGuard.Failure.self) {
+            try launchClaudeShell(shell("exit 0"), lease: nil, guardExecutable: fixture.guardPath + "\0")
+        }
+        callerUnchanged()
+        let failed = shell("exit 0")
+        failed.currentDirectoryURL = fixture.root.appendingPathComponent("missing-directory")
+        #expect(throws: (any Error).self) {
+            try launchClaudeShell(failed, lease: nil, guardExecutable: fixture.guardPath)
+        }
+        callerUnchanged()
+        for arguments in [["--exec-shell"], ["--exec-shell", ""], ["--exec-shell", "exit 0", "extra"],
+                          ["--exec-shell", "exit\0 0"], ["--exec-shell", "exit 0", "--wall-seconds", "2"],
+                          ["--wall-seconds", "-1", "--", "/bin/sh"],
+                          ["--wall-seconds", "2", "--lease-fd", "0", "--", "/bin/sh"]] {
+            #expect(throws: OwnedProcessGuard.Failure.self) { try OwnedProcessGuard.runCommand(arguments: arguments) }
+            callerUnchanged()
+        }
+    }
+
     @Test func queuedCancellationDoesNotCreateProvider() throws {
         let fixture = try GuardFixture()
         defer { fixture.remove() }
@@ -87,7 +172,7 @@ struct OwnedProcessGuardTests {
         defer { fixture.finish(process) }
         let provider = try fixture.waitForProvider()
         process.terminate()
-        try fixture.wait(process)
+        try fixture.waitForWrapperExit(process)
         #expect(try fixture.attempt() == .refusedConcurrent)
         #expect(kill(provider, 0) == 0)
         let deadline = Date().addingTimeInterval(8)
@@ -101,6 +186,9 @@ struct OwnedProcessGuardTests {
             verdict = try fixture.attempt()
         }
         #expect(verdict == .admitted(pid: 99))
+        try fixture.wait(process)
+        #expect(process.terminationReason == .uncaughtSignal)
+        #expect(process.terminationStatus == SIGTERM)
     }
 }
 
@@ -149,7 +237,7 @@ private struct GuardFixture {
             process.arguments = ["-c", "exec 3<&0; exec </dev/null; exec \(quote(guardPath)) internal-process-guard --wall-seconds \(wallSeconds) --lease-fd 3 -- \(provider)"]
         }
         process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
-        let verdict = try gate().admit(kind: .learner) { fd in try launchClaudeShell(process, lease: fd) }
+        let verdict = try gate().admit(kind: .learner) { fd in try launchClaudeShell(process, lease: fd, guardExecutable: guardPath) }
         guard verdict.isAdmitted else { throw FixtureError.notAdmitted }
         return process
     }
@@ -162,6 +250,27 @@ private struct GuardFixture {
             Thread.sleep(forTimeInterval: 0.01)
         }
         throw FixtureError.timedOut
+    }
+
+    func waitForWrapperExit(_ process: Process) throws {
+        #if os(Linux)
+        // Detached descendants retain Foundation's notification socket. Observe
+        // the exact wrapper's kernel exit, leaving Foundation its eventual reap.
+        let deadline = Date().addingTimeInterval(8)
+        while process.isRunning, Date() < deadline {
+            var info = siginfo_t()
+            let result = waitid(P_PID, id_t(process.processIdentifier), &info, WEXITED | WNOWAIT | WNOHANG)
+            if result == 0, info.si_signo == SIGCHLD {
+                #expect(info.si_code == CLD_KILLED)
+                return
+            }
+            if result < 0, errno != EINTR, errno != ECHILD { throw POSIXError(.EIO) }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        guard !process.isRunning else { throw FixtureError.timedOut }
+        #else
+        try wait(process)
+        #endif
     }
 
     func wait(_ process: Process) throws {

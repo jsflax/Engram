@@ -154,6 +154,11 @@ public enum OwnedProcessGuard {
     /// Shared entry point for the hidden hooks command and portable fixture.
     /// Arguments are generated internally; no PATH lookup chooses the guard.
     public static func runCommand(arguments: [String]) throws -> Int32 {
+        if arguments.first == "--exec-shell" {
+            guard arguments.count == 2, !arguments[1].isEmpty,
+                  !arguments[1].utf8.contains(0) else { throw Failure.invalidArguments }
+            try execShell(arguments[1])
+        }
         var wall: Double?, lease: Int32?, command: [String] = []
         var index = 0
         while index < arguments.count {
@@ -171,7 +176,14 @@ public enum OwnedProcessGuard {
             }
             index += 2
         }
-        guard let wall, !command.isEmpty else { throw Failure.invalidArguments }
+        guard let wall, wall.isFinite, wall > 0,
+              let executable = command.first, executable.hasPrefix("/"),
+              command.allSatisfy({ !$0.utf8.contains(0) }) else { throw Failure.invalidArguments }
+        if let lease {
+            var state = stat()
+            guard lease > STDERR_FILENO, fstat(lease, &state) == 0,
+                  state.st_mode & S_IFMT == S_IFREG else { throw Failure.invalidArguments }
+        }
         var descriptors: [Int32] = [-1, -1]
         guard pipe(&descriptors) == 0 else { throw Failure.systemCall("signal_pipe", errno) }
         defer { close(descriptors[0]); close(descriptors[1]) }
@@ -192,6 +204,44 @@ public enum OwnedProcessGuard {
             signal(SIGCHLD, previousChild)
             guardSignalWriteFD = -1
         }
+        // Only this dedicated command changes its own mask. Install cancellation
+        // handlers first so a pending signal is queued before provider admission.
+        var empty = sigset_t(), previousMask = sigset_t()
+        sigemptyset(&empty)
+        let reset = pthread_sigmask(SIG_SETMASK, &empty, &previousMask)
+        guard reset == 0 else { throw Failure.systemCall("signal_mask", reset) }
+        defer { pthread_sigmask(SIG_SETMASK, &previousMask, nil) }
         return try run(command: command, wallSeconds: wall, cancellationFD: descriptors[0], leaseFD: lease)
+    }
+
+
+    /// Foundation may inherit a worker thread's blocked mask. Reset it in the
+    /// dedicated child, never briefly unmask the embedding app's calling thread.
+    /// exec preserves the owned PID and stdin, including the admission lease.
+    private static func execShell(_ body: String) throws -> Never {
+        let command: [String] = ["/bin/sh", "-c", body]
+        let argv = command.map { strdup($0) } + [nil]
+        defer { for value in argv { free(value) } }
+        guard argv.dropLast().allSatisfy({ $0 != nil }) else {
+            throw Failure.systemCall("argument_allocation", ENOMEM)
+        }
+        let previousTerm = signal(SIGTERM, SIG_DFL)
+        let previousInt = signal(SIGINT, SIG_DFL)
+        let previousHup = signal(SIGHUP, SIG_DFL)
+        let previousChild = signal(SIGCHLD, SIG_DFL)
+        defer {
+            signal(SIGTERM, previousTerm); signal(SIGINT, previousInt)
+            signal(SIGHUP, previousHup); signal(SIGCHLD, previousChild)
+        }
+        var empty = sigset_t(), previousMask = sigset_t()
+        sigemptyset(&empty)
+        let reset = pthread_sigmask(SIG_SETMASK, &empty, &previousMask)
+        guard reset == 0 else { throw Failure.systemCall("signal_mask", reset) }
+        defer { pthread_sigmask(SIG_SETMASK, &previousMask, nil) }
+        let execError = argv.withUnsafeBufferPointer { args in
+            _ = execv("/bin/sh", UnsafeMutablePointer(mutating: args.baseAddress!))
+            return errno
+        }
+        throw Failure.systemCall("exec_shell", execError)
     }
 }
