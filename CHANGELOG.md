@@ -4,6 +4,14 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.17] - 2026-10-23
+
+### Fixed
+- Visualizer audio and point lights fetch individual simulation positions
+  directly, avoiding graph-wide position dictionary construction for sparse
+  lookups and empty near-node scans. Node selection, sound limits, update
+  cadence, glow behavior and missing-position handling are preserved.
+
 ## [0.15.16] - 2026-10-23
 
 ### Fixed
