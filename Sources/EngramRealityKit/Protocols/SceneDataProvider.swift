@@ -96,6 +96,9 @@ public protocol SceneDataProvider: AnyObject {
     var projectColorMap: [String: SIMD3<Float>] { get }
     /// Current positions for all nodes.
     var positions: [UUID: SIMD3<Float>] { get }
+    /// Current position for one node, or nil when it has no simulation position.
+    /// Sparse consumers need not materialize the complete positions dictionary.
+    func position(for id: UUID) -> SIMD3<Float>?
     /// Nodes with active recall glow — value is elapsed seconds since glow start.
     var glowingNodes: [UUID: Float] { get }
     /// Nodes with arrival glow — value is elapsed seconds since creation.
@@ -142,6 +145,8 @@ public protocol SceneDataProvider: AnyObject {
 }
 
 extension SceneDataProvider {
+    public func position(for id: UUID) -> SIMD3<Float>? { positions[id] }
+
     public func tickWithTimings(dt: Float) -> ProviderTickTimings? {
         tick(dt: dt)
         return nil

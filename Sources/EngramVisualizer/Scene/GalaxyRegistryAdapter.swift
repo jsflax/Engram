@@ -310,6 +310,14 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         registry?.mergedPositions ?? [:]
     }
 
+    func position(for id: UUID) -> SIMD3<Float>? {
+        guard let simulation = registry?.unifiedSimulation,
+              let index = simulation.index(for: id) else { return nil }
+        // Resolve the current simulation slot on every call. Render slots can
+        // differ, and appends, removal or provider replacement can move indices.
+        return SIMD3(simulation.posX[index], simulation.posY[index], simulation.posZ[index])
+    }
+
     /// Flat positions parallel to `nodes`, refreshed once per tick from the
     /// unified simulation's flat arrays (no UUID hashing on access).
     var positionArray: [SIMD3<Float>] { framePositionArray }

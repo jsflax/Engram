@@ -737,7 +737,7 @@ public final class EngramRealityScene {
             let light = pointLightPool[i]
             if i < activeCount {
                 let target = lightTargets[i]
-                if let pos = dataProvider.positions[target.id] {
+                if let pos = dataProvider.position(for: target.id) {
                     light.position = pos * scaleFactor
                     light.components.set(PointLightComponent(
                         color: .init(
