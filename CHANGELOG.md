@@ -4,6 +4,20 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.16] - 2026-10-23
+
+### Fixed
+- Updates LatticeCore to 2.2.8 so malformed audit frames are rejected before
+  applying or acknowledging entries, and invalid entries that reuse an
+  earlier ID cannot advance the sync cursor.
+- Learner health now explains shared worker launch delays in hook status and
+  the app, including recorded load, cooldown eligibility, age and task scope.
+  Historical or unrelated checks do not replace the current task's status.
+  Launch limits and lifecycle-triggered retry behavior are unchanged.
+- Visualizer flow particles request graph positions only when a new particle
+  batch is due, avoiding unused full-map reads between spawns. Particle detail,
+  spawn timing, endpoints and aging are preserved.
+
 ## [0.15.15] - 2026-10-23
 
 ### Fixed
