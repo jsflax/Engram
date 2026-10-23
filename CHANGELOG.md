@@ -4,6 +4,17 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.19] - 2026-10-23
+
+### Fixed
+- Avoid remapping retained graph rows and indices when a validated publication
+  only appends nodes at the tail or adds no visible nodes. Interior insertions,
+  duplicate precedence, hub updates and conservative rebuild behavior remain
+  unchanged.
+- Attribute Codex advice and lifecycle receipts to the concrete agent when
+  sessions share a root envelope. Preserve separate shared-session records and
+  explicitly mark legacy receipts whose agent identity is unknown.
+
 ## [0.15.18] - 2026-10-23
 
 ### Fixed
