@@ -11,8 +11,9 @@ import simd
 /// LOD: when the camera is far from a galaxy, its per-project nebulae fade
 /// out and one galaxy-sized single-color mass fades in — so a distant team
 /// reads as a colored body, and flying closer resolves it into its project
-/// clusters. Opacity rides OpacityComponent, written only when the factor
-/// moves past a threshold (per-frame component churn stalls RealityKit).
+/// clusters. Fully transparent LOD entities are disabled so their particle
+/// simulation stops. Visible opacity changes are throttled between exact
+/// endpoints (per-frame component churn stalls RealityKit).
 @MainActor
 public final class NebulaBatchSystem {
     private var activeNebulae: [String: Entity] = [:]
@@ -241,9 +242,18 @@ public final class NebulaBatchSystem {
 
     private func setOpacity(key: String, entity: Entity, opacity: Float) {
         let clamped = min(1, max(0, opacity))
-        if let last = lastOpacity[key], abs(last - clamped) < 0.05 { return }
-        entity.components.set(OpacityComponent(opacity: clamped))
-        lastOpacity[key] = clamped
+        let visible = clamped > 0
+        let last = lastOpacity[key]
+        let endpointChanged = (clamped == 0 || clamped == 1) && last != clamped
+        let becomingVisible = visible && (!entity.isEnabled || last == 0)
+        if last == nil || abs((last ?? clamped) - clamped) >= 0.05
+            || endpointChanged || becomingVisible {
+            // Apply even a tiny positive opacity before re-enabling. The
+            // ordinary deadband must not leave a returning emitter at zero.
+            entity.components.set(OpacityComponent(opacity: clamped))
+            lastOpacity[key] = clamped
+        }
+        if entity.isEnabled != visible { entity.isEnabled = visible }
     }
 
     private func nebulaColors(for key: String, rgb: SIMD3<Float>) -> (start: NSColor, end: NSColor) {
