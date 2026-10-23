@@ -65,10 +65,12 @@ def load_config(path):
 def failure_kind(payload):
     """Recognize explicit tool-result failures, never guess from arbitrary text.
 
-    These structured forms are supported when a runtime emits them. The local
-    Codex 0.154.0 source omits exit status from Bash hook payloads and gates out
-    MCP error results, so full failure parity requires a host runtime change.
-    Other tool-specific shapes remain unknown; raw stdout cannot prove failure.
+    These structured forms are supported when a runtime emits them. Official
+    Codex rust-v0.163.0-alpha.11 source (5425d3e) emits unified-exec Bash output
+    as a string without exit status and suppresses MCP error PostToolUse events.
+    Code-mode return values are separate from hook responses. See the README
+    for immutable source references; this does not attest an installed binary.
+    Full failure parity needs a host contract change. Raw stdout stays unknown.
     """
     response = payload.get("tool_response")
     if not isinstance(response, dict):

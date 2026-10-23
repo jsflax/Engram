@@ -348,12 +348,30 @@ class NativeTestRunnerTests(unittest.TestCase):
                             for item in receipt["cleanup"]["signals"]))
 
     def test_transient_inventory_timeout_preserves_progress_and_known_ownership(self):
-        runner = self.runner("import time\nfor i in range(30):\n print(i,flush=True); time.sleep(0.1)")
-        processes = HARNESS.processes
+        ready, release = self.root / "ready", self.root / "release"
+        runner = self.runner(
+            "import time\nfrom pathlib import Path\n"
+            "for i in range(15): print(i,flush=True)\n"
+            f"Path({str(ready)!r}).touch()\n"
+            "deadline=time.monotonic()+5\n"
+            f"while not Path({str(release)!r}).exists():\n"
+            " if time.monotonic() >= deadline: raise TimeoutError('fixture release not received')\n"
+            " time.sleep(0.01)\n"
+            "for i in range(15,30): print(i,flush=True)\n")
         calls, known, child = [], {}, []
+        now = [0.0]
+
+        def advance(seconds):
+            now[0] += seconds
 
         def inventory(timeout):
             calls.append(timeout)
+            if len(calls) == 1:
+                deadline = time.monotonic() + 2
+                while not ready.exists():
+                    if time.monotonic() >= deadline:
+                        self.fail("child did not reach the bounded handshake")
+                    time.sleep(0.01)
             if len(calls) == 2:
                 known.update(runner.known)
                 self.assertIn(runner.child.pid, known)
@@ -362,10 +380,29 @@ class NativeTestRunnerTests(unittest.TestCase):
             if len(calls) == 3:
                 self.assertIs(runner.child, child[0])
                 self.assertEqual(runner.known, known)
-            return processes(timeout=timeout)
+                self.assertIsNone(runner.child.poll())
+            if len(calls) == 4:
+                # The previous snapshot recovered while the child was still
+                # waiting. Only now may it emit the remaining output and exit.
+                release.touch()
+                runner.child.wait(timeout=2)
+            if runner.child.poll() is not None:
+                return {}
+            return {runner.child.pid: {
+                "pid": runner.child.pid, "parent": os.getpid(), "group": runner.child.pid,
+                "started": "fixture child", "state": "S", "command": sys.executable}}
 
-        with patch.object(HARNESS, "processes", side_effect=inventory):
-            self.assertEqual(runner.run(), 0)
+        # Test monitor ordering, not host ps latency or a three-second sleep
+        # racing the five-second budget. Other fixtures exercise real ps/time.
+        clock = Mock(monotonic=lambda: now[0], sleep=advance)
+        try:
+            with patch.object(HARNESS, "time", clock), \
+                    patch.object(HARNESS, "processes", side_effect=inventory):
+                self.assertEqual(runner.run(), 0)
+        finally:
+            if getattr(runner, "child", None) is not None and runner.child.poll() is None:
+                runner.child.kill()
+                runner.child.wait(timeout=2)
         receipt = self.receipt()
         observation = receipt["monitoring_inventory"]
         self.assertEqual(observation["timeout_count"], 1)

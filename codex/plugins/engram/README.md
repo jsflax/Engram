@@ -40,11 +40,20 @@ identities fail closed, including when one candidate is disabled.
 | SessionEnd | Clean ephemeral tool counters; preserve learning progress |
 
 **Tool-failure limitation:** Engram classifies only explicit structured failure
-metadata, such as an integer shell exit code or an MCP error flag. Current
-[Codex hook documentation](https://learn.chatgpt.com/docs/hooks) includes nonzero
-Bash exits, but tool output remains host-specific. Plain-text output is left
-unclassified; the adapter never guesses failure from arbitrary stdout. Verify
-actual receipts on each host before claiming Claude `PostToolUseFailure` parity.
+metadata, such as an integer shell exit code or an MCP error flag. In official
+Codex `rust-v0.163.0-alpha.11` source, completed unified-exec commands, including
+completion observed through `write_stdin`, emit `Bash` hook responses containing
+an output string without exit status.
+[The hook response and code-mode return value are separate](https://github.com/openai/codex/blob/5425d3e625daa58eea3ad1de27c087eb3b2ffbd3/codex-rs/core/src/tools/context.rs#L409-L477);
+the latter's `exit_code` is unavailable to this hook. MCP results with
+`isError=true` and handler errors are
+[filtered before `PostToolUse`](https://github.com/openai/codex/blob/5425d3e625daa58eea3ad1de27c087eb3b2ffbd3/codex-rs/core/src/tools/registry.rs#L799-L835).
+
+These are source-version limits, not attestation of any installed binary.
+Full Bash/MCP failure parity with Claude `PostToolUseFailure` requires a host
+contract change. Plain-text output stays unclassified; Engram never guesses
+failure from stdout. Other runtimes that supply explicit structured status can
+use the existing classifier.
 
 Advice uses the prompt and inferred project, with no fixed memory UUID pins.
 When the project is inferred, semantically relevant memories from this user's
