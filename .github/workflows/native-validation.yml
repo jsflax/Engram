@@ -201,7 +201,7 @@ jobs:
           python3 -B scripts/run_native_tests.py --diagnostics-dir "$VALIDATION_ROOT/evidence/native-tests" \
             --timeout-seconds 1800 --silence-seconds 300 -- \
             "$VALIDATION_ROOT/bin/swift-validation" test --force-resolved-versions --disable-index-store --skip-build \
-            --filter 'EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests|LockedSnapshotTests' \
+            --filter 'EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests|LockedSnapshotTests|NodeInsertionReuseModelTests' \
             --skip PerfTests --skip keyBERTKeywordExtraction --skip recall_semanticRelevanceOrdering \
             --skip recall_connectedMemory_showsEdgeRelation \
             --skip recall_graphTraversal_relatesToDoesNotLeakViaUnrelatedStructuralEdge \

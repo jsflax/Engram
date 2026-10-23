@@ -1,4 +1,5 @@
 import Foundation
+import EngramSceneKit
 
 /// Shared routing for patrol selection and holo lookups; never retains a second
 /// node snapshot or rebuilds project subsets during a mascot's animation tick.
@@ -19,31 +20,74 @@ final class MascotGraphIndex {
     }
 
     func update(nodes: [RKNodeSnapshot], nodeVersion: UInt64,
-                nodeAppendGeneration: UInt64?, provider: AnyObject) {
+                nodeAppendGeneration: UInt64?, provider: AnyObject,
+                nodeInsertionReuse: NodeInsertionReuse? = nil) {
         let sameProvider = cachedProvider === provider
         guard !sameProvider || self.nodeVersion != nodeVersion
-                || nodeCount != nodes.count else { return }
-        let keepsPrefix = sameProvider && nodeAppendGeneration != nil
-            && appendGeneration == nodeAppendGeneration && nodes.count >= nodeCount
-        if !keepsPrefix {
-            indicesByProject.removeAll(keepingCapacity: true)
-            indexByID.removeAll(keepingCapacity: true)
-            projects.removeAll(keepingCapacity: true)
-            nodeCount = 0
-        }
-        indexByID.reserveCapacity(nodes.count)
-        for index in nodeCount..<nodes.count {
-            let node = nodes[index]
-            nodesVisited += 1
-            indicesByProject[node.project, default: []].append(index)
-            projects.insert(node.project)
-            // Match the old first(where:) lookup if a provider contains copies.
-            if indexByID[node.id] == nil { indexByID[node.id] = index }
+                || nodeCount != nodes.count || appendGeneration != nodeAppendGeneration else { return }
+        let offeredReuse = nodeInsertionReuse ?? (provider as? any SceneDataProvider)?
+            .nodeInsertionReuse(since: self.nodeVersion, count: nodeCount)
+        if sameProvider, let reuse = offeredReuse,
+           reuse.matches(fromVersion: self.nodeVersion, oldCount: nodeCount,
+                         toVersion: nodeVersion, newCount: nodes.count) {
+            indicesByProject = indicesByProject.mapValues { indices in
+                indices.map { reuse.newIndex(forOldIndex: $0)! }
+            }
+            indexByID = indexByID.mapValues { reuse.newIndex(forOldIndex: $0)! }
+            var insertedByProject: [String: [Int]] = [:]
+            for range in reuse.insertedRanges {
+                for index in range {
+                    let node = nodes[index]
+                    nodesVisited += 1
+                    projects.insert(node.project)
+                    insertedByProject[node.project, default: []].append(index)
+                    // An inserted duplicate before the previous winner becomes
+                    // the first match; later copies must not replace it.
+                    if index < (indexByID[node.id] ?? Int.max) { indexByID[node.id] = index }
+                }
+            }
+            for (project, inserted) in insertedByProject {
+                indicesByProject[project] = Self.merge(indicesByProject[project] ?? [], inserted)
+            }
+        } else {
+            let keepsPrefix = sameProvider && nodeAppendGeneration != nil
+                && appendGeneration == nodeAppendGeneration && nodes.count >= nodeCount
+            if !keepsPrefix {
+                indicesByProject.removeAll(keepingCapacity: true)
+                indexByID.removeAll(keepingCapacity: true)
+                projects.removeAll(keepingCapacity: true)
+                nodeCount = 0
+            }
+            indexByID.reserveCapacity(nodes.count)
+            for index in nodeCount..<nodes.count {
+                let node = nodes[index]
+                nodesVisited += 1
+                indicesByProject[node.project, default: []].append(index)
+                projects.insert(node.project)
+                // Match the old first(where:) lookup if a provider contains copies.
+                if indexByID[node.id] == nil { indexByID[node.id] = index }
+            }
         }
         cachedProvider = provider
         self.nodeVersion = nodeVersion
         appendGeneration = nodeAppendGeneration
         nodeCount = nodes.count
+    }
+
+    private static func merge(_ old: [Int], _ inserted: [Int]) -> [Int] {
+        var result: [Int] = []
+        result.reserveCapacity(old.count + inserted.count)
+        var oldIndex = 0, newIndex = 0
+        while oldIndex < old.count && newIndex < inserted.count {
+            if old[oldIndex] < inserted[newIndex] {
+                result.append(old[oldIndex]); oldIndex += 1
+            } else {
+                result.append(inserted[newIndex]); newIndex += 1
+            }
+        }
+        result.append(contentsOf: old.dropFirst(oldIndex))
+        result.append(contentsOf: inserted.dropFirst(newIndex))
+        return result
     }
 
     /// Point lights share the guarded first-match lookup. Colors remain live:

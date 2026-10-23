@@ -1,5 +1,6 @@
 import Foundation
 import simd
+import EngramSceneKit
 
 /// Per-galaxy aggregate for render systems that think in GALAXIES rather
 /// than nodes: titles, far-LOD gas, and bridges. The provider flattens
@@ -126,6 +127,9 @@ public protocol SceneDataProvider: AnyObject {
     /// Stable only while the complete prior node prefix remains unchanged.
     /// Consumers must also check provider identity and a nonshrinking count.
     var nodeAppendGeneration: UInt64 { get }
+    /// Exact insertion-only reuse from one node publication. A consumer must
+    /// separately verify provider identity and the descriptor's versions/counts.
+    func nodeInsertionReuse(since version: UInt64, count: Int) -> NodeInsertionReuse?
     /// Increments when positions or their node ordering change; stable while idle.
     var positionVersion: UInt64 { get }
 
@@ -158,6 +162,7 @@ extension SceneDataProvider {
     public var hubVersion: UInt64 { topologyVersion }
     public var edgeVersion: UInt64 { topologyVersion }
     public var nodeAppendGeneration: UInt64 { nodeVersion }
+    public func nodeInsertionReuse(since version: UInt64, count: Int) -> NodeInsertionReuse? { nil }
 
     public var positionArray: [SIMD3<Float>] {
         nodes.map { positions[$0.id] ?? .zero }

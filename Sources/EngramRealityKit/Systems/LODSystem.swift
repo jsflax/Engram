@@ -291,9 +291,15 @@ public final class LODSystem {
         // filter did 2 hashed lookups × edge count per frame (460k+ at 230k
         // edges); with int indices + a bit array it's two loads and two tests.
         if endpointMetadataChanged {
-            edgeEndpoints.update(nodes: nodes, edges: edges, provider: provider,
-                                 nodeVersion: nodeVersion, edgeVersion: edgeVersion,
-                                 nodeAppendGeneration: nodeAppendGeneration)
+            if let dataProvider = provider as? any SceneDataProvider {
+                edgeEndpoints.update(nodes: nodes, edges: edges, dataProvider: dataProvider,
+                                     nodeVersion: nodeVersion, edgeVersion: edgeVersion,
+                                     nodeAppendGeneration: nodeAppendGeneration)
+            } else {
+                edgeEndpoints.update(nodes: nodes, edges: edges, provider: provider,
+                                     nodeVersion: nodeVersion, edgeVersion: edgeVersion,
+                                     nodeAppendGeneration: nodeAppendGeneration)
+            }
             endpointNodeVersion = nodesRevision
             endpointEdgeVersion = edgesRevision
         }

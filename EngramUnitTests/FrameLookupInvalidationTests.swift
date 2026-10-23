@@ -31,6 +31,8 @@ private final class FrameLookupProvider: SceneDataProvider {
     var nodeVersion: UInt64 { explicitNodeVersion ?? topologyVersion }
     var hubVersion: UInt64 { explicitHubVersion ?? topologyVersion }
     var nodeAppendGeneration: UInt64 { explicitAppendGeneration ?? topologyVersion }
+    var insertionReuse: NodeInsertionReuse?
+    func nodeInsertionReuse(since version: UInt64, count: Int) -> NodeInsertionReuse? { insertionReuse }
     private(set) var tickDeltas: [Float] = []
     func tick(dt: Float) { tickDeltas.append(dt) }
 }
@@ -745,4 +747,93 @@ final class FrameLookupInvalidationTests: XCTestCase {
         XCTAssertTrue(cache.topic(at: 0)?.sum == SIMD3<Float>(5, -7, 9))
         XCTAssertTrue(cache.topic(at: 0)?.count == 2)
     }
+    func testLabelInsertionRangesMatchFullRebuild() {
+        let provider = FrameLookupProvider()
+        let a = node(UUID(), "A", topic: "shared"), b = node(UUID(), "B", topic: "other")
+        let c = node(UUID(), "C", topic: "shared")
+        provider.nodes = [a, b, c]
+        provider.explicitNodeVersion = 1; provider.explicitAppendGeneration = 1
+        var cache = LabelProjectTopicCache()
+        _ = cache.update(provider)
+        let visited = cache.nodesVisited
+        let first = node(UUID(), "B", topic: "other"), middle = node(UUID(), "D", topic: "new")
+        provider.nodes = [first, a, middle, b, c]
+        provider.explicitNodeVersion = 2; provider.explicitAppendGeneration = 2
+        provider.insertionReuse = NodeInsertionReuse(fromVersion: 1, toVersion: 2, oldCount: 3, newCount: 5,
+            retainedRanges: [.init(oldRange: 0..<1, newStart: 1), .init(oldRange: 1..<3, newStart: 3)])
+        let result = cache.update(provider)
+        var reference = LabelProjectTopicCache()
+        let expected = reference.update(provider)
+        XCTAssertTrue(result.projects == expected.projects && result.topics == expected.topics)
+        XCTAssertTrue(cache.nodesVisited - visited == 2)
+        let positions = provider.nodes.indices.map { SIMD3<Float>(Float($0), Float($0 - 3), 2) }
+        cache.rescanPositions(nodes: provider.nodes, positionArray: positions, positions: [:])
+        reference.rescanPositions(nodes: provider.nodes, positionArray: positions, positions: [:])
+        XCTAssertTrue(cache.topicCount == reference.topicCount)
+        for slot in 0..<cache.topicCount {
+            XCTAssertTrue(cache.topic(at: slot)?.name == reference.topic(at: slot)?.name)
+            XCTAssertTrue(cache.topic(at: slot)?.sum == reference.topic(at: slot)?.sum)
+            XCTAssertTrue(cache.topic(at: slot)?.count == reference.topic(at: slot)?.count)
+            XCTAssertTrue(cache.topic(at: slot)?.project == reference.topic(at: slot)?.project)
+            XCTAssertTrue(cache.topic(at: slot)?.maxY == reference.topic(at: slot)?.maxY)
+        }
+        for project in result.projects { XCTAssertTrue(cache.maxY(forProject: project) == reference.maxY(forProject: project)) }
+        XCTAssertTrue(cache.topic(at: 0)?.name == "other")
+        XCTAssertTrue(cache.topic(at: 1)?.project == "C")
+        cache.rescanPositions(nodes: provider.nodes, positionArray: [.zero], positions: [a.id: SIMD3(0, -9, 0)])
+        XCTAssertTrue(cache.topic(at: 1)?.project == "A")
+        XCTAssertTrue(cache.topic(at: 1)?.maxY == -9)
+    }
+
+    func testMascotInsertionRangesMatchFullRebuild() {
+        let provider = FrameLookupProvider()
+        let a = node(UUID(), "A"), b = node(UUID(), "B"), duplicate = node(a.id, "B")
+        provider.nodes = [a, b, duplicate]
+        provider.explicitNodeVersion = 1; provider.explicitAppendGeneration = 1
+        let index = MascotGraphIndex()
+        index.update(nodes: provider.nodes, nodeVersion: 1, nodeAppendGeneration: 1, provider: provider)
+        let visited = index.nodesVisited
+        provider.nodes = [node(a.id, "First"), a, node(UUID(), "B"), b, duplicate, node(a.id, "Last")]
+        provider.explicitNodeVersion = 2; provider.explicitAppendGeneration = 2
+        provider.insertionReuse = NodeInsertionReuse(fromVersion: 1, toVersion: 2, oldCount: 3, newCount: 6,
+            retainedRanges: [.init(oldRange: 0..<1, newStart: 1), .init(oldRange: 1..<3, newStart: 3)])
+        index.update(nodes: provider.nodes, nodeVersion: 2, nodeAppendGeneration: 2, provider: provider)
+        let reference = MascotGraphIndex()
+        reference.update(nodes: provider.nodes, topologyVersion: 2, provider: NSObject())
+        XCTAssertTrue(index.nodesVisited - visited == 3)
+        XCTAssertTrue(index.projects == reference.projects)
+        XCTAssertTrue(index.indicesByProject == reference.indicesByProject)
+        XCTAssertTrue(index.indexByID == reference.indexByID)
+        XCTAssertTrue(index.indexByID[a.id] == 0)
+        XCTAssertTrue(index.indicesByProject["B"] == [2, 3, 4])
+    }
+
+    func testInsertionMembershipFallbacksMatchFullRebuild() {
+        let a = node(UUID(), "A"), b = node(UUID(), "B")
+        for mode in 0..<5 {
+            let original = FrameLookupProvider()
+            original.nodes = [a, b]; original.explicitNodeVersion = 1; original.explicitAppendGeneration = 1
+            var cache = LabelProjectTopicCache(); _ = cache.update(original)
+            let index = MascotGraphIndex()
+            index.update(nodes: original.nodes, nodeVersion: 1, nodeAppendGeneration: 1, provider: original)
+            let provider = mode == 2 ? FrameLookupProvider() : original
+            provider.nodes = mode == 4 ? [b] : [node(a.id, "Edited", topic: "changed"), b, node(UUID(), "New")]
+            provider.explicitNodeVersion = 3; provider.explicitAppendGeneration = 3
+            if mode < 3 {
+                provider.insertionReuse = NodeInsertionReuse(fromVersion: mode == 0 ? 2 : 1, toVersion: 3,
+                    oldCount: mode == 1 ? 1 : 2, newCount: 3,
+                    retainedRanges: [.init(oldRange: 0..<(mode == 1 ? 1 : 2), newStart: 0)])
+            }
+            let actual = cache.update(provider)
+            var fresh = LabelProjectTopicCache(); let expected = fresh.update(provider)
+            XCTAssertTrue(actual.projects == expected.projects && actual.topics == expected.topics)
+            XCTAssertTrue(cache.nodesVisited == UInt64(2 + provider.nodes.count))
+            index.update(nodes: provider.nodes, nodeVersion: 3, nodeAppendGeneration: 3, provider: provider)
+            let freshIndex = MascotGraphIndex()
+            freshIndex.update(nodes: provider.nodes, topologyVersion: 3, provider: NSObject())
+            XCTAssertTrue(index.indexByID == freshIndex.indexByID && index.indicesByProject == freshIndex.indicesByProject)
+            XCTAssertTrue(index.nodesVisited == 2 + provider.nodes.count)
+        }
+    }
+
 }
