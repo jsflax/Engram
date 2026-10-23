@@ -498,20 +498,34 @@ class BeginBusyContractTests(unittest.TestCase):
                     self.assertNotIn("write_outcome", audit.records[-1])
 
     def test_exact_contract_extracted_from_native_source_is_accepted(self):
-        # Parse the producer's actual literals rather than building both sides
-        # from a shared fixture. This catches drift such as stored vs updated.
+        # Read the shared producer and its actual call-site arguments. Keep the
+        # independent expected contracts above so stored/updated drift fails.
         source = (REPO_ROOT / "Sources/EngramKit/MemoryTools+Core.swift").read_text()
         pattern = (r'content: \[\.text\(("(?:\\.|[^"\\])*")\)\],\s*'
                    r'structuredContent: \.object\(\[\s*"engram_write_receipt": \.object\(\['
                    r'(.*?)\]\),\s*\]\),\s*isError: true')
+        producers = re.findall(pattern, source, re.DOTALL)
+        self.assertEqual(len(producers), 1)
+        text, fields = producers[0]
+        calls = re.findall(r'Self\.busyReceipt\(tool: ("(?:\\.|[^"\\])*"), '
+                           r'verb: ("(?:\\.|[^"\\])*"), contention: contention\)', source)
         contracts = {}
-        for text, fields in re.findall(pattern, source, re.DOTALL):
+        for tool_literal, verb_literal in calls:
+            tool, verb = json.loads(tool_literal), json.loads(verb_literal)
+            if tool not in {"remember", "update"}:
+                continue  # merge is outside the learner's allowed write tools.
+            self.assertNotIn(tool, contracts)
             receipt = {}
             for name, kind, literal in re.findall(r'"(\w+)": \.(int|string|array)\((.*?)\),', fields):
                 self.assertEqual(kind, {"schema_version": "int", "memory_ids": "array"}.get(name, "string"))
-                receipt[name] = json.loads(literal)
+                self.assertNotIn(name, receipt)
+                if name == "tool":
+                    self.assertEqual(literal, "tool")
+                    receipt[name] = tool
+                else:
+                    receipt[name] = json.loads(literal)
             contracts[receipt["tool"]] = {"isError": True,
-                "content": [{"type": "text", "text": json.loads(text)}],
+                "content": [{"type": "text", "text": json.loads(text.replace(r"\(verb)", verb))}],
                 "structuredContent": {"engram_write_receipt": receipt}}
         self.assertEqual(set(contracts), {"remember", "update"})
         for tool, contract in contracts.items():
