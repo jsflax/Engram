@@ -171,6 +171,14 @@ def dispatch(config, payload, start, *, recall_call=run_recall):
             raise recall.Failure("invalid")
         session = hashlib.sha256(sid.encode()).hexdigest()[:20]
         audit["session"] = session
+        # Child hooks can share the root session_id. Keep optional actor metadata
+        # without changing session-scoped counters, deduplication or cleanup.
+        agent = payload.get("agent_id")
+        if isinstance(agent, str) and 1 <= len(agent) <= 256:
+            try:
+                audit["agent"] = hashlib.sha256(agent.encode()).hexdigest()[:20]
+            except UnicodeError:
+                pass  # Unusable optional identity must not alter hook behavior.
         if any(key in os.environ for key in recall.RECURSION_ENV):
             raise recall.Failure("guard")
         if event == "SessionEnd":

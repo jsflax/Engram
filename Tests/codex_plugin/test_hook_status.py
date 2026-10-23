@@ -47,8 +47,8 @@ class StatusTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(json.dumps(v) for v in value) + "\n" if log else json.dumps(value))
 
-    def report(self):
-        return STATUS.report(environ={"CODEX_HOME": str(self.home), "CODEX_THREAD_ID": SID})
+    def report(self, sid=SID):
+        return STATUS.report(environ={"CODEX_HOME": str(self.home), "CODEX_THREAD_ID": sid})
 
     def admission_event(self, reason="load", *, sid=SID, request=REQUEST, stamp=STAMP, **facts):
         if reason == "load" and not facts:
@@ -260,6 +260,134 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(result["router"]["receipts"][0]["status"], "queued")
         self.assertNotIn("secret", json.dumps(result))
         self.assertNotIn(OTHER, json.dumps(result))
+
+    def test_shared_hook_session_selects_concrete_actor_and_isolates_siblings(self):
+        sibling = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+        root_hash, child_hash, sibling_hash = [hashlib.sha256(v.encode()).hexdigest()[:20]
+                                               for v in (SID, OTHER, sibling)]
+        for component, relative in (("advice", "recall-state/receipts.jsonl"),
+                                    ("lifecycle", "lifecycle/receipts.jsonl")):
+            self.write(self.modern / relative, [
+                {"session": root_hash, "agent": None, "status": "emitted"},
+                {"session": root_hash, "agent": child_hash, "event": "SubagentStart", "status": "empty"},
+                {"session": root_hash, "agent": sibling_hash, "status": "timeout"}], log=True)
+            root = self.report()[component]
+            self.assertEqual([r["status"] for r in root["receipts"]], ["emitted"])
+            self.assertEqual(root["receipts"][0]["attribution"], "session_match_agent_unspecified")
+            self.assertEqual([r["agent"] for r in root["related_receipts"]], [child_hash, sibling_hash])
+            self.assertTrue(all(r["attribution"] == "shared_session_other_agent" for r in root["related_receipts"]))
+            child = self.report(OTHER)[component]
+            self.assertEqual([r["agent"] for r in child["receipts"]], [child_hash])
+            self.assertEqual(child["receipts"][0]["attribution"], "selected_agent")
+            self.assertEqual(child["related_receipts"], [])
+            self.assertNotIn(sibling_hash, json.dumps(child))
+
+    def test_explicit_actor_wins_and_legacy_or_invalid_actor_stays_limited(self):
+        root_digest = hashlib.sha256(SID.encode()).hexdigest()
+        other_digest = hashlib.sha256(OTHER.encode()).hexdigest()
+        self.write(self.modern / "recall-state/receipts.jsonl", [
+            {"session": other_digest[:20], "agent": root_digest, "status": "emitted"},
+            {"session": root_digest[:20], "status": "empty"},
+            {"session": root_digest[:20], "agent": None, "status": "guard"},
+            {"session": root_digest[:20], "agent": other_digest, "status": "timeout"},
+            *[{"session": root_digest[:20], "agent": bad, "status": "invalid"}
+              for bad in ([], {}, True, "", "PRIVATE_ACTOR")]], log=True)
+        view = self.report()["advice"]
+        self.assertEqual([r["attribution"] for r in view["receipts"]],
+                         ["selected_agent", "session_match_agent_unspecified", "session_match_agent_unspecified"])
+        self.assertEqual(view["related_matching_records"], 6)
+        self.assertEqual(view["related_receipts"][0]["attribution"], "shared_session_other_agent")
+        self.assertTrue(all(r["attribution"] == "session_match_invalid_agent" for r in view["related_receipts"][1:]))
+        self.assertNotIn("PRIVATE", json.dumps(view))
+
+    def test_router_canonical_actor_precedes_shared_hook_session(self):
+        self.write(self.modern / "router-receipts.jsonl", [
+            {"session_id": SID, "hook_session_id": OTHER, "status": "observed"},
+            {"session_id": OTHER, "hook_session_id": SID, "hook_event": "SubagentStop", "status": "queued"},
+            {"hook_session_id": SID, "status": "not_queued"},
+            {"session_id": None, "hook_session_id": SID, "status": "rejected"},
+            {"session_id": "PRIVATE_ID", "hook_session_id": SID, "status": "rejected"}], log=True)
+        root = self.report()["router"]
+        self.assertEqual([r["attribution"] for r in root["receipts"]],
+                         ["selected_task", "hook_session_match_task_unspecified"])
+        self.assertEqual([r["attribution"] for r in root["related_receipts"]],
+                         ["shared_hook_session_other_task", "hook_session_match_invalid_task", "hook_session_match_invalid_task"])
+        child = self.report(OTHER)["router"]
+        self.assertEqual(len(child["receipts"]), 1)
+        self.assertEqual(child["receipts"][0]["session_id"], OTHER)
+        self.assertEqual(child["receipts"][0]["attribution"], "selected_task")
+        self.assertNotIn("PRIVATE", json.dumps(root))
+
+    def test_child_learner_event_cannot_link_parent_to_child_run(self):
+        root = self.learner_fixture(session={"status": "succeeded"})
+        self.write(root / "events.jsonl", [{"session_id": OTHER, "hook_session_id": SID,
+            "event": "learner_finished", "status": "failed", "run_id": RUN}], log=True)
+        self.write(root / "runs" / RUN / "run.json", {"session_id": OTHER, "hook_session_id": SID,
+            "status": "failed", "reason": "unverified_completion"})
+        original, opened = STATUS.open_regular, []
+        def selected_only(path):
+            opened.append(Path(path))
+            self.assertNotIn("runs", Path(path).parts)
+            self.assertNotIn(OTHER, str(path))
+            return original(path)
+        with patch.object(STATUS, "open_regular", side_effect=selected_only):
+            parent = self.report()["learner"]
+        self.assertEqual(parent["events"], [])
+        self.assertEqual(parent["latest_run"]["read_status"], "not_linked")
+        self.assertEqual(parent["health"]["failure"]["class"], "none_observed")
+        child = self.report(OTHER)["learner"]
+        self.assertEqual(child["events"][0]["attribution"], "selected_task")
+        self.assertEqual(child["latest_run"]["run_id"], RUN)
+        self.assertEqual(child["latest_run"]["identity_attribution"], "selected_task")
+
+    def test_scoped_json_rejects_conflicting_or_malformed_canonical_identity(self):
+        path = self.modern / "learner/sessions" / (SID + ".json")
+        for canonical in (OTHER, None, [], "PRIVATE_ID"):
+            with self.subTest(canonical=canonical):
+                self.write(path, {"session_id": canonical, "hook_session_id": SID, "offset": 0})
+                value, view = STATUS.scoped_json(path, SID)
+                self.assertIsNone(value)
+                self.assertEqual(view["read"]["read_status"], "session_mismatch")
+        self.write(path, {"hook_session_id": SID, "offset": 0})
+        value, view = STATUS.scoped_json(path, SID)
+        self.assertIsNotNone(value)
+        self.assertEqual(view["identity_attribution"], "hook_session_match_task_unspecified")
+        self.write(path, {"binding": {"session_id": OTHER, "hook_session_id": SID}})
+        self.assertIsNone(STATUS.scoped_json(path, SID, binding=True)[0])
+
+    def test_linked_run_canonical_identity_cannot_fall_back_to_root(self):
+        root = self.learner_fixture()
+        for identity in ({"session_id": OTHER, "hook_session_id": SID},
+                         {"session_id": None, "hook_session_id": SID},
+                         {"hook_session_id": OTHER}):
+            self.write(root / "runs" / RUN / "run.json", {**identity, "status": "failed"})
+            original = STATUS.open_regular
+            def no_private_result(path):
+                self.assertNotEqual(Path(path).name, "result.json")
+                return original(path)
+            with patch.object(STATUS, "open_regular", side_effect=no_private_result):
+                result = STATUS.linked_run(root, RUN, SID)
+            self.assertEqual(result["read"]["read_status"], "session_mismatch")
+        self.write(root / "runs" / RUN / "run.json", {"hook_session_id": SID, "status": "succeeded"})
+        self.assertEqual(STATUS.linked_run(root, RUN, SID)["identity_attribution"],
+                         "hook_session_match_task_unspecified")
+
+    def test_related_receipts_share_one_bounded_read_and_do_not_evict_selected(self):
+        sh, oh = [hashlib.sha256(v.encode()).hexdigest()[:20] for v in (SID, OTHER)]
+        self.write(self.modern / "recall-state/receipts.jsonl", [
+            {"session": sh, "agent": sh, "status": "emitted"},
+            *[{"session": sh, "agent": oh, "status": "empty"}] * 25], log=True)
+        original = STATUS.read_bounded
+        with patch.object(STATUS, "read_bounded", wraps=original) as reads:
+            view = self.report()["advice"]
+        selected_reads = [c for c in reads.call_args_list if str(c.args[0]).endswith("recall-state/receipts.jsonl")]
+        self.assertEqual(len(selected_reads), 1)
+        self.assertEqual(selected_reads[0].args[1], STATUS.MAX_LOG_BYTES)
+        self.assertTrue(selected_reads[0].kwargs["tail"])
+        self.assertEqual(view["window"]["matching_records"], 1)
+        self.assertEqual(view["receipts"][0]["status"], "emitted")
+        self.assertEqual(view["related_matching_records"], 25)
+        self.assertEqual(len(view["related_receipts"]), STATUS.MAX_RECORDS)
 
     def test_subagent_stop_survives_selected_report_without_widening_metadata(self):
         # Stored metadata fixtures exercise reporting, not host hook delivery.
