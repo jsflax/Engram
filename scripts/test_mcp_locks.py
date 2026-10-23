@@ -177,6 +177,8 @@ class PersistenceHarnessTests(unittest.TestCase):
             assert sys.argv[4:] == ["--force"]
             path = Path(sys.argv[3])
             assert path.is_file() and path.stat().st_size == 0
+            if mode == "timeout_before_marker":
+                time.sleep(30)
             (path.parent / "migration-invocation.json").write_text(json.dumps({
                 "argv": sys.argv[1:], "pid": os.getpid(),
                 "account_environment": {key: os.environ.get(key) for key in ("HOME", "CODEX_HOME")},
@@ -243,20 +245,48 @@ class PersistenceHarnessTests(unittest.TestCase):
 
     def test_explicit_migration_deadline_and_output_limit_reap_owned_child(self):
         for mode, seconds, reason in (("timeout", 0.5, "original seed deadline"),
+                                      ("timeout_before_marker", 0.5, "original seed deadline"),
                                       ("overflow", 5, "output exceeded")):
             with self.subTest(mode=mode), self.temporary_directory() as directory:
                 root = Path(directory).resolve()
                 binary = self.fake_migrator(directory, mode)
-                started = time.monotonic()
-                with contextlib.redirect_stderr(io.StringIO()) as diagnostic:
-                    with self.assertRaisesRegex(AssertionError, reason):
-                        HARNESS.prepare_empty_seed(binary, root / "memory.sqlite", environment=dict(os.environ),
-                                                   cwd=root, deadline=started + seconds)
-                self.assertLess(time.monotonic() - started, seconds + 4)
-                self.assertLessEqual(len(json.loads(diagnostic.getvalue())["output_tail"].encode()), 16 * 1024)
-                pid = json.loads((root / "migration-invocation.json").read_text())["pid"]
-                with self.assertRaises(ProcessLookupError):
-                    os.kill(pid, 0)
+                children = []
+                real_popen = subprocess.Popen
+
+                def capture(*args, **kwargs):
+                    child = real_popen(*args, **kwargs)
+                    children.append(child)
+                    return child
+
+                try:
+                    started = time.monotonic()
+                    with patch.object(HARNESS.subprocess, "Popen", side_effect=capture), \
+                            contextlib.redirect_stderr(io.StringIO()) as diagnostic:
+                        with self.assertRaisesRegex(AssertionError, reason):
+                            HARNESS.prepare_empty_seed(binary, root / "memory.sqlite", environment=dict(os.environ),
+                                                       cwd=root, deadline=started + seconds)
+                    self.assertLess(time.monotonic() - started, seconds + 4)
+                    self.assertLessEqual(len(json.loads(diagnostic.getvalue())["output_tail"].encode()), 16 * 1024)
+                    # The parent owns the handle even if the deadline expires
+                    # before Python starts or writes its invocation marker.
+                    self.assertEqual(len(children), 1)
+                    child = children[0]
+                    # Do not poll/wait here: that could reap a child the
+                    # harness failed to join and hide a cleanup regression.
+                    self.assertIsNotNone(child.returncode)
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(child.pid, 0)
+                    self.assertTrue(child.stdout.closed)
+                    if mode == "timeout_before_marker":
+                        self.assertFalse((root / "migration-invocation.json").exists())
+                finally:
+                    for child in children:
+                        if child.returncode is None:
+                            with contextlib.suppress(ProcessLookupError):
+                                child.kill()
+                            child.wait(timeout=2)
+                        if child.stdout is not None:
+                            child.stdout.close()
 
     def test_explicit_migration_requires_binding_new_file_and_remaining_setup_budget(self):
         with self.temporary_directory() as directory:
