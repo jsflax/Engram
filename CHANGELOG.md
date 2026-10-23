@@ -4,6 +4,16 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.18] - 2026-10-23
+
+### Fixed
+- Reuse unchanged graph metadata when earlier galaxies add batches during
+  loading. Retained nodes avoid repeated UUID, project and topic indexing,
+  while graph order, duplicate precedence, positions and centroid update
+  cadence remain intact. Edits and provider changes keep the full rebuild path.
+- Native build supervision tolerates transient process-inventory timeouts
+  and requires a recovered observation before reporting success.
+
 ## [0.15.17] - 2026-10-23
 
 ### Fixed
