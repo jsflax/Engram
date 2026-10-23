@@ -4,7 +4,7 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
-## [Unreleased]
+## [0.15.15] - 2026-10-23
 
 ### Fixed
 - Background Claude launches reset inherited signal masks in their dedicated
