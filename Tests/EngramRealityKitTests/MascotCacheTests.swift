@@ -1,5 +1,6 @@
 import Foundation
 import RealityKit
+import EngramSceneKit
 import Testing
 @testable import EngramRealityKit
 
@@ -215,6 +216,64 @@ struct MascotCacheTests {
         #expect(index.indicesByProject["B"] == [1, 2])
         #expect(index.indexByID[first.id] == 0)
         #expect(index.indexByID[fourth.id] == 3)
+    }
+
+    @Test("Certified tails and no-op publications preserve retained routing without index remaps")
+    func tailAndNoOpKeepRetainedIndicesWithoutRemapping() throws {
+        let owner = NSObject()
+        let a = node(project: "A"), b = node(project: "B")
+        let duplicate = node(a.id, project: "B")
+        let oldNodes = [a, b, duplicate]
+        let index = MascotGraphIndex()
+        index.update(nodes: oldNodes, nodeVersion: 1, nodeAppendGeneration: 1, provider: owner)
+        let oldGroups = index.indicesByProject
+        let remapped = index.retainedIndexRemapCount
+        let visited = index.nodesVisited
+
+        let lateDuplicate = node(a.id, project: "Later")
+        let c = node(project: "A"), d = node(project: "C")
+        let tailNodes = oldNodes + [lateDuplicate, c, d]
+        let tail = try #require(NodeInsertionReuse(fromVersion: 1, toVersion: 2,
+            oldCount: oldNodes.count, newCount: tailNodes.count,
+            retainedRanges: [.init(oldRange: 0..<1, newStart: 0),
+                             .init(oldRange: 1..<3, newStart: 1)]))
+        index.update(nodes: tailNodes, nodeVersion: 2, nodeAppendGeneration: 2,
+                     provider: owner, nodeInsertionReuse: tail)
+        #expect(index.retainedIndexRemapCount == remapped)
+        #expect(index.nodesVisited - visited == 3)
+        #expect(index.indexByID[a.id] == 0)
+        #expect(index.indicesByProject == ["A": [0, 4], "B": [1, 2], "Later": [3], "C": [5]])
+        #expect(oldGroups == ["A": [0], "B": [1, 2]])
+
+        let noOp = try #require(NodeInsertionReuse(fromVersion: 2, toVersion: 3,
+            oldCount: tailNodes.count, newCount: tailNodes.count,
+            retainedRanges: [.init(oldRange: 0..<2, newStart: 0),
+                             .init(oldRange: 2..<6, newStart: 2)]))
+        let tailGroups = index.indicesByProject, tailLookup = index.indexByID
+        index.update(nodes: tailNodes, nodeVersion: 3, nodeAppendGeneration: 3,
+                     provider: owner, nodeInsertionReuse: noOp)
+        #expect(index.retainedIndexRemapCount == remapped)
+        #expect(index.nodesVisited - visited == 3)
+        #expect(index.indicesByProject == tailGroups && index.indexByID == tailLookup)
+
+        // The following proof must join the no-op's new version. A new duplicate
+        // before all retained rows must still become the first-match winner.
+        let first = node(a.id, project: "First")
+        let interiorNodes = [first] + tailNodes
+        let interior = try #require(NodeInsertionReuse(fromVersion: 3, toVersion: 4,
+            oldCount: tailNodes.count, newCount: interiorNodes.count,
+            retainedRanges: [.init(oldRange: 0..<2, newStart: 1),
+                             .init(oldRange: 2..<6, newStart: 3)]))
+        index.update(nodes: interiorNodes, nodeVersion: 4, nodeAppendGeneration: 4,
+                     provider: owner, nodeInsertionReuse: interior)
+        #expect(index.retainedIndexRemapCount - remapped == tailNodes.count + tailLookup.count)
+        #expect(index.nodesVisited - visited == 4)
+        let reference = MascotGraphIndex()
+        reference.update(nodes: interiorNodes, topologyVersion: 4, provider: NSObject())
+        #expect(index.projects == reference.projects)
+        #expect(index.indicesByProject == reference.indicesByProject)
+        #expect(index.indexByID == reference.indexByID)
+        #expect(index.indexByID[a.id] == 0)
     }
 
     @Test

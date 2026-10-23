@@ -50,6 +50,7 @@ struct NodeInsertionReuseModelTests {
                     #expect(actual == expected)
                     #expect(constructedIndices == insertedIndices)
                     #expect(reuse.insertedRanges.flatMap { Array($0) } == insertedIndices)
+                    #expect(reuse.preservesExistingIndices == (Array(expected.prefix(oldCount)) == previous))
                     for oldIndex in previous.indices {
                         #expect(reuse.newIndex(forOldIndex: oldIndex) == expected.firstIndex(of: oldIndex))
                     }
@@ -84,6 +85,13 @@ struct NodeInsertionReuseModelTests {
         #expect(reuse.newIndex(forOldIndex: 0) == 0)
         #expect(reuse.newIndex(forOldIndex: 2) == Int.max - 1)
         #expect(reuse.insertedRanges == [2..<(Int.max - 1)])
+        #expect(!reuse.preservesExistingIndices)
+        let wrapped = try #require(NodeInsertionReuse(
+            fromVersion: .max, toVersion: 0, oldCount: 3, newCount: 4,
+            retainedRanges: [.init(oldRange: 0..<1, newStart: 0),
+                             .init(oldRange: 1..<3, newStart: 1)]))
+        #expect(wrapped.preservesExistingIndices)
+        #expect(wrapped.matches(fromVersion: .max, oldCount: 3, toVersion: 0, newCount: 4))
     }
 
     @Test("Malformed certificates cannot lose, reorder or overlap retained rows")
@@ -97,6 +105,10 @@ struct NodeInsertionReuseModelTests {
             [.init(oldRange: 0..<3, newStart: -1)],
             [.init(oldRange: 0..<3, newStart: 2)],
             [.init(oldRange: 0..<4, newStart: 0)],
+            // Matching first/last positions alone is not a proof: a shifted
+            // middle row overlaps the unchanged last row and must be rejected.
+            [.init(oldRange: 0..<1, newStart: 0), .init(oldRange: 1..<2, newStart: 2),
+             .init(oldRange: 2..<3, newStart: 2)],
         ]
         for ranges in invalid {
             #expect(NodeInsertionReuse(fromVersion: 1, toVersion: 2,

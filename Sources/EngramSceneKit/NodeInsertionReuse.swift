@@ -19,6 +19,13 @@ public struct NodeInsertionReuse: Equatable, Sendable {
     public let retainedRanges: [RetainedRange]
     public let insertedRanges: [Range<Int>]
 
+    /// The validated ranges cover every old row. If each starts at its old
+    /// index, only tail insertions (or no insertions) remain. Empty old arrays
+    /// satisfy this too; consumers still must validate origin and versions.
+    public var preservesExistingIndices: Bool {
+        retainedRanges.allSatisfy { $0.newStart == $0.oldRange.lowerBound }
+    }
+
     public init?(fromVersion: UInt64, toVersion: UInt64, oldCount: Int,
                  newCount: Int, retainedRanges: [RetainedRange]) {
         guard fromVersion != toVersion, oldCount >= 0, newCount >= oldCount else { return nil }

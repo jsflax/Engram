@@ -1631,6 +1631,158 @@ final class AdapterSnapshotTests: XCTestCase {
         XCTAssertTrue(registry.galaxyForNode(b.id) === group)
     }
 
+    func testCertifiedTailAndNoOpAvoidRetainedMergeAndSnapshotWork() async throws {
+        let (lattice, registry, group, groupGeneration, personal, personalGeneration, adapter) =
+            try await crossGalaxyStreamingFixture()
+        defer { lattice.close() }
+        // The empty middle segment must not prevent a true tail proof or make
+        // an insertion before the personal suffix look like a tail append.
+        let empty = Galaxy(id: "synced", displayName: "Empty", lattice: lattice.sendableReference)
+        registry.register(empty)
+        let first = node(label: "Group winner")
+        let suffix = (0..<1_024).map { node(label: "Personal \($0)") }
+        group.applyLoadChunk(nodes: [(1, first)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: suffix.enumerated().map { (Int64($0.offset + 1), $0.element) },
+                                generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        let retained = adapter.nodes
+        let copied = registry.retainedNodeCopyCount
+        let snapshots = adapter.retainedSnapshotCopyCount
+        let remapped = adapter.retainedNodeIndexRemapCount
+        let built = adapter.nodeSnapshotBuildCount
+        let tail = node(label: "Tail")
+        let oldVersion = adapter.nodeVersion
+        personal.applyLoadChunk(nodes: [(1_025, tail)], generation: personalGeneration)
+        group.renderStore.insertHub(first.id)
+        adapter.tick(dt: 1 / 60)
+        let proof = try XCTUnwrap(adapter.nodeInsertionReuse(since: oldVersion, count: retained.count))
+        XCTAssertTrue(proof.preservesExistingIndices)
+        XCTAssertEqual(adapter.nodes.map(\.id), [first.id] + suffix.map(\.id) + [tail.id])
+        XCTAssertEqual(adapter.nodes.first?.isHub, true, "A tail proof cannot suppress independent hub changes")
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount - built, 2, "One new row and one changed hub style")
+        XCTAssertEqual(registry.retainedNodeCopyCount, copied)
+        XCTAssertEqual(adapter.retainedSnapshotCopyCount, snapshots)
+        XCTAssertEqual(adapter.retainedNodeIndexRemapCount, remapped)
+        XCTAssertEqual(retained.map(\.id), [first.id] + suffix.map(\.id))
+        XCTAssertFalse(retained[0].isHub, "Previously published value snapshots remain immutable")
+
+        // A lower-priority duplicate publishes a new source revision without
+        // adding a visible row. Keep its descriptor/version and old winner.
+        let noOpVersion = adapter.nodeVersion, noOpBuilt = adapter.nodeSnapshotBuildCount
+        personal.applyLoadChunk(nodes: [(1_026, node(id: first.id, label: "Hidden duplicate"))],
+                                generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        let noOp = try XCTUnwrap(adapter.nodeInsertionReuse(since: noOpVersion, count: retained.count + 1))
+        XCTAssertTrue(noOp.preservesExistingIndices)
+        XCTAssertTrue(noOp.insertedRanges.isEmpty)
+        XCTAssertGreaterThan(adapter.nodeVersion, noOpVersion)
+        XCTAssertEqual(adapter.nodes.first?.label, first.label)
+        XCTAssertTrue(registry.galaxyForNode(first.id) === group)
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount, noOpBuilt)
+        XCTAssertEqual(registry.retainedNodeCopyCount, copied)
+        XCTAssertEqual(adapter.retainedSnapshotCopyCount, snapshots)
+        XCTAssertEqual(adapter.retainedNodeIndexRemapCount, remapped)
+
+        // The no-op still consumed the hidden source row. A later append must
+        // resume from the new galaxy ends and publish just its new visible row.
+        let afterNoOp = node(label: "After no-op"), afterNoOpVersion = adapter.nodeVersion
+        personal.applyLoadChunk(nodes: [(1_027, afterNoOp)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        let resumed = try XCTUnwrap(adapter.nodeInsertionReuse(since: afterNoOpVersion, count: retained.count + 1))
+        XCTAssertTrue(resumed.preservesExistingIndices)
+        XCTAssertEqual(adapter.nodes.map(\.id), [first.id] + suffix.map(\.id) + [tail.id, afterNoOp.id])
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount, noOpBuilt + 1)
+        XCTAssertEqual(registry.retainedNodeCopyCount, copied)
+        XCTAssertEqual(adapter.retainedSnapshotCopyCount, snapshots)
+        XCTAssertEqual(adapter.retainedNodeIndexRemapCount, remapped)
+
+        // Positive work control: a genuine interior insertion must still move
+        // retained rows. The new counters would detect the former tail path.
+        let interior = node(label: "Interior"), interiorVersion = adapter.nodeVersion
+        group.applyLoadChunk(nodes: [(2, interior)], generation: groupGeneration)
+        adapter.tick(dt: 1 / 60)
+        let shifted = try XCTUnwrap(adapter.nodeInsertionReuse(since: interiorVersion, count: retained.count + 2))
+        XCTAssertFalse(shifted.preservesExistingIndices)
+        XCTAssertEqual(adapter.nodes.map(\.id), [first.id, interior.id] + suffix.map(\.id) + [tail.id, afterNoOp.id])
+        XCTAssertEqual(registry.retainedNodeCopyCount - copied, UInt64(retained.count + 2))
+        XCTAssertEqual(adapter.retainedSnapshotCopyCount - snapshots, UInt64(retained.count + 2))
+        XCTAssertEqual(adapter.retainedNodeIndexRemapCount - remapped, UInt64(retained.count + 2))
+    }
+
+    func testCertifiedTailAndNoOpAvoidSimulationAndMembershipRemaps() throws {
+        let sim = ForceSimulation3D(), owner = GalaxyRegistry()
+        var indices = SimulationIndexCache(), memberships = CentroidMembershipCache()
+        _ = indices.refresh(nodeCount: 0, preservingPrefix: false, simulation: sim, nodeVersion: 1) { _ in
+            XCTFail("An empty cache has no IDs"); return UUID()
+        }
+        memberships.refresh(nodeCount: 0, nodeVersion: 1, appendGeneration: 1, provider: owner) { _ in
+            XCTFail("An empty cache has no members"); return ("", "")
+        }
+        var ids = (0..<1_024).map { _ in UUID() }
+        for id in ids.dropLast() { sim.addNode(id, project: "P", topic: "T") }
+        var groups = Array(repeating: (project: "P", galaxy: "g"), count: ids.count)
+        let emptyProof = try XCTUnwrap(NodeInsertionReuse(fromVersion: 1, toVersion: 2,
+            oldCount: 0, newCount: ids.count, retainedRanges: []))
+        XCTAssertTrue(indices.refresh(nodeCount: ids.count, preservingPrefix: false, simulation: sim,
+            insertionReuse: emptyProof, nodeVersion: 2) { ids[$0] })
+        memberships.refresh(nodeCount: groups.count, nodeVersion: 2, appendGeneration: 2,
+            provider: owner, insertionReuse: emptyProof) { groups[$0] }
+        XCTAssertEqual(indices.indices.last, -1)
+        let oldCount = ids.count, tail = UUID()
+        sim.addNode(ids.last!, project: "P", topic: "T")
+        sim.addNode(tail, project: "Q", topic: "T")
+        ids.append(tail); groups.append(("Q", "g"))
+        let tailProof = try XCTUnwrap(NodeInsertionReuse(fromVersion: 2, toVersion: 3,
+            oldCount: oldCount, newCount: ids.count,
+            retainedRanges: [.init(oldRange: 0..<1, newStart: 0),
+                             .init(oldRange: 1..<oldCount, newStart: 1)]))
+        var visited: [Int] = []
+        XCTAssertTrue(indices.refresh(nodeCount: ids.count, preservingPrefix: false, simulation: sim,
+            insertionReuse: tailProof, nodeVersion: 3) { visited.append($0); return ids[$0] })
+        XCTAssertEqual(visited, [oldCount - 1, oldCount], "Only a previous miss and the new tail need ID lookup")
+        memberships.refresh(nodeCount: groups.count, nodeVersion: 3, appendGeneration: 3,
+            provider: owner, insertionReuse: tailProof) { groups[$0] }
+        let noOp = try XCTUnwrap(NodeInsertionReuse(fromVersion: 3, toVersion: 4,
+            oldCount: ids.count, newCount: ids.count,
+            retainedRanges: [.init(oldRange: 0..<ids.count, newStart: 0)]))
+        visited.removeAll()
+        XCTAssertTrue(indices.refresh(nodeCount: ids.count, preservingPrefix: false, simulation: sim,
+            insertionReuse: noOp, nodeVersion: 4) { visited.append($0); return ids[$0] })
+        memberships.refresh(nodeCount: groups.count, nodeVersion: 4, appendGeneration: 4,
+            provider: owner, insertionReuse: noOp) { _ in
+                XCTFail("A certified no-op has no new membership"); return ("", "")
+            }
+        XCTAssertTrue(visited.isEmpty)
+        XCTAssertEqual(indices.indices, ids.map { sim.index(for: $0) ?? -1 })
+        XCTAssertEqual(indices.retainedIndexCopyCount, 0)
+        XCTAssertEqual(memberships.retainedMembershipCopyCount, 0)
+        XCTAssertEqual(memberships.membershipOrderVisitCount, 0)
+
+        let inserted = UUID(), previousCount = ids.count
+        sim.addNode(inserted, project: "Inserted", topic: "T")
+        ids.insert(inserted, at: 1); groups.insert(("Inserted", "h"), at: 1)
+        let interior = try XCTUnwrap(NodeInsertionReuse(fromVersion: 4, toVersion: 5,
+            oldCount: previousCount, newCount: ids.count,
+            retainedRanges: [.init(oldRange: 0..<1, newStart: 0),
+                             .init(oldRange: 1..<previousCount, newStart: 2)]))
+        _ = indices.refresh(nodeCount: ids.count, preservingPrefix: false, simulation: sim,
+            insertionReuse: interior, nodeVersion: 5) { ids[$0] }
+        memberships.refresh(nodeCount: groups.count, nodeVersion: 5, appendGeneration: 5,
+            provider: owner, insertionReuse: interior) { groups[$0] }
+        XCTAssertEqual(indices.indices, ids.map { sim.index(for: $0) ?? -1 })
+        XCTAssertEqual(indices.retainedIndexCopyCount, UInt64(previousCount))
+        XCTAssertEqual(memberships.retainedMembershipCopyCount, UInt64(previousCount))
+        XCTAssertEqual(memberships.membershipOrderVisitCount, UInt64(groups.count))
+        let positions = ids.indices.map { SIMD3<Float>(Float($0), 0, 0) }
+        memberships.reduce(positions: positions, simulationIndices: Array(ids.indices), galaxyCenters: [:])
+        var reference = CentroidMembershipCache()
+        reference.refresh(nodeCount: groups.count, nodeVersion: 5, appendGeneration: 5,
+                          provider: owner) { groups[$0] }
+        reference.reduce(positions: positions, simulationIndices: Array(ids.indices), galaxyCenters: [:])
+        XCTAssertEqual(memberships.projectCentroids, reference.projectCentroids)
+        XCTAssertEqual(memberships.nebulaClusters.map(\.project), reference.nebulaClusters.map(\.project))
+    }
+
     func testCrossGalaxyInsertionReusePreservesRenderedOrderAndLivePositions() async throws {
         let (lattice, registry, group, groupGeneration, personal, personalGeneration, adapter) =
             try await crossGalaxyStreamingFixture()

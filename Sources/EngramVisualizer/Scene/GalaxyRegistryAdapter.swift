@@ -9,6 +9,7 @@ import EngramSceneKit
 @MainActor
 struct SimulationIndexCache {
     private(set) var indices: [Int] = []
+    private(set) var retainedIndexCopyCount: UInt64 = 0
     private var unresolved: [Int] = []
     private weak var indexedSimulation: ForceSimulation3D?
     private var indexGeneration: UInt64 = .max
@@ -20,37 +21,45 @@ struct SimulationIndexCache {
                           insertionReuse: NodeInsertionReuse? = nil,
                           nodeVersion: UInt64? = nil,
                           nodeID: (Int) -> UUID) -> Bool {
+        var certifiedUnchangedIndices = false
         if indexedSimulation === simulation,
            indexGeneration == simulation.nodeIndexGeneration,
            let previousVersion = renderedNodeVersion, let nodeVersion,
            let reuse = insertionReuse,
            reuse.matches(fromVersion: previousVersion, oldCount: indices.count,
                          toVersion: nodeVersion, newCount: nodeCount) {
-            var oldIndices = indices
-            var remaining: [Int] = []
-            for oldIndex in unresolved {
-                guard let index = reuse.newIndex(forOldIndex: oldIndex) else { continue }
-                if nodeOrderVersion != simulation.nodeOrderVersion,
-                   let resolved = simulation.index(for: nodeID(index)) {
-                    oldIndices[oldIndex] = resolved
-                } else { remaining.append(index) }
+            if reuse.preservesExistingIndices {
+                certifiedUnchangedIndices = true
+            } else {
+                var oldIndices = indices
+                var remaining: [Int] = []
+                for oldIndex in unresolved {
+                    guard let index = reuse.newIndex(forOldIndex: oldIndex) else { continue }
+                    if nodeOrderVersion != simulation.nodeOrderVersion,
+                       let resolved = simulation.index(for: nodeID(index)) {
+                        oldIndices[oldIndex] = resolved
+                    } else { remaining.append(index) }
+                }
+                // The validated descriptor covers every existing index exactly
+                // once. Only inserted and previously unresolved rows hash a UUID.
+                retainedIndexCopyCount &+= UInt64(indices.count)
+                indices = reuse.remap(oldIndices) { index in
+                    let resolved = simulation.index(for: nodeID(index)) ?? -1
+                    if resolved < 0 { remaining.append(index) }
+                    return resolved
+                }!
+                unresolved = remaining
+                nodeOrderVersion = simulation.nodeOrderVersion
+                renderedNodeVersion = nodeVersion
+                return true
             }
-            // The validated descriptor covers every existing index exactly
-            // once. Only inserted and previously unresolved rows hash a UUID.
-            indices = reuse.remap(oldIndices) { index in
-                let resolved = simulation.index(for: nodeID(index)) ?? -1
-                if resolved < 0 { remaining.append(index) }
-                return resolved
-            }!
-            unresolved = remaining
-            nodeOrderVersion = simulation.nodeOrderVersion
-            renderedNodeVersion = nodeVersion
-            return true
         }
-        let reset = !preservingPrefix || indices.count > nodeCount
+        let reset = !(preservingPrefix || certifiedUnchangedIndices) || indices.count > nodeCount
             || indexedSimulation !== simulation
             || indexGeneration != simulation.nodeIndexGeneration
-        var changed = reset
+        // Keep the previous descriptor-path publication result even for a
+        // no-op; only the retained-index copying is omitted.
+        var changed = reset || certifiedUnchangedIndices
         if reset {
             indices.removeAll(keepingCapacity: true)
             unresolved.removeAll(keepingCapacity: true)
@@ -137,6 +146,8 @@ struct CentroidMembershipCache {
     private var nodeVersion: UInt64 = .max
     private var appendGeneration: UInt64 = .max
     private(set) var membershipVisitCount: UInt64 = 0
+    private(set) var retainedMembershipCopyCount: UInt64 = 0
+    private(set) var membershipOrderVisitCount: UInt64 = 0
 
     mutating func refresh(nodeCount: Int, nodeVersion: UInt64, appendGeneration: UInt64,
                           provider: AnyObject,
@@ -145,7 +156,20 @@ struct CentroidMembershipCache {
         if self.provider === provider, let reuse = insertionReuse,
            reuse.matches(fromVersion: self.nodeVersion, oldCount: members.count,
                          toVersion: nodeVersion, newCount: nodeCount) {
+            if reuse.preservesExistingIndices {
+                if members.capacity < nodeCount {
+                    members.reserveCapacity(max(nodeCount, max(64, members.capacity * 2)))
+                }
+                for index in members.count..<nodeCount {
+                    let member = makeMember(membership(index))
+                    members.append(member)
+                }
+                self.nodeVersion = nodeVersion
+                self.appendGeneration = appendGeneration
+                return
+            }
             let previous = members
+            retainedMembershipCopyCount &+= UInt64(members.count)
             members = reuse.remap(previous) { makeMember(membership($0)) }!
             // Group slots stay stable, but observable group order must follow
             // the first member in the new rendered order, just as a rebuild.
@@ -156,6 +180,7 @@ struct CentroidMembershipCache {
             clusterOrder.removeAll(keepingCapacity: true)
             pairOrder.removeAll(keepingCapacity: true)
             for member in members {
+                membershipOrderVisitCount &+= 1
                 if !seenProjects[member.project] {
                     seenProjects[member.project] = true; projectOrder.append(member.project)
                 }
@@ -362,6 +387,8 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     private var lastRegistryAppendGeneration: UInt64 = 0
     private(set) var nodePrefixComparisonCount: UInt64 = 0
     private(set) var nodeSnapshotBuildCount: UInt64 = 0
+    private(set) var retainedSnapshotCopyCount: UInt64 = 0
+    private(set) var retainedNodeIndexRemapCount: UInt64 = 0
     private(set) var edgePrefixComparisonCount: UInt64 = 0
     private(set) var edgeSnapshotBuildCount: UInt64 = 0
 
@@ -648,19 +675,36 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
             let nodes = registry.mergedNodes
             if let reuse = registry.nodeInsertionReuse(since: lastNodesVersion, count: cachedNodes.count),
                cachedNodeIDsAreUnique {
-                cachedNodeIndices = cachedNodeIndices.mapValues { reuse.newIndex(forOldIndex: $0)! }
-                let oldNodes = cachedNodes
-                cachedNodes = reuse.remap(oldNodes) { index in
+                if !reuse.preservesExistingIndices {
+                    cachedNodeIndices = cachedNodeIndices.mapValues {
+                        retainedNodeIndexRemapCount &+= 1
+                        return reuse.newIndex(forOldIndex: $0)!
+                    }
+                }
+                let makeSnapshot = { (index: Int) -> RKNodeSnapshot in
                     let node = nodes[index]
-                    nodeSnapshotBuildCount &+= 1
-                    if cachedNodeIndices.updateValue(index, forKey: node.id) != nil {
-                        cachedNodeIDsAreUnique = false
+                    self.nodeSnapshotBuildCount &+= 1
+                    if self.cachedNodeIndices.updateValue(index, forKey: node.id) != nil {
+                        self.cachedNodeIDsAreUnique = false
                     }
                     return RKNodeSnapshot(id: node.id, project: node.project, topic: node.topic,
                         label: node.label, content: node.content, importance: node.importance,
                         isHub: mergedHubs.contains(node.id), createdAt: node.createdAt,
                         lastAccessedAt: node.lastAccessedAt)
-                }!
+                }
+                if reuse.preservesExistingIndices {
+                    if cachedNodes.capacity < nodes.count {
+                        cachedNodes.reserveCapacity(max(nodes.count, max(64, cachedNodes.capacity * 2)))
+                    }
+                    for index in cachedNodes.count..<nodes.count {
+                        let snapshot = makeSnapshot(index)
+                        cachedNodes.append(snapshot)
+                    }
+                } else {
+                    let oldNodes = cachedNodes
+                    retainedSnapshotCopyCount &+= UInt64(oldNodes.count)
+                    cachedNodes = reuse.remap(oldNodes, inserting: makeSnapshot)!
+                }
                 pendingIndexReuse = publicReuse(reuse)
                 preservesIndexPrefix = preservesIndexPrefix && reuse.insertedRanges.allSatisfy {
                     $0.lowerBound >= reuse.oldCount

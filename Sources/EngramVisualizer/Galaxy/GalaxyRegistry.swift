@@ -98,6 +98,8 @@ final class GalaxyRegistry {
     @ObservationIgnored private(set) var mergedNodeAppendGeneration: UInt64 = 0
     @ObservationIgnored private(set) var mergedColorMapVersion: UInt64 = 0
     @ObservationIgnored private(set) var routingNodeVisitCount: UInt64 = 0
+    /// Explicit retained-row copies in the insertion merge (not Array CoW).
+    @ObservationIgnored private(set) var retainedNodeCopyCount: UInt64 = 0
     @ObservationIgnored private var loadTasks: [String: Task<Void, Never>] = [:]
 
     /// A certificate for this publication only. A consumer that missed a node
@@ -583,18 +585,25 @@ final class GalaxyRegistry {
               let reuse = NodeInsertionReuse(fromVersion: mergedNodesVersion,
                     toVersion: mergedNodesVersion &+ 1, oldCount: previousNodeCount,
                     newCount: newEnd, retainedRanges: ranges) else { return false }
-        var nodes: [NodeData] = []
-        nodes.reserveCapacity(newEnd)
-        oldEnd = 0
-        for index in ordered.indices {
-            // Bounds were checked above before any publication or mutation.
-            let end = oldEnds[index]
-            nodes.append(contentsOf: mergedNodes[oldEnd..<end])
-            nodes.append(contentsOf: appended[index])
-            oldEnd = end
+        if reuse.preservesExistingIndices {
+            // All old rows stay in place, including across empty galaxy
+            // segments. Append only the validated tail; a no-op keeps storage.
+            for additions in appended { mergedNodes.append(contentsOf: additions) }
+        } else {
+            var nodes: [NodeData] = []
+            nodes.reserveCapacity(newEnd)
+            oldEnd = 0
+            for index in ordered.indices {
+                // Bounds were checked above before any publication or mutation.
+                let end = oldEnds[index]
+                retainedNodeCopyCount &+= UInt64(end - oldEnd)
+                nodes.append(contentsOf: mergedNodes[oldEnd..<end])
+                nodes.append(contentsOf: appended[index])
+                oldEnd = end
+            }
+            mergedNodes = nodes
         }
         for (id, owner) in newOwners { nodeToGalaxy[id] = owner }
-        mergedNodes = nodes
         mergedNodeEnds = ends
         lastNodeInsertionReuse = reuse
         retainedNodePrefix = reuse.insertedRanges.first?.lowerBound ?? previousNodeCount

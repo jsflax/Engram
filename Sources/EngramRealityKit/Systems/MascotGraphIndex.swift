@@ -13,6 +13,8 @@ final class MascotGraphIndex {
     private(set) var indicesByProject: [String: [Int]] = [:]
     private(set) var indexByID: [UUID: Int] = [:]
     private(set) var nodesVisited = 0
+    /// Retained project slots and UUID slots translated during interior insertion.
+    private(set) var retainedIndexRemapCount = 0
 
     /// Callers without a node-domain contract retain the full rebuild behavior.
     func update(nodes: [RKNodeSnapshot], topologyVersion: UInt64, provider: AnyObject) {
@@ -30,17 +32,30 @@ final class MascotGraphIndex {
         if sameProvider, let reuse = offeredReuse,
            reuse.matches(fromVersion: self.nodeVersion, oldCount: nodeCount,
                          toVersion: nodeVersion, newCount: nodes.count) {
-            indicesByProject = indicesByProject.mapValues { indices in
-                indices.map { reuse.newIndex(forOldIndex: $0)! }
+            let preservesExistingIndices = reuse.preservesExistingIndices
+            if !preservesExistingIndices {
+                indicesByProject = indicesByProject.mapValues { indices in
+                    indices.map {
+                        retainedIndexRemapCount += 1
+                        return reuse.newIndex(forOldIndex: $0)!
+                    }
+                }
+                indexByID = indexByID.mapValues {
+                    retainedIndexRemapCount += 1
+                    return reuse.newIndex(forOldIndex: $0)!
+                }
             }
-            indexByID = indexByID.mapValues { reuse.newIndex(forOldIndex: $0)! }
             var insertedByProject: [String: [Int]] = [:]
             for range in reuse.insertedRanges {
                 for index in range {
                     let node = nodes[index]
                     nodesVisited += 1
                     projects.insert(node.project)
-                    insertedByProject[node.project, default: []].append(index)
+                    if preservesExistingIndices {
+                        indicesByProject[node.project, default: []].append(index)
+                    } else {
+                        insertedByProject[node.project, default: []].append(index)
+                    }
                     // An inserted duplicate before the previous winner becomes
                     // the first match; later copies must not replace it.
                     if index < (indexByID[node.id] ?? Int.max) { indexByID[node.id] = index }
