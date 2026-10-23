@@ -347,6 +347,118 @@ class NativeTestRunnerTests(unittest.TestCase):
         self.assertTrue(any(item.get("direct_child_fallback")
                             for item in receipt["cleanup"]["signals"]))
 
+    def test_transient_inventory_timeout_preserves_progress_and_known_ownership(self):
+        runner = self.runner("import time\nfor i in range(30):\n print(i,flush=True); time.sleep(0.1)")
+        processes = HARNESS.processes
+        calls, known, child = [], {}, []
+
+        def inventory(timeout):
+            calls.append(timeout)
+            if len(calls) == 2:
+                known.update(runner.known)
+                self.assertIn(runner.child.pid, known)
+                child.append(runner.child)
+                raise subprocess.TimeoutExpired("fixture ps", timeout)
+            if len(calls) == 3:
+                self.assertIs(runner.child, child[0])
+                self.assertEqual(runner.known, known)
+            return processes(timeout=timeout)
+
+        with patch.object(HARNESS, "processes", side_effect=inventory):
+            self.assertEqual(runner.run(), 0)
+        receipt = self.receipt()
+        observation = receipt["monitoring_inventory"]
+        self.assertEqual(observation["timeout_count"], 1)
+        self.assertEqual(observation["recovery_count"], 1)
+        self.assertFalse(observation["pending_timeout"])
+        self.assertGreater(observation["last_recovery_elapsed_seconds"],
+                           observation["last_timeout_elapsed_seconds"])
+        self.assertEqual(calls[:3], [2, 2, 2])
+        self.assertEqual(runner.console.getvalue().splitlines(),
+                         [str(i).encode() for i in range(30)])
+        self.assertEqual(receipt["child_exit_code"], 0)
+        self.assertEqual(receipt["cleanup"], {"signals": [], "remaining": [], "errors": []})
+        self.assertEqual(receipt["errors"], [])
+        self.assertTrue(receipt["reader_complete"])
+
+    def test_persistent_inventory_timeout_at_zero_exit_cannot_pass(self):
+        runner = self.runner("print('completed',flush=True)")
+        with patch.object(HARNESS, "processes", side_effect=subprocess.TimeoutExpired("fixture ps", 2)):
+            self.assertEqual(runner.run(), 125)
+        receipt = self.receipt()
+        self.assertEqual(receipt["child_exit_code"], 0)
+        self.assertEqual(receipt["reason"], "inventory_unresolved")
+        self.assertTrue(receipt["monitoring_inventory"]["pending_timeout"])
+        self.assertEqual(receipt["monitoring_inventory"]["recovery_count"], 0)
+        self.assertTrue(receipt["cleanup"]["errors"])
+
+    def test_post_exit_fresh_inventory_cannot_clear_monitoring_timeout(self):
+        runner = self.runner("import time; time.sleep(1.2)")
+        processes = HARNESS.processes
+        calls = []
+
+        def inventory(timeout):
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise subprocess.TimeoutExpired("fixture ps", timeout)
+            if len(calls) == 2:
+                runner.child.wait(timeout=2)
+            return processes(timeout=timeout)
+
+        with patch.object(HARNESS, "processes", side_effect=inventory):
+            self.assertEqual(runner.run(), 125)
+        receipt = self.receipt()
+        self.assertEqual(receipt["child_exit_code"], 0)
+        self.assertEqual(receipt["reason"], "inventory_unresolved")
+        self.assertTrue(receipt["monitoring_inventory"]["pending_timeout"])
+        self.assertEqual(receipt["monitoring_inventory"]["recovery_count"], 0)
+        self.assertEqual(receipt["cleanup"], {"signals": [], "remaining": [], "errors": []})
+
+    def test_persistent_inventory_timeout_remains_runtime_bounded_and_reaps_child(self):
+        runner = self.runner("import time; time.sleep(30)", timeout=1.2)
+        start = time.monotonic()
+        with patch.object(HARNESS, "processes", side_effect=subprocess.TimeoutExpired("fixture ps", 2)):
+            self.assertEqual(runner.run(), 124)
+        self.assertLess(time.monotonic() - start, 3)
+        receipt = self.receipt()
+        self.assertEqual(receipt["reason"], "timeout")
+        self.assertGreaterEqual(receipt["monitoring_inventory"]["timeout_count"], 2)
+        self.assertTrue(receipt["monitoring_inventory"]["pending_timeout"])
+        self.assertEqual(receipt["monitoring_inventory"]["recovery_count"], 0)
+        self.assertTrue(receipt["cleanup"]["errors"])
+        self.assertIsNotNone(runner.child.returncode)
+        self.assertTrue(any(item.get("direct_child_fallback")
+                            for item in receipt["cleanup"]["signals"]))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(runner.child.pid, 0)
+
+    def test_pending_inventory_timeout_preserves_child_failure_and_signal_precedence(self):
+        for index, (child_exit, received_signal, expected) in enumerate(
+                ((7, None, 7), (0, signal.SIGTERM, 128 + signal.SIGTERM))):
+            with self.subTest(child_exit=child_exit, received_signal=received_signal):
+                runner = self.runner(f'import sys; sys.exit({child_exit})')
+                runner.directory = self.root / str(index)
+                processes = HARNESS.processes
+                first = True
+
+                def inventory(timeout):
+                    nonlocal first
+                    if first:
+                        first = False
+                        runner.child.wait(timeout=2)
+                        if received_signal is not None:
+                            runner.signals.append(received_signal)
+                        raise subprocess.TimeoutExpired("fixture ps", timeout)
+                    return processes(timeout=timeout)
+
+                with patch.object(HARNESS, "processes", side_effect=inventory):
+                    self.assertEqual(runner.run(), expected)
+                receipt = json.loads((runner.directory / "receipt.json").read_text())
+                self.assertEqual(receipt["child_exit_code"], child_exit)
+                self.assertEqual(receipt["reason"], "signal" if received_signal else "exit")
+                self.assertTrue(receipt["monitoring_inventory"]["pending_timeout"])
+                self.assertEqual(receipt["cleanup"], {"signals": [], "remaining": [], "errors": []})
+
     def test_empty_or_malformed_inventory_is_an_error(self):
         for output in ("", "unexpected process format\n"):
             with self.subTest(output=output), \
