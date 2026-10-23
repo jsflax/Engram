@@ -36,6 +36,36 @@ private final class FrameLookupProvider: SceneDataProvider {
 }
 
 @MainActor
+private final class SparsePositionProvider: SceneDataProvider {
+    var nodes: [RKNodeSnapshot] = []
+    var edges: [RKEdgeSnapshot] = []
+    var hubs: Set<UUID> = []
+    var projectColorMap: [String: SIMD3<Float>] = [:]
+    var storedPositions: [UUID: SIMD3<Float>] = [:]
+    private(set) var positionReads = 0
+    private(set) var requestedIDs: [UUID] = []
+    var positions: [UUID: SIMD3<Float>] {
+        positionReads += 1
+        return storedPositions
+    }
+    func position(for id: UUID) -> SIMD3<Float>? {
+        requestedIDs.append(id)
+        return storedPositions[id]
+    }
+    var glowingNodes: [UUID: Float] = [:]
+    var newNodeGlows: [UUID: Float] = [:]
+    var dyingNodes: Set<UUID> = []
+    var selectedNode: UUID?
+    var expandedHubs: Set<UUID> = []
+    var searchMatchIds: Set<UUID> = []
+    var isSearchActive = false
+    var projectCentroids: [String: SIMD3<Float>] = [:]
+    var topologyVersion: UInt64 = 0
+    var positionVersion: UInt64 = 0
+    func tick(dt: Float) {}
+}
+
+@MainActor
 final class FrameLookupInvalidationTests: XCTestCase {
     func testFrameGapIntervalsTailAndDrain() {
         let diagnostics = FrameGapDiagnostics(enabled: true), owner = NSObject()
@@ -261,6 +291,55 @@ final class FrameLookupInvalidationTests: XCTestCase {
         XCTAssertTrue(provider.tickDeltas == [0.25])
         erased.tick(dt: 0.5)
         XCTAssertTrue(provider.tickDeltas == [0.25, 0.5])
+    }
+
+    func testSparsePositionFallbackPreservesDictionarySemantics() {
+        let provider = FrameLookupProvider(), id = UUID(), missing = UUID()
+        let erased: any SceneDataProvider = provider
+        XCTAssertTrue(erased.position(for: id) == nil)
+        provider.positions = [id: SIMD3(1, 2, 3)]
+        XCTAssertTrue(erased.position(for: id) == SIMD3<Float>(1, 2, 3))
+        provider.positions = [id: SIMD3(4, 5, 6)]
+        XCTAssertTrue(erased.position(for: id) == SIMD3<Float>(4, 5, 6))
+        XCTAssertTrue(erased.position(for: missing) == nil)
+        provider.positions = [:]
+        XCTAssertTrue(erased.position(for: id) == nil)
+        XCTAssertTrue(provider.positionReads == 5)
+    }
+
+    func testSparseAudioPositionsScaleWithNearCandidates() {
+        for count in [3, 50_000] {
+            let provider = SparsePositionProvider()
+            provider.nodes = (0..<count).map { _ in node(UUID(), "project") }
+            let ids = provider.nodes.prefix(3).map(\.id)
+            provider.storedPositions = [ids[0]: SIMD3(30, 0, 0), ids[2]: SIMD3(3, 4, 0)]
+            let erased: any SceneDataProvider = provider
+            XCTAssertTrue(RKSpatialAudioSystem.proximityCandidates(
+                nodes: provider.nodes, dataProvider: erased, nearNodes: [], cameraPosition: .zero).isEmpty)
+            XCTAssertTrue(provider.requestedIDs.isEmpty)
+            let first = RKSpatialAudioSystem.proximityCandidates(
+                nodes: provider.nodes, dataProvider: erased, nearNodes: [0, 1, 2], cameraPosition: .zero)
+            XCTAssertTrue(first.map(\.index) == [2, 0])
+            XCTAssertTrue(first.map(\.distance) == [5, 30])
+            XCTAssertTrue(provider.requestedIDs == ids)
+            XCTAssertTrue(provider.positionReads == 0)
+
+            // Resolve live coordinates and omissions through the existential;
+            // neither a previous selection nor a whole-map snapshot is reused.
+            provider.storedPositions = [ids[0]: SIMD3(1, 0, 0)]
+            let moved = RKSpatialAudioSystem.proximityCandidates(
+                nodes: provider.nodes, dataProvider: erased, nearNodes: [0, 1, 2], cameraPosition: SIMD3(2, 0, 0))
+            XCTAssertTrue(moved.map(\.index) == [0])
+            XCTAssertTrue(moved.map(\.distance) == [1])
+            XCTAssertTrue(provider.requestedIDs == ids + ids)
+            XCTAssertTrue(erased.position(for: ids[2]) == nil)
+            XCTAssertTrue(provider.positionReads == 0)
+            provider.nodes = []
+            XCTAssertTrue(RKSpatialAudioSystem.proximityCandidates(
+                nodes: provider.nodes, dataProvider: erased, nearNodes: [], cameraPosition: .zero).isEmpty)
+            XCTAssertTrue(provider.requestedIDs.count == 7)
+            XCTAssertTrue(provider.positionReads == 0)
+        }
     }
 
     private func node(_ id: UUID, _ project: String, topic: String = "topic") -> RKNodeSnapshot {

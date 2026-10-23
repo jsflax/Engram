@@ -119,6 +119,7 @@ class HostPreparationTests(unittest.TestCase):
                           lambda match: '    func test' + match[1].upper() + match[2] + '(',
                           mirrored, flags=re.M)
         mirrored = mirrored.replace('    func testTick(dt: Float)', '    func tick(dt: Float)')
+        mirrored = mirrored.replace('    func testPosition(for id: UUID)', '    func position(for id: UUID)')
         mirrored = mirrored.replace('#expect(', 'XCTAssertTrue(')
         self.assertEqual((repo / 'EngramUnitTests/FrameLookupInvalidationTests.swift').read_text(), mirrored)
         expected = ['FrameLookupInvalidationTests/' + name for name in (
@@ -128,6 +129,8 @@ class HostPreparationTests(unittest.TestCase):
             'testFrameGapDisabledPathDoesNotReadClock',
             'testFrameGapForceOutcomesPreserveAcceptanceGuards',
             'testOptionalTickTimingFallbackCallsOrdinaryProviderExactlyOnce',
+            'testSparsePositionFallbackPreservesDictionarySemantics',
+            'testSparseAudioPositionsScaleWithNearCandidates',
             'testLightColorsRemainLive', 'testLightNodeInvalidation', 'testSelectedEdgeDeletion',
             'testSelectedEdgeReorderAndReplacement', 'testStableFlowAndSelectionChange',
             'testFlowProviderCountAndCap', 'testLabelMembershipSeparatesDomainsAndExtendsAppendPrefix',
@@ -135,7 +138,8 @@ class HostPreparationTests(unittest.TestCase):
             'testLabelNumericRescanPreservesMissingPositionSemantics',
             'testLabelNumericSlotsFollowReorderAndTopicChanges')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 107)
+        self.assertEqual(len(inventory), 110)
+        self.assertIn('AdapterSnapshotTests/testSparsePositionsFollowSimulationChangesAndRegistryReplacement', inventory)
         self.assertIn('AdapterSnapshotTests/testMascotVisibilityReachesSceneAndPreservesExistingEntities', inventory)
         for name in (
             'testCertifiedCrossGalaxyNodeAppendsReuseUnchangedEdges',

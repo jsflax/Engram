@@ -63,8 +63,8 @@ public final class ForceSimulation3D {
 
     /// Position dictionary — lazily materialized from the flat x/y/z arrays
     /// on first read per generation. Flat-array render paths avoid this work;
-    /// whole-map consumers such as camera snapshots, flow spawning, point
-    /// lights and spatial audio can still request it during a frame.
+    /// whole-map consumers such as camera snapshots and flow spawning can
+    /// still request it during a frame. Lights and audio use sparse lookups.
     /// (Eagerly rebuilding it every frame in syncPositions
     /// was ~8-11ms/frame of pure UUID-hash inserts at 42k.)
     private var _positionsCache: [UUID: SIMD3<Float>] = [:]

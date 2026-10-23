@@ -177,18 +177,12 @@ public final class RKSpatialAudioSystem {
         }
         let cameraPos = cameraProvider.cameraState.cameraPosition
         let nodes = dataProvider.nodes
-        let positions = dataProvider.positions
         let scaleFactor = scene.scaleFactor
 
         // Find nearest nodes from the near tier
-        var candidates: [(index: Int, distance: Float)] = []
-        for idx in visibleSet.nearNodes {
-            let node = nodes[idx]
-            guard let pos = positions[node.id] else { continue }
-            let dist = simd_length(pos - cameraPos)
-            candidates.append((idx, dist))
-        }
-        candidates.sort { $0.distance < $1.distance }
+        let candidates = Self.proximityCandidates(nodes: nodes, dataProvider: dataProvider,
+                                                 nearNodes: visibleSet.nearNodes,
+                                                 cameraPosition: cameraPos)
 
         // Assign tones to nearest N nodes
         let activeCount = min(candidates.count, maxProximityVoices)
@@ -208,7 +202,7 @@ public final class RKSpatialAudioSystem {
                 let idx = candidates[i].index
                 let node = nodes[idx]
                 let dist = candidates[i].distance
-                guard let pos = positions[node.id] else {
+                guard let pos = dataProvider.position(for: node.id) else {
                     muteVoice(&proximityPool[i])
                     continue
                 }
@@ -250,6 +244,21 @@ public final class RKSpatialAudioSystem {
         }
     }
 
+    /// Select from the near tier without constructing positions for the rest of
+    /// the graph. Keep every candidate and the existing distance ordering.
+    static func proximityCandidates(
+        nodes: [RKNodeSnapshot], dataProvider: SceneDataProvider,
+        nearNodes: [Int], cameraPosition: SIMD3<Float>
+    ) -> [(index: Int, distance: Float)] {
+        var candidates: [(index: Int, distance: Float)] = []
+        for idx in nearNodes {
+            guard let pos = dataProvider.position(for: nodes[idx].id) else { continue }
+            candidates.append((idx, simd_length(pos - cameraPosition)))
+        }
+        candidates.sort { $0.distance < $1.distance }
+        return candidates
+    }
+
     // MARK: - Edge Hums
 
     private func updateEdgeHums(
@@ -263,15 +272,14 @@ public final class RKSpatialAudioSystem {
         }
 
         let edges = dataProvider.edges
-        let positions = dataProvider.positions
         let scaleFactor = scene.scaleFactor
         var activeCount = 0
 
         for edge in edges {
             guard activeCount < maxEdgeHumVoices else { break }
             guard edge.sourceId == selectedNode || edge.targetId == selectedNode else { continue }
-            guard let srcPos = positions[edge.sourceId],
-                  let tgtPos = positions[edge.targetId] else { continue }
+            guard let srcPos = dataProvider.position(for: edge.sourceId),
+                  let tgtPos = dataProvider.position(for: edge.targetId) else { continue }
 
             let midpoint = (srcPos + tgtPos) * 0.5 * scaleFactor
             edgePool[activeCount].entity.position = midpoint
@@ -328,7 +336,7 @@ public final class RKSpatialAudioSystem {
 
             // Play recall sound at node position
             if let resource = recallGlowResource,
-               let pos = dataProvider.positions[nodeId] {
+               let pos = dataProvider.position(for: nodeId) {
                 let audioEntity = Entity()
                 audioEntity.position = pos * scene.scaleFactor
                 var spatialAudio = SpatialAudioComponent()

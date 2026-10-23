@@ -1,6 +1,7 @@
 @testable import Engram
 import EngramKit
 import EngramSceneKit
+import EngramRealityKit
 import Lattice
 import RealityKit
 import XCTest
@@ -9,6 +10,45 @@ import XCTest
 final class AdapterSnapshotTests: XCTestCase {
     private let config = DrainConfig(hiddenProjects: [], hiddenRelations: [], timeFilter: nil,
                                      is3D: true, soundEnabled: false, notificationsEnabled: false)
+
+    func testSparsePositionsFollowSimulationChangesAndRegistryReplacement() {
+        let registry = GalaxyRegistry(), replacement = GalaxyRegistry()
+        let adapter = GalaxyRegistryAdapter(registry: registry)
+        let erased: any SceneDataProvider = adapter
+        let a = UUID(), b = UUID(), c = UUID()
+        let sim = registry.unifiedSimulation
+        XCTAssertNil(erased.position(for: a))
+        sim.addNode(b, project: "p", topic: "t")
+        sim.addNode(a, project: "p", topic: "t")
+        sim.setPosition(a, to: SIMD3(1, 2, 3))
+        sim.setPosition(b, to: SIMD3(4, 5, 6))
+        XCTAssertTrue(adapter.nodes.isEmpty, "Sparse positions are simulation values, not render-array slots")
+        XCTAssertEqual(erased.position(for: a), sim.positions[a])
+        XCTAssertEqual(erased.position(for: b), sim.positions[b])
+
+        // No adapter tick or render revision is needed to see moved coordinates.
+        sim.setPosition(a, to: SIMD3(7, 8, 9))
+        XCTAssertEqual(erased.position(for: a), SIMD3<Float>(7, 8, 9))
+        sim.addNode(c, project: "p", topic: "t")
+        sim.setPosition(c, to: SIMD3(10, 11, 12))
+        XCTAssertEqual(erased.position(for: c), SIMD3<Float>(10, 11, 12))
+        sim.removeNodes([b])
+        XCTAssertEqual(sim.index(for: a), 0)
+        XCTAssertNil(erased.position(for: b))
+        XCTAssertEqual(erased.position(for: a), SIMD3<Float>(7, 8, 9))
+        XCTAssertEqual(erased.position(for: c), SIMD3<Float>(10, 11, 12))
+        sim.removeNodes([a])
+        XCTAssertNil(erased.position(for: a))
+        XCTAssertEqual(erased.position(for: c), SIMD3<Float>(10, 11, 12))
+
+        replacement.unifiedSimulation.addNode(a, project: "p", topic: "t")
+        replacement.unifiedSimulation.setPosition(a, to: SIMD3(13, 14, 15))
+        adapter.registry = replacement
+        XCTAssertEqual(erased.position(for: a), SIMD3<Float>(13, 14, 15))
+        XCTAssertNil(erased.position(for: c))
+        adapter.registry = nil
+        XCTAssertNil(erased.position(for: a))
+    }
 
     func testMascotVisibilityReachesSceneAndPreservesExistingEntities() throws {
         let registry = GalaxyRegistry()
