@@ -129,9 +129,44 @@ def valid_uuid(value):
 
 
 def task_matches(record, sid):
-    return isinstance(record, dict) and any(
-        valid_uuid(record.get(key)) and record[key].lower() == sid
-        for key in ("session_id", "hook_session_id"))
+    scope = router_actor_scope(record, sid)
+    return scope is not None and scope[0]
+
+
+def hook_actor_scope(record, digest):
+    """An explicit agent identifies the actor; session may identify its root."""
+    hashes = (digest, digest[:20])
+    session_matches = record.get("session") in hashes
+    agent = record.get("agent")
+    if isinstance(agent, str) and HASH.fullmatch(agent):
+        if agent in hashes:
+            return True, "selected_agent"
+        if session_matches:
+            return False, "shared_session_other_agent"
+    elif session_matches:
+        if agent is None:
+            return True, "session_match_agent_unspecified"
+        return False, "session_match_invalid_agent"
+    return None
+
+
+def router_actor_scope(record, sid):
+    """Canonical task identity takes precedence over the hook envelope's root."""
+    if not isinstance(record, dict):
+        return None
+    actor = record.get("session_id")
+    hook = record.get("hook_session_id")
+    hook_matches = valid_uuid(hook) and hook.lower() == sid
+    if valid_uuid(actor):
+        if actor.lower() == sid:
+            return True, "selected_task"
+        if hook_matches:
+            return False, "shared_hook_session_other_task"
+    elif hook_matches:
+        if "session_id" not in record:
+            return True, "hook_session_match_task_unspecified"
+        return False, "hook_session_match_invalid_task"
+    return None
 
 
 class ReadFailure(Exception):
@@ -274,6 +309,29 @@ def read_log(path, matches, *, observe=None):
         except (ValueError, UnicodeError, RecursionError):
             meta["invalid_records"] += 1
     return list(found), meta
+
+
+def scoped_receipts(path, classify):
+    """One bounded read, with related actors kept apart from selected receipts."""
+    related = deque(maxlen=MAX_RECORDS)
+    related_count = 0
+
+    def observe(record):
+        nonlocal related_count
+        scope = classify(record)
+        if scope is not None and not scope[0]:
+            related_count += 1
+            related.append({**metadata(record), "attribution": scope[1]})
+
+    def selected(record):
+        scope = classify(record)
+        return scope is not None and scope[0]
+
+    rows, window = read_log(path, selected, observe=observe)
+    return {"window": window,
+            "receipts": [{**metadata(row), "attribution": classify(row)[1]} for row in rows],
+            "related_receipts": list(related),
+            "related_matching_records": related_count if "matching_records" in window else None}
 
 
 def worker_admission_view(record, sid, pending, *, now=None):
@@ -540,7 +598,8 @@ def scoped_json(path, sid, binding=False):
     identity = value.get("binding") if binding else value
     if not task_matches(identity, sid):
         return None, {"read": {**read, "read_status": "session_mismatch"}}
-    out = {"read": read, "metadata": metadata(value)}
+    out = {"read": read, "metadata": metadata(value),
+           "identity_attribution": router_actor_scope(identity, sid)[1]}
     if binding:
         out["binding"] = metadata(identity)
     # These fields influence whether recovery is safe. Preserve invalidity as
@@ -932,11 +991,14 @@ def linked_run(learner, linked, sid, *, provider_result=True, settlement_sha256=
         return {"read_status": "unsafe_link"}
     run, run_read = read_json(learner / "runs" / linked / "run.json")
     view = {"run_id": linked, "read": run_read}
-    if run is not None and "session_id" in run and not task_matches(run, sid):
+    if (run is not None and any(key in run for key in ("session_id", "hook_session_id"))
+            and not task_matches(run, sid)):
         view["read"] = {**run_read, "read_status": "session_mismatch"}
         return view
     if run is not None:
         view["run_receipt"] = metadata(run)
+        scope = router_actor_scope(run, sid)
+        view["identity_attribution"] = scope[1] if scope else "linked_record_without_task_identity"
         durable |= any(key in run for key in ("execution_manifest_sha256", "attempted_write_calls",
                                               "applied_write_calls", "unchanged_write_calls"))
         if provider_result:
@@ -1215,10 +1277,12 @@ def report(session_id=None, environ=None):
     root, selection = state_root(home)
     if root is None:
         return {"status": "state_root_unavailable", "session_id": sid, "state_root": selection}
-    session_hash = hashlib.sha256(sid.encode()).hexdigest()[:20]
-    advice, advice_window = read_log(root / "recall-state/receipts.jsonl", lambda v: v.get("session") == session_hash)
-    lifecycle, lifecycle_window = read_log(root / "lifecycle/receipts.jsonl", lambda v: v.get("session") == session_hash)
-    router, router_window = read_log(root / "router-receipts.jsonl", lambda v: task_matches(v, sid))
+    session_digest = hashlib.sha256(sid.encode()).hexdigest()
+    session_hash = session_digest[:20]
+    advice = scoped_receipts(root / "recall-state/receipts.jsonl", lambda v: hook_actor_scope(v, session_digest))
+    advice["delivery_evidence"] = "receipt_only_not_model_delivery"
+    lifecycle = scoped_receipts(root / "lifecycle/receipts.jsonl", lambda v: hook_actor_scope(v, session_digest))
+    router = scoped_receipts(root / "router-receipts.jsonl", lambda v: router_actor_scope(v, sid))
     if selection["selection"] == "modern_host":
         learner, root_selection = root / "learner", {"selection": "shared_host", "relative_path": "learner",
                                                     "activation_evidence": "not_checked"}
@@ -1226,8 +1290,7 @@ def report(session_id=None, environ=None):
         learner, root_selection = learner_root(root, sid)
     if learner is None:
         return {"status": "ok", "session_id": sid, "session_sha256_prefix": session_hash, "state_root": selection,
-                "advice": {"window": advice_window, "receipts": [metadata(v) for v in advice],
-                           "delivery_evidence": "receipt_only_not_model_delivery"},
+                "advice": advice,
                 "learner": {"status": "state_root_unavailable", "state_root": root_selection,
                             "memory_readback": "not_performed", "health": health_summary({})}}
     last_admission = None
@@ -1243,15 +1306,14 @@ def report(session_id=None, environ=None):
     _, enrollment_view = scoped_json(learner / "enrollments" / (sid + ".json"), sid)
     _, migration_view = scoped_json(learner / "migration-holds" / (sid + ".json"), sid)
     out = {"status": "ok", "session_id": sid, "session_sha256_prefix": session_hash, "state_root": selection,
-           "advice": {"window": advice_window, "receipts": [metadata(v) for v in advice],
-                      "delivery_evidence": "receipt_only_not_model_delivery"},
-           "lifecycle": {"window": lifecycle_window, "receipts": [metadata(v) for v in lifecycle]},
-           "router": {"window": router_window, "receipts": [metadata(v) for v in router],
+           "advice": advice,
+           "lifecycle": lifecycle,
+           "router": {**router,
                       "policy": policy_view(root / "learner-routes.json"),
                       "evidence": "routing_receipts_not_provider_completion"},
            "learner": {"state_root": root_selection, "window": event_window,
                        "policy": policy_view(learner / "admission.json"),
-                       "events": [metadata(v) for v in events],
+                       "events": [{**metadata(v), "attribution": router_actor_scope(v, sid)[1]} for v in events],
                        "session": state_view, "admission": admission_view, "enrollment": enrollment_view,
                        "pending": pending_view, "migration_hold": migration_view,
                        "worker_admission": worker_admission_view(last_admission, sid, pending_view.get("metadata", {})),

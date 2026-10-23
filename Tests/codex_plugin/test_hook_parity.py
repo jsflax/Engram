@@ -221,6 +221,42 @@ class HookParityTests(unittest.TestCase):
                 self.assertIn("Do not spawn a duplicate", result["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(emitted, [15, 45])
 
+    def test_optional_child_identity_is_hashed_without_splitting_session_counters(self):
+        emitted = []
+        for index in range(1, 16):
+            agent = "first-child" if index % 2 else "second-child"
+            output, _ = self.run_lifecycle(self.payload(index=index, agent_id=agent))
+            self.assertEqual(self.receipts()[-1]["agent"], hashlib.sha256(agent.encode()).hexdigest()[:20])
+            if output:
+                emitted.append(index)
+        self.assertEqual(emitted, [15])
+        state = json.loads((self.root / "state.json").read_text())
+        session_hash = hashlib.sha256(b"fixture-session").hexdigest()[:20]
+        self.assertEqual(set(state["sessions"]), {session_hash})
+        self.assertEqual(state["sessions"][session_hash]["count"], 15)
+        # Actor metadata must not change replay identity or root cleanup behavior.
+        self.run_lifecycle(self.payload(index=15, agent_id="different-child"))
+        self.assertEqual(self.receipts()[-1]["status"], "duplicate")
+        self.run_lifecycle(self.payload("SessionEnd"))
+        self.assertEqual(json.loads((self.root / "state.json").read_text())["sessions"], {})
+        text = (self.root / "receipts.jsonl").read_text()
+        self.assertNotIn("first-child", text)
+        self.assertNotIn("second-child", text)
+
+    def test_optional_actor_metadata_is_bounded_and_does_not_change_tool_outcome(self):
+        for agent in (None, "", [], {}, True, "x" * 257, "\ud800"):
+            with self.subTest(agent_type=type(agent).__name__):
+                output, fake = self.run_lifecycle(self.payload("PostToolUse", agent_id=agent,
+                    tool_name="Bash", tool_response="unstructured output"))
+                self.assertEqual(output, {})
+                fake.assert_not_called()
+                self.assertNotIn("agent", self.receipts()[-1])
+                self.assertEqual(self.receipts()[-1]["status"], "unclassified_ignored")
+        self.run_lifecycle(self.payload("PostToolUse", agent_id="x" * 256,
+            tool_name="Bash", tool_response="unstructured output"))
+        self.assertEqual(self.receipts()[-1]["agent"], hashlib.sha256(b"x" * 256).hexdigest()[:20])
+        self.assertFalse((self.root / "state.json").exists())
+
     def test_nudge_merges_without_losing_recall_context(self):
         for index in range(1, 15):
             self.run_lifecycle(self.payload(index=index))
