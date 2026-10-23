@@ -1,3 +1,4 @@
+import EngramMemoryCore
 import Foundation
 
 /// Time budgets for hook-side memory operations.
@@ -13,24 +14,48 @@ import Foundation
 /// sessions.
 enum HookBudget {
 
-    /// Fraction of the registered hook timeout granted to recall — the
-    /// rest is headroom for model load, the gate, nudges, and I/O.
-    private static let recallFraction = 0.6
-    /// Floor keeps a tight registration from starving a healthy first run
-    /// (embedding model load is ~1-2s cold); ceiling keeps a generous
-    /// registration from re-creating the stall this exists to prevent.
-    private static let floorSeconds = 3.0
-    private static let ceilingSeconds = 15.0
+    /// The ceiling, overridable without a rebuild through
+    /// `ENGRAM_HOOK_RECALL_CEILING_S` (seconds, clamped to 3...60). Unset,
+    /// empty or unparsable → the default 15 s. Policy: HookBudgetPolicy.
+    static func ceilingSeconds(environment: [String: String] = ProcessInfo.processInfo.environment) -> Double {
+        HookBudgetPolicy.ceilingSeconds(environment: environment)
+    }
 
     /// The recall budget in seconds for `event` (e.g. "UserPromptSubmit").
     static func recallBudget(event: String) -> Double {
-        if let raw = ProcessInfo.processInfo.environment["ENGRAM_HOOK_RECALL_BUDGET_MS"],
-           let ms = Double(raw), ms > 0 {
-            return ms / 1000.0
-        }
-        let registered = registeredTimeout(event: event) ?? 60.0
-        return min(max(registered * recallFraction, floorSeconds), ceilingSeconds)
+        HookBudgetPolicy.recallSeconds(registeredTimeout: registeredTimeout(event: event),
+                                       environment: ProcessInfo.processInfo.environment)
     }
+
+    static func watchdogSeconds(event: String, recallBudget: Double) -> Double {
+        HookBudgetPolicy.watchdogSeconds(recallBudget: recallBudget,
+                                         registeredTimeout: registeredTimeout(event: event))
+    }
+
+    // MARK: Budget shaping (2026-10-21 contention incident) — thin wrappers
+    // over HookBudgetPolicy (EngramMemoryCore), where the decisions are tested.
+
+    static var secondaryAttachFraction: Double { HookBudgetPolicy.secondaryAttachFraction }
+    static var maintenanceMinimumRemainingSeconds: Double { HookBudgetPolicy.maintenanceMinimumRemainingSeconds }
+    static var loadFactor: Double { HookBudgetPolicy.loadFactor }
+
+    /// Whether to attach the synced DB and group spokes after `elapsed`
+    /// seconds of a `budget`-second recall budget have gone to the hub open
+    /// and embedder load. Each attach is another open against a possibly
+    /// contended file; past this point they turn "slow" into "exceeded 15 s".
+    static func shouldAttachSecondary(elapsed: Double, budget: Double) -> Bool {
+        HookBudgetPolicy.shouldAttachSecondary(elapsed: elapsed, budget: budget)
+    }
+
+    /// Whether the post-recall maintenance check may run at all.
+    static func shouldRunMaintenanceCheck(remaining: Double, loadAverage: Double?,
+                                          processorCount: Int) -> Bool {
+        HookBudgetPolicy.shouldRunMaintenanceCheck(remaining: remaining, loadAverage: loadAverage,
+                                                   processorCount: processorCount)
+    }
+
+    /// 1-minute load average, nil when unavailable.
+    static func loadAverage1m() -> Double? { HookBudgetPolicy.loadAverage1m() }
 
     /// This binary's own registered timeout for `event`, from settings.json.
     /// Returns nil when unregistered/unreadable (caller falls back to the

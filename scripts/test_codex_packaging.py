@@ -138,7 +138,8 @@ esac
         shutil.copy(self.payload / "install_codex_learner.py", scripts)
         (scripts / "codex_learner").mkdir()
         for name in ("codex_learner.py", "codex_learner/__init__.py", "codex_learner/transcript.py",
-                     "codex_learner/runner.py", "codex_learner/memory_proxy.py", "codex_learner/learner_prompt.md"):
+                     "codex_learner/runner.py", "codex_learner/spawn_admission.py",
+                     "codex_learner/provider_guard.py", "codex_learner/memory_proxy.py", "codex_learner/learner_prompt.md"):
             (scripts / name).write_text("# packaged fixture\n")
         health = source / "codex/plugins/engram/skills/hook-status/scripts/hook_status.py"
         health.parent.mkdir(parents=True)
@@ -166,6 +167,25 @@ for binary in Engram EngramHooks EngramDaemon; do echo local-build > ".build/rel
         files = [p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_file()]
         self.assertIn("codex_learner/learner_prompt.md", files)
         self.assertIn("codex_learner/memory_proxy.py", files)
+        for name in ('spawn_admission.py', 'provider_guard.py'):
+            relative = 'codex_learner/' + name
+            self.assertIn(relative, files)
+            self.assertEqual((target / relative).read_bytes(), (SCRIPTS / relative).read_bytes())
+        # Import the actual assembled learner with no repository or installed
+        # package fallback. Imports may not launch a provider or use a network.
+        result = subprocess.run([sys.executable, '-I', '-S', '-B', '-c', '''
+import pathlib, sys
+root = pathlib.Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root))
+def offline(event, args):
+    if event in {'subprocess.Popen', 'os.system', 'socket.connect', 'socket.getaddrinfo'}:
+        raise RuntimeError('unexpected import side effect: ' + event)
+sys.addaudithook(offline)
+from codex_learner import runner, spawn_admission, provider_guard
+for module in (runner, spawn_admission, provider_guard):
+    assert pathlib.Path(module.__file__).resolve().is_relative_to(root)
+''', str(target)], cwd=self.root, env=self.env, text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((target / "hook_status.py").read_bytes(),
                          (SCRIPTS.parent / "codex/plugins/engram/skills/hook-status/scripts/hook_status.py").read_bytes())
         # The UI helper must also run from the isolated installed payload.

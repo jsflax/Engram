@@ -251,11 +251,7 @@ struct EngramDaemon: AsyncParsableCommand {
             log("Personal sync disabled (no active personal subscription) — running GROUP-ONLY with \(memberships.count) spoke(s)")
         }
 
-        // Now open with IPC — replication slot cursor will be 0 after nuclear compact
-        var localConfig = Lattice.Configuration(
-            fileURL: URL(fileURLWithPath: dbPath),
-            migration: engramMigrations
-        )
+        // Now open with IPC — replication slot cursor will be 0 after nuclear compact.
         // One IPC target per sync destination: the personal spoke plus one
         // per group. Every filter is set HERE, at configuration time — a
         // spoke that connects before its filter arrives would run
@@ -273,7 +269,10 @@ struct EngramDaemon: AsyncParsableCommand {
                 // Stage A4: un-exposing must not delete what the group has.
                 narrowingEmitsRemovals: false))
         }
-        localConfig.ipcTargets = hubTargets
+        // Give each hub BEGIN the same 2 s acquisition budget as an MCP
+        // writer. Sync delivery can make multiple bounded attempts; this
+        // setting does not promise priority or a whole-delivery deadline.
+        let localConfig = SyncService.daemonHubConfiguration(dbPath: dbPath, ipcTargets: hubTargets)
 
         let localLattice: Lattice
         do {
@@ -292,7 +291,7 @@ struct EngramDaemon: AsyncParsableCommand {
         // 4. Normal compaction (non-nuclear) — safe with IPC already active
         if !nuclearCompact {
             log("Compacting history before sync...")
-            SyncService.compactBeforeSync(localLattice)
+            SyncService.compactBeforeSync(localLattice, log: log)
             // Self-heal a machine carrying the Aug 2026 audit explosion:
             // users who never run `memory-sync repair-audit` recover on
             // their next daemon start. No-op below the threshold.
@@ -609,15 +608,9 @@ struct EngramDaemon: AsyncParsableCommand {
             // the next daemon restart — run it hourly. Bounded checkpoint
             // after: compaction deletes are WAL writes, and the unbounded
             // TRUNCATE variant would hold the writer gate against readers.
-            let hubDeleted = localLattice.compactHistory()
-            localLattice.checkpointBounded()
-            var syncedDeleted: Int64 = 0
+            SyncService.compactAndCheckpoint(localLattice, context: "Hourly hub compaction", log: log)
             if let synced = syncedLattice {
-                syncedDeleted = synced.compactHistory()
-                synced.checkpointBounded()
-            }
-            if hubDeleted > 0 || syncedDeleted > 0 {
-                log("Hourly compaction: hub -\(hubDeleted) rows, synced -\(syncedDeleted) rows")
+                SyncService.compactAndCheckpoint(synced, context: "Hourly synced compaction", log: log)
             }
             // H4 (Aug 2026 incident): self-diagnose a pinned hub WAL, so
             // the next wedged-reader recurrence is a log line and a status

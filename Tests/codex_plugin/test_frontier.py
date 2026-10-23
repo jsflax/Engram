@@ -66,6 +66,9 @@ def setUpModule():
     spec.loader.exec_module(module)
     RUNNER = importlib.import_module(PACKAGE + ".runner")
     ADMISSION = importlib.import_module(PACKAGE + ".admission")
+    from suite_support import fixture_spawn_gate
+    lease_fixture = GUARDS.enter_context(tempfile.TemporaryDirectory(prefix="frontier-gate-", dir=TEMP_ROOT))
+    GUARDS.enter_context(fixture_spawn_gate(RUNNER.spawn_admission, Path(lease_fixture) / "gate"))
 
 
 def tearDownModule():

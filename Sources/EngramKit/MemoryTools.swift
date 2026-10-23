@@ -119,6 +119,14 @@ public actor MemoryTools {
     private let syncedReference: LatticeThreadSafeReference?
     private let groupReferences: [GroupSpokeRef]
 
+    /// Dedicated short-busy-timeout hub handle for the recall access-stat
+    /// bump (MemoryTools+AccessStats). Opened lazily on first MCP recall;
+    /// nil until then or after repeated open failures.
+    var accessStatLattice: Lattice?
+    var accessStatOpenFailures = 0
+    /// What the last recall did about access stats (diagnostics + tests).
+    var lastAccessStatBump: AccessStatBumpOutcome = .none
+
     private struct ResolvedDatabases {
         let local: Lattice
         let synced: Lattice?
@@ -1352,9 +1360,10 @@ public actor MemoryTools {
     }
 
     /// Every lattice this instance can hold a read generation on: the hub,
-    /// the personal synced mirror, the group spokes, and the attach-cache
-    /// union handles built over them.
+    /// the dedicated access-stat handle, the personal synced mirror, the
+    /// group spokes, and the attach-cache union handles built over them.
     func retireAllReadMarks() {
+        accessStatLattice?.retireAllGenerations()
         // A failed first open has no published handles to retire. Cleanup
         // must never retry that open through the nonthrowing accessors.
         guard let databases = resolvedDatabases else { return }

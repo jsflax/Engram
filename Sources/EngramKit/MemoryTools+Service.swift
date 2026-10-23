@@ -31,7 +31,7 @@ extension MemoryTools: MemoryService {
         return captured.result
     }
 
-    private func recallWithRows(_ request: RecallRequest) async throws
+    private func recallWithRows(_ request: RecallRequest, bumpAccessStats: Bool = true) async throws
         -> (result: RecallResult, rows: [RecallRowBoundary]) {
         try prepareStorage()
         var args: [String: Value] = [
@@ -40,7 +40,7 @@ extension MemoryTools: MemoryService {
             "limit": .int(request.limit),
         ]
         if let project = request.project { args["project"] = .string(project) }
-        let result = try await handleRecall(args)
+        let result = try await handleRecall(args, bumpAccessStats: bumpAccessStats)
         // Snapshot both captures together before returning across another
         // await; advice must never consult a later call's actor state.
         return (RecallResult(hits: lastRecallHits,
@@ -56,7 +56,7 @@ extension MemoryTools: MemoryService {
         let words = MemoryTools.extractContentWords(from: request.prompt)
         let query = words.isEmpty ? request.prompt : words.joined(separator: " ")
         let captured = try await recallWithRows(RecallRequest(
-            query: query, project: request.project, depth: 1, limit: 5))
+            query: query, project: request.project, depth: 1, limit: 5), bumpAccessStats: false)
         return Self.boundedAdvice(captured.result, rows: captured.rows,
                                   query: query, budget: request.budget)
     }

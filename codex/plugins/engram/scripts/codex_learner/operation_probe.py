@@ -23,7 +23,7 @@ import subprocess
 import threading
 import time
 
-from . import execution_manifest as manifest, stdio_bridge as bridge
+from . import execution_manifest as manifest, stdio_bridge as bridge, spawn_admission
 from .operation_gateway import envelope
 from .writer_fence import HeldFence
 
@@ -225,7 +225,9 @@ def _exchange(transport, *, fence, expected_binding, limits=None,
         # An exclusive recovery lock never enters the child. The parent holds
         # it for the whole bounded read-only exchange and cleanup.
         argv, env, cwd, pass_fds = bridge._fenced_transport(transport, None if recovery else fence)
-        _require(not recovery or pass_fds == (), "invalid_recovery_inheritance")
+        # Recovery never inherits its exclusive writer fence. The separate
+        # process-lifetime admission lease may follow this read-only child.
+        _require(not recovery or pass_fds == spawn_admission.pass_fds(), "invalid_recovery_inheritance")
         if threading.current_thread() is threading.main_thread():
             for sig in (signal.SIGTERM, signal.SIGINT):
                 old_signals[sig] = signal.signal(sig, interrupt)

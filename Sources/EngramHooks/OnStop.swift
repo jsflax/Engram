@@ -13,20 +13,6 @@ struct OnStop: AsyncParsableCommand {
         abstract: "Gate session-learner on transcript novelty (Stop hook)"
     )
 
-    /// Path to the memory-hooks binary: THIS running executable, falling
-    /// back to the Mac install location. The previous hardcoded
-    /// ~/.claude/bin path exec-127'd in every sandbox (where the binary is
-    /// installed at /usr/local/bin/memory-hooks): each box Stop hook
-    /// "fired" and the gate spawn silently died — production sample_gate
-    /// ops sat at 0 the whole launch (Aug 13 incident).
-    private static var hooksBin: String {
-        if let own = Bundle.main.executablePath,
-           FileManager.default.isExecutableFile(atPath: own) {
-            return own
-        }
-        return NSHomeDirectory() + "/.claude/bin/memory-hooks"
-    }
-
     func run() async throws {
         // Guard against infinite recursion
         if ProcessInfo.processInfo.environment["CLAUDE_MEMORY_LEARNER"] != nil {
@@ -78,7 +64,9 @@ struct OnStop: AsyncParsableCommand {
     /// The sample-gate will run TranscriptSampler (~1-12s) and only spawn the
     /// session-learner claude subprocess if novel content is found.
     private func spawnSampleGate(transcriptPath: String, project: String, cwd: String, sessionId: String?) throws {
-        let bin = Self.hooksBin
+        // Resolve this release's running hooks binary; an older installed copy
+        // must not supply the internal shell launch contract.
+        let bin = try processGuardExecutable(explicit: nil)
         let logPath = NSHomeDirectory() + "/.claude/sample-gate.log"
 
         rotateFileIfNeeded(logPath)
@@ -102,8 +90,8 @@ struct OnStop: AsyncParsableCommand {
         """
 
         let sh = Process()
-        sh.executableURL = URL(fileURLWithPath: "/bin/sh")
-        sh.arguments = ["-c", shellCommand]
+        sh.executableURL = URL(fileURLWithPath: bin)
+        sh.arguments = ["internal-process-guard", "--exec-shell", shellCommand]
         // Pass CLAUDE_MEMORY_LEARNER so the session-learner's claude subprocess
         // inherits it, and when that subprocess's Stop hook fires OnStop,
         // the guard at the top of run() prevents infinite recursion.

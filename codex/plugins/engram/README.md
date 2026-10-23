@@ -59,6 +59,13 @@ with later appended content. Fresh children may learn their first work only when
 their creation time and inherited-history boundary are proven.
 
 One queue and provider lock serialize automatic learners on each Codex home.
+Claude and Codex background workers also share a per-device lifetime lease and
+a 10-minute cooldown between worker starts. This cooldown is separate from the
+provider's configured wall-time deadline. The provider guard retains the lease
+until its owned provider child has terminated and been reaped. High or unavailable
+load, invalid state, and failed cooldown persistence defer admission while keeping
+queued work intact. A later lifecycle event can retry it; no timer guarantees a
+wakeup when the cooldown expires.
 The learner has no project shell, browser, other integrations, or recursive hook
 access. Its memory proxy enforces approved tools, each new memory's explicit privacy
 choice, session provenance, bounded calls/writes, and exact write receipts. Ordinary

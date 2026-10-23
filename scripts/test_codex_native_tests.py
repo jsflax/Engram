@@ -141,6 +141,44 @@ class NativeTestRunnerTests(unittest.TestCase):
         self.assertTrue(list((self.root / "diagnostics").glob("*.sample.txt")))
         self.assertEqual(receipt["cleanup"]["signals"], [])
 
+    def test_success_allows_short_lived_descendant_to_exit_without_signaling(self):
+        program = ("import subprocess; "
+                   "child=subprocess.Popen(['/bin/sleep','0.6']); print(child.pid,flush=True)")
+        runner = self.runner(program)
+        self.assertEqual(runner.run(), 0)
+        receipt = self.receipt()
+        self.assertEqual(receipt["reason"], "exit")
+        self.assertEqual(receipt["child_exit_code"], 0)
+        self.assertEqual(receipt["cleanup"], {"signals": [], "remaining": [], "errors": []})
+        child_pid = int(runner.console.getvalue().strip())
+        current = HARNESS.processes().get(child_pid)
+        self.assertTrue(current is None or "Z" in current["state"], current)
+        self.assertTrue(receipt["reader_complete"])
+
+    def test_success_requiring_descendant_signal_fails_and_records_executable_identity(self):
+        program = ("import subprocess; "
+                   "child=subprocess.Popen(['/bin/sleep','30']); print(child.pid,flush=True)")
+        runner = self.runner(program)
+        self.assertEqual(runner.run(), 125)
+        receipt = self.receipt()
+        self.assertEqual(receipt["reason"], "cleanup_required")
+        self.assertEqual(receipt["child_exit_code"], 0)
+        child_pid = int(runner.console.getvalue().strip())
+        self.assertEqual(len(receipt["cleanup"]["signals"]), 1)
+        target = receipt["cleanup"]["signals"][0]
+        self.assertEqual(target["pid"], child_pid)
+        self.assertEqual(target["signal"], "SIGTERM")
+        self.assertEqual(Path(target["command"]).name, "sleep")
+        self.assertTrue(target["started"])
+        self.assertEqual(target["group"], runner.child.pid)
+        self.assertIn("parent", target)
+        self.assertIn("state", target)
+        self.assertEqual(receipt["cleanup"]["remaining"], [])
+        self.assertEqual(receipt["cleanup"]["errors"], [])
+        current = HARNESS.processes().get(child_pid)
+        self.assertTrue(current is None or "Z" in current["state"], current)
+        self.assertTrue(receipt["reader_complete"])
+
     def test_timeout_cleans_detached_descendant_that_ignores_term(self):
         child_program = "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(30)"
         program = ("import subprocess,sys,time; "
@@ -179,6 +217,112 @@ class NativeTestRunnerTests(unittest.TestCase):
             receipt = runner.cleanup(time.monotonic() + 2)
         kill.assert_not_called()
         self.assertEqual(receipt["remaining"], [])
+
+    def test_each_signal_revalidates_birth_and_records_current_executable(self):
+        old = {"pid": 200, "parent": 100, "group": 200, "started": "old", "state": "S", "command": "launcher"}
+        for started in ("old", "reused"):
+            with self.subTest(started=started):
+                runner = self.runner("pass")
+                runner.child = Mock(pid=100)
+                runner.child.poll.return_value = 0
+                runner.known = {200: old}
+                current = dict(old, parent=1, command="actual-helper", started=started)
+                snapshots = iter([{200: old}, {200: current}])
+                with patch.object(HARNESS, "processes", side_effect=lambda **kwargs: next(snapshots, {})), \
+                        patch.object(HARNESS.os, "kill") as kill:
+                    receipt = runner.cleanup(time.monotonic() + 2)
+                if started == "old":
+                    kill.assert_called_once_with(200, signal.SIGTERM)
+                    self.assertEqual(receipt["signals"], [dict(current, signal="SIGTERM")])
+                else:
+                    kill.assert_not_called()
+                    self.assertEqual(receipt["signals"], [])
+                self.assertEqual(receipt["remaining"], [])
+
+    def test_cleanup_inventory_obeys_remaining_deadline_and_never_signals_after_it(self):
+        runner = self.runner("pass")
+        runner.child = Mock(pid=100)
+        runner.child.poll.return_value = 0
+        item = {"pid": 200, "parent": 1, "group": 200, "started": "old", "state": "S", "command": "helper"}
+        runner.known = {200: item}
+        now, budgets = [0.0], []
+
+        def inventory(timeout):
+            budgets.append(timeout)
+            now[0] += 0.1
+            return {200: item}
+
+        with patch.object(HARNESS.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(HARNESS, "processes", side_effect=inventory), \
+                patch.object(HARNESS.os, "kill") as kill:
+            receipt = runner.cleanup(0.15)
+        kill.assert_not_called()
+        self.assertEqual(len(budgets), 2)
+        self.assertAlmostEqual(budgets[0], 0.15)
+        self.assertAlmostEqual(budgets[1], 0.05)
+        self.assertEqual(receipt["signals"], [])
+        self.assertTrue(receipt["errors"])
+
+    def test_cancellation_during_natural_exit_grace_proceeds_immediately_to_cleanup(self):
+        runner = self.runner("pass")
+        runner.child = Mock(pid=100)
+        runner.child.poll.return_value = 0
+        item = {"pid": 200, "parent": 1, "group": 200, "started": "old", "state": "S", "command": "helper"}
+        runner.known = {200: item}
+        calls = []
+
+        def inventory(timeout):
+            calls.append(timeout)
+            if len(calls) == 1:
+                runner.signals.append(signal.SIGTERM)
+            return {200: item} if len(calls) <= 3 else {}
+
+        with patch.object(HARNESS, "processes", side_effect=inventory), \
+                patch.object(HARNESS.time, "sleep") as sleep, \
+                patch.object(HARNESS.os, "kill") as kill:
+            receipt = runner.cleanup(time.monotonic() + 15, successful_exit=True)
+        self.assertLessEqual(calls[0], 1)
+        self.assertEqual(calls[1], 2)
+        sleep.assert_not_called()
+        kill.assert_called_once_with(200, signal.SIGTERM)
+        self.assertEqual(receipt["signals"], [dict(item, signal="SIGTERM")])
+
+    def test_natural_exit_grace_timeout_is_recorded_and_other_inventory_errors_remain_failures(self):
+        for error in (subprocess.TimeoutExpired("ps", 1), OSError("inventory unavailable")):
+            with self.subTest(error=type(error).__name__):
+                runner = self.runner("pass")
+                runner.child = Mock(pid=100)
+                runner.child.poll.return_value = 0
+                with patch.object(HARNESS, "processes", side_effect=[error, {}, {}, {}, {}, {}]) as inventory, \
+                        patch.object(HARNESS.os, "kill") as kill:
+                    receipt = runner.cleanup(time.monotonic() + 15, successful_exit=True)
+                self.assertGreater(inventory.call_count, 1)
+                kill.assert_not_called()
+                self.assertEqual(receipt["signals"], [])
+                self.assertEqual(receipt["remaining"], [])
+                if isinstance(error, subprocess.TimeoutExpired):
+                    self.assertEqual(receipt["natural_exit_grace_timeout"], repr(error))
+                    self.assertEqual(receipt["errors"], [])
+                else:
+                    self.assertEqual(receipt["errors"], [repr(error)])
+
+    def test_natural_exit_grace_expiring_between_poll_and_inventory_is_not_a_cleanup_error(self):
+        runner = self.runner("pass")
+        runner.child = Mock(pid=100)
+        now = [0.0]
+
+        def poll():
+            now[0] = 1.01
+            return 0
+
+        runner.child.poll.side_effect = poll
+        with patch.object(HARNESS.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(HARNESS, "processes", return_value={}) as inventory, \
+                patch.object(HARNESS.os, "kill") as kill:
+            receipt = runner.cleanup(15, successful_exit=True)
+        kill.assert_not_called()
+        self.assertEqual(inventory.call_args_list[0].kwargs["timeout"], 2)
+        self.assertEqual(receipt, {"signals": [], "remaining": [], "errors": []})
 
     def test_observed_descendant_remains_owned_after_reparenting_and_exec(self):
         runner = self.runner("pass")
@@ -234,9 +378,9 @@ class NativeTestRunnerTests(unittest.TestCase):
         runner = self.runner("pass")
         cleanup = runner.cleanup
 
-        def interrupted_cleanup(deadline):
+        def interrupted_cleanup(deadline, **kwargs):
             runner.signals.append(signal.SIGTERM)
-            return cleanup(deadline)
+            return cleanup(deadline, **kwargs)
 
         with patch.object(runner, "cleanup", side_effect=interrupted_cleanup):
             self.assertEqual(runner.run(), 128 + signal.SIGTERM)
@@ -248,12 +392,12 @@ class NativeTestRunnerTests(unittest.TestCase):
         refresh = runner.refresh
         first = True
 
-        def delayed_snapshot():
+        def delayed_snapshot(**kwargs):
             nonlocal first
             if first:
                 first = False
                 time.sleep(0.25)
-            return refresh()
+            return refresh(**kwargs)
 
         with patch.object(runner, "refresh", side_effect=delayed_snapshot):
             self.assertEqual(runner.run(), 124)

@@ -30,11 +30,20 @@ public func rotateFileIfNeeded(_ path: String, maxBytes: Int = 256 * 1024) {
 ///   - postCommand: Optional shell command to run after `claude` exits (regardless of exit code).
 ///   - maxTurns: Agentic turn bound passed as `--max-turns` — a detached
 ///     learner must not be able to run away on the host's API key.
-///   - wallClockSeconds: Hard kill after this long, via a portable sh
-///     watcher (macOS has no `timeout(1)`); pairs with maxTurns so one
-///     wedged tool call can't hold the process open either.
+///   - wallClockSeconds: Send TERM after this long, then KILL after a three
+///     second grace period. The native guard retains admission until it reaps
+///     the provider, including when kernel I/O delays termination.
 ///   - learnerLogContext: Optional per-session launch/exit attribution. Child
 ///     exit status is not a memory-write or persistence receipt.
+///   - admission: Concurrency/cooldown/load gate (SpawnAdmission). The default
+///     is the shared on-disk gate; pass nil to bypass it (tests only).
+///   - beforeLaunch: Optional observational-state callback after admission and
+///     immediately before process launch. A refused admission never invokes it.
+///   - guardExecutable: Explicit same-release hooks binary for embedding apps.
+///     Hook callers re-exec their current binary; no PATH helper is selected.
+/// - Returns: `.spawned` or `.skipped(verdict)`. A refusal is not an error —
+///   callers log the verdict and move on.
+@discardableResult
 public func spawnClaudeSubprocess(
     prompt: String,
     systemPrompt: String,
@@ -47,8 +56,12 @@ public func spawnClaudeSubprocess(
     postCommand: String? = nil,
     maxTurns: Int = 15,
     wallClockSeconds: Int = 720,
-    learnerLogContext: LearnerLogContext? = nil
-) throws {
+    learnerLogContext: LearnerLogContext? = nil,
+    admission: SpawnAdmission? = .default,
+    beforeLaunch: (() throws -> Void)? = nil,
+    guardExecutable: String? = nil
+) throws -> SpawnOutcome {
+    let guardPath = try processGuardExecutable(explicit: guardExecutable)
     rotateFileIfNeeded(logPath)
     let lifecycleLog = learnerLogContext.map { LearnerLifecycleLog(context: $0) }
     if let lifecycleLog {
@@ -62,7 +75,8 @@ public func spawnClaudeSubprocess(
         prompt: prompt, systemPrompt: systemPrompt, allowedTools: allowedTools,
         model: model, logPath: logPath, extraClaudeArgs: extraClaudeArgs,
         postCommand: postCommand, maxTurns: maxTurns,
-        wallClockSeconds: wallClockSeconds, lifecycleLog: lifecycleLog)
+        wallClockSeconds: wallClockSeconds, lifecycleLog: lifecycleLog,
+        inheritsAdmissionLease: admission != nil, guardExecutable: guardPath)
 
     let sh = Process()
     sh.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -79,8 +93,81 @@ public func spawnClaudeSubprocess(
     sh.standardOutput = FileHandle.nullDevice
     sh.standardError = FileHandle.nullDevice
 
-    try sh.run()
-    // Don't wait — fire and forget
+    // Foundation explicitly maps standardInput across exec. The shell moves
+    // the lease to fd 3 before replacing stdin. The native guard retains it
+    // and explicitly closes it in the provider child before exec.
+    let launch: (Int32?) throws -> Int32 = { lease in
+        try launchClaudeShell(sh, lease: lease, guardExecutable: guardPath, beforeLaunch: beforeLaunch)
+    }
+    guard let admission else {
+        return .spawned(pid: try launch(nil))
+    }
+    let verdict = try admission.admit(kind: SpawnOutcome.kind(forEnvGuard: envGuard.key)) { try launch($0) }
+    if case .admitted(let pid) = verdict { return .spawned(pid: pid) }
+    return .skipped(verdict)
+}
+
+/// Only the running hooks executable or an explicit packaged path may act as
+/// the guard. In particular, an installed older memory-hooks on PATH cannot
+/// silently supply an incompatible internal command to an updated app.
+public func processGuardExecutable(explicit: String?) throws -> String {
+    let candidate: URL
+    if let explicit {
+        guard explicit.hasPrefix("/"), !explicit.utf8.contains(0) else { throw OwnedProcessGuard.Failure.invalidArguments }
+        candidate = URL(fileURLWithPath: explicit)
+    } else {
+        guard let current = Bundle.main.executableURL,
+              ["memory-hooks", "EngramHooks"].contains(current.lastPathComponent) else {
+            throw OwnedProcessGuard.Failure.invalidArguments
+        }
+        candidate = current
+    }
+    let resolved = candidate.resolvingSymlinksInPath().path
+    guard FileManager.default.isExecutableFile(atPath: resolved) else {
+        throw OwnedProcessGuard.Failure.invalidArguments
+    }
+    return resolved
+}
+
+/// Foundation's inherited stdin mapping is shared by production and stand-in
+/// tests. The same-release child resets its own signal mask before becoming the
+/// shell; the embedding caller's mask and pending signals remain untouched.
+/// The callback runs only after admission and before the child can exit.
+func launchClaudeShell(_ process: Process, lease: Int32?, guardExecutable: String,
+                       beforeLaunch: (() throws -> Void)? = nil) throws -> Int32 {
+    guard process.executableURL?.path == "/bin/sh", let arguments = process.arguments,
+          arguments.count == 2, arguments[0] == "-c", !arguments[1].isEmpty,
+          !arguments[1].utf8.contains(0) else { throw OwnedProcessGuard.Failure.invalidArguments }
+    let guardPath = try processGuardExecutable(explicit: guardExecutable)
+    process.standardInput = lease.map { FileHandle(fileDescriptor: $0, closeOnDealloc: false) } ?? .nullDevice
+    try beforeLaunch?()
+    process.executableURL = URL(fileURLWithPath: guardPath)
+    process.arguments = ["internal-process-guard", "--exec-shell", arguments[1]]
+    try process.run()
+    return process.processIdentifier
+}
+
+/// Result of `spawnClaudeSubprocess`.
+public enum SpawnOutcome: Equatable, Sendable, CustomStringConvertible {
+    case spawned(pid: Int32)
+    case skipped(SpawnAdmission.Verdict)
+
+    public var description: String {
+        switch self {
+        case .spawned(let pid): return "spawned (wrapper pid \(pid))"
+        case .skipped(let verdict): return verdict.description
+        }
+    }
+
+    /// The recursion-guard variable doubles as the subprocess kind.
+    static func kind(forEnvGuard key: String) -> SpawnAdmission.Kind {
+        switch key {
+        case "CLAUDE_MEMORY_LEARNER": return .learner
+        case "CLAUDE_MEMORY_MAINTENANCE": return .maintenance
+        case "CLAUDE_MEMORY_SYNC_RECONCILIATION": return .reconciliation
+        default: return .other
+        }
+    }
 }
 
 /// Pure command construction also lets the detached shell contract be tested
@@ -89,12 +176,16 @@ func claudeSubprocessShellCommand(
     prompt: String, systemPrompt: String, allowedTools: String, model: String,
     logPath: String, extraClaudeArgs: String = "", postCommand: String? = nil,
     maxTurns: Int = 15, wallClockSeconds: Int = 720,
-    lifecycleLog: LearnerLifecycleLog? = nil
+    lifecycleLog: LearnerLifecycleLog? = nil, inheritsAdmissionLease: Bool = false,
+    guardExecutable: String
 ) -> String {
     let escapedPrompt = prompt.replacingOccurrences(of: "'", with: "'\\''")
     let escapedSystemPrompt = systemPrompt.replacingOccurrences(of: "'", with: "'\\''")
     let started = lifecycleLog?.appendCommand(event: "learner_child_started") ?? ""
     let exited = lifecycleLog?.appendCommand(event: "learner_child_exited", includeExitCode: true) ?? ""
+    let leaseSetup = inheritsAdmissionLease ? "exec 3<&0; exec </dev/null; " : ""
+    let guardPath = guardExecutable.replacingOccurrences(of: "'", with: "'\\''")
+    let guardLease = inheritsAdmissionLease ? " --lease-fd 3" : ""
 
     // Per-run temp capture, appended to the log on completion: keeps
     // concurrent spawns from interleaving AND lets the failure checks below
@@ -102,12 +193,15 @@ func claudeSubprocessShellCommand(
     // previous run's errors forever).
     // `;` separators, NOT `&&`: `a && b & ` backgrounds the whole chain
     // (POSIX precedence), which would leave $T set only inside the
-    // backgrounded subshell and make the wall-clock kill hit the wrapper
-    // instead of claude.
+    // backgrounded subshell. CPID identifies the native guard, whose observed
+    // exit code is the provider's reaped status; it is not a persistence receipt.
+    // `/usr/bin/nice -n 10`: a detached learner competes with the user's
+    // interactive sessions and their Swift builds for CPU; it should lose.
     return """
-    T=$(mktemp) || exit 1; \
+    \(leaseSetup)T=$(mktemp) || exit 1; \
     echo '===== started at '\\''\(ISO8601DateFormatter().string(from: Date()))'\\'' =====' >> '\(logPath)'; \
-    claude -p '\(escapedPrompt)' \
+    '\(guardPath)' internal-process-guard --wall-seconds \(wallClockSeconds)\(guardLease) -- \
+      /usr/bin/nice -n 10 claude -p '\(escapedPrompt)' \
       --model \(model) \
       --allowedTools '\(allowedTools)' \
       --max-turns \(maxTurns) \
@@ -116,9 +210,8 @@ func claudeSubprocessShellCommand(
       --append-system-prompt '\(escapedSystemPrompt)' \
       \(extraClaudeArgs) \
       > "$T" 2>&1 & CPID=$!; \
-    ( sleep \(wallClockSeconds) && kill "$CPID" 2>/dev/null \
-      && echo '===== killed at \(wallClockSeconds)s wall-clock bound =====' >> "$T" ) & WPID=$!;\(started) \
-    wait "$CPID"; RC=$?; kill "$WPID" 2>/dev/null;\(exited) cat "$T" >> '\(logPath)'; \
+    \(started) \
+    wait "$CPID"; RC=$?;\(exited) cat "$T" >> '\(logPath)'; \
     if grep -qi 'not logged in\\|invalid api key\\|please run /login' "$T"; then \
       echo '===== ERROR: spawned claude is NOT AUTHENTICATED — the subprocess died before doing anything. Headless/env-auth setups strip ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN from hook children; use credential-file auth in CLAUDE_CONFIG_DIR, or spawn from a non-hook process. =====' >> '\(logPath)'; \
     elif [ "$RC" -ne 0 ]; then \

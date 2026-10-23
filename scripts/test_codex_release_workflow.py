@@ -95,10 +95,15 @@ assert os.environ['ENGRAM_ADOPTION_TEST_ROOT'] == str(
     Path(os.environ['HOME']) / 'localdev/engram-native-tests-987654321-2')
 assert os.environ['ENGRAM_TEST_ROOT'] == os.environ['ENGRAM_ADOPTION_TEST_ROOT']
 assert os.environ['TMPDIR'] == str(Path(os.environ['ENGRAM_ADOPTION_TEST_ROOT']) / 'tmp')
+assert os.environ['ENGRAM_TEST_PROCESS_GUARD'] == str(Path(os.environ['FAKE_SWIFT_BIN']) / 'EngramProcessGuardFixture')
 raise SystemExit(subprocess.run(args.command[1:], check=False).returncode)
 ''')
             bin_dir = root / 'bin'
             bin_dir.mkdir()
+            swift_bin = root / 'swift debug products'; swift_bin.mkdir()
+            guard = swift_bin / 'EngramProcessGuardFixture'
+            guard.write_text('#!/bin/sh\nexit 99\n'); guard.chmod(0o700)
+            github_env = root / 'github-env'
             log = root / 'calls.jsonl'
             fake = '#!' + sys.executable + '\n' + '''import json,os,sys
 from pathlib import Path
@@ -109,7 +114,10 @@ if kind=='mkdir':
     fixture = Path(os.environ['HOME'])/'localdev/engram-native-tests-987654321-2'
     assert args == ['-m','700','-p',str(fixture),str(fixture/'tmp')],args
 elif kind=='swift':
-    assert '--force-resolved-versions' in args,args
+    if args == ['build','--show-bin-path']:
+        print(os.environ['FAKE_SWIFT_BIN'])
+    else:
+        assert '--force-resolved-versions' in args,args
 else:
     assert '-disableAutomaticPackageResolution' in args,args
     assert '-onlyUsePackageVersionsFromResolvedFile' in args,args
@@ -126,7 +134,8 @@ with open(os.environ['CALL_LOG'],'a') as output:
             (root / 'appcast.xml').write_text('<sparkle:version>14</sparkle:version>\n')
             env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
                        RELEASE_TAG='v0.14.8', APPLE_TEAM_ID='ABCDEFGHIJ', RUNNER_TEMP=str(root),
-                       GITHUB_RUN_ID='987654321', GITHUB_RUN_ATTEMPT='2')
+                       GITHUB_RUN_ID='987654321', GITHUB_RUN_ATTEMPT='2',
+                       GITHUB_ENV=str(github_env), FAKE_SWIFT_BIN=str(swift_bin), LINUX_ROOT=str(root / 'linux'))
             steps = {
                 'release.yml': ['Resolve dependencies', 'Build tests', 'Run tests',
                                 'Run statement-budget regressions (serial)',
@@ -139,10 +148,18 @@ with open(os.environ['CALL_LOG'],'a') as output:
                         result = subprocess.run(['/bin/bash', '-e', '-c', run_block(workflow, name)],
                                                 cwd=root, env=env, capture_output=True, text=True, timeout=20)
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        if name == 'Build tests':
+                            self.assertEqual(github_env.read_text(), 'ENGRAM_TEST_PROCESS_GUARD=' + str(guard) + '\n')
+                            env['ENGRAM_TEST_PROCESS_GUARD'] = str(guard)
             calls = [json.loads(line) for line in log.read_text().splitlines()]
-            self.assertEqual(sum(call[0] == 'swift' for call in calls), 8)
+            self.assertEqual(sum(call[0] == 'swift' for call in calls), 9)
             self.assertEqual(sum(call[0] == 'xcodebuild' for call in calls), 1)
             self.assertEqual(sum(call[0] == 'mkdir' for call in calls), 1)
+            for target in ('EngramMemoryCore', 'EngramMemoryCoreTests'):
+                self.assertIn(['swift', 'build', '--package-path', str(root / 'linux/repo'),
+                    '--scratch-path', str(root / 'linux/root-build'), '--cache-path', str(root / 'linux/cache'),
+                    '--config-path', str(root / 'linux/config'), '--security-path', str(root / 'linux/security'),
+                    '--force-resolved-versions', '--target', target], calls)
             tests = [call for call in calls if call[:2] == ['swift', 'test']]
             self.assertEqual(len(tests), 3)
             self.assertTrue(any('recall_statementBudget' in call for call in tests))
@@ -157,6 +174,378 @@ with open(os.environ['CALL_LOG'],'a') as output:
                 '--skip', 'recall_statementBudget', '--skip', 'clusters_statementBudget',
                 '--skip', 'busyBeginDoesNotInvokeBodyOrPublishReceipt',
             ])
+
+    def test_build_exports_only_an_executable_guard_after_success(self):
+        for workflow, name in (('release.yml', 'Build tests'), ('native-validation.yml', 'Build native tests')):
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory(prefix='engram guard build ') as temporary:
+                root = Path(temporary).resolve()
+                bin_dir = root / 'bin'; bin_dir.mkdir()
+                products = root / 'swift debug products'; products.mkdir()
+                guard = products / 'EngramProcessGuardFixture'
+                github_env, log = root / 'github-env', root / 'calls.jsonl'
+                fake = '#!' + sys.executable + '\n' + """import json,os,sys
+with open(os.environ['CALL_LOG'],'a') as output:
+    output.write(json.dumps(sys.argv[1:])+'\\n')
+if sys.argv[1:]==['build','--show-bin-path']:
+    print(os.environ['FAKE_SWIFT_BIN'])
+else:
+    raise SystemExit(int(os.environ['FAKE_BUILD_EXIT']))
+"""
+                for tool in ('swift', 'swift-validation'):
+                    executable = bin_dir / tool
+                    executable.write_text(fake); executable.chmod(0o700)
+                env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
+                    VALIDATION_ROOT=str(root), GITHUB_ENV=str(github_env), FAKE_SWIFT_BIN=str(products))
+                build = ['build', '--force-resolved-versions']
+                if workflow == 'native-validation.yml':
+                    build += ['--disable-index-store']
+                build += ['--build-tests']
+                for state, build_exit in (('executable', 0), ('missing', 0), ('nonexecutable', 0), ('executable', 29)):
+                    with self.subTest(state=state, build_exit=build_exit):
+                        github_env.unlink(missing_ok=True); log.unlink(missing_ok=True); guard.unlink(missing_ok=True)
+                        if state != 'missing':
+                            guard.write_text('#!/bin/sh\nexit 99\n')
+                            guard.chmod(0o700 if state == 'executable' else 0o600)
+                        result = subprocess.run(['/bin/bash', '-e', '-c', run_block(workflow, name)],
+                            cwd=root, env=dict(env, FAKE_BUILD_EXIT=str(build_exit)),
+                            capture_output=True, text=True, timeout=10)
+                        expected = build_exit or (0 if state == 'executable' else 1)
+                        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                        self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
+                            [build] + ([] if build_exit else [['build', '--show-bin-path']]))
+                        if expected:
+                            self.assertFalse(github_env.exists())
+                        else:
+                            self.assertEqual(github_env.read_text(), 'ENGRAM_TEST_PROCESS_GUARD=' + str(guard) + '\n')
+
+    def test_packaged_guard_smoke_requires_exact_command_status_and_clean_receipt(self):
+        name = 'Validate packaged process guard command'
+        good = {
+            'reason': 'exit', 'child_exit_code': 7, 'exit_code': 7,
+            'reader_complete': True, 'reader_error': None, 'errors': [],
+            'signals_received': [], 'log_truncated': False,
+            'cleanup': {'remaining': [], 'errors': [], 'signals': []},
+        }
+        changes = [
+            ('reason', 'timeout'), ('child_exit_code', 0), ('exit_code', 0),
+            ('reader_complete', False), ('reader_error', 'read failed'), ('errors', ['error']),
+            ('signals_received', [15]), ('log_truncated', True),
+            ('cleanup.remaining', [123]), ('cleanup.errors', ['error']), ('cleanup.signals', [15]),
+        ]
+        scenarios = [('clean', 7, good), ('wrong-zero-status', 0, good), ('wrong-failure-status', 29, good)]
+        for key, value in changes:
+            receipt = json.loads(json.dumps(good))
+            target = receipt
+            parts = key.split('.')
+            for part in parts[:-1]:
+                target = target[part]
+            target[parts[-1]] = value
+            scenarios.append((key, 7, receipt))
+        for workflow in ('release.yml', 'native-validation.yml'):
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory(prefix='engram guard smoke ') as temporary:
+                root = Path(temporary).resolve()
+                validation = root / 'validation'; (validation / 'repo').mkdir(parents=True)
+                bin_dir = root / 'bin'; bin_dir.mkdir()
+                (validation / 'bin').mkdir()
+                products = root / 'swift debug products'; products.mkdir()
+                log, continued = root / 'calls.jsonl', root / 'continued'
+                receipt_path = validation / 'evidence/process-guard-command/receipt.json'
+                receipt_path.parent.mkdir(parents=True)
+                swift = '#!' + sys.executable + '\n' + """import json,os,sys
+assert sys.argv[1:]==['build','--show-bin-path'],sys.argv
+with open(os.environ['CALL_LOG'],'a') as output:
+    output.write(json.dumps({'tool':'swift','args':sys.argv[1:]})+'\\n')
+print(os.environ['FAKE_SWIFT_BIN'])
+"""
+                for executable in (bin_dir / 'swift', validation / 'bin/swift-validation'):
+                    executable.write_text(swift); executable.chmod(0o700)
+                # The fake supervisor records the original command and emits
+                # only a configured receipt. Real inline receipt validation
+                # still runs. Map the release receipt argument to this private
+                # fixture so no fake tool writes into the real user's home.
+                python = bin_dir / 'python3'
+                python.write_text('#!' + sys.executable + '\n' + """import json,os,sys
+from pathlib import Path
+args=sys.argv[1:]
+with open(os.environ['CALL_LOG'],'a') as output:
+    output.write(json.dumps({'tool':'python3','args':args,'cwd':str(Path.cwd())})+'\\n')
+if args[:2]==['-B','scripts/run_native_tests.py']:
+    Path(os.environ['FAKE_RECEIPT_PATH']).write_text(os.environ['FAKE_RECEIPT'])
+    raise SystemExit(int(os.environ['FAKE_GATE_EXIT']))
+assert args[:2]==['-B','-'],args
+if len(args)==3:
+    args[2]=os.environ['FAKE_RECEIPT_PATH']
+os.execv(sys.executable,[sys.executable,*args])
+""")
+                python.chmod(0o700)
+                env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
+                    VALIDATION_ROOT=str(validation), GITHUB_ENV=str(root / 'github-env'),
+                    GITHUB_RUN_ID='987654321', GITHUB_RUN_ATTEMPT='2', FAKE_SWIFT_BIN=str(products),
+                    FAKE_RECEIPT_PATH=str(receipt_path))
+                release = workflow == 'release.yml'
+                evidence = (Path(env['HOME']) / 'localdev/engram-process-guard-987654321-2'
+                            if release else receipt_path.parent)
+                expected = ['-B', 'scripts/run_native_tests.py', '--diagnostics-dir', str(evidence),
+                    '--timeout-seconds', '20', '--silence-seconds', '10', '--',
+                    str(products / 'EngramHooks'), 'internal-process-guard', '--wall-seconds', '2',
+                    '--', '/bin/sh', '-c', 'exit 7']
+                section = step_section(workflow, name)
+                self.assertIn('timeout-minutes: 2', section)
+                self.assertNotIn('continue-on-error', section)
+                for scenario, code, receipt in scenarios:
+                    with self.subTest(scenario=scenario):
+                        log.unlink(missing_ok=True); continued.unlink(missing_ok=True)
+                        result = subprocess.run(['/bin/bash', '-e', '-c',
+                            run_block(workflow, name) + 'printf continued > "$1"\n', 'gate', str(continued)],
+                            cwd=root, env=dict(env, FAKE_GATE_EXIT=str(code), FAKE_RECEIPT=json.dumps(receipt)),
+                            capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode, 0 if scenario == 'clean' else 1,
+                                         result.stdout + result.stderr)
+                        self.assertEqual(continued.exists(), scenario == 'clean')
+                        calls = [json.loads(line) for line in log.read_text().splitlines()]
+                        self.assertEqual(calls[0], {'tool': 'swift', 'args': ['build', '--show-bin-path']})
+                        self.assertEqual(calls[1], {'tool': 'python3', 'args': expected,
+                                                   'cwd': str(root if release else validation / 'repo')})
+                        self.assertEqual(len(calls), 3 if code == 7 else 2)
+                        if code == 7:
+                            self.assertEqual(calls[2]['args'], ['-B', '-'] + (
+                                [str(evidence / 'receipt.json')] if release else []))
+
+    def test_visualizer_build_scopes_ibtool_environment_and_preserves_gate_failure(self):
+        with tempfile.TemporaryDirectory(prefix='engram asset tool workflow ') as temporary:
+            root = Path(temporary).resolve()
+            validation = root / 'validation'
+            scripts = validation / 'repo/scripts'; scripts.mkdir(parents=True)
+            bin_dir = root / 'bin'; bin_dir.mkdir()
+            (bin_dir / 'python3').symlink_to(sys.executable)
+            log, continued = root / 'calls.jsonl', root / 'continued'
+            record = '''import json,os,sys
+with open(os.environ['CALL_LOG'],'a') as output:
+    output.write(json.dumps({'tool':TOOL,'args':sys.argv[1:],
+        'ibtool_mode':os.environ.get('IBToolNeverDeque')})+'\\n')
+'''
+            # Execute a real child from the fake supervisor so the test observes
+            # environment inheritance through the same shell/Python boundary.
+            (scripts / 'run_native_tests.py').write_text("TOOL='supervisor'\n" + record + '''import subprocess
+command=sys.argv[sys.argv.index('--')+1:]
+code=subprocess.run(command,check=False).returncode
+raise SystemExit(code or (int(os.environ['FAKE_WRAPPER_EXIT']) if command[1]=='build-for-testing' else 0))
+''')
+            (scripts / 'prepare_visualizer_tests.py').write_text("TOOL='prepare'\n" + record)
+            xcode = bin_dir / 'xcodebuild'
+            xcode.write_text('#!' + sys.executable + '\nTOOL="xcodebuild"\n' + record +
+                "raise SystemExit(int(os.environ['FAKE_CHILD_EXIT']))\n")
+            xcode.chmod(0o700)
+            build = run_block('visualizer-validation.yml', 'Full app and unit target build for testing')
+            tests = run_block('visualizer-validation.yml', 'Bind isolated test host and run focused Galaxy regressions')
+            for child_exit, wrapper_exit, expected in ((0, 0, 0), (7, 0, 7), (0, 125, 125)):
+                with self.subTest(child_exit=child_exit, wrapper_exit=wrapper_exit):
+                    log.unlink(missing_ok=True); continued.unlink(missing_ok=True)
+                    result = subprocess.run(['/bin/bash', '-e', '-c', build + tests
+                        + 'printf continued > "$1"\n', 'gate', str(continued)], cwd=root,
+                        env=dict(os.environ, PATH=str(bin_dir), VALIDATION_ROOT=str(validation),
+                            CALL_LOG=str(log), IBToolNeverDeque='inherited-value',
+                            FAKE_CHILD_EXIT=str(child_exit), FAKE_WRAPPER_EXIT=str(wrapper_exit)),
+                        capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    self.assertEqual(continued.exists(), expected == 0)
+                    calls = [json.loads(line) for line in log.read_text().splitlines()]
+                    self.assertEqual([call['tool'] for call in calls[:2]], ['supervisor', 'xcodebuild'])
+                    self.assertEqual([call['ibtool_mode'] for call in calls[:2]], ['1', '1'])
+                    self.assertEqual(calls[1]['args'][:2], ['build-for-testing', '-project'])
+                    if expected:
+                        self.assertEqual(len(calls), 2)
+                    else:
+                        self.assertEqual([call['tool'] for call in calls[2:]],
+                            ['prepare', 'supervisor', 'xcodebuild', 'prepare', 'prepare'])
+                        self.assertTrue(all(call['ibtool_mode'] == 'inherited-value' for call in calls[2:]))
+                        self.assertEqual(calls[4]['args'][0], 'test-without-building')
+
+    def test_linux_installs_python_before_builds_and_propagates_tooling_failure(self):
+        name = 'Install portable test Python runtime'
+        workflow = (ROOT / '.github/workflows/linux-core.yml').read_text()
+        order = ['Prepare isolated Linux work and output paths', name,
+                 'Build EngramMemoryCore (Linux)', 'Compile its tests (Linux)',
+                 'Execute exact portable core tests (Linux)']
+        positions = [workflow.index('      - name: ' + step + '\n') for step in order]
+        self.assertEqual(positions, sorted(positions))
+        with tempfile.TemporaryDirectory(prefix='engram linux Python ') as temporary:
+            root = Path(temporary).resolve()
+            bin_dir = root / 'bin'; bin_dir.mkdir()
+            log, installed, continued = root / 'calls.jsonl', root / 'installed', root / 'continued'
+            fake = '#!' + sys.executable + '\n' + '''import json,os,sys
+from pathlib import Path
+tool,args=Path(sys.argv[0]).name,sys.argv[1:]
+with open(os.environ['CALL_LOG'],'a') as output:
+    output.write(json.dumps([tool,*args])+'\\n')
+phase = args[0] if tool == 'apt-get' else 'version'
+if phase == os.environ['FAIL_PHASE']:
+    raise SystemExit(29)
+if phase == 'install':
+    assert args == ['install','--no-install-recommends','-y','python3'],args
+    Path(os.environ['INSTALLED']).touch()
+elif tool == 'python3':
+    assert args == ['--version'] and Path(os.environ['INSTALLED']).is_file(),args
+    print('Python 3.12 fixture')
+else:
+    assert args == ['update'],args
+'''
+            for tool in ('apt-get', 'python3'):
+                command = bin_dir / tool
+                command.write_text(fake); command.chmod(0o700)
+            expected = [['apt-get', 'update'],
+                        ['apt-get', 'install', '--no-install-recommends', '-y', 'python3'],
+                        ['python3', '--version']]
+            for phase, count in (('update', 1), ('install', 2), ('version', 3), ('', 3)):
+                with self.subTest(phase=phase):
+                    for path in (log, installed, continued):
+                        path.unlink(missing_ok=True)
+                    result = subprocess.run(['/bin/bash', '-e', '-c', run_block('linux-core.yml', name)
+                        + 'printf continued > "$1"\n', 'tooling', str(continued)], cwd=root,
+                        env=dict(os.environ, PATH=str(bin_dir), CALL_LOG=str(log),
+                                 INSTALLED=str(installed), FAIL_PHASE=phase),
+                        capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 29 if phase else 0, result.stdout + result.stderr)
+                    self.assertEqual(continued.exists(), not phase)
+                    self.assertEqual([json.loads(line) for line in log.read_text().splitlines()], expected[:count])
+                    if not phase:
+                        self.assertEqual(result.stdout, 'Python 3.12 fixture\n')
+
+    def test_linux_preparation_trusts_only_workspace_and_archives_exact_source(self):
+        block = run_block('linux-core.yml', 'Prepare isolated Linux work and output paths')
+        with tempfile.TemporaryDirectory(prefix='engram linux ownership ') as temporary:
+            root = Path(temporary).resolve()
+            checkout = root / 'checkout with spaces'; checkout.mkdir()
+            bin_dir = root / 'bin'; bin_dir.mkdir()
+            (bin_dir / 'git').symlink_to(shutil.which('git'))
+            swift = bin_dir / 'swift'
+            swift.write_text('#!/bin/sh\n[ "$#" = 1 ] && [ "$1" = --version ] || exit 99\n'
+                             'printf "fixture Swift version\\n"\n')
+            swift.chmod(0o700)
+            github_env = root / 'github-env'
+            # Isolate Git from user configuration and preserve the job's existing
+            # environment-based private dependency rewrite alongside per-command trust.
+            env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+            env.update(HOME=str(root / 'home'), PATH=f'{bin_dir}:/usr/bin:/bin',
+                GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_COUNT='1',
+                GIT_CONFIG_KEY_0='url.https://example.invalid/private/.insteadOf',
+                GIT_CONFIG_VALUE_0='https://example.invalid/source/',
+                GITHUB_WORKSPACE=str(checkout), GITHUB_ENV=str(github_env),
+                GITHUB_RUN_ID='987654321', GITHUB_RUN_ATTEMPT='2')
+
+            def git(*args, check=True):
+                return subprocess.run(['git', *args], cwd=checkout, env=env,
+                    capture_output=True, text=True, timeout=10, check=check)
+
+            git('init', '-q')
+            source = checkout / 'source.txt'; source.write_text('committed source\n')
+            git('add', 'source.txt')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                '-c', 'commit.gpgsign=false', 'commit', '-qm', 'fixture')
+            sha = git('rev-parse', 'HEAD').stdout.strip()
+            source.write_text('uncommitted source\n')
+            (checkout / 'untracked.txt').write_text('untracked\n')
+            env.update(SOURCE_SHA=sha, GIT_TEST_ASSUME_DIFFERENT_OWNER='1')
+            refused = git('rev-parse', 'HEAD', check=False)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn('dubious ownership', refused.stderr)
+            task_root = root / 'home/localdev/engram-linux-987654321-2'
+            for scenario, overrides in (
+                ('wrong-workspace', {'GITHUB_WORKSPACE': str(root)}),
+                ('wrong-source', {'SOURCE_SHA': '0' * 40}),
+                ('exact-source', {}),
+            ):
+                with self.subTest(scenario=scenario):
+                    result = subprocess.run(['/bin/bash', '-e', '-c', block], cwd=checkout,
+                        env=dict(env, **overrides), capture_output=True, text=True, timeout=10)
+                    if scenario != 'exact-source':
+                        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertFalse(task_root.exists())
+                        self.assertFalse(github_env.exists())
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual((task_root / 'repo/source.txt').read_text(), 'committed source\n')
+                        self.assertFalse((task_root / 'repo/untracked.txt').exists())
+                        self.assertIn('LINUX_ROOT=' + str(task_root) + '\n', github_env.read_text())
+            # Trust must not persist, and -c must not replace the existing rewrite.
+            self.assertIn('dubious ownership', git('rev-parse', 'HEAD', check=False).stderr)
+            rewrite = git('-c', 'safe.directory=' + str(checkout), 'config', '--get', env['GIT_CONFIG_KEY_0'])
+            self.assertEqual(rewrite.stdout.strip(), env['GIT_CONFIG_VALUE_0'])
+
+    def test_linux_portable_gate_requires_each_lifetime_test_and_propagates_failure(self):
+        required = [
+            'detachedShellOwnsLeaseUntilProviderExitEvenWhenProviderClosesFD',
+            'unavailableAndSaturatedLoadRefuseWithoutCooldown',
+            'overridesCannotOutliveRegisteredHostOrWatchdog',
+            'exactReapedNormalAndSignalStatuses',
+            'queuedCancellationDoesNotCreateProvider',
+            'deadlineReapsProviderAfterItMovesProcessGroup',
+            'timeoutReapsTermIgnoringProviderBeforeReleasingLease',
+            'cancellationEscalatesWithoutDroppingProviderLease',
+            'wrapperDeathAndProviderFDClosureDoNotReleaseGuardLease',
+        ]
+        lines = ['✔ Test ' + name + '() passed after 0.001 seconds.' for name in required]
+        summary = '✔ Test run with 9 tests passed after 0.100 seconds.\n'
+        complete = '\n'.join(lines) + '\n' + summary
+        scenarios = [('complete', complete, 0)]
+        scenarios += [(name, '\n'.join(line for line in lines if name + '()' not in line) + '\n' + summary, 0)
+                      for name in required]
+        scenarios += [
+            ('no-summary', '\n'.join(lines) + '\n', 0),
+            ('skipped', complete + '✘ Test additionalCase() skipped.\n', 0),
+            ('failed', complete + '✘ Suite Additional failed.\n', 0),
+            ('process-failed', complete, 29),
+        ]
+        with tempfile.TemporaryDirectory(prefix='engram portable gate ') as temporary:
+            root = Path(temporary).resolve()
+            scripts = root / 'repo/scripts'; scripts.mkdir(parents=True)
+            bin_dir = root / 'bin'; bin_dir.mkdir()
+            (root / 'evidence').mkdir()
+            (bin_dir / 'python3').symlink_to(sys.executable)
+            log, continued = root / 'calls.jsonl', root / 'continued'
+            (scripts / 'prepare_portable_core_tests.py').write_text("""import json,os,sys
+with open(os.environ['CALL_LOG'],'a') as output:
+    output.write(json.dumps({'tool':'prepare','args':sys.argv[1:]})+'\\n')
+""")
+            swift = bin_dir / 'swift'
+            swift.write_text('#!' + sys.executable + '\n' + """import json,os,sys
+from pathlib import Path
+root=Path(os.environ['LINUX_ROOT'])
+args=sys.argv[1:]
+with open(os.environ['CALL_LOG'],'a') as output:
+    output.write(json.dumps({'tool':'swift','args':args})+'\\n')
+if args[0]=='build':
+    assert args[-1]=='--show-bin-path',args
+    print(root/'portable-build/debug')
+else:
+    assert args[0]=='test' and args[-1]=='--no-parallel',args
+    assert os.environ['ENGRAM_TEST_PROCESS_GUARD']==str(root/'portable-build/debug/EngramProcessGuardFixture')
+    print(os.environ['FAKE_TEST_OUTPUT'],end='')
+    raise SystemExit(int(os.environ['FAKE_TEST_EXIT']))
+""")
+            swift.chmod(0o700)
+            env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
+                       LINUX_ROOT=str(root), SOURCE_SHA='a' * 40)
+            options = ['--package-path', str(root / 'portable'), '--scratch-path', str(root / 'portable-build'),
+                       '--cache-path', str(root / 'cache'), '--config-path', str(root / 'config'),
+                       '--security-path', str(root / 'security')]
+            for scenario, output, code in scenarios:
+                with self.subTest(scenario=scenario):
+                    log.unlink(missing_ok=True); continued.unlink(missing_ok=True)
+                    result = subprocess.run(['/bin/bash', '-e', '-c',
+                        run_block('linux-core.yml', 'Execute exact portable core tests (Linux)')
+                        + 'printf continued > "$1"\n', 'gate', str(continued)],
+                        cwd=root, env=dict(env, FAKE_TEST_OUTPUT=output, FAKE_TEST_EXIT=str(code)),
+                        capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, code or (0 if scenario == 'complete' else 1),
+                                     result.stdout + result.stderr)
+                    self.assertEqual(continued.exists(), scenario == 'complete')
+                    self.assertEqual([json.loads(line) for line in log.read_text().splitlines()], [
+                        {'tool': 'prepare', 'args': ['--repository', str(root / 'repo'),
+                            '--destination', str(root / 'portable'), '--source-sha', 'a' * 40]},
+                        {'tool': 'swift', 'args': ['build', *options, '--show-bin-path']},
+                        {'tool': 'swift', 'args': ['test', *options, '--no-parallel']},
+                    ])
 
     def test_begin_timing_skip_has_mandatory_isolated_gate_and_propagates_failure(self):
         selected = 'busyBeginDoesNotInvokeBodyOrPublishReceipt'
@@ -295,10 +684,12 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
         for name, step_id in ids.items():
             self.assertEqual(re.findall(r'^        id: (.*)$', step_section(workflow, name), re.M), [step_id])
         prerequisites = {
+            'Validate packaged process guard command': 'native_build',
             'Run full native release filter': 'native_build',
             'Run force preparation regressions (serial)': 'native_build',
             'Run ledger BEGIN timing regression (serial)': 'native_build',
             'Collect ledger BEGIN contention diagnostics (serial)': 'native_build',
+            'Run daemon hub contention and recovery (isolated)': 'native_build',
             'Run both statement budgets in separate serial processes': 'native_build',
             'Validate Python MCP harness fixtures': 'checkout_source',
             'Build release Engram native product': 'dependencies',

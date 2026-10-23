@@ -30,11 +30,11 @@ def required_swift_tests(output, expected):
             and not failed_or_skipped}
 
 
-def processes():
+def processes(timeout=2):
     # comm excludes arguments and environments (which can contain credentials).
     output = subprocess.check_output(
         ["/bin/ps", "-axo", "pid=,ppid=,pgid=,lstart=,stat=,comm="],
-        text=True, timeout=2)
+        text=True, timeout=timeout)
     result = {}
     for line in output.splitlines():
         fields = line.split(None, 9)
@@ -75,8 +75,8 @@ class Runner:
         self.group_closed = False
         self.required_tests = tuple(required_tests)
 
-    def refresh(self):
-        current = {pid: item for pid, item in processes().items() if "Z" not in item["state"]}
+    def refresh(self, timeout=2):
+        current = {pid: item for pid, item in processes(timeout=timeout).items() if "Z" not in item["state"]}
         # Remember descendants even after reparenting, but never reuse a stale
         # PID after its start identity changes.
         owned = {pid: item for pid, item in current.items()
@@ -168,33 +168,68 @@ class Runner:
         except Exception as error:
             record["errors"].append(repr(error))
 
-    def cleanup(self, deadline):
+    def cleanup(self, deadline, *, successful_exit=False):
         receipt = {"signals": [], "remaining": [], "errors": []}
+
+        def inventory_budget(until):
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Cleanup inventory deadline expired")
+            return min(2, remaining)
+
+        # A successful launcher can exit just before its children finish. Allow
+        # natural completion briefly, within the same cleanup budget; failures,
+        # timeouts and cancellation still proceed straight to termination.
+        if successful_exit:
+            until = min(deadline, time.monotonic() + 1)
+            try:
+                while not self.signals and time.monotonic() < until:
+                    self.child.poll()
+                    remaining = until - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    if not self.refresh(timeout=min(2, remaining)) or self.signals:
+                        break
+                    time.sleep(min(0.05, max(0, until - time.monotonic())))
+            except subprocess.TimeoutExpired as error:
+                # Exhausting the optional grace starts normal cleanup, which
+                # must obtain a fresh inventory before it can signal anything.
+                receipt["natural_exit_grace_timeout"] = repr(error)
+            except Exception as error:
+                receipt["errors"].append(repr(error))
         for number in (signal.SIGTERM, signal.SIGKILL):
             if time.monotonic() >= deadline:
                 break
             try:
-                owned = self.refresh()
+                owned = self.refresh(timeout=inventory_budget(deadline))
                 # Children first, then their launcher. Revalidate every PID
-                # against a fresh snapshot before each signaling phase.
+                # and birth identity immediately before signaling it.
                 for pid, item in sorted(owned.items(), key=lambda pair: pair[0] == self.child.pid):
+                    if time.monotonic() >= deadline:
+                        break
+                    current = processes(timeout=inventory_budget(deadline)).get(pid)
+                    if time.monotonic() >= deadline:
+                        break
+                    if current is None or identity(current) != identity(item) or "Z" in current["state"]:
+                        continue
                     try:
                         os.kill(pid, number)
-                        receipt["signals"].append({"pid": pid, "started": item["started"],
-                                                   "signal": signal.Signals(number).name})
+                        # comm identifies the observed executable without
+                        # exposing argv or environment credentials.
+                        receipt["signals"].append(dict(current, signal=signal.Signals(number).name))
                     except ProcessLookupError:
                         pass
                 until = min(deadline, time.monotonic() + self.cleanup_grace)
                 while time.monotonic() < until:
                     self.child.poll()  # Reap our direct child before inspecting ps.
-                    if not self.refresh():
+                    if not self.refresh(timeout=inventory_budget(deadline)):
                         break
-                    time.sleep(0.05)
+                    time.sleep(min(0.05, max(0, until - time.monotonic())))
             except Exception as error:
                 receipt["errors"].append(repr(error))
                 # An unreadable inventory removes authority to target unknown
                 # descendants, but Popen still owns its unreaped direct child.
-                if self.child.poll() is None:
+                if self.child.poll() is None and time.monotonic() < deadline:
                     try:
                         if number == signal.SIGTERM:
                             self.child.terminate()
@@ -203,18 +238,19 @@ class Runner:
                         receipt["signals"].append({"pid": self.child.pid,
                                                    "signal": signal.Signals(number).name,
                                                    "direct_child_fallback": True})
-                        self.child.wait(timeout=max(0.01, min(
-                            self.cleanup_grace, deadline - time.monotonic())))
+                        remaining = deadline - time.monotonic()
+                        if remaining > 0:
+                            self.child.wait(timeout=min(self.cleanup_grace, remaining))
                     except subprocess.TimeoutExpired:
                         pass
                     except Exception as fallback_error:
                         receipt["errors"].append(repr(fallback_error))
         try:
-            self.child.wait(timeout=max(0.01, min(1, deadline - time.monotonic())))
+            self.child.wait(timeout=max(0, min(1, deadline - time.monotonic())))
         except subprocess.TimeoutExpired:
             receipt["errors"].append("Direct child did not exit")
         try:
-            receipt["remaining"] = list(self.refresh().values())
+            receipt["remaining"] = list(self.refresh(timeout=inventory_budget(deadline)).values())
         except Exception as error:
             receipt["errors"].append(repr(error))
         return receipt
@@ -268,7 +304,7 @@ class Runner:
             reason, code = "supervisor_error", 125
             self.errors.append(repr(error))
         finally:
-            cleanup = self.cleanup(min(time.monotonic() + 15, final_deadline))
+            cleanup = self.cleanup(min(time.monotonic() + 15, final_deadline), successful_exit=code == 0)
             reader.join(timeout=2)
             reader_complete = not reader.is_alive()
             self.child.stdout.close()
@@ -276,6 +312,8 @@ class Runner:
                 signal.signal(number, handler)
             if not code and self.signals:
                 reason, code = "signal", 128 + self.signals[0]
+            if not code and cleanup["signals"]:
+                reason, code = "cleanup_required", 125
             if not code and (cleanup["remaining"] or cleanup["errors"] or
                              not reader_complete or self.reader_error):
                 code = 125

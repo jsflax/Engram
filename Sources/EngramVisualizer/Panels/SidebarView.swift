@@ -75,10 +75,6 @@ struct SidebarView: View {
     // SwiftUI body evaluation, which made opening the drawer a lag spike.
     var projectCounts: [String: Int] { galaxyRegistry.panelSnapshot.projectCounts }
 
-    func refreshProjectCounts() {
-        galaxyRegistry.panelSnapshot.refresh(from: galaxyRegistry)
-    }
-
     var body: some View {
         let renderConfig = SidebarRenderConfiguration(config: config)
         return VStack(spacing: 0) {
@@ -131,7 +127,6 @@ struct SidebarView: View {
             .strokeBorder(.white.opacity(0.08), lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.5), radius: 20, x: 5)
-        .onAppear { refreshProjectCounts() }
         .task {
             while !Task.isCancelled {
                 let size = await Task.detached(priority: .utility) { Self.readDBFileSize() }.value

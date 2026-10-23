@@ -16,7 +16,7 @@ struct LatticeAdoptionRecallTests {
     private static let project = "Adoption"
 
     private struct QueryEmbedder: Embedder {
-        var dimension: Int { 384 }
+        var dimension: Int = 384
         func embed(text: String) async throws -> [Float]? {
             var vector = [Float](repeating: 0, count: dimension)
             vector[0] = 1
@@ -59,7 +59,7 @@ struct LatticeAdoptionRecallTests {
         let ids: [UUID]
     }
 
-    private func fixture(seed: Bool = true) throws -> Fixture {
+    private func fixture(seed: Bool = true, queryDimension: Int = 384) throws -> Fixture {
         let root = ProcessInfo.processInfo.environment["ENGRAM_ADOPTION_TEST_ROOT"]
             .map { URL(fileURLWithPath: $0, isDirectory: true) }
             ?? FileManager.default.temporaryDirectory
@@ -85,7 +85,7 @@ struct LatticeAdoptionRecallTests {
             }
         }
         return Fixture(tools: MemoryTools(localRef: writer.sendableReference, syncedRef: nil,
-                                          embedder: QueryEmbedder(),
+                                          embedder: QueryEmbedder(dimension: queryDimension),
                                           identity: StaticIdentityProvider(.anonymous)),
                        writer: writer, path: path, ids: ids)
     }
@@ -220,6 +220,58 @@ struct LatticeAdoptionRecallTests {
         let result = try await recall(fixture)
         assertRecallContract(result, fixture)
         try assertPersistedStats(fixture, bumped: true, since: before)
+    }
+
+    @Test(arguments: ["typed", "direct", "mcp"])
+    func recall_vectorQueryFailureThrowsInsteadOfReturningEmpty(_ entrypoint: String) async throws {
+        let fixture = try fixture(queryDimension: 3)
+        // Rows retain their real 384-dimensional vectors. A mismatched query
+        // fails inside the native vector engine without changing the schema.
+        let failedQuery = fixture.writer.objects(Memory.self)
+            .nearest(to: Vector<Float>([1, 0, 0]), on: \.embedding, limit: 6, distance: .l2)
+            .snapshot()
+        let sealedError = fixture.writer.lastQueryError()
+        #expect(failedQuery.isEmpty)
+        let error = try #require(sealedError)
+        #expect(error.lowercased().contains("dimension"), "The fixture must exercise a real vector-query error")
+
+        await #expect(throws: MemoryOperationError.storageUnavailable) {
+            switch entrypoint {
+            case "typed":
+                _ = try await recall(fixture)
+            case "direct":
+                _ = try await fixture.tools.directRecall(query: "fixed unit query", project: Self.project,
+                                                         depth: 0, limit: 6)
+            default:
+                _ = try await fixture.tools.handle(CallTool.Parameters(name: "recall", arguments: [
+                    "query": .string("fixed unit query"), "project": .string(Self.project),
+                    "depth": .int(0), "limit": .int(6),
+                ]))
+            }
+        }
+        try assertPersistedStats(fixture, bumped: false)
+    }
+
+    @Test func recall_trueEmptyVectorResultRemainsSuccessful() async throws {
+        let fixture = try fixture()
+        let missingTopic = "no matching topic"
+        let queryEmbedding = try await QueryEmbedder().embed(text: "fixed unit query")
+        let vector = try #require(queryEmbedding)
+        let emptyQuery = fixture.writer.objects(Memory.self)
+            .where { $0.topic == missingTopic }
+            .nearest(to: Vector<Float>(vector), on: \.embedding, limit: 6, distance: .l2)
+            .snapshot()
+        let sealedError = fixture.writer.lastQueryError()
+        #expect(sealedError == nil)
+        #expect(emptyQuery.isEmpty)
+
+        let result = try await fixture.tools.handle(CallTool.Parameters(name: "recall", arguments: [
+            "query": .string("fixed unit query"), "project": .string(Self.project),
+            "topic": .string(missingTopic), "depth": .int(0), "limit": .int(6),
+        ]))
+        #expect(result.isError == false)
+        #expect(MemoryTools.text(from: result) == "No memories found.")
+        try assertPersistedStats(fixture, bumped: false)
     }
 
     @Test func recall_preservesGradualStalenessRanking() async throws {

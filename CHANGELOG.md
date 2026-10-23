@@ -4,6 +4,69 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [Unreleased]
+
+### Fixed
+- Background Claude launches reset inherited signal masks in their dedicated
+  child before starting the shell. This prevents Linux shell waits from hanging
+  after provider exit while preserving the calling app's signal state and the
+  provider admission lease.
+- Visualizer drawer presentation now updates a child view instead of the graph
+  root. Opening reuses the panel summaries maintained by graph publications
+  instead of requesting another full rebuild. Hover, pin and hide behavior are
+  preserved; visible input latency still requires on-device measurement.
+- Interactive `remember`, `update`, new-edge `connect`, `merge`, `organize`
+  and `consolidate` use checked transactions and at most three BEGIN attempts,
+  with 100/300 ms backoff plus jitter. Retries stop once the body has entered;
+  body or COMMIT failures are never replayed. The 6.5 s budget governs retry
+  admission, not the whole write call. The schema-1 five-key busy receipt is
+  preserved; the operation ledger retains its separate tighter retry policy.
+- Hook advice and lifecycle recalls skip access-stat writes. MCP recall bumps
+  at most 128 unique hub rows through an independent handle with a 75 ms lock
+  wait, and drops the optional update on contention. Recall results remain
+  complete; mirror-only rows remain visible without statistics writes there.
+  Access counts and last-access times are approximate ranking/timeline hints.
+- The sample gate distinguishes failed vector queries from a verified empty
+  search scope. New stores can start learning, expired/deleted rows do not
+  prevent bootstrap, and an actual distance of exactly 1.0 remains valid.
+  Queries with no usable distance in a populated scope skip the learner.
+- Structured recall results include rendered text and row topic/content with
+  the existing foreign-content fencing. Connected-row content uses the same
+  bounded preview as rendered recall; identity/privacy fields are preserved.
+- Compaction failures remain visible after a subsequent checkpoint clears
+  Lattice's thread-local error slot. Startup and hourly maintenance log the
+  captured failure instead of treating it as a successful zero-row prune.
+
+### Changed
+- Claude background subprocesses and Codex learner workers share a kernel
+  lifetime lock and a durable 10-minute start cooldown. Missing load readings,
+  corrupt state and failed cooldown persistence refuse admission explicitly.
+  A live lease never expires based on PID age. Waiting wrappers retain the
+  lease while their provider child runs; native Codex executor/probe children
+  inherit it separately from the exclusive writer fence. The shared cooldown
+  throttles starts but does not guarantee fairness between providers.
+- Native and Python provider guards retain admission until they reap their own
+  provider child. Cancellation and deadlines send TERM, then KILL after a
+  three-second grace period. Providers that close inherited descriptors or
+  ignore TERM cannot cause an early lease release. External destruction of
+  the guard and descendants that leave the owned group remain outside this
+  direct-child termination guarantee.
+- Maintenance requires 300 local Memory writes and a 60-minute cooldown.
+  Its completion baseline excludes all writes observed through that head,
+  including concurrent writers; AuditLog cannot attribute them to maintenance.
+  Failed head queries preserve the previous baseline. Launching never replaces
+  a completion baseline with an older head if the child finishes immediately.
+- Advice can omit secondary databases when opening the hub and loading the
+  embedder consume over 40% of its recall budget. The reduced search scope is
+  logged. Maintenance checks also require remaining budget and readable load
+  below the configured ceiling. Recall-budget overrides leave headroom below
+  both the registered host timeout and the whole-hook watchdog.
+- The daemon hub requests a 2 s BEGIN acquisition wait instead of Lattice's
+  30 s default. This does not impose writer priority, a lock-holding limit or
+  a whole-delivery deadline. Qualification includes a dedicated real IPC
+  contention/recovery test; cold setup and dependency-owned behavior are
+  tracked separately.
+
 ## [0.15.14] - 2026-10-21
 
 ### Fixed

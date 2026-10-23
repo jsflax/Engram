@@ -54,12 +54,22 @@ extension MemoryTools {
             )
         }
 
-        // Create edge (always in localLattice), attributed to the writer
+        // Create edge (always in localLattice), attributed to the writer.
+        // One checked transaction with a bounded BEGIN retry: an autocommit
+        // `add` under contention used to surface as an opaque MCP error.
         let edge = Edge(sourceGlobalId: fromGid, targetGlobalId: toGid, relation: relationEnum, authorUserId: currentUserId)
-        try localLattice.add(edge)
-
-        guard let edgeGid = edge.globalId else {
-            throw MCPError.internalError("Failed to persist edge — globalId is nil after add()")
+        let edgeGid: UUID
+        do {
+            edgeGid = try LatticeBeginRetry.run(on: localLattice, log: { log("[connect] \($0)") }) {
+                try localLattice.add(edge)
+                guard let gid = edge.globalId else {
+                    throw MCPError.internalError("Failed to persist edge — globalId is nil after add()")
+                }
+                return gid
+            }.value
+        } catch let contention as LatticeBeginRetry.Contention {
+            log("[connect] not connected: \(contention)")
+            return Self.busyReceipt(tool: "connect", verb: "connected", contention: contention)
         }
 
         log("Connected [id:\(fromGid.uuidString)] --[\(relation)]--> [id:\(toGid.uuidString)]")

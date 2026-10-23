@@ -46,8 +46,12 @@ Subagent compaction events use separate child cursors even when Codex supplies
 the parent session ID; the mapping requires explicit child metadata and a known
 boundary separating inherited messages.
 
-One learner runs at a time, with a 10-minute limit, at most 12 memory calls and
-five writes per batch. An independent MCP gateway enforces the limits and checks
+Claude and Codex background workers share a per-device lifetime lease and a
+10-minute cooldown between worker starts. High load, unavailable load readings, or
+invalid admission state can defer work without removing it from the queue; a
+later lifecycle event can retry it. There is no automatic cooldown wakeup timer.
+Separately, each Codex learner provider has a default 10-minute deadline, at most
+12 memory calls and five writes per batch. An independent MCP gateway enforces the limits and checks
 write receipts. Successful transcript ranges are checkpointed so repeated hooks
 do not learn them again. Failures preserve the cursor and impose a five-minute
 backoff. A wakeup processes at most four batches (24,000 visible characters each)
@@ -192,7 +196,7 @@ Removes the binary and MCP registration. Database is preserved at `~/.claude/mem
 - **Task continuity**: `checkpoint` saves plan/progress/context state. `resume` restores it in a new session. Tasks persist across conversations.
 - **Clustering**: `find_clusters` uses greedy cosine-distance clustering to find related memory groups. `consolidate` creates a summary, deprioritizes originals (importance -> 0), and links them with `summarized_by` edges. `organize` batch re-topics memories with automatic hub creation.
 - **Cross-project linking**: `remember` auto-detects mentions of other project names in content and creates `relates_to` edges to those projects' hub memories.
-- **Hooks**: Optional `memory-hooks` binary for Claude Code hooks integration — auto-injects recalled context before each message (`advise`), blocks session end to capture insights when significant work is detected (`stop`), and triggers maintenance when memory operations accumulate.
+- **Hooks**: Optional `memory-hooks` binary for Claude Code hooks integration — auto-injects recalled context before each message (`advise`), starts a detached transcript novelty check on Stop without blocking session end for learning, and triggers maintenance when memory operations accumulate.
 
 ## Configuration
 

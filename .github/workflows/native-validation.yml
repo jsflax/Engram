@@ -152,7 +152,34 @@ jobs:
       - name: Build native tests
         id: native_build
         timeout-minutes: 75
-        run: '"$VALIDATION_ROOT/bin/swift-validation" build --force-resolved-versions --disable-index-store --build-tests'
+        run: |
+          set -euo pipefail
+          "$VALIDATION_ROOT/bin/swift-validation" build --force-resolved-versions --disable-index-store --build-tests
+          guard_bin="$("$VALIDATION_ROOT/bin/swift-validation" build --show-bin-path)/EngramProcessGuardFixture"
+          test -x "$guard_bin"
+          echo "ENGRAM_TEST_PROCESS_GUARD=$guard_bin" >> "$GITHUB_ENV"
+
+      - name: Validate packaged process guard command
+        if: ${{ !cancelled() && steps.native_build.outcome == 'success' }}
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VALIDATION_ROOT/repo"
+          hooks_bin="$("$VALIDATION_ROOT/bin/swift-validation" build --show-bin-path)/EngramHooks"
+          status=0
+          python3 -B scripts/run_native_tests.py --diagnostics-dir "$VALIDATION_ROOT/evidence/process-guard-command" \
+            --timeout-seconds 20 --silence-seconds 10 -- \
+            "$hooks_bin" internal-process-guard --wall-seconds 2 -- /bin/sh -c 'exit 7' || status=$?
+          test "$status" -eq 7
+          python3 -B - <<'PY'
+          import json, os, pathlib
+          receipt = json.loads((pathlib.Path(os.environ['VALIDATION_ROOT']) / 'evidence/process-guard-command/receipt.json').read_text())
+          assert receipt['reason'] == 'exit' and receipt['child_exit_code'] == 7 and receipt['exit_code'] == 7
+          assert receipt['reader_complete'] and not receipt['reader_error'] and not receipt['errors']
+          assert not receipt['signals_received'] and not receipt['log_truncated']
+          assert not receipt['cleanup']['remaining'] and not receipt['cleanup']['errors'] and not receipt['cleanup']['signals']
+          PY
 
       - name: Run full native release filter
         if: ${{ !cancelled() && steps.native_build.outcome == 'success' }}
@@ -214,6 +241,26 @@ jobs:
             --timeout-seconds 120 --silence-seconds 60 -- \
             "$VALIDATION_ROOT/bin/swift-validation" test --force-resolved-versions --disable-index-store --skip-build \
             --filter beginContentionTimingDiagnostics
+
+      # This fixture owns the process-global Core log sink. Require its actual
+      # Swift Testing pass in a separate process; broad-suite disablement is
+      # not a waiver of real daemon BEGIN/ACK/cursor recovery qualification.
+      - name: Run daemon hub contention and recovery (isolated)
+        if: ${{ !cancelled() && steps.native_build.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VALIDATION_ROOT/repo"
+          fixture_root="$HOME/localdev/dh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 700 "$fixture_root"
+          ENGRAM_TEST_ROOT="$fixture_root" ENGRAM_DAEMON_CONTENTION_ISOLATED=1 LATTICE_LOG_LEVEL=3 \
+            ENGRAM_DAEMON_CONTENTION_LOG="$VALIDATION_ROOT/evidence/daemon-contention-core.log" \
+            python3 -B scripts/run_native_tests.py --diagnostics-dir "$VALIDATION_ROOT/evidence/daemon-contention" \
+            --timeout-seconds 210 --silence-seconds 180 \
+            --require-swift-test realHubBeginContentionPreservesUnacknowledgedWorkAndRecovers -- \
+            "$VALIDATION_ROOT/bin/swift-validation" test --force-resolved-versions --disable-index-store --skip-build --no-parallel \
+            --filter 'EngramTests.DaemonHubContentionTests'
 
       - name: Run both statement budgets in separate serial processes
         if: ${{ !cancelled() && steps.native_build.outcome == 'success' }}

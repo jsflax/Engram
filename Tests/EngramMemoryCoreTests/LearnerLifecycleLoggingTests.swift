@@ -105,7 +105,7 @@ struct LearnerLifecycleLoggingTests {
         }
     }
 
-    @Test func watchdogStillTerminatesChildAndRetainsObservedStatus() throws {
+    @Test func guardTerminatesChildAndRetainsObservedStatus() throws {
         let f = try LifecycleFixture()
         defer { f.remove() }
         let log = try f.log()
@@ -122,7 +122,7 @@ struct LearnerLifecycleLoggingTests {
         defer { f.remove() }
         let log = try f.log()
         let parent = try f.start(log: log, code: 7, sleep: 1, detach: true)
-        try f.wait(parent)
+        try f.waitForLaunchingParentExit(parent)
         #expect(!f.exists("post-command"))
         let deadline = Date().addingTimeInterval(5)
         while !f.exists("post-command"), Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
@@ -131,13 +131,16 @@ struct LearnerLifecycleLoggingTests {
         #expect(lines.contains("learner_child_started"))
         #expect(lines.contains("learner_child_exited"))
         #expect(lines.contains("exit_code=7"))
+        try f.wait(parent)
     }
 }
 
 private struct LifecycleFixture {
     let root: URL
+    let guardExecutable: String
 
     init() throws {
+        guardExecutable = try #require(ProcessInfo.processInfo.environment["ENGRAM_TEST_PROCESS_GUARD"])
         let base = ProcessInfo.processInfo.environment["ENGRAM_TEST_TMPDIR"].map { URL(fileURLWithPath: $0) }
             ?? FileManager.default.temporaryDirectory
         root = base.appendingPathComponent("learner-lifecycle-\(UUID().uuidString)")
@@ -159,7 +162,7 @@ private struct LifecycleFixture {
             prompt: "fake prompt", systemPrompt: "fake system", allowedTools: "Read", model: "fake",
             logPath: root.appendingPathComponent("shared.log").path,
             postCommand: "touch '\(root.appendingPathComponent("post-command").path)'",
-            wallClockSeconds: wallClockSeconds, lifecycleLog: log)
+            wallClockSeconds: wallClockSeconds, lifecycleLog: log, guardExecutable: guardExecutable)
     }
 
     func start(log: LearnerLifecycleLog?, code: Int, sleep: Int = 0,
@@ -173,8 +176,29 @@ private struct LifecycleFixture {
         p.currentDirectoryURL = root
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
-        try p.run()
+        _ = try launchClaudeShell(p, lease: nil, guardExecutable: guardExecutable)
         return p
+    }
+
+    func waitForLaunchingParentExit(_ process: Process) throws {
+        #if os(Linux)
+        // Foundation's notification socket remains open in detached descendants.
+        // Observe the immediate parent's exit without taking Foundation's reap.
+        let deadline = Date().addingTimeInterval(5)
+        while process.isRunning, Date() < deadline {
+            var info = siginfo_t()
+            let result = waitid(P_PID, id_t(process.processIdentifier), &info, WEXITED | WNOWAIT | WNOHANG)
+            if result == 0, info.si_signo == SIGCHLD {
+                #expect(info.si_code == CLD_EXITED)
+                return
+            }
+            if result < 0, errno != EINTR, errno != ECHILD { throw POSIXError(.EIO) }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        guard !process.isRunning else { throw FixtureError.timedOut }
+        #else
+        try wait(process)
+        #endif
     }
 
     func wait(_ process: Process) throws {

@@ -11,7 +11,18 @@ import re
 import subprocess
 
 CLASSES = ('GalaxyLoadChangesTests', 'GalaxyDrainTests', 'VisualizerHostIsolationTests', 'AdapterSnapshotTests',
-           'FrameLookupInvalidationTests', 'SceneMetadataDomainTests')
+           'FrameLookupInvalidationTests', 'SceneMetadataDomainTests', 'LogsViewTests')
+# These functional regressions share a class with device-dependent performance
+# budgets. Select their methods explicitly rather than widening that class.
+METHODS = {'PanelPerformanceTests': (
+    'testSidebarPresentationDoesNotReevaluateItsGraphParent',
+    'testSidebarHoverDismissalCanBeCancelledByReentryAndPinning',
+    'testPanelSnapshotTracksInitialAndLiveChangesWithoutSidebarAppearance',
+    'testLogTailBoundsBytesAndLinesWithoutBreakingUnicode',
+)}
+
+def test_identifiers():
+    return list(CLASSES) + [name + '/' + method for name, methods in METHODS.items() for method in methods]
 
 def require(ok, message):
     if not ok:
@@ -27,12 +38,23 @@ def owned(root, path):
 
 def inventory(repo):
     result = []
-    for name in CLASSES:
+    for name in (*CLASSES, *METHODS):
         source = repo / 'EngramUnitTests' / (name + '.swift')
         methods = re.findall(r'^\s+func (test\w+)\(', source.read_text(), re.M)
         require(methods and len(methods) == len(set(methods)), 'invalid test source inventory')
+        if name in METHODS:
+            require(set(METHODS[name]) <= set(methods), 'selected test missing from source inventory')
+            methods = METHODS[name]
         result.extend(name + '/' + method for method in methods)
+    require(len(result) == len(set(result)), 'duplicate selected test')
     return sorted(result)
+
+def audit_passes(log, expected):
+    passed = re.findall(r"Test Case '-\[(?:\w+\.)?(\w+) (test\w+)\]' passed", log)
+    actual = sorted(name + '/' + method for name, method in passed if name in (*CLASSES, *METHODS))
+    require(actual == expected, 'missing, duplicate or unexpected focused XCTest pass')
+    require(not re.search(r"Test Case .*\b(?:failed|skipped)\b", log), 'failed or skipped test')
+    return actual
 
 def isolate(value, environment):
     """Only documented xctestrun v2 host-environment/selection fields change."""
@@ -62,7 +84,7 @@ def isolate(value, environment):
     require(isinstance(testing, dict), 'missing generated test launch environment')
     require(not (set(testing) & (set(environment) | {'HOME', 'CODEX_HOME'})), 'conflicting test launch environment')
     target['EnvironmentVariables'] = {**existing, **environment}
-    target['OnlyTestIdentifiers'] = list(CLASSES)
+    target['OnlyTestIdentifiers'] = test_identifiers()
     target['ParallelizationEnabled'] = False
     configuration['TestTargets'] = targets
     return result
@@ -187,10 +209,7 @@ def audit(root):
     expected = inventory(root / 'repo')
     require(expected == binding['expected_tests'], 'test inventory changed')
     log = (evidence / 'tests/output.log').read_text()
-    passed = re.findall(r"Test Case '-\[(?:\w+\.)?(\w+) (test\w+)\]' passed", log)
-    actual = sorted(name + '/' + method for name, method in passed if name in CLASSES)
-    require(actual == expected, 'missing, duplicate or unexpected focused XCTest pass')
-    require(not re.search(r"Test Case .*\b(?:failed|skipped)\b", log), 'failed or skipped test')
+    actual = audit_passes(log, expected)
     result = json.loads((evidence / 'tests/receipt.json').read_text())
     require(result.get('exit_code') == 0 and result.get('reason') == 'exit'
             and result.get('child_exit_code') == 0 and not result.get('log_truncated')

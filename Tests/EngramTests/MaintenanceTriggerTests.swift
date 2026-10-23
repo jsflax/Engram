@@ -10,7 +10,7 @@ import Foundation
 // by counting audit rows. It used to count `tableName == "Memory" AND
 // timestamp > lastRun`, which on a 3.96M-row audit log takes 3.8s warm — on
 // every prompt once past the cooldown, unbudgeted, inside the hook's window.
-// It now counts above a PRIMARY KEY watermark recorded at the last spawn,
+// It now counts above an initially seeded or completion PRIMARY KEY watermark,
 // which the index can answer without visiting the table (0.05s on the same
 // database).
 //

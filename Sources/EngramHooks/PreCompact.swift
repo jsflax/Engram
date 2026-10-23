@@ -102,7 +102,7 @@ struct PreCompact: AsyncParsableCommand {
         """
 
         do {
-            try spawnClaudeSubprocess(
+            let outcome = try spawnClaudeSubprocess(
                 prompt: prompt,
                 systemPrompt: Self.sessionLearnerSystemPrompt,
                 allowedTools: Self.allowedTools,
@@ -115,7 +115,7 @@ struct PreCompact: AsyncParsableCommand {
                 extraClaudeArgs: RemoteConfig.active?.learnerMcpArgs ?? "",
                 learnerLogContext: LearnerLogContext(sessionId: input.sessionId, trigger: .autoPrecompact)
             )
-            hookLog("PreCompact hook: spawned session-learner CLI for project \(project)")
+            hookLog("PreCompact hook: session-learner CLI for project \(project): \(outcome)")
         } catch {
             hookLog("PreCompact hook: failed to spawn session-learner: \(error)")
         }

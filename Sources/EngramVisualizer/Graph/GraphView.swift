@@ -49,14 +49,9 @@ struct GraphView: View {
     @State var debouncedTimeSliderDate: Date?
     @State private var isTimelinePlaying: Bool = false
 
-    // Sidebar (hover-to-peek, click-to-pin)
-    @State private var sidebarPinned: Bool = false
-    @State private var sidebarPeeking: Bool = false
-    @State private var sidebarHideTask: Task<Void, Never>?
     @Environment(AccountService.self) private var accountService
     @Environment(GroupService.self) private var groupService
     var syncManager: SyncManager // don't want to observe this
-    private var sidebarVisible: Bool { sidebarPinned || sidebarPeeking }
 
     // Embedding projection / layout mode
     @State var transitionProgress: CGFloat = 0  // 0 = force, 1 = embedding
@@ -189,7 +184,7 @@ struct GraphView: View {
             graphOverlays(size: size, colorMap: colorMap)
             detailPanel(size: size, colorMap: colorMap)
             groupPanels(size: size)
-            sidebarLayer(colorMap: colorMap)
+            sidebarLayer()
         }
     }
 
@@ -222,81 +217,20 @@ struct GraphView: View {
 
     // MARK: - Sidebar Layer (hover-to-peek, click-to-pin)
 
-    @ViewBuilder
-    private func sidebarLayer(colorMap: [String: Color]) -> some View {
-        // Hover zone: only covers the sidebar + toggle button, not the full window
-        HStack(alignment: .top, spacing: 0) {
-            // Sidebar panel
-            if sidebarVisible {
-                SidebarView(
-                    galaxyRegistry: galaxyRegistry,
-                    projectionState: embeddingProjection.state,
-                    toggleProject: toggleProject,
-                    toggleRelation: toggleRelation,
-                    switchLayoutMode: { mode in
-                        switchLayoutMode(to: mode, viewSize: NSApp.keyWindow?.frame.size ?? CGSize(width: 800, height: 600))
-                    },
-                    driveToProject: { cameraProjectTarget = $0 },
-                    accountService: accountService
-                )
-                .transition(.move(edge: .leading).combined(with: .opacity))
-            }
-
-            // Toggle button
-            VStack {
-                Button {
-                    if !sidebarVisible { PanelResponseRecorder.begin("sidebar.open") }
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        sidebarPinned.toggle()
-                        if sidebarPinned {
-                            sidebarHideTask?.cancel()
-                            sidebarPeeking = false
-                        }
-                    }
-                } label: {
-                    Image(systemName: "sidebar.left")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.white.opacity(sidebarPinned ? 0.9 : 0.5))
-                        .frame(width: 28, height: 28)
-                        .background(
-                            RoundedRectangle(cornerRadius: 6)
-                                .fill(.white.opacity(sidebarPinned ? 0.12 : 0.05))
-                        )
-                }
-                .buttonStyle(.plain)
-                .help(sidebarPinned ? "Unpin sidebar" : "Pin sidebar")
-                .accessibilityLabel(sidebarPinned ? "Unpin sidebar" : "Pin sidebar")
-                .accessibilityIdentifier("sidebar.toggle")
-                Spacer()
-            }
-            .frame(width: 44)
-            .padding(.top, 38)
+    private func sidebarLayer() -> some View {
+        SidebarDrawer {
+            SidebarView(
+                galaxyRegistry: galaxyRegistry,
+                projectionState: embeddingProjection.state,
+                toggleProject: toggleProject,
+                toggleRelation: toggleRelation,
+                switchLayoutMode: { mode in
+                    switchLayoutMode(to: mode, viewSize: NSApp.keyWindow?.frame.size ?? CGSize(width: 800, height: 600))
+                },
+                driveToProject: { cameraProjectTarget = $0 },
+                accountService: accountService
+            )
         }
-        .fixedSize(horizontal: true, vertical: false)
-        .frame(maxHeight: .infinity, alignment: .top)
-        .contentShape(Rectangle())
-        .onHover { hovering in
-            if hovering {
-                sidebarHideTask?.cancel()
-                if !sidebarPinned && !sidebarPeeking {
-                    PanelResponseRecorder.begin("sidebar.open")
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        sidebarPeeking = true
-                    }
-                }
-            } else if !sidebarPinned {
-                sidebarHideTask?.cancel()
-                sidebarHideTask = Task { @MainActor in
-                    try? await Task.sleep(for: .milliseconds(300))
-                    guard !Task.isCancelled else { return }
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        sidebarPeeking = false
-                    }
-                }
-            }
-        }
-        // Push to left edge of the ZStack
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: - Overlays
@@ -541,5 +475,93 @@ struct GraphView: View {
     /// Look up a project's color from a pre-built map. Falls back to gray for unknown projects.
     static func projectColor(for project: String, in colorMap: [String: Color]) -> Color {
         colorMap[project] ?? .gray
+    }
+}
+
+
+/// Presentation changes belong to the drawer, so hovering/pinning does not
+/// invalidate GraphView and re-read its graph configuration or selected memory.
+@MainActor @Observable
+final class SidebarPresentation {
+    private(set) var isPinned = false
+    private(set) var isPeeking = false
+    var isVisible: Bool { isPinned || isPeeking }
+    @ObservationIgnored nonisolated(unsafe) private var hideTask: Task<Void, Never>?
+
+    func togglePinned() {
+        if !isVisible { PanelResponseRecorder.begin("sidebar.open") }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            isPinned.toggle()
+            if isPinned {
+                hideTask?.cancel()
+                isPeeking = false
+            }
+        }
+    }
+
+    func hoverChanged(_ hovering: Bool) {
+        if hovering {
+            hideTask?.cancel()
+            if !isPinned && !isPeeking {
+                PanelResponseRecorder.begin("sidebar.open")
+                withAnimation(.easeInOut(duration: 0.2)) { isPeeking = true }
+            }
+        } else if !isPinned {
+            hideTask?.cancel()
+            hideTask = Task { @MainActor [weak self] in
+                do { try await Task.sleep(for: .milliseconds(300)) } catch { return }
+                guard !Task.isCancelled, let self else { return }
+                withAnimation(.easeInOut(duration: 0.2)) { self.isPeeking = false }
+            }
+        }
+    }
+
+    deinit { hideTask?.cancel() }
+}
+
+/// Owns presentation independently of the graph host. The content closure is
+/// evaluated only while visible, preserving lazy creation of the selected tab.
+struct SidebarDrawer<Content: View>: View {
+    @State private var presentation: SidebarPresentation
+    private let content: () -> Content
+
+    init(presentation: SidebarPresentation = SidebarPresentation(),
+         @ViewBuilder content: @escaping () -> Content) {
+        _presentation = State(initialValue: presentation)
+        self.content = content
+    }
+
+    var body: some View {
+        // The hover shape covers the panel and toggle strip, not the window.
+        HStack(alignment: .top, spacing: 0) {
+            if presentation.isVisible {
+                content()
+                    .transition(.move(edge: .leading).combined(with: .opacity))
+            }
+            VStack {
+                Button(action: presentation.togglePinned) {
+                    Image(systemName: "sidebar.left")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.white.opacity(presentation.isPinned ? 0.9 : 0.5))
+                        .frame(width: 28, height: 28)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(.white.opacity(presentation.isPinned ? 0.12 : 0.05))
+                        )
+                }
+                .buttonStyle(.plain)
+                .help(presentation.isPinned ? "Unpin sidebar" : "Pin sidebar")
+                .accessibilityLabel(presentation.isPinned ? "Unpin sidebar" : "Pin sidebar")
+                .accessibilityIdentifier("sidebar.toggle")
+                Spacer()
+            }
+            .frame(width: 44)
+            .padding(.top, 38)
+        }
+        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .contentShape(Rectangle())
+        .onHover(perform: presentation.hoverChanged)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

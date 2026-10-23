@@ -209,6 +209,27 @@ class InstallerTests(unittest.TestCase):
             self.run_install()
         self.assertFalse(self.hooks_path.exists())
 
+    def test_real_runtime_stages_provider_guard_and_imports_without_repository_fallback(self):
+        assets = installer.load_assets(MODULE_PATH.parent)
+        for name in ('spawn_admission.py', 'provider_guard.py'):
+            relative = 'codex_learner/' + name
+            self.assertEqual(assets[relative], (MODULE_PATH.parent / relative).read_bytes())
+        runtime = installer.stage_runtime(self.state, assets)
+        result = subprocess.run([sys.executable, '-I', '-S', '-B', '-c', '''
+import pathlib, sys
+root = pathlib.Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root))
+def offline(event, args):
+    if event in {'subprocess.Popen', 'os.system', 'socket.connect', 'socket.getaddrinfo'}:
+        raise RuntimeError('unexpected import side effect: ' + event)
+sys.addaudithook(offline)
+from codex_learner import runner, spawn_admission, provider_guard
+for module in (runner, spawn_admission, provider_guard):
+    assert pathlib.Path(module.__file__).resolve().is_relative_to(root)
+''', str(runtime)], cwd=self.root, text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.hooks_path.exists(), 'staging must not register hooks')
+
     def test_edited_owned_command_requires_review_instead_of_duplication(self):
         self.run_install()
         hooks = self.read_hooks()

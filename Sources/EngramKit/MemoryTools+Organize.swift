@@ -132,21 +132,28 @@ extension MemoryTools {
             source: "organize",
             embedding: hubEmbedding
         )
-        try localLattice.add(hub)
-
-        guard let hubGlobalId = hub.globalId else {
-            return CallTool.Result(content: [.text("Failed to get hub globalId.")], isError: true)
-        }
-
-        // Link each memory to hub and update its topic
-        try localLattice.transaction {
-            for gid in ids {
-                if let mem = memories[gid] {
-                    let edge = Edge(sourceGlobalId: gid, targetGlobalId: hubGlobalId, relation: .partOf, authorUserId: currentUserId)
-                    try localLattice.add(edge)
-                    mem.topic = label
+        // Hub, edges and topic updates share one checked transaction with a
+        // bounded BEGIN retry (previously an autocommit add followed by an
+        // unchecked transaction whose failed BEGIN trapped the process).
+        let hubGlobalId: UUID
+        do {
+            hubGlobalId = try LatticeBeginRetry.run(on: localLattice, log: { log("[organize] \($0)") }) {
+                try localLattice.add(hub)
+                guard let hubGid = hub.globalId else {
+                    throw MCPError.internalError("Failed to get hub globalId.")
                 }
-            }
+                for gid in ids {
+                    if let mem = memories[gid] {
+                        let edge = Edge(sourceGlobalId: gid, targetGlobalId: hubGid, relation: .partOf, authorUserId: currentUserId)
+                        try localLattice.add(edge)
+                        mem.topic = label
+                    }
+                }
+                return hubGid
+            }.value
+        } catch let contention as LatticeBeginRetry.Contention {
+            log("[organize] not organized: \(contention)")
+            return Self.busyReceipt(tool: "organize", verb: "organized", contention: contention)
         }
 
         log("Organized \(ids.count) memories under '\(label)' → hub [id:\(hubGlobalId.uuidString)]")

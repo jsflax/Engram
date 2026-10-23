@@ -47,6 +47,8 @@ class RunnerReconnectTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory(prefix='runner-reconnect-', dir=TEST_ROOT)
         self.addCleanup(temp.cleanup)
         self.base = Path(temp.name).resolve()
+        from suite_support import fixture_spawn_gate
+        self.enterContext(fixture_spawn_gate(R.spawn_admission, self.base / "gate"))
         self.root, self.project, self.sessions, self.plugin, self.host = [self.base / name for name in
             ('learner', 'project', 'sessions', 'plugin', 'host')]
         for path in (self.root, self.project, self.sessions, self.plugin, self.host): path.mkdir(mode=0o700)

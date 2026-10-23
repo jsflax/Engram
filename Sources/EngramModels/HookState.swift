@@ -8,7 +8,10 @@ public final class HookState {
     public enum Key: String, Codable, Sendable {
         case maintenanceLastRunTimestamp = "maintenance.lastRunTimestamp"
         case maintenanceActive = "maintenance.active"
-        /// AuditLog primary key at the last maintenance spawn. The trigger
+        /// Initially seeded AuditLog primary key or the last best-effort
+        /// completion baseline. Completion excludes concurrent
+        /// writes through that head as well; audit rows lack writer origin.
+        /// The trigger
         /// counts qualifying audit rows ABOVE this watermark instead of
         /// scanning every `tableName = 'Memory'` row for a timestamp window
         /// — the rowid restriction keeps the count off the table pages
@@ -25,6 +28,9 @@ public final class HookState {
         /// key-filtered SQL-side, so an unknown enum value never reaches
         /// their decoder.
         case embeddingSpaceVersion = "embedding.spaceVersion"
+        /// Unix time of the last ADMITTED session-learner spawn (the
+        /// spawn gate itself is file-based: SpawnAdmission). Visibility only.
+        case learnerLastSpawnAt = "learner.lastSpawnAt"
     }
 
     /// The state key.

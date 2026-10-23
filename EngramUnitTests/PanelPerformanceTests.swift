@@ -1,4 +1,5 @@
 @testable import Engram
+import AppKit
 import EngramKit
 import Lattice
 import SwiftUI
@@ -10,6 +11,27 @@ private extension Galaxy {
         pendingUpdate.withLock {
             $0.bulkNodeBatches = [[(pk: 1, node: nodes[0])], [(pk: 2, node: nodes[1])]]
             $0.finalize = true
+        }
+    }
+}
+
+@MainActor
+private final class SidebarRenderCounter {
+    var parentBodies = 0
+    var drawerBodies = 0
+}
+
+/// Hosts the production drawer below a parent whose work models the graph
+/// host. Counting actual SwiftUI evaluations verifies the observation boundary.
+private struct SidebarIsolationHost: View {
+    let presentation: SidebarPresentation
+    let counter: SidebarRenderCounter
+
+    var body: some View {
+        let _ = counter.parentBodies += 1
+        SidebarDrawer(presentation: presentation) {
+            let _ = counter.drawerBodies += 1
+            Text("Drawer fixture").frame(width: 310)
         }
     }
 }
@@ -38,6 +60,62 @@ final class PanelPerformanceTests: XCTestCase {
         XCTAssertNil(phases.mutationReturnToDrawMilliseconds)
         XCTAssertEqual(phases.beginToDrawMilliseconds, 500)
         XCTAssertEqual(phases.csvValues, "0.000,,,500.000")
+    }
+
+    func testSidebarPresentationDoesNotReevaluateItsGraphParent() async throws {
+        let presentation = SidebarPresentation()
+        let counter = SidebarRenderCounter()
+        let host = NSHostingView(rootView: SidebarIsolationHost(presentation: presentation, counter: counter))
+        host.frame = NSRect(x: 0, y: 0, width: 600, height: 500)
+        host.layoutSubtreeIfNeeded()
+        try await waitUntil {
+            host.layoutSubtreeIfNeeded()
+            return counter.parentBodies > 0
+        }
+        let initialParentBodies = counter.parentBodies
+        XCTAssertEqual(counter.drawerBodies, 0, "Closed drawer content stays lazy")
+
+        for _ in 0..<3 {
+            let previousDrawerBodies = counter.drawerBodies
+            presentation.hoverChanged(true)
+            try await waitUntil {
+                host.layoutSubtreeIfNeeded()
+                return counter.drawerBodies > previousDrawerBodies
+            }
+            XCTAssertTrue(presentation.isVisible)
+            XCTAssertEqual(counter.parentBodies, initialParentBodies,
+                           "Peek must not re-evaluate the graph parent's configuration or selected-memory lookup")
+            // The production button uses this same action. Pinning cancels
+            // hover dismissal; unpinning closes a pinned-only presentation.
+            presentation.togglePinned()
+            presentation.hoverChanged(false)
+            XCTAssertTrue(presentation.isPinned && presentation.isVisible)
+            presentation.togglePinned()
+            XCTAssertFalse(presentation.isVisible)
+            host.layoutSubtreeIfNeeded()
+            await Task.yield()
+            host.layoutSubtreeIfNeeded()
+            XCTAssertEqual(counter.parentBodies, initialParentBodies)
+        }
+    }
+
+    func testSidebarHoverDismissalCanBeCancelledByReentryAndPinning() async throws {
+        let presentation = SidebarPresentation()
+        presentation.hoverChanged(true)
+        presentation.hoverChanged(false)
+        XCTAssertTrue(presentation.isVisible, "Leaving starts the existing delayed hide")
+        presentation.hoverChanged(true)
+        try await Task.sleep(for: .milliseconds(350))
+        XCTAssertTrue(presentation.isVisible, "Reentry cancels the pending dismissal")
+        presentation.hoverChanged(false)
+        presentation.togglePinned()
+        try await Task.sleep(for: .milliseconds(350))
+        XCTAssertTrue(presentation.isPinned && presentation.isVisible, "Pinning cancels the pending dismissal")
+        presentation.togglePinned()
+        XCTAssertFalse(presentation.isVisible)
+        presentation.hoverChanged(true)
+        presentation.hoverChanged(false)
+        try await waitUntil { !presentation.isVisible }
     }
 
     func testSidebarRenderConfigurationBoundsSQLAndKeepsLiveConfigFresh() throws {
@@ -338,6 +416,38 @@ final class PanelPerformanceTests: XCTestCase {
         XCTAssertEqual(snapshot.recent.count, 50)
         XCTAssertEqual(snapshot.recent.first?.label, "Node 79")
         XCTAssertEqual(snapshot.recent.last?.label, "Node 30")
+    }
+
+    func testPanelSnapshotTracksInitialAndLiveChangesWithoutSidebarAppearance() async throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        let registry = GalaxyRegistry()
+        let galaxy = Galaxy(id: "personal", displayName: "Personal", lattice: lattice.sendableReference)
+        registry.register(galaxy)
+        let nodes = (0..<2).map { index in
+            NodeData(id: UUID(), project: "Initial", topic: "Topic", label: "Node \(index)", content: "",
+                     createdAt: .distantPast, lastAccessedAt: .distantPast, importance: 0)
+        }
+        await galaxy.preparePanelInitialSnapshotForTesting(nodes: nodes)
+        let config = DrainConfig(hiddenProjects: [], hiddenRelations: [], timeFilter: nil,
+                                 is3D: true, soundEnabled: false, notificationsEnabled: false)
+        // Exercise the producer/registry publication path with no sidebar and
+        // no direct panel refresh request, including the partial initial drain.
+        galaxy.drainPendingUpdate(config: config, workBudget: 0)
+        registry.mergeRenderData()
+        XCTAssertTrue(galaxy.isDrainingInitialSnapshot)
+        galaxy.drainPendingUpdate(config: config, workBudget: 0)
+        registry.mergeRenderData()
+        try await waitUntil { registry.panelSnapshot.projectCounts == ["Initial": 2] }
+        XCTAssertEqual(registry.panelSnapshot.totalCount, 2)
+        XCTAssertEqual(registry.panelSnapshot.loadingStores, 0)
+
+        let changed = NodeData(id: nodes[0].id, project: "Changed", topic: "Topic", label: "Updated while closed",
+                               content: "", createdAt: .distantPast, lastAccessedAt: .distantPast, importance: 0)
+        galaxy.handleNodeUpdate(pk: 1, node: changed, config: config)
+        registry.mergeRenderData()
+        try await waitUntil { registry.panelSnapshot.projectCounts == ["Initial": 1, "Changed": 1] }
+        XCTAssertEqual(registry.panelSnapshot.totalCount, 2)
+        XCTAssertTrue(registry.panelSnapshot.recentNodes.contains { $0.label == "Updated while closed" })
     }
 
     func testPanelRefreshWaitsForInitialDrainThenPublishesPendingRequest() async throws {

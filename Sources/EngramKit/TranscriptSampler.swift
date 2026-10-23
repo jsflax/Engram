@@ -11,14 +11,20 @@ import Lattice
 public struct TranscriptSampler {
 
     /// A scored excerpt from the transcript.
-    public struct ScoredExcerpt: Sendable {
+    public struct ScoredExcerpt: Sendable, Equatable {
         public let text: String
         public let minDistance: Double  // distance to nearest existing memory
         public let charLength: Int
+        /// A query failed, or eligible memories exist without a usable vector
+        /// distance. The fallback distance must not be read as a measurement.
+        /// A successfully read empty search scope is novel, not degraded;
+        /// a measured distance of exactly 1.0 is also valid.
+        public let isDegraded: Bool
 
-        public init(text: String, minDistance: Double, charLength: Int) {
+        public init(text: String, minDistance: Double, charLength: Int, isDegraded: Bool = false) {
             self.text = text
             self.minDistance = minDistance
+            self.isDegraded = isDegraded
             self.charLength = charLength
         }
     }
@@ -71,6 +77,7 @@ public struct TranscriptSampler {
         // 3. Embed each block and score by novelty
         var scored: [ScoredExcerpt] = []
         let now = Date()
+        let search = NoveltySearch(lattice: lattice, now: now)
 
         for block in substantive {
             // Truncate before embedding to keep it focused
@@ -79,17 +86,13 @@ public struct TranscriptSampler {
             guard let floats = try? await embedder.embed(text: truncated) else { continue }
             let embedding = Vector<Float>(floats)
 
-            // Find nearest existing memory
-            let nearest = lattice.objects(Memory.self)
-                .where { $0.expiresAt > now }
-                .nearest(to: embedding, on: \.embedding, limit: 1, distance: .l2)
-
-            let minDist = nearest.first.map { $0.distances["embedding"] ?? 1.0 } ?? 1.0
+            let score = search.score(embedding)
 
             scored.append(ScoredExcerpt(
                 text: truncated,
-                minDistance: minDist,
-                charLength: truncated.count
+                minDistance: score.distance,
+                charLength: truncated.count,
+                isDegraded: score.isDegraded
             ))
         }
 
@@ -121,6 +124,42 @@ public struct TranscriptSampler {
         return result
     }
 
+    /// Reuse the eligible-count observation for this advisory sampling pass.
+    /// The count and nearest query have the same visibility predicate. Check
+    /// each sealed error immediately: another query can clear its thread-local
+    /// slot, and an empty failure result must never bootstrap a learner.
+    struct NoveltySearch {
+        let lattice: Lattice
+        let now: Date
+        let eligibleCount: Int?
+
+        init(lattice: Lattice, now: Date) {
+            self.lattice = lattice
+            self.now = now
+            let count = lattice.count(Memory.self, where: {
+                $0.expiresAt > now && $0.deletedAt == nil
+            })
+            self.eligibleCount = lattice.lastQueryError() == nil ? count : nil
+        }
+
+        func score(_ embedding: Vector<Float>) -> (distance: Double, isDegraded: Bool) {
+            guard !embedding.isEmpty, embedding.elements.allSatisfy(\.isFinite),
+                  let eligibleCount else { return (1.0, true) }
+            // Avoid initializing a vector index just to discover an already
+            // verified empty scope. This also lets a new store start learning.
+            if eligibleCount == 0 { return (1.0, false) }
+            let matches = lattice.objects(Memory.self)
+                .where { $0.expiresAt > now && $0.deletedAt == nil }
+                .nearest(to: embedding, on: \.embedding, limit: 1, distance: .l2)
+                .snapshot()
+            let queryFailed = lattice.lastQueryError() != nil
+            guard !queryFailed,
+                  let distance = matches.first?.distances["embedding"],
+                  distance.isFinite, distance >= 0 else { return (1.0, true) }
+            return (distance, false)
+        }
+    }
+
     /// Format scored excerpts into a string suitable for FM assessment.
     public static func formatForAssessment(_ excerpts: [ScoredExcerpt]) -> String {
         excerpts.enumerated().map { i, e in
@@ -135,5 +174,26 @@ public struct TranscriptSampler {
     /// shared with the remote/Linux hooks.
     public static func extractAssistantTextBlocks(from path: String) -> [String] {
         TranscriptExcerpts.assistantTextBlocks(from: path)
+    }
+}
+
+
+// MARK: - Gate decision
+
+/// What the sample gate should do with the sampler's output. Pure, so the
+/// fail-open/fail-closed policy is testable without a transcript or a model.
+public enum SampleGateDecision: Equatable, Sendable {
+    /// Spawn the learner with these (non-degraded) excerpts as hints.
+    case spawn(excerpts: [TranscriptSampler.ScoredExcerpt])
+    /// Do not spawn; `reason` is logged verbatim.
+    case skip(reason: String)
+
+    public static func decide(_ excerpts: [TranscriptSampler.ScoredExcerpt]) -> SampleGateDecision {
+        guard !excerpts.isEmpty else { return .skip(reason: "no novel excerpts") }
+        let usable = excerpts.filter { !$0.isDegraded && $0.minDistance.isFinite && $0.minDistance >= 0 }
+        guard !usable.isEmpty else {
+            return .skip(reason: "degraded: no usable novelty measurement or verified empty search scope")
+        }
+        return .spawn(excerpts: usable)
     }
 }

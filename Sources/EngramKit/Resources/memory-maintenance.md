@@ -19,7 +19,7 @@ Run `stats()` and `list_topics()` for each project to understand memory distribu
 ### 2. Find redundancy
 
 Run `find_clusters(project: "...", min_cluster_size: 2, max_clusters: 10)` for each project. For each cluster:
-- Read the actual memory content via `recall` to understand what each one says
+- Read the actual memory content via `recall` to understand what each one says (the structured result's `engram_recall.text` and per-row `content` carry the same text the rendered block shows; a result with ids only means an older server)
 - Decide: are these genuinely redundant (saying the same thing) or topically similar but distinct?
 - Only consolidate memories that are truly saying the same thing in different words
 - Keep memories that cover different aspects of the same topic as separate entries

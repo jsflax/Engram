@@ -12,7 +12,8 @@ import Foundation
 // the old one-statement-per-field-per-memory pattern (~250-300 statements per
 // depth-1 recall, each paying an O(WAL) scan — 228s observed in production)
 // into O(K + C + F) statements, and the access-stat bumps move into ONE
-// batched transaction on the objects' own connection.
+// bounded best-effort transaction on a dedicated 75 ms hub handle. Hook
+// recall skips those approximate statistics writes entirely.
 //
 // The statement counter is process-global, so this suite is serialized.
 

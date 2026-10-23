@@ -181,24 +181,25 @@ def _fenced_transport(transport, writer_fence=None):
     returned FD is borrowed; neither this helper nor relay closes/unlocks it.
     """
     argv, env, cwd = _transport(transport)
-    if writer_fence is None:
-        return argv, env, cwd, ()
     if __package__:
-        from . import writer_fence as fences
+        from . import writer_fence as fences, spawn_admission
     else:
         # Direct packaged script execution. Resolve only the executing package,
         # never an environment-supplied import or lock path.
         scripts = str(Path(__file__).resolve().parent.parent)
         if scripts not in sys.path:
             sys.path.insert(0, scripts)
-        from codex_learner import writer_fence as fences
+        from codex_learner import writer_fence as fences, spawn_admission
+    inherited = spawn_admission.pass_fds()
+    if writer_fence is None:
+        return argv, env, cwd, inherited
     if type(writer_fence) is not fences.HeldFence or writer_fence.mode != "shared":
         raise RelayError("invalid_writer_fence")
     descriptor, = writer_fence.pass_fds()
     binding = writer_fence.binding()
     env[FENCE_DESCRIPTOR_ENV] = str(descriptor)
     env[FENCE_BINDING_ENV] = base64.b64encode(fences.durable.encode(binding)).decode("ascii")
-    return argv, env, cwd, (descriptor,)
+    return argv, env, cwd, (descriptor,) + inherited
 
 
 def _cleanup(child: subprocess.Popen, timeout: float):

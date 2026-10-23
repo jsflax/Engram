@@ -70,16 +70,17 @@ struct Advise: AsyncParsableCommand {
 
         // H1.6: the section accumulator doubles as the UNCONDITIONAL
         // watchdog. Armed here — before ANY lattice/DB touch — with an OS
-        // thread deadline of budget+2s: the budgets above stop WAITING on a
+        // thread deadline of at most budget+2s (within the host timeout): the budgets above stop WAITING on a
         // wedged database, but only the watchdog still runs when a C++
         // frame is stuck in an uninterruptible lock wait and the
         // cooperative pool is starved. Whatever has accumulated by then
         // ships, with a one-line notice, exit 0.
+        let watchdogSeconds = HookBudget.watchdogSeconds(event: "UserPromptSubmit", recallBudget: budget)
         let watchdog = HookWatchdog(eventName: "UserPromptSubmit")
         watchdog.arm(
-            firesAt: hookStart.addingTimeInterval(budget + 2),
+            firesAt: hookStart.addingTimeInterval(watchdogSeconds),
             notice: "⚠️ Memory hook watchdog: the memory system did not finish within "
-                + "\(String(format: "%.0f", budget))s+2s; emitting partial context and exiting. "
+                + "\(String(format: "%.1f", watchdogSeconds))s; emitting partial context and exiting. "
                 + "Memories are intact; recall resumes when the database recovers.")
 
         if let remote = RemoteConfig.active {
@@ -126,7 +127,8 @@ struct Advise: AsyncParsableCommand {
             let outcome = try await HookBudget.race(
                 seconds: max(0, deadline.timeIntervalSinceNow)
             ) { () -> (result: String, query: String)? in
-                guard let tools = await initMemoryTools(sessionId: sid) else {
+                guard let tools = await initMemoryTools(sessionId: sid,
+                                                        budget: (start: hookStart, seconds: budget)) else {
                     hookLog("Advise: failed to initialize memory tools")
                     return nil
                 }
@@ -186,8 +188,13 @@ struct Advise: AsyncParsableCommand {
             hookLog("Advise: recall blew its budget — skipping the maintenance check")
         } else {
             let remaining = deadline.timeIntervalSinceNow
-            if remaining <= 0 {
-                hookLog("Advise: no budget left for the maintenance check — skipping")
+            let load = HookBudget.loadAverage1m()
+            let ncpu = ProcessInfo.processInfo.activeProcessorCount
+            if !HookBudget.shouldRunMaintenanceCheck(remaining: remaining, loadAverage: load,
+                                                     processorCount: ncpu) {
+                hookLog("Advise: skipping the maintenance check (remaining "
+                    + String(format: "%.1fs", remaining) + ", load "
+                    + (load.map { String(format: "%.1f", $0) } ?? "unavailable") + ")")
             } else {
                 let outcome = try? await HookBudget.race(seconds: remaining) {
                     spawnMaintenanceIfNeeded(project: proj, cwd: input.cwd)
@@ -319,8 +326,8 @@ struct Advise: AsyncParsableCommand {
     ///    once per window: the cooldown is measured from the last SPAWN, so
     ///    a database that never reaches the threshold pays it forever.
     ///
-    /// The window is now anchored on the audit primary key recorded at the
-    /// last spawn instead of on a timestamp. `id > watermark` is a rowid
+    /// The window is anchored on the initially seeded audit primary key or
+    /// the last completion baseline. `id > watermark` is a rowid
     /// restriction the index can answer, so the count never leaves the index
     /// for the rows it rejects: 0.05s on that same database, a 75x cut, and
     /// exact — not an estimate.
@@ -335,17 +342,22 @@ struct Advise: AsyncParsableCommand {
         let lastRunTimestamp = Double(
             getHookState(lattice, key: .maintenanceLastRunTimestamp) ?? "0"
         ) ?? 0
+        guard lattice.lastQueryError == nil else { return }
         let since = Date(timeIntervalSince1970: lastRunTimestamp)
 
         // Don't spawn if maintenance is already running — but with a
         // staleness escape: the flag is cleared by the maintenance agent on
         // completion, so a SIGKILL mid-run used to leave it stuck at "1" and
         // disable maintenance forever. lastRunTimestamp is set alongside the
-        // flag, so an "active" older than an hour is a corpse, not a run.
+        // flag. Age only permits reconsideration; the cross-provider lifetime
+        // lease remains authoritative about whether a worker is still alive.
         if getHookState(lattice, key: .maintenanceActive) == "1" {
             let flagAge = Date().timeIntervalSince(since)
             if flagAge < 3600 { return }
-            setHookState(lattice, key: .maintenanceActive, value: "0")
+        }
+        guard lattice.lastQueryError == nil else {
+            hookLog("Advise: maintenance state unavailable; leaving baseline unchanged")
+            return
         }
 
         // Enforce minimum cooldown to prevent maintenance's own writes from re-triggering
@@ -356,8 +368,14 @@ struct Advise: AsyncParsableCommand {
         let headId = lattice.objects(AuditLog.self)
             .sortedBy(\.primaryKey, order: .reverse)
             .first?.primaryKey ?? 0
+        guard lattice.lastQueryError == nil else {
+            hookLog("Advise: maintenance audit head unavailable; leaving baseline unchanged")
+            return
+        }
 
-        guard let stored = getHookState(lattice, key: .maintenanceAuditWatermark),
+        let storedWatermark = getHookState(lattice, key: .maintenanceAuditWatermark)
+        guard lattice.lastQueryError == nil else { return }
+        guard let stored = storedWatermark,
               let watermark = Int64(stored) else {
             // First evaluation on this database, or the first after upgrading
             // from the timestamp-window trigger. Anchor at the current head
@@ -373,14 +391,11 @@ struct Advise: AsyncParsableCommand {
             .where { $0.primaryKey > watermark && $0.tableName == "Memory" && $0.isFromRemote == false }
             .count
 
+        guard lattice.lastQueryError == nil else {
+            hookLog("Advise: maintenance delta unavailable; leaving baseline unchanged")
+            return
+        }
         guard delta >= maintenanceThreshold else { return }
-
-        // Update baseline immediately to prevent re-spawning on next advise call
-        setHookState(lattice, key: .maintenanceLastRunTimestamp, value: String(Date().timeIntervalSince1970))
-        setHookState(lattice, key: .maintenanceAuditWatermark, value: String(headId))
-
-        // Signal the visualizer that maintenance is active
-        setHookState(lattice, key: .maintenanceActive, value: "1")
 
         let prompt = """
         Perform maintenance on the memory database. Focus on project "\(project)".
@@ -392,8 +407,9 @@ struct Advise: AsyncParsableCommand {
 
         let hooksBin = NSHomeDirectory() + "/.claude/bin/memory-hooks"
 
+        var markedActive = false
         do {
-            try spawnClaudeSubprocess(
+            let outcome = try spawnClaudeSubprocess(
                 prompt: prompt,
                 systemPrompt: Self.maintenanceSystemPrompt,
                 allowedTools: Self.maintenanceAllowedTools,
@@ -405,10 +421,31 @@ struct Advise: AsyncParsableCommand {
                 // Maintenance legitimately runs long (consolidate/organize
                 // sweeps) — keep bounds well above the learner defaults.
                 maxTurns: 40,
-                wallClockSeconds: 1800
+                wallClockSeconds: 1800,
+                beforeLaunch: {
+                    // Before launch: a fast child cannot clear this flag and
+                    // then have its completed state overwritten by its parent.
+                    markedActive = true
+                    setHookState(lattice, key: .maintenanceActive, value: "1")
+                }
             )
-            hookLog("Advise: spawned memory-maintenance subprocess (ops delta: \(delta))")
+            switch outcome {
+            case .spawned:
+                // The timestamp follows successful admission/launch. The
+                // kernel lease prevents overlap even if these best-effort
+                // writes fail or a later hook sees the old baseline.
+                setHookState(lattice, key: .maintenanceLastRunTimestamp, value: String(Date().timeIntervalSince1970))
+                // Completion owns the next baseline. A fast child may have
+                // already advanced it; never overwrite that head with the
+                // older value captured before launch.
+                hookLog("Advise: spawned memory-maintenance subprocess (ops delta: \(delta))")
+            case .skipped(let verdict):
+                // Refusal must not consume the maintenance window or mutate
+                // active/last-run/watermark state; no maintenance was launched.
+                hookLog("Advise: memory-maintenance \(verdict) (ops delta: \(delta))")
+            }
         } catch {
+            if markedActive { setHookState(lattice, key: .maintenanceActive, value: "0") }
             hookLog("Advise: failed to spawn memory-maintenance: \(error)")
         }
     }

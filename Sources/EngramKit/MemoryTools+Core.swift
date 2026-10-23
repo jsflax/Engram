@@ -9,7 +9,15 @@ import NaturalLanguage
 extension MemoryTools {
     /// Perform a recall and return the text result directly, without MCP framing.
     /// Used by the hooks binary to inject recalled memories as context.
-    public func directRecall(query: String, project: String?, depth: Int = 1, limit: Int = 5) async throws -> String? {
+    ///
+    /// `bumpAccessStats` defaults to FALSE on this path: hooks run inside the
+    /// user's prompt latency on every turn, and the access-stat bump is a
+    /// write transaction on the hub — under contention it waited the full
+    /// busy timeout (2 s) per prompt per session and was itself one more
+    /// writer competing with `remember`. lastAccessedAt/accessCount are
+    /// ranking hints, so the MCP `recall` tool's best-effort bump is enough.
+    public func directRecall(query: String, project: String?, depth: Int = 1, limit: Int = 5,
+                             bumpAccessStats: Bool = false) async throws -> String? {
         try prepareStorage()
         var args: [String: Value] = ["query": .string(query)]
         if let project {
@@ -17,7 +25,7 @@ extension MemoryTools {
         }
         args["depth"] = .int(depth)
         args["limit"] = .int(limit)
-        let result = try await handleRecall(args)
+        let result = try await handleRecall(args, bumpAccessStats: bumpAccessStats)
         // Extract text from the CallTool.Result
         guard let textContent = result.content.first else { return nil }
         switch textContent {
@@ -191,41 +199,21 @@ extension MemoryTools {
         let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance, isPrivate: isPrivate, authorUserId: authorID, modifiedAt: rememberedAt)
 
         // The Memory and its required graph/topic effects share one checked
-        // transaction. A failed BEGIN cannot execute the body in autocommit.
-        // Other errors still propagate without claiming that rollback settled.
-        var transactionBodyEntered = false
+        // transaction. A failed BEGIN cannot execute the body in autocommit
+        // and is retried a bounded number of times (LatticeBeginRetry); every
+        // other error still propagates without claiming that rollback settled.
         let effects: RememberCommitEffects
         do {
-            effects = try localLattice.withTransaction { () throws -> RememberCommitEffects in
-                transactionBodyEntered = true
-                return try commitRemember(memory, parentGidValue: parentGidValue,
-                                          episodeId: episodeId,
-                                          autoConnectCandidates: autoConnectCandidates,
-                                          authorID: authorID)
-            }
-        } catch {
-            // Only a failed BEGIN proves this attempt did not run any write.
-            // Identical text from a body, COMMIT, rollback, or notification
-            // failure must retain its unknown persistence outcome.
-            guard !transactionBodyEntered,
-                  case LatticeError.transactionError(let detail) = error,
-                  ["database is locked", "database is busy", "database table is locked",
-                   "database schema is locked"].contains(where: {
-                      detail == "Failed to begin transaction: " + $0
-                  }) else { throw error }
-            return CallTool.Result(
-                content: [.text("Memory was not stored: the database was busy before the write transaction started. Retry on a later turn.")],
-                structuredContent: .object([
-                    "engram_write_receipt": .object([
-                        "schema_version": .int(1),
-                        "tool": .string("remember"),
-                        "write_outcome": .string("not_stored_transaction_not_started"),
-                        "reason": .string("database_busy"),
-                        "memory_ids": .array([]),
-                    ]),
-                ]),
-                isError: true
-            )
+            effects = try LatticeBeginRetry.run(on: localLattice, log: { log("[remember] \($0)") }) {
+                try commitRemember(memory, parentGidValue: parentGidValue,
+                                   episodeId: episodeId,
+                                   autoConnectCandidates: autoConnectCandidates,
+                                   authorID: authorID)
+            }.value
+        } catch let contention as LatticeBeginRetry.Contention {
+            // Only failed BEGINs reach here: this attempt ran no write.
+            log("[remember] not stored: \(contention)")
+            return Self.busyReceipt(tool: "remember", verb: "stored", contention: contention)
         }
 
         let memoryGlobalId = effects.memoryID
@@ -489,32 +477,89 @@ extension MemoryTools {
     /// Recalled content is untrusted and must never supply target privacy. Keep
     /// text/row markers unchanged for existing consumers, and retain row order
     /// rather than collapsing potentially conflicting copies by ID.
-    nonisolated static func recallResult(_ text: String, hits: [RecallHit]) -> CallTool.Result {
+    ///
+    /// Clients that render `structuredContent` INSTEAD of the text block
+    /// (Claude Code does) saw only ids after the 0.15.9 metadata contract
+    /// landed — learners and maintenance could no longer read what they
+    /// recalled, so they could not dedupe and wrote duplicates. Each row now
+    /// also carries its `topic` and `content` (fenced for foreign rows when
+    /// the fence policy is on, exactly as the text block renders it), and
+    /// the envelope carries the rendered `text`. id/project/isPrivate stay
+    /// the authoritative native metadata; content remains untrusted data.
+    /// The structured row must not expand a connected preview into a full
+    /// memory body. Keep the text and structured rendering on the same policy.
+    nonisolated static func recallContent(_ content: String, depth: Int,
+                                          isForeign: Bool, fenceForeign: Bool) -> String {
+        if fenceForeign && isForeign { return fencedForeignContent(content) }
+        guard depth > 0, content.count > 500 else { return content }
+        let firstLine = content.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? content
+        return String(firstLine.prefix(120)) + "..."
+    }
+
+    nonisolated static func recallResult(_ text: String, hits: [RecallHit],
+                                         fenceForeign: Bool = false) -> CallTool.Result {
         let rows: [Value] = hits.map { hit in
-            .object([
+            let content = Self.recallContent(hit.memory.content, depth: hit.depth,
+                                             isForeign: hit.isForeign, fenceForeign: fenceForeign)
+            return .object([
                 "id": .string(hit.memory.id.uuidString),
                 "project": hit.memory.project.map(Value.string) ?? .null,
                 "isPrivate": .bool(hit.memory.isPrivate),
+                "topic": hit.memory.topic.map(Value.string) ?? .null,
+                "content": .string(content),
             ])
         }
         return CallTool.Result(content: [.text(text)], structuredContent: .object([
-            "engram_recall": .object(["version": .int(1), "rows": .array(rows)]),
+            "engram_recall": .object(["version": .int(1), "text": .string(text), "rows": .array(rows)]),
         ]), isError: false)
     }
 
-    func handleRecall(_ args: [String: Value]?) async throws -> CallTool.Result {
+    /// The receipt every write tool returns when a bounded BEGIN retry still
+    /// never admitted the transaction body. `write_outcome` stays
+    /// `not_stored_transaction_not_started`: nothing was written, a retry is
+    /// safe.
+    ///
+    /// The text and the receipt's key set are a FROZEN contract: the Codex
+    /// learner's memory proxy (scripts/codex_learner/memory_proxy.py,
+    /// `verified_begin_busy_response`) accepts this no-write receipt only when
+    /// the text matches byte for byte and the receipt has exactly these five
+    /// keys at schema_version 1. Attempt count and total wait therefore go to
+    /// the server log (`[tool] not stored: BEGIN contention after N
+    /// attempt(s), X s`), not into the receipt; a receipt-level field needs a
+    /// coordinated schema_version bump on both sides.
+    nonisolated static func busyReceipt(tool: String, verb: String,
+                                        contention: LatticeBeginRetry.Contention) -> CallTool.Result {
+        _ = contention
+        return CallTool.Result(
+            content: [.text("Memory was not \(verb): the database was busy before the write transaction started. Retry on a later turn.")],
+            structuredContent: .object([
+                "engram_write_receipt": .object([
+                    "schema_version": .int(1),
+                    "tool": .string(tool),
+                    "write_outcome": .string("not_stored_transaction_not_started"),
+                    "reason": .string("database_busy"),
+                    "memory_ids": .array([]),
+                ]),
+            ]),
+            isError: true
+        )
+    }
+
+    func handleRecall(_ args: [String: Value]?, bumpAccessStats: Bool = true) async throws -> CallTool.Result {
         lastRecallHits = []
         lastRecallMode = .vector
         lastRecallRows = []
         var recalledHits: [RecallHit] = []
         var recalledMode: RecallMode = .vector
         var renderedRows: [RecallRowBoundary] = []
+        var accessStatOutcome: AccessStatBumpOutcome = bumpAccessStats ? .skippedNothing : .skippedOptOut
         // Keep capture local across embedding awaits, then publish it with
         // this invocation's result, including empty/error returns.
         defer {
             lastRecallHits = recalledHits
             lastRecallMode = recalledMode
             lastRecallRows = renderedRows
+            lastAccessStatBump = accessStatOutcome
         }
         let a = try args.decode(RecallArgs.self)
         guard !a.query.isEmpty else {
@@ -587,6 +632,12 @@ extension MemoryTools {
             let nearest = results
                 .nearest(to: embedding, on: \.embedding, limit: fetchLimit, distance: .l2)
                 .snapshot()
+            // Read the sealed query error on this thread before another
+            // query or materialization can clear it. Failure is not absence.
+            if let queryError = db.lastQueryError() {
+                log("[recall] nearest() failed: \(queryError)")
+                throw MemoryOperationError.storageUnavailable
+            }
             log("[recall] nearest() returned \(nearest.count) results")
             sessionLog("[recall] nearest() returned \(nearest.count) results")
 
@@ -601,7 +652,7 @@ extension MemoryTools {
             if nearest.isEmpty {
                 log("[recall] No results, returning empty")
                 sessionLog("[recall] No results")
-                return Self.recallResult("No memories found.", hits: recalledHits)
+                return Self.recallResult("No memories found.", hits: recalledHits, fenceForeign: fenceForeignContent)
             }
 
             // Apply soft project boosting and reinforcement scoring on distances
@@ -663,7 +714,7 @@ extension MemoryTools {
             let topResults = Array(sorted.prefix(limit))
 
             if topResults.isEmpty {
-                return Self.recallResult("No memories found.", hits: recalledHits)
+                return Self.recallResult("No memories found.", hits: recalledHits, fenceForeign: fenceForeignContent)
             }
 
             // Filter out outliers: adaptive threshold anchored to best result.
@@ -700,8 +751,8 @@ extension MemoryTools {
             // group DB, which the daemon relays over WSS to every member —
             // an O(members) write fan-out per recall, and those remote
             // entries would perpetually re-trip the reconciliation trigger.
-            // Access stats are personal ranking metadata, so only the copies
-            // that live in the hub or the personal mirror get bumped.
+            // The dedicated bump handle writes only hub copies; a personal
+            // mirror-only result is deliberately left unchanged.
             var bumpTargets: [Memory] = filtered.map(\.object).filter { m in
                 guard !groupSpokes.isEmpty else { return true }
                 guard let gid = m.globalId else { return false }
@@ -836,41 +887,40 @@ extension MemoryTools {
                         } else if m.content.count <= 500 {
                             output += "[\(m.project)/\(m.topic)]\(connBadge)\(connVia)\(expires)\(edgeInfo) \(m.content)"
                         } else {
-                            let firstLine = m.content.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? m.content
-                            let preview = String(firstLine.prefix(120))
+                            let preview = Self.recallContent(m.content, depth: mem.depth,
+                                                            isForeign: false, fenceForeign: false)
                             let charCount = m.content.count
                             let sectionCount = m.content.components(separatedBy: "\n").filter { $0.hasPrefix("## ") || $0.hasPrefix("### ") }.count
                             let sizeInfo = sectionCount > 0 ? "\(sectionCount) sections, \(charCount) chars" : "\(charCount) chars"
-                            output += "[\(m.project)/\(m.topic)]\(connBadge)\(connVia) (\(sizeInfo)\(expires))\(edgeInfo) \(preview)\(charCount > 120 ? "..." : "")"
+                            output += "[\(m.project)/\(m.topic)]\(connBadge)\(connVia) (\(sizeInfo)\(expires))\(edgeInfo) \(preview)"
                         }
                     }
                 }
             }
 
             // Access-stat bumps: best-effort ranking metadata, batched into
-            // ONE transaction on `db` — the handle the recalled objects
-            // actually belong to (for synced projects that's the attaching
-            // lattice; a localLattice txn silently wrapped nothing).
+            // ONE transaction on a dedicated hub handle, resolving rows on
+            // that same handle so no setter autocommits on an attachment.
             // `increment` is a SQL-side atomic `SET c = c + 1` (no
             // read-modify-write race, no stale-snapshot hazard). Non-fatal:
-            // a busy synced DB must not throw away a composed recall result.
-            sessionLog("[recall] Bumping access stats (\(bumpTargets.count) memories)")
-            let accessNow = Date()
-            do {
-                try db.withTransaction {
-                    for m in bumpTargets {
-                        m.lastAccessedAt = accessNow
-                        m.increment("accessCount")
-                    }
-                }
-            } catch {
-                log("[recall] access-stat bump skipped: \(error)")
-                sessionLog("[recall] access-stat bump skipped (non-fatal)")
+            // a busy hub must not throw away a composed recall result.
+            //
+            // The bump runs OFF the recall's own handle: a dedicated hub
+            // connection with a ~75 ms busy timeout (MemoryTools+AccessStats),
+            // rather than the 2 s MCP busy timeout. This work is synchronous;
+            // 75 ms is a lock-wait budget, not an overall latency guarantee.
+            // Hook callers opt out entirely.
+            if bumpAccessStats {
+                sessionLog("[recall] Bumping access stats (\(bumpTargets.count) memories)")
+                bumpAccessStatsBestEffort(bumpTargets, now: Date())
+                accessStatOutcome = lastAccessStatBump
+            } else {
+                sessionLog("[recall] access-stat bump skipped (caller opted out)")
             }
 
             log("[recall] DONE, returning \(output.count) chars")
             sessionLog("[recall] DONE, returning \(output.count) chars")
-            return Self.recallResult(output, hits: recalledHits)
+            return Self.recallResult(output, hits: recalledHits, fenceForeign: fenceForeignContent)
         } else {
             recalledMode = .fullText
             log("[recall] No embedding available, falling back to FTS5")
@@ -919,9 +969,9 @@ extension MemoryTools {
                 output += "[\(m.project)/\(m.topic)]\(badge)\(via)\(ftsInfo)\(expires)\(created) \(body)"
             }
             if output.isEmpty {
-                return Self.recallResult("No memories found.", hits: recalledHits)
+                return Self.recallResult("No memories found.", hits: recalledHits, fenceForeign: fenceForeignContent)
             }
-            return Self.recallResult(output, hits: recalledHits)
+            return Self.recallResult(output, hits: recalledHits, fenceForeign: fenceForeignContent)
         }
     }
 
@@ -1156,10 +1206,8 @@ extension MemoryTools {
             }
         }
 
-        var transactionBodyEntered = false
         do {
-            try writeLattice.withTransaction {
-                transactionBodyEntered = true
+            try LatticeBeginRetry.run(on: writeLattice, log: { log("[update] \($0)") }) {
                 if let content = a.content {
                     mem.content = content
                     contentChanged = true
@@ -1233,29 +1281,12 @@ extension MemoryTools {
                 // the original author, and the sync firewall keys on it.
                 mem.modifiedAt = Date()
             }
-        } catch {
-            // Only a failed BEGIN proves that this attempt wrote nothing.
-            // Setter, COMMIT, rollback and notification failures retain an
-            // unknown outcome; never turn those into a safe-retry receipt.
-            guard !transactionBodyEntered,
-                  case LatticeError.transactionError(let detail) = error,
-                  ["database is locked", "database is busy", "database table is locked",
-                   "database schema is locked"].contains(where: {
-                      detail == "Failed to begin transaction: " + $0
-                  }) else { throw error }
-            return CallTool.Result(
-                content: [.text("Memory was not updated: the database was busy before the write transaction started. Retry on a later turn.")],
-                structuredContent: .object([
-                    "engram_write_receipt": .object([
-                        "schema_version": .int(1),
-                        "tool": .string("update"),
-                        "write_outcome": .string("not_stored_transaction_not_started"),
-                        "reason": .string("database_busy"),
-                        "memory_ids": .array([]),
-                    ]),
-                ]),
-                isError: true
-            )
+        } catch let contention as LatticeBeginRetry.Contention {
+            // Only failed BEGINs reach here: this attempt wrote nothing.
+            // Setter, COMMIT, rollback and notification failures propagate
+            // with their unknown outcome; never a safe-retry receipt.
+            log("[update] not updated: \(contention)")
+            return Self.busyReceipt(tool: "update", verb: "updated", contention: contention)
         }
 
         // Restore graph connectivity alongside the memory: edges tombstoned
@@ -1340,7 +1371,8 @@ extension MemoryTools {
         var tombstonedCount = 0
         var edgeCount = 0
         let selfId = currentUserId
-        try localLattice.transaction {
+        do {
+            try LatticeBeginRetry.run(on: localLattice, log: { log("[merge] \($0)") }) {
             try localLattice.add(merged)
 
             guard let gid = merged.globalId else {
@@ -1363,6 +1395,10 @@ extension MemoryTools {
                     hardDeleted += 1
                 }
             }
+            }
+        } catch let contention as LatticeBeginRetry.Contention {
+            log("[merge] not merged: \(contention)")
+            return Self.busyReceipt(tool: "merge", verb: "merged", contention: contention)
         }
 
         var notes: [String] = []
