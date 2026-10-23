@@ -79,6 +79,9 @@ struct LearnerHealthView: View {
             .accessibilityIdentifier("learner-health.headline")
         row("Policy", label(health.policy.state))
         row("Activity", label(health.activity.state))
+        if health.headline == "admission_deferred", let launch = health.workerAdmission {
+            row("Launch delay", launch.reasonText)
+        }
         row("Queue", label(health.outcomes.queue.state))
         row("Provider", label(health.outcomes.providerCompletion.state))
         if let status = health.outcomes.providerCompletion.runStatus {
@@ -96,6 +99,29 @@ struct LearnerHealthView: View {
         }
         row("Readback", label(health.outcomes.independentReadback.state))
         Text(health.recoveryText).foregroundStyle(.secondary)
+
+        if let launch = health.workerAdmission, launch.state != "not_observed" {
+            DisclosureGroup("Last shared worker launch check") {
+                VStack(alignment: .leading, spacing: 8) {
+                    row("Check status", label(launch.state))
+                    row("Recorded decision", launch.reasonText)
+                    row("Applies to", launch.scopeText)
+                    if let age = launch.ageSeconds { row("Age at refresh", "\(age.formatted()) seconds") }
+                    if let freshness = launch.freshness { row("Evidence", label(freshness)) }
+                    if let load = launch.decision?.loadAverage, let limit = launch.decision?.loadLimit {
+                        row("Recorded load / limit", "\(load.formatted(.number.precision(.fractionLength(0...2)))) / \(limit.formatted())")
+                    }
+                    if let eligibility = launch.nextAttempt?.eligibility {
+                        row("Cooldown", eligibility == "elapsed" ? "Elapsed" : "Not yet elapsed")
+                    }
+                    if let time = launch.nextAttempt?.eligibilityTimeText {
+                        row("Earliest eligibility", time)
+                    }
+                    Text("This recorded check does not establish current worker activity. An eligible lifecycle event can attempt another launch; no timed retry is scheduled.")
+                }
+                .foregroundStyle(.secondary)
+            }
+        }
 
         DisclosureGroup("Progress and receipts") {
             VStack(alignment: .leading, spacing: 8) {
@@ -183,6 +209,9 @@ struct LearnerHealthView: View {
     /// Presentation of the reader's enums only; never derives a health state.
     private func label(_ code: String) -> String {
         switch code {
+        case "admission_deferred": "Waiting for worker launch"
+        case "clock_skew": "Timestamp is ahead of this clock"
+        case "historical_advisory": "Historical check; task attribution unavailable"
         case "processing_unverified", "processing_marker": "Processing recorded; activity unverified"
         case "publication_recovery_pending": "Unfinished progress update"
         case "legacy_reconciliation_recovery_pending": "Unfinished legacy review receipt"

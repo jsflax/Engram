@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import datetime as dt
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -21,6 +23,10 @@ MAX_LINE_BYTES = 8192
 MAX_LINES = 512
 MAX_RECORDS = 12
 MAX_OUTPUT_BYTES = 49152
+ADMISSION_MAX_AGE_SECONDS = 600
+WORKER_ADMISSION_EVENTS = {"worker_admission_deferred", "worker_admitted"}
+WORKER_ADMISSION_REASONS = {"admitted", "cooldown", "load", "load_unavailable",
+                            "concurrency", "state_unavailable"}
 RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}")
 UUID_TEXT = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 HASH = re.compile(r"(?:[0-9a-f]{20}|[0-9a-f]{64})")
@@ -29,6 +35,7 @@ EVENTS = {"SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop", "
           "PreToolUse", "PostToolUse", "unknown",
           "queued", "rejected", "duplicate_event", "blocked", "deferred_short", "learner_finished", "worker_error",
           "reconciliation_required", "resumed", "resume_refused"}
+EVENTS |= WORKER_ADMISSION_EVENTS
 STATUSES = {"emitted", "empty", "invalid", "timeout", "cancelled", "cleanup_timeout", "spawn_error",
             "protocol", "tool_error", "oversize", "guard", "disabled", "no_pins", "busy", "duplicate",
             "cooldown", "circuit", "policy_denied", "policy_unavailable", "running", "succeeded", "failed",
@@ -245,7 +252,7 @@ def read_json(path):
         return None, {**meta, "read_status": "invalid_json"}
 
 
-def read_log(path, matches):
+def read_log(path, matches, *, observe=None):
     data, meta = read_bounded(path, MAX_LOG_BYTES, tail=True)
     found = deque(maxlen=MAX_RECORDS)
     if data is None:
@@ -259,12 +266,90 @@ def read_log(path, matches):
             record = json.loads(line)
             if not isinstance(record, dict):
                 raise ValueError
+            if observe is not None:
+                observe(record)
             if matches(record):
                 meta["matching_records"] += 1
                 found.append(record)
         except (ValueError, UnicodeError, RecursionError):
             meta["invalid_records"] += 1
     return list(found), meta
+
+
+def worker_admission_view(record, sid, pending, *, now=None):
+    """Latest bounded shared-worker decision, never worker liveness or authority.
+
+    Log append order supersedes older decisions, including an admission for a
+    different candidate. Other task identities never leave this view.
+    """
+    out = {"state": "not_observed", "scope": "shared_worker",
+           "evidence": "recorded_admission_not_worker_liveness",
+           "next_attempt": {"policy": "next_eligible_lifecycle_event", "scheduled_at": None}}
+    if record is None:
+        return out
+    out["state"] = "unknown"
+    when = record.get("time")
+    try:
+        if not isinstance(when, str) or not TIMESTAMP.fullmatch(when):
+            return out
+        stamp = dt.datetime.fromisoformat(when.replace("Z", "+00:00")).timestamp()
+        current = time.time() if now is None else now
+        age = current - stamp
+        if not math.isfinite(age):
+            return out
+    except (ValueError, OverflowError, OSError, TypeError):
+        return out
+    out.update(observed_at=when, age_seconds=max(0, int(age)),
+               freshness="clock_skew" if age < 0 else "stale" if age > ADMISSION_MAX_AGE_SECONDS else "recent")
+    decision = record.get("admission")
+    if decision is None:
+        # Old reason-only global events cannot prove this task was selected.
+        if (record.get("event") == "worker_admission_deferred"
+                and isinstance(record.get("reason"), str)
+                and record["reason"] in WORKER_ADMISSION_REASONS - {"admitted"}):
+            out.update(state="historical_advisory", reason=record["reason"])
+        return out
+    if (type(decision) is not dict
+            or not {"schema_version", "reason"} <= set(decision)
+            or set(decision) - {"schema_version", "reason", "load_average", "load_limit", "cooldown_eligible_after"}
+            or type(decision["schema_version"]) is not int or decision["schema_version"] != 1
+            or not isinstance(decision["reason"], str) or decision["reason"] not in WORKER_ADMISSION_REASONS):
+        return out
+    reason = decision["reason"]
+    if (record.get("reason") != reason or record.get("event") !=
+            ("worker_admitted" if reason == "admitted" else "worker_admission_deferred")):
+        return out
+    for key in ("load_average", "load_limit", "cooldown_eligible_after"):
+        if key in decision and (type(decision[key]) not in (int, float)
+                                or not 0 <= decision[key] <= 2**53 or not math.isfinite(decision[key])):
+            return out
+    if ("load_average" in decision) != ("load_limit" in decision):
+        return out
+    if (reason == "load" and ("load_average" not in decision
+                               or decision["load_average"] <= decision["load_limit"])):
+        return out
+    if (reason == "cooldown") != ("cooldown_eligible_after" in decision):
+        return out
+    candidate = record.get("session_id")
+    lane, request = record.get("lane"), record.get("request_id")
+    if (not valid_uuid(candidate) or not isinstance(lane, str) or lane not in {"pending", "recovery"}
+            or lane == "pending" and (not isinstance(request, str) or not re.fullmatch(r"[0-9a-f]{32}", request))
+            or lane == "recovery" and request is not None):
+        return out
+    if candidate.lower() != sid:
+        binding = "other_session"
+    elif lane == "recovery":
+        binding = "selected_recovery_candidate"
+    elif request == pending.get("request_id"):
+        binding = "selected_pending_request"
+    else:
+        binding = "previous_selected_request"
+    out.update(state="admitted" if reason == "admitted" else "deferred", reason=reason,
+               candidate_binding=binding, lane=lane, decision=dict(decision))
+    if "cooldown_eligible_after" in decision:
+        out["next_attempt"]["eligible_after"] = decision["cooldown_eligible_after"]
+        out["next_attempt"]["eligibility"] = "elapsed" if decision["cooldown_eligible_after"] <= current else "not_before"
+    return out
 
 
 def runtime_identity(value):
@@ -1089,6 +1174,13 @@ def health_summary(learner, *, backlog=None, now=None):
             headline, activity, action = "queued", "queued", "none"
         elif pending_missing and session and admission.get("processing_present") is False:
             headline, activity, action = "idle", "idle", "none"
+    worker_admission = learner.get("worker_admission") or worker_admission_view(None, "", {}, now=now)
+    if (headline == "queued" and worker_admission.get("state") == "deferred"
+            and worker_admission.get("candidate_binding") == "selected_pending_request"
+            and worker_admission.get("freshness") == "recent"
+            and worker_admission.get("next_attempt", {}).get("eligibility") != "elapsed"):
+        headline, activity = "admission_deferred", "admission_deferred"
+        action = "inspect_admission" if worker_admission.get("reason") == "state_unavailable" else "wait_for_eligible_event"
     activity_view = {"state": activity, "evidence": "bounded_metadata_not_worker_liveness"}
     if paused and "pause_reason" in pending:
         activity_view["pending_pause_reason"] = pending["pause_reason"]
@@ -1098,6 +1190,7 @@ def health_summary(learner, *, backlog=None, now=None):
             "evidence": "bounded_metadata_non_atomic_snapshot", "policy": {"state": policy_state,
                 **({"mode": policy["mode"]} if "mode" in policy else {})},
             "activity": activity_view, "holds": holds, "progress": progress, "failure": failure,
+            "worker_admission": worker_admission,
             "metadata_issues": issues,
             "recovery": {"action": action, "automatic_replay_authorized": False},
             "outcomes": {"queue": {"state": queue_state}, "provider_completion": provider,
@@ -1137,7 +1230,13 @@ def report(session_id=None, environ=None):
                            "delivery_evidence": "receipt_only_not_model_delivery"},
                 "learner": {"status": "state_root_unavailable", "state_root": root_selection,
                             "memory_readback": "not_performed", "health": health_summary({})}}
-    events, event_window = read_log(learner / "events.jsonl", lambda v: task_matches(v, sid))
+    last_admission = None
+    def observe_admission(record):
+        nonlocal last_admission
+        if isinstance(record.get("event"), str) and record["event"] in WORKER_ADMISSION_EVENTS:
+            last_admission = record
+    events, event_window = read_log(learner / "events.jsonl", lambda v: task_matches(v, sid),
+                                   observe=observe_admission)
     state, state_view = scoped_json(learner / "sessions" / (sid + ".json"), sid)
     admission, admission_view = scoped_json(learner / "admissions" / (sid + ".json"), sid, binding=True)
     pending, pending_view = scoped_json(learner / "pending" / (sid + ".json"), sid)
@@ -1155,6 +1254,7 @@ def report(session_id=None, environ=None):
                        "events": [metadata(v) for v in events],
                        "session": state_view, "admission": admission_view, "enrollment": enrollment_view,
                        "pending": pending_view, "migration_hold": migration_view,
+                       "worker_admission": worker_admission_view(last_admission, sid, pending_view.get("metadata", {})),
                        "publication": publication_view(learner, sid),
                        "legacy_reconciliation": legacy_reconciliation_view(learner, sid, state),
                        "residual_reconciliation": residual_reconciliation_view(learner, sid, state),

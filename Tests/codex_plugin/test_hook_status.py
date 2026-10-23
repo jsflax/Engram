@@ -50,6 +50,138 @@ class StatusTests(unittest.TestCase):
     def report(self):
         return STATUS.report(environ={"CODEX_HOME": str(self.home), "CODEX_THREAD_ID": SID})
 
+    def admission_event(self, reason="load", *, sid=SID, request=REQUEST, stamp=STAMP, **facts):
+        if reason == "load" and not facts:
+            facts = {"load_average": 50.0, "load_limit": 32}
+        return {"event": "worker_admitted" if reason == "admitted" else "worker_admission_deferred",
+                "session_id": sid, "request_id": request, "lane": "pending", "time": stamp,
+                "reason": reason, "admission": {"schema_version": 1, "reason": reason, **facts}}
+
+    def admission_report(self, rows, *, now=None, session=None, pending=None):
+        root = self.learner_fixture(session={"status": "succeeded", **(session or {})},
+            pending={"event": "Stop", "size_bytes": 1000, **(pending or {})})
+        self.write(root / "events.jsonl", rows, log=True)
+        epoch = STATUS.dt.datetime.fromisoformat(STAMP.replace("Z", "+00:00")).timestamp()
+        with patch.object(STATUS.time, "time", return_value=epoch + 10 if now is None else now), \
+             patch.object(STATUS.os, "getloadavg", side_effect=AssertionError("status must not sample load")):
+            return self.report()
+
+    def test_selected_worker_load_deferral_has_facts_age_and_no_scheduled_wake(self):
+        value = self.admission_report([self.admission_event()])
+        health = value["learner"]["health"]
+        decision = health["worker_admission"]
+        self.assertEqual(health["headline"], "admission_deferred")
+        self.assertEqual(health["recovery"]["action"], "wait_for_eligible_event")
+        self.assertFalse(health["recovery"]["automatic_replay_authorized"])
+        self.assertEqual(decision["candidate_binding"], "selected_pending_request")
+        self.assertEqual(decision["age_seconds"], 10)
+        self.assertEqual(decision["decision"]["load_average"], 50)
+        self.assertEqual(decision["decision"]["load_limit"], 32)
+        self.assertEqual(decision["next_attempt"],
+                         {"policy": "next_eligible_lifecycle_event", "scheduled_at": None})
+        self.assertEqual(health["outcomes"]["queue"]["state"], "queued")
+        self.assertEqual(health["failure"]["class"], "none_observed")
+
+    def test_health_without_admission_has_typed_not_observed_default(self):
+        health = STATUS.health_summary({})
+        self.assertEqual(health["headline"], "unknown")
+        self.assertEqual(health["worker_admission"], STATUS.worker_admission_view(None, SID, {}))
+        self.assertEqual(health["worker_admission"]["state"], "not_observed")
+        self.assertIsNone(health["worker_admission"]["next_attempt"]["scheduled_at"])
+
+    def test_other_candidate_or_previous_request_is_not_selected_deferral(self):
+        for changed, binding in (({"sid": OTHER}, "other_session"),
+                                 ({"request": "d" * 32}, "previous_selected_request")):
+            with self.subTest(binding=binding):
+                value = self.admission_report([self.admission_event(**changed)])
+                health = value["learner"]["health"]
+                self.assertEqual(health["headline"], "queued")
+                self.assertEqual(health["worker_admission"]["candidate_binding"], binding)
+                if binding == "other_session":
+                    self.assertNotIn(OTHER, json.dumps(value["learner"]["worker_admission"]))
+                    self.assertEqual(value["learner"]["events"], [])
+
+    def test_legacy_global_reason_is_historical_advisory_only(self):
+        value = self.admission_report([{"event": "worker_admission_deferred", "reason": "load", "time": STAMP,
+                                        "private": "/secret/path"}])
+        health = value["learner"]["health"]
+        self.assertEqual(health["headline"], "queued")
+        self.assertEqual(health["worker_admission"]["state"], "historical_advisory")
+        self.assertEqual(health["worker_admission"]["scope"], "shared_worker")
+        self.assertNotIn("secret", json.dumps(value))
+
+    def test_later_admission_for_any_candidate_supersedes_selected_deferral(self):
+        for admitted_sid in (SID, OTHER):
+            with self.subTest(sid=admitted_sid):
+                value = self.admission_report([self.admission_event(),
+                    self.admission_event("admitted", sid=admitted_sid, load_average=0, load_limit=32)])
+                self.assertEqual(value["learner"]["health"]["headline"], "queued")
+                self.assertEqual(value["learner"]["worker_admission"]["state"], "admitted")
+                self.assertNotEqual(value["learner"]["health"]["activity"]["state"], "processing_unverified")
+
+    def test_stale_or_future_deferral_cannot_claim_current_admission_state(self):
+        epoch = STATUS.dt.datetime.fromisoformat(STAMP.replace("Z", "+00:00")).timestamp()
+        for now, freshness in ((epoch + 601, "stale"), (epoch - 1, "clock_skew")):
+            value = self.admission_report([self.admission_event()], now=now)
+            self.assertEqual(value["learner"]["health"]["headline"], "queued")
+            self.assertEqual(value["learner"]["worker_admission"]["freshness"], freshness)
+
+    def test_cooldown_eligibility_is_not_a_scheduled_wake_and_can_expire(self):
+        epoch = STATUS.dt.datetime.fromisoformat(STAMP.replace("Z", "+00:00")).timestamp()
+        row = self.admission_event("cooldown", cooldown_eligible_after=epoch + 100)
+        value = self.admission_report([row])
+        next_attempt = value["learner"]["worker_admission"]["next_attempt"]
+        self.assertEqual(next_attempt["eligible_after"], epoch + 100)
+        self.assertIsNone(next_attempt["scheduled_at"])
+        self.assertEqual(value["learner"]["health"]["headline"], "admission_deferred")
+        expired = self.admission_report([row], now=epoch + 101)
+        self.assertEqual(expired["learner"]["worker_admission"]["next_attempt"]["eligibility"], "elapsed")
+        self.assertEqual(expired["learner"]["health"]["headline"], "queued")
+
+    def test_concurrency_and_unavailable_decisions_do_not_claim_provider_failure(self):
+        for reason in ("concurrency", "load_unavailable", "state_unavailable"):
+            with self.subTest(reason=reason):
+                value = self.admission_report([self.admission_event(reason)])
+                health = value["learner"]["health"]
+                self.assertEqual(health["headline"], "admission_deferred")
+                self.assertEqual(health["worker_admission"]["reason"], reason)
+                self.assertEqual(health["failure"]["class"], "none_observed")
+                self.assertFalse(health["recovery"]["automatic_replay_authorized"])
+
+    def test_malformed_latest_decision_blocks_fallback_without_leaking_content(self):
+        row = self.admission_event()
+        invalid = [dict(row, admission={**row["admission"], "private": "SECRET_PATH"}),
+                   dict(row, admission={"schema_version": 1, "reason": "load", "load_average": True, "load_limit": 0}),
+                   dict(row, admission={"schema_version": 1, "reason": "load", "load_average": float("nan"), "load_limit": 1}),
+                   dict(row, admission={"schema_version": 1, "reason": "load", "load_average": 10**400, "load_limit": 1}),
+                   dict(row, lane=[]), dict(row, time="SECRET_TIMESTAMP"), dict(row, reason={}),
+                   dict(row, admission={"schema_version": 1, "reason": "private"})]
+        for changed in invalid:
+            with self.subTest(fields=changed.keys()):
+                value = self.admission_report([row, changed])
+                self.assertEqual(value["learner"]["worker_admission"]["state"], "unknown")
+                self.assertEqual(value["learner"]["health"]["headline"], "queued")
+                self.assertNotIn("SECRET", json.dumps(value))
+
+    def test_worker_admission_does_not_override_session_holds_backoff_or_pause(self):
+        epoch = STATUS.dt.datetime.fromisoformat(STAMP.replace("Z", "+00:00")).timestamp()
+        for session, pending, expected in [
+            ({"retry_after": epoch + 100}, {}, "backoff"),
+            ({}, {"paused_request_id": REQUEST, "pause_reason": "batch_limit"}, "batch_limit"),
+            ({"status": "reconciliation_required", "reconciliation_required": {"reason": "write_status_unknown"}}, {}, "reconciliation_required")]:
+            value = self.admission_report([self.admission_event()], session=session, pending=pending)
+            self.assertEqual(value["learner"]["health"]["headline"], expected)
+
+    def test_admission_observation_uses_same_bounded_log_read(self):
+        real = STATUS.read_bounded
+        with patch.object(STATUS, "read_bounded", wraps=real) as reads:
+            value = self.admission_report([self.admission_event()])
+        event_reads = [c for c in reads.call_args_list if c.args[0].name == "events.jsonl"]
+        self.assertEqual(len(event_reads), 1)
+        self.assertEqual(event_reads[0].args[1], STATUS.MAX_LOG_BYTES)
+        self.assertTrue(event_reads[0].kwargs["tail"])
+        self.assertLessEqual(len(STATUS.render_report(value).encode()) + 1, STATUS.MAX_OUTPUT_BYTES)
+
     def test_startup_failure_fixed_codes_surface_without_changing_hold_or_replay(self):
         root = self.learner_fixture(session={"status": "reconciliation_required", "last_run": RUN,
             "reconciliation_required": {"run_id": RUN, "reason": "unverified_completion"}})

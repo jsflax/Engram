@@ -62,10 +62,10 @@ public final class ForceSimulation3D {
     public func index(for id: UUID) -> Int? { idToIndex[id] }
 
     /// Position dictionary — lazily materialized from the flat x/y/z arrays
-    /// on first read per generation. The render path consumes the flat
-    /// `posX/posY/posZ` arrays directly, so a render-only frame never builds
-    /// this 42k-entry dict; only hitTest/teleport/centroid consumers pay for
-    /// it, once per tick. (Eagerly rebuilding it every frame in syncPositions
+    /// on first read per generation. Flat-array render paths avoid this work;
+    /// whole-map consumers such as camera snapshots, flow spawning, point
+    /// lights and spatial audio can still request it during a frame.
+    /// (Eagerly rebuilding it every frame in syncPositions
     /// was ~8-11ms/frame of pure UUID-hash inserts at 42k.)
     private var _positionsCache: [UUID: SIMD3<Float>] = [:]
     private var _positionsCacheGeneration: UInt64 = .max

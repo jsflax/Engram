@@ -28,6 +28,61 @@ class SpawnAdmissionTests(unittest.TestCase):
     def lease(self, **kwargs):
         return G.lease(directory=self.directory, now=10_000, load=lambda: 0, **kwargs)
 
+    def test_diagnostics_preserve_threshold_cooldown_and_refusal_state(self):
+        with G.lease(directory=self.directory, now=10_000, load=lambda: 4.0, processors=2) as held:
+            self.assertTrue(held.admitted)
+            self.assertIsNone(held.reason)
+            self.assertEqual(held.diagnostic, {"schema_version": 1, "reason": "admitted",
+                                               "load_average": 4.0, "load_limit": 4})
+            original = (self.directory / "spawn-state.json").read_bytes()
+            with G.lease(directory=self.directory, now=10_601, load=lambda: 0) as competing:
+                self.assertFalse(competing.admitted)
+                self.assertEqual(competing.diagnostic, {"schema_version": 1, "reason": "concurrency"})
+            self.assertEqual(G.pass_fds(), (held.fd,))
+        self.assertEqual(G.pass_fds(), ())
+        load = mock.Mock(side_effect=AssertionError("cooldown must precede load evaluation"))
+        with G.lease(directory=self.directory, now=10_001, load=load, processors=2) as cooling:
+            self.assertFalse(cooling.admitted)
+            self.assertEqual(cooling.reason, "cooldown")
+            self.assertEqual(cooling.diagnostic, {"schema_version": 1, "reason": "cooldown",
+                                                 "cooldown_eligible_after": 10_600.0})
+        load.assert_not_called()
+        with G.lease(directory=self.directory, now=10_600, load=lambda: 4.01, processors=2) as overloaded:
+            self.assertFalse(overloaded.admitted)
+            self.assertEqual(overloaded.reason, "load")
+            self.assertEqual(overloaded.diagnostic, {"schema_version": 1, "reason": "load",
+                                                    "load_average": 4.01, "load_limit": 4})
+            self.assertEqual(G.pass_fds(), ())
+        self.assertEqual((self.directory / "spawn-state.json").read_bytes(), original)
+        with G.lease(directory=self.directory, now=10_600, load=lambda: 4.0, processors=2) as later:
+            self.assertTrue(later.admitted)
+        self.assertEqual(json.loads((self.directory / "spawn-state.json").read_bytes()),
+                         {"version": 1, "lastSpawnAt": 10_600})
+
+    def test_unusable_diagnostic_numbers_do_not_change_gate_decisions(self):
+        cases = [
+            (2**53 + 2, 1, "load", {}),
+            (0, 2**53 + 1, None, {}),
+            (0, float("inf"), None, {}),
+            (True, 1, None, {}),
+        ]
+        for value, processors, reason, fields in cases:
+            with self.subTest(value=value, processors=processors):
+                with G.lease(directory=self.directory, now=10_000, load=lambda: value,
+                             processors=processors, cooldown=0) as result:
+                    self.assertEqual(result.reason, reason)
+                    self.assertEqual(result.admitted, reason is None)
+                    self.assertEqual(result.diagnostic,
+                                     {"schema_version": 1, "reason": reason or "admitted", **fields})
+                    json.dumps(result.diagnostic, allow_nan=False)
+        with G.lease(directory=self.directory, now=2**53, load=lambda: 0, processors=1) as held:
+            self.assertTrue(held.admitted)
+        original = (self.directory / "spawn-state.json").read_bytes()
+        with G.lease(directory=self.directory, now=2**53, load=lambda: 0, cooldown=1) as cooling:
+            self.assertEqual(cooling.reason, "cooldown")
+            self.assertEqual(cooling.diagnostic, {"schema_version": 1, "reason": "cooldown"})
+        self.assertEqual((self.directory / "spawn-state.json").read_bytes(), original)
+
     def test_fixture_future_session_clock_does_not_poison_later_admission(self):
         from suite_support import fixture_spawn_gate
         with fixture_spawn_gate(G, self.directory):
@@ -68,6 +123,7 @@ class SpawnAdmissionTests(unittest.TestCase):
             path.write_bytes(raw); path.chmod(0o600)
             with self.lease() as result:
                 self.assertEqual(result.reason, "state_unavailable")
+                self.assertEqual(result.diagnostic, {"schema_version": 1, "reason": "state_unavailable"})
                 self.assertEqual(G.pass_fds(), ())
             self.assertEqual(path.read_bytes(), raw)
         path.unlink(); path.symlink_to(self.root / "absent")
@@ -77,8 +133,10 @@ class SpawnAdmissionTests(unittest.TestCase):
 
     def test_unavailable_load_and_fsync_failure_cannot_admit(self):
         for value in [None, float("nan"), float("inf"), -1]:
-            with G.lease(directory=self.directory, load=lambda: value) as result:
+            with G.lease(directory=self.directory, load=lambda: value, processors=2) as result:
                 self.assertEqual(result.reason, "load_unavailable")
+                self.assertEqual(result.diagnostic, {"schema_version": 1, "reason": "load_unavailable"})
+                json.dumps(result.diagnostic, allow_nan=False)
         self.assertFalse((self.directory / "spawn-state.json").exists())
         with mock.patch.object(G.os, "fsync", side_effect=OSError("fixture fsync failure")):
             with self.lease() as result:
@@ -221,7 +279,7 @@ with G.lease(directory=sys.argv[2], now=10000, load=lambda:0) as lease:
         production = G.lease
         fixture = WorkerFairnessTests(methodName="runTest")
         fixture.setUp(); self.addCleanup(fixture.doCleanups)
-        fixture.add(1, recovery=True, failed=True)
+        recovery_sid = fixture.add(1, recovery=True, failed=True)
         fixture.add(2)
         schedule = fixture.root / "worker-schedule.json"
         for raw in (b"{invalid", b"x" * (1024 * 1024 + 1)):
@@ -240,7 +298,9 @@ with G.lease(directory=sys.argv[2], now=10000, load=lambda:0) as lease:
             before.setdefault("enqueue.lock", b"")
             self.assertEqual(after, before)
             self.assertEqual(fixture.attempts, [])
-            self.assertEqual(fixture.events[-1], ("worker_admission_deferred", {"reason": "concurrency"}))
+            self.assertEqual(fixture.events[-1], ("worker_admission_deferred", {
+                "reason": "concurrency", "session_id": recovery_sid, "lane": "recovery",
+                "admission": {"schema_version": 1, "reason": "concurrency"}}))
 
     def test_new_unpaused_pending_during_backoff_does_not_spend_shared_cooldown(self):
         from test_worker_fairness import WorkerFairnessTests, R
@@ -264,10 +324,18 @@ with G.lease(directory=sys.argv[2], now=10000, load=lambda:0) as lease:
         production = G.lease
         fixture = WorkerFairnessTests(methodName="runTest")
         fixture.setUp(); self.addCleanup(fixture.doCleanups)
-        fixture.add(1)
+        sid = fixture.add(1)
+        pending = fixture.root / "pending" / (sid + ".json")
+        R.atomic_json(pending, {**json.loads(pending.read_bytes()), "request_id": "c" * 32})
         ordinary = R.process_request
         def process(*args):
             self.assertTrue(G.pass_fds())
+            admitted = [fields for name, fields in fixture.events if name == "worker_admitted"]
+            self.assertEqual(len(admitted), 1)
+            self.assertEqual(admitted[0]["session_id"], sid)
+            self.assertEqual(admitted[0]["request_id"], "c" * 32)
+            self.assertEqual(admitted[0]["lane"], "pending")
+            self.assertEqual(admitted[0]["admission"]["reason"], "admitted")
             with production(directory=self.directory, load=lambda: 0, cooldown=0) as second:
                 self.assertEqual(second.reason, "concurrency")
             return ordinary(*args)
@@ -278,6 +346,34 @@ with G.lease(directory=sys.argv[2], now=10000, load=lambda:0) as lease:
         self.assertEqual(G.pass_fds(), ())
         with production(directory=self.directory, load=lambda: 0, cooldown=0) as later:
             self.assertTrue(later.admitted)
+
+    def test_admitted_telemetry_io_failure_does_not_revoke_execution(self):
+        from test_worker_fairness import WorkerFairnessTests, R
+        fixture = WorkerFairnessTests(methodName="runTest")
+        fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        sid = fixture.add(1)
+        def event(root, name, **fields):
+            if name == "worker_admitted":
+                raise OSError("synthetic diagnostic write failure")
+            fixture.event(root, name, **fields)
+        with mock.patch.object(R, "event_log", side_effect=event):
+            self.assertEqual(R.worker(fixture.root), 0)
+        self.assertEqual(fixture.attempts, [("pending", sid)])
+        self.assertFalse((fixture.root / "pending" / (sid + ".json")).exists())
+
+    def test_worker_diagnostic_omits_noncanonical_request_text(self):
+        from test_worker_fairness import WorkerFairnessTests, R
+        fixture = WorkerFairnessTests(methodName="runTest")
+        fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        sid = fixture.add(1)
+        pending = fixture.root / "pending" / (sid + ".json")
+        R.atomic_json(pending, {**json.loads(pending.read_bytes()), "request_id": "PRIVATE" * 2000})
+        self.assertEqual(R.worker(fixture.root), 0)
+        admitted = [fields for name, fields in fixture.events if name == "worker_admitted"]
+        self.assertEqual(len(admitted), 1)
+        self.assertNotIn("request_id", admitted[0])
+        self.assertNotIn("PRIVATE", json.dumps(admitted))
+        self.assertEqual(fixture.attempts, [("pending", sid)])
 
     def test_legacy_shared_gate_and_guard_are_identical(self):
         for name in ("spawn_admission.py", "provider_guard.py"):
