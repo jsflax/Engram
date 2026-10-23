@@ -142,7 +142,7 @@ class HostPreparationTests(unittest.TestCase):
             'testMascotInsertionRangesMatchFullRebuild',
             'testInsertionMembershipFallbacksMatchFullRebuild')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 126)
+        self.assertEqual(len(inventory), 128)
         self.assertIn('AdapterSnapshotTests/testSparsePositionsFollowSimulationChangesAndRegistryReplacement', inventory)
         self.assertIn('AdapterSnapshotTests/testMascotVisibilityReachesSceneAndPreservesExistingEntities', inventory)
         for name in (
@@ -152,6 +152,8 @@ class HostPreparationTests(unittest.TestCase):
             'testCrossGalaxyAppendsWithEdgeEditsDeletesAndFiltersUseFullMerge',
             'testCrossGalaxyPrefixEditsReorderFilteringAndShrinkInvalidateReuse',
             'testCrossGalaxyReplacementPrecedenceAndSingleGalaxyTransitionsResetReuse',
+            'testCertifiedTailAndNoOpAvoidRetainedMergeAndSnapshotWork',
+            'testCertifiedTailAndNoOpAvoidSimulationAndMembershipRemaps',
             'testCrossGalaxyInsertionReusePreservesRenderedOrderAndLivePositions',
             'testCrossGalaxyInsertionBuildsOnlyNewSnapshotsAcrossLargeRetainedSuffix',
             'testCrossGalaxyInsertionProofRejectsTakeoverAndMissedPublication',
