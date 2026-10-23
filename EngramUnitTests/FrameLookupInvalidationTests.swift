@@ -9,7 +9,12 @@ private final class FrameLookupProvider: SceneDataProvider {
     var edges: [RKEdgeSnapshot] = []
     var hubs: Set<UUID> = []
     var projectColorMap: [String: SIMD3<Float>] = [:]
-    var positions: [UUID: SIMD3<Float>] = [:]
+    private var storedPositions: [UUID: SIMD3<Float>] = [:]
+    private(set) var positionReads = 0
+    var positions: [UUID: SIMD3<Float>] {
+        get { positionReads += 1; return storedPositions }
+        set { storedPositions = newValue }
+    }
     var glowingNodes: [UUID: Float] = [:]
     var newNodeGlows: [UUID: Float] = [:]
     var dyingNodes: Set<UUID> = []
@@ -359,20 +364,55 @@ final class FrameLookupInvalidationTests: XCTestCase {
         provider.edges = [edge(selected, target)]
         system.update(dataProvider: provider, dt: 0.2)
         XCTAssertTrue(system.particles.isEmpty)
+        XCTAssertTrue(provider.positionReads == 0)
         system.update(dataProvider: provider, dt: 0.2)
         XCTAssertTrue(system.particles.count == 1)
+        XCTAssertTrue(provider.positionReads == 1)
         let age = system.particles[0].age
         system.update(dataProvider: provider, dt: 0.1)
         XCTAssertTrue(system.particles.count == 1)
         XCTAssertTrue(system.particles[0].age > age)
+        XCTAssertTrue(provider.positionReads == 1)
         provider.selectedNode = nil
         system.update(dataProvider: provider, dt: 0.1)
         XCTAssertTrue(system.connectedEdgeIndices.isEmpty)
         XCTAssertTrue(system.particles.isEmpty)
+        XCTAssertTrue(provider.positionReads == 1)
         provider.selectedNode = target
         system.update(dataProvider: provider, dt: 0.4)
         XCTAssertTrue(system.particles.first?.sourcePos == SIMD3<Float>(1, 0, 0))
         XCTAssertTrue(system.particles.first?.targetPos == SIMD3<Float>.zero)
+        XCTAssertTrue(provider.positionReads == 2)
+
+        // A long frame uses one snapshot for all due batches. Existing particles
+        // retain their captured endpoints while aging on non-spawn frames.
+        let catchUp = RKFlowParticleSystem()
+        catchUp.update(dataProvider: provider, dt: 0.8)
+        XCTAssertTrue(provider.positionReads == 3)
+        XCTAssertTrue(catchUp.particles.count == 2)
+        XCTAssertTrue(catchUp.particles.allSatisfy { $0.age == 0.8 && $0.progress == 0.8 / 1.25 })
+        provider.positions = [selected: SIMD3(5, 0, 0), target: SIMD3(7, 0, 0)]
+        catchUp.update(dataProvider: provider, dt: 0)
+        catchUp.update(dataProvider: provider, dt: 0.1)
+        XCTAssertTrue(provider.positionReads == 3)
+        XCTAssertTrue(catchUp.particles.count == 2)
+        XCTAssertTrue(catchUp.particles.allSatisfy { $0.age > 0.8 && $0.sourcePos == SIMD3<Float>(1, 0, 0) && $0.targetPos == .zero })
+
+        provider.edges = []
+        system.update(dataProvider: provider, dt: 2)
+        XCTAssertTrue(system.particles.isEmpty)
+        XCTAssertTrue(provider.positionReads == 3)
+        provider.edges = [edge(UUID(), UUID())]
+        provider.topologyVersion += 1
+        system.update(dataProvider: provider, dt: 2)
+        XCTAssertTrue(system.connectedEdgeIndices.isEmpty)
+        XCTAssertTrue(provider.positionReads == 3)
+        provider.edges = [edge(selected, target)]
+        provider.positions = [:]
+        provider.topologyVersion += 1
+        system.update(dataProvider: provider, dt: 0.4)
+        XCTAssertTrue(system.particles.isEmpty)
+        XCTAssertTrue(provider.positionReads == 4)
     }
 
     func testFlowProviderCountAndCap() {

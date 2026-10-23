@@ -24,9 +24,25 @@ import uuid
 _HELD = contextvars.ContextVar("engram_spawn_lease", default=None)
 
 
+def _diagnostic_number(value):
+    return type(value) in (int, float) and 0 <= value <= 2**53 and math.isfinite(value)
+
+
 class Lease:
-    def __init__(self, fd=None, reason=None):
+    def __init__(self, fd=None, reason=None, *, load_average=None, processors=None,
+                 previous=None, cooldown=None):
         self.fd, self.reason = fd, reason
+        diagnostic_reason = "admitted" if fd is not None and reason is None else "state_unavailable"
+        if reason in {"cooldown", "load", "load_unavailable", "concurrency", "state_unavailable"}:
+            diagnostic_reason = reason
+        self.diagnostic = {"schema_version": 1, "reason": diagnostic_reason}
+        if (_diagnostic_number(load_average) and _diagnostic_number(processors)
+                and _diagnostic_number(2 * processors)):
+            self.diagnostic.update(load_average=load_average, load_limit=2 * processors)
+        if reason == "cooldown" and _diagnostic_number(previous) and _diagnostic_number(cooldown):
+            eligible_after = previous + cooldown
+            if _diagnostic_number(eligible_after):
+                self.diagnostic["cooldown_eligible_after"] = eligible_after
 
     @property
     def admitted(self):
@@ -165,19 +181,19 @@ def lease(*, directory=None, now=None, load=None, processors=None, cooldown=600.
                 raise ValueError("invalid_clock_or_policy")
             previous = _read(path / "spawn-state.json")
             if previous is not None and current - previous < cooldown:
-                result = Lease(reason="cooldown")
+                result = Lease(reason="cooldown", previous=previous, cooldown=cooldown)
             else:
                 value = os.getloadavg()[0] if load is None else load()
                 count = max(1, os.cpu_count() or 1) if processors is None else max(1, processors)
                 if value is None or not math.isfinite(value) or value < 0:
-                    result = Lease(reason="load_unavailable")
+                    result = Lease(reason="load_unavailable", load_average=value, processors=count)
                 elif value > 2 * count:
-                    result = Lease(reason="load")
+                    result = Lease(reason="load", load_average=value, processors=count)
                 else:
                     _same(fd, lock)
                     _save(path / "spawn-state.json", current)
                     token = _HELD.set(fd)
-                    result = Lease(fd=fd)
+                    result = Lease(fd=fd, load_average=value, processors=count)
         except BlockingIOError:
             result = Lease(reason="concurrency")
         except (OSError, ValueError, TypeError, OverflowError):

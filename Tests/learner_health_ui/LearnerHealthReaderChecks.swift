@@ -26,6 +26,50 @@ enum LearnerHealthReaderChecks {
         var object = try JSONSerialization.jsonObject(with: fixture) as! [String: Any]
         var learner = object["learner"] as! [String: Any]
         var model = learner["health"] as! [String: Any]
+        require(health.workerAdmission == nil, "Older reports without launch metadata remain readable")
+        model["headline"] = "admission_deferred"
+        model["recovery"] = ["action": "wait_for_eligible_event"]
+        var launch: [String: Any] = ["state": "deferred", "reason": "load",
+            "candidate_binding": "selected_pending_request", "age_seconds": 10, "freshness": "recent",
+            "decision": ["schema_version": 1, "reason": "load", "load_average": 50.36, "load_limit": 32],
+            "next_attempt": ["policy": "next_eligible_lifecycle_event", "scheduled_at": NSNull()]]
+        model["worker_admission"] = launch
+        learner["health"] = model
+        object["learner"] = learner
+        let deferred = try LearnerHealthSnapshot.decode(JSONSerialization.data(withJSONObject: object), sessionID: sessionID).learner.health
+        require(deferred.title == "Waiting to start", "Launch deferral must be visible")
+        require(deferred.workerAdmission?.decision?.loadAverage == 50.36, "Recorded load must decode")
+        require(deferred.workerAdmission?.decision?.loadLimit == 32, "The actual recorded limit must decode")
+        require(deferred.workerAdmission?.scopeText == "This task's current queued request", "Exact request scope must be visible")
+        require(deferred.workerAdmission?.ageSeconds == 10, "Recorded age must decode")
+        require(deferred.recoveryText.contains("No timed retry"), "An eligible event is not a promised timer")
+        model["headline"] = "queued"
+        model["recovery"] = ["action": "none"]
+        launch["candidate_binding"] = "other_session"
+        launch["freshness"] = "stale"
+        model["worker_admission"] = launch
+        learner["health"] = model
+        object["learner"] = learner
+        let advisory = try LearnerHealthSnapshot.decode(JSONSerialization.data(withJSONObject: object), sessionID: sessionID).learner.health
+        require(advisory.title == "Queued", "Advisory launch evidence cannot override the shared health decision")
+        require(advisory.workerAdmission?.scopeText == "Another task", "Other task scope must remain explicit")
+        require(advisory.workerAdmission?.freshness == "stale", "Stale evidence must remain distinguishable")
+        launch["state"] = "historical_advisory"
+        launch["next_attempt"] = ["eligible_after": 1_792_734_000, "eligibility": "not_before"]
+        model["worker_admission"] = launch
+        learner["health"] = model
+        object["learner"] = learner
+        let cooldown = try LearnerHealthSnapshot.decode(JSONSerialization.data(withJSONObject: object), sessionID: sessionID).learner.health
+        require(cooldown.workerAdmission?.state == "historical_advisory", "Historical checks must remain explicit")
+        require(cooldown.workerAdmission?.nextAttempt?.eligibleAfter == 1_792_734_000, "Actual cooldown time must decode")
+        require(cooldown.workerAdmission?.nextAttempt?.eligibilityTimeText?.isEmpty == false, "Cooldown time must have a display value")
+        launch["next_attempt"] = ["eligible_after": 9_007_199_254_740_992.0]
+        model["worker_admission"] = launch
+        learner["health"] = model
+        object["learner"] = learner
+        let distant = try LearnerHealthSnapshot.decode(JSONSerialization.data(withJSONObject: object), sessionID: sessionID).learner.health
+        require(distant.workerAdmission?.nextAttempt?.eligibilityTimeText == "Recorded time is outside the display range", "Out-of-range dates cannot be formatted as real eligibility times")
+        model.removeValue(forKey: "worker_admission")
         model["headline"] = "processing_unverified"
         learner["health"] = model
         object["learner"] = learner

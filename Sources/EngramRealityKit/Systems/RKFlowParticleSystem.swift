@@ -67,30 +67,33 @@ public final class RKFlowParticleSystem {
 
         guard !connectedEdgeIndices.isEmpty else { return }
 
-        let positions = dataProvider.positions
-
         // Spawn new particles
         spawnTimer += dt
-        while spawnTimer >= spawnInterval {
-            spawnTimer -= spawnInterval
-            for edgeIdx in connectedEdgeIndices {
-                let edge = edges[edgeIdx]
-                guard let src = positions[edge.sourceId],
-                      let tgt = positions[edge.targetId] else { continue }
-                // Always flow away from selected node
-                let (from, to): (SIMD3<Float>, SIMD3<Float>)
-                if edge.sourceId == selectedNode {
-                    (from, to) = (src, tgt)
-                } else {
-                    (from, to) = (tgt, src)
+        if spawnTimer >= spawnInterval {
+            // This getter can materialize the whole graph. Read it only when
+            // spawning, once even when a long frame catches up several batches.
+            let positions = dataProvider.positions
+            while spawnTimer >= spawnInterval {
+                spawnTimer -= spawnInterval
+                for edgeIdx in connectedEdgeIndices {
+                    let edge = edges[edgeIdx]
+                    guard let src = positions[edge.sourceId],
+                          let tgt = positions[edge.targetId] else { continue }
+                    // Always flow away from selected node
+                    let (from, to): (SIMD3<Float>, SIMD3<Float>)
+                    if edge.sourceId == selectedNode {
+                        (from, to) = (src, tgt)
+                    } else {
+                        (from, to) = (tgt, src)
+                    }
+                    particles.append(Particle(
+                        edgeIndex: edgeIdx,
+                        sourcePos: from,
+                        targetPos: to,
+                        progress: 0,
+                        age: 0
+                    ))
                 }
-                particles.append(Particle(
-                    edgeIndex: edgeIdx,
-                    sourcePos: from,
-                    targetPos: to,
-                    progress: 0,
-                    age: 0
-                ))
             }
         }
 

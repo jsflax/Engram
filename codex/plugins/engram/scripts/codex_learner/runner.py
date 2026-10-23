@@ -1415,9 +1415,25 @@ def worker(root: Path) -> int:
                 break
             if shared_lease is None:
                 shared_lease = shared_slot.enter_context(spawn_admission.lease())
+                # This is the candidate seen before shared admission, not proof
+                # it executed. Re-selection below remains authoritative.
+                candidate_lane, candidate_sid, candidate_work = choice
+                diagnostic = {"lane": candidate_lane, "admission": shared_lease.diagnostic}
+                if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", candidate_sid):
+                    diagnostic["session_id"] = candidate_sid
+                if candidate_work is not None:
+                    candidate_request = candidate_work[1]["request_id"]
+                    if re.fullmatch(r"[0-9a-f]{32}", candidate_request):
+                        diagnostic["request_id"] = candidate_request
                 if not shared_lease.admitted:
-                    event_log(root, "worker_admission_deferred", reason=shared_lease.reason)
+                    event_log(root, "worker_admission_deferred", reason=shared_lease.reason, **diagnostic)
                     return 0  # Pending/cursor/holds and schedule bytes untouched.
+                # Supersede prior deferrals even when the candidate changes or
+                # disappears before the post-admission selection.
+                try:
+                    event_log(root, "worker_admitted", reason="admitted", **diagnostic)
+                except OSError:
+                    pass  # Advisory telemetry must not revoke an acquired lease.
                 schedule = worker_schedule.Schedule(root)
                 if schedule.reset:
                     event_log(root, "worker_schedule_reset", reason="invalid_advisory_metadata_preserved")

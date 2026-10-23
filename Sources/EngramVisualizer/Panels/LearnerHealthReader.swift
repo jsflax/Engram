@@ -68,6 +68,54 @@ struct LearnerHealthSnapshot: Decodable, Sendable {
         }
     }
     struct Recovery: Decodable, Sendable { let action: String }
+    struct WorkerAdmission: Decodable, Sendable {
+        struct Decision: Decodable, Sendable {
+            let loadAverage: Double?
+            let loadLimit: Double?
+        }
+        struct NextAttempt: Decodable, Sendable {
+            let eligibility: String?
+            let eligibleAfter: Double?
+
+            var eligibilityTimeText: String? {
+                guard let eligibleAfter else { return nil }
+                guard eligibleAfter.isFinite, eligibleAfter >= 0,
+                      eligibleAfter <= Date.distantFuture.timeIntervalSince1970 else {
+                    return "Recorded time is outside the display range"
+                }
+                return Date(timeIntervalSince1970: eligibleAfter).formatted(date: .abbreviated, time: .standard)
+            }
+        }
+        let state: String
+        let reason: String?
+        let candidateBinding: String?
+        let ageSeconds: Int64?
+        let freshness: String?
+        let decision: Decision?
+        let nextAttempt: NextAttempt?
+
+        var reasonText: String {
+            switch reason {
+            case "load": "System load exceeded the launch limit"
+            case "cooldown": "Waiting between worker launches"
+            case "concurrency": "Another worker held the shared launch slot"
+            case "load_unavailable": "System load could not be checked"
+            case "state_unavailable": "Launch state could not be verified"
+            case "admitted": "Launch allowed; execution is not verified"
+            default: "Launch decision unavailable"
+            }
+        }
+
+        var scopeText: String {
+            switch candidateBinding {
+            case "selected_pending_request": "This task's current queued request"
+            case "selected_recovery_candidate": "This task's recovery candidate"
+            case "previous_selected_request": "An earlier request for this task"
+            case "other_session": "Another task"
+            default: "Shared worker; task attribution unavailable"
+            }
+        }
+    }
     struct WriteCounts: Decodable, Sendable {
         let attemptedWriteCalls: Int?
         let appliedWriteCalls: Int?
@@ -158,6 +206,7 @@ struct LearnerHealthSnapshot: Decodable, Sendable {
         let progress: Progress
         let failure: Failure
         let recovery: Recovery
+        let workerAdmission: WorkerAdmission?
         let outcomes: Outcomes
 
         var title: String {
@@ -169,6 +218,7 @@ struct LearnerHealthSnapshot: Decodable, Sendable {
             case "failed": "Needs inspection"
             case "disabled": "Disabled"
             case "backoff": "Waiting before retry"
+            case "admission_deferred": "Waiting to start"
             case "batch_limit": "Paused at batch limit"
             case "paused": "Paused"
             case "queued": "Queued"
@@ -184,6 +234,8 @@ struct LearnerHealthSnapshot: Decodable, Sendable {
             case "recover_publication": "Recover the unfinished progress update before learning from this task again."
             case "inspect_processing_attempt": "Inspect the recorded processing attempt before retrying."
             case "wait_for_backoff_then_resume": "Wait for backoff to expire, then resume the pending request."
+            case "wait_for_eligible_event": "Another eligible lifecycle event can attempt a launch. No timed retry is scheduled."
+            case "inspect_admission": "Inspect the shared worker's launch state before retrying."
             case "resume_pending": "The pending request needs a supported resume."
             case "inspect_failure": "Inspect the failure before resuming."
             case "enable_policy": "Enable the learner policy to allow future work."
