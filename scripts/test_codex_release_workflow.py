@@ -39,6 +39,36 @@ def run_block(workflow, name):
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def test_native_validation_runs_both_legacy_suites_and_propagates_failure(self):
+        block = run_block('native-validation.yml', 'Validate legacy Codex learner and installers')
+        for failing_suite in ('', 'scripts', 'scripts/tests'):
+            with self.subTest(failing_suite=failing_suite), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                for name in ('repo', 'evidence', 'bin'):
+                    (root / name).mkdir()
+                calls = root / 'calls.jsonl'
+                python = root / 'bin/python3'
+                python.write_text('#!' + sys.executable + '\n' + '''import json, os, sys
+with open(os.environ['CALL_LOG'], 'a') as output:
+    output.write(json.dumps(sys.argv[1:]) + '\\n')
+suite = sys.argv[sys.argv.index('-s') + 1]
+print('discovery=' + suite, flush=True)
+raise SystemExit(23 if suite == os.environ['FAIL_DISCOVERY'] else 0)
+''')
+                python.chmod(0o700)
+                env = dict(os.environ, PATH=f'{root / "bin"}:/usr/bin:/bin',
+                           VALIDATION_ROOT=str(root), CALL_LOG=str(calls), FAIL_DISCOVERY=failing_suite)
+                result = subprocess.run(['/bin/bash', '-e', '-c', block], env=env,
+                                        capture_output=True, text=True, timeout=20)
+                self.assertEqual(result.returncode, 23 if failing_suite else 0, result.stdout + result.stderr)
+                locations = ['scripts'] if failing_suite == 'scripts' else ['scripts', 'scripts/tests']
+                self.assertEqual([json.loads(line) for line in calls.read_text().splitlines()], [
+                    ['-B', '-m', 'unittest', 'discover', '-s', location, '-p', 'test_codex*.py']
+                    for location in locations])
+                self.assertEqual((root / 'evidence/codex-scripts.log').read_text(), 'discovery=scripts\n')
+                if len(locations) == 2:
+                    self.assertEqual((root / 'evidence/codex-legacy-tests.log').read_text(), 'discovery=scripts/tests\n')
+
     def test_xcode_and_package_sdk_mirrors_match_owned_fork(self):
         expected = {
             'https://github.com/modelcontextprotocol/swift-sdk':
@@ -684,6 +714,7 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
         for name, step_id in ids.items():
             self.assertEqual(re.findall(r'^        id: (.*)$', step_section(workflow, name), re.M), [step_id])
         prerequisites = {
+            'Validate legacy Codex learner and installers': 'checkout_source',
             'Validate packaged process guard command': 'native_build',
             'Run full native release filter': 'native_build',
             'Run force preparation regressions (serial)': 'native_build',

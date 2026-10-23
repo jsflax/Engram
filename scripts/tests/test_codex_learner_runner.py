@@ -94,6 +94,14 @@ class RunnerTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
+        # Queue tests use the real lease with isolated files and a fixed clock.
+        # Production cooldown/load refusal is covered by test_spawn_admission;
+        # unrelated host learners must not decide whether these fixtures run.
+        production_lease = runner.spawn_admission.lease
+        admission = mock.patch.object(runner.spawn_admission, "lease", side_effect=lambda: production_lease(
+            directory=self.base / "admission", now=10_000, load=lambda: 0, cooldown=0))
+        admission.start()
+        self.addCleanup(admission.stop)
         self.root = self.base / "state"
         self.home = self.base / "codex-home"
         self.home.mkdir()
