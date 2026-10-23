@@ -13,10 +13,40 @@ struct SimulationIndexCache {
     private weak var indexedSimulation: ForceSimulation3D?
     private var indexGeneration: UInt64 = .max
     private var nodeOrderVersion: UInt64 = .max
+    private var renderedNodeVersion: UInt64?
 
     mutating func refresh(nodeCount: Int, preservingPrefix: Bool,
                           simulation: ForceSimulation3D,
+                          insertionReuse: NodeInsertionReuse? = nil,
+                          nodeVersion: UInt64? = nil,
                           nodeID: (Int) -> UUID) -> Bool {
+        if indexedSimulation === simulation,
+           indexGeneration == simulation.nodeIndexGeneration,
+           let previousVersion = renderedNodeVersion, let nodeVersion,
+           let reuse = insertionReuse,
+           reuse.matches(fromVersion: previousVersion, oldCount: indices.count,
+                         toVersion: nodeVersion, newCount: nodeCount) {
+            var oldIndices = indices
+            var remaining: [Int] = []
+            for oldIndex in unresolved {
+                guard let index = reuse.newIndex(forOldIndex: oldIndex) else { continue }
+                if nodeOrderVersion != simulation.nodeOrderVersion,
+                   let resolved = simulation.index(for: nodeID(index)) {
+                    oldIndices[oldIndex] = resolved
+                } else { remaining.append(index) }
+            }
+            // The validated descriptor covers every existing index exactly
+            // once. Only inserted and previously unresolved rows hash a UUID.
+            indices = reuse.remap(oldIndices) { index in
+                let resolved = simulation.index(for: nodeID(index)) ?? -1
+                if resolved < 0 { remaining.append(index) }
+                return resolved
+            }!
+            unresolved = remaining
+            nodeOrderVersion = simulation.nodeOrderVersion
+            renderedNodeVersion = nodeVersion
+            return true
+        }
         let reset = !preservingPrefix || indices.count > nodeCount
             || indexedSimulation !== simulation
             || indexGeneration != simulation.nodeIndexGeneration
@@ -51,6 +81,7 @@ struct SimulationIndexCache {
         indexedSimulation = simulation
         indexGeneration = simulation.nodeIndexGeneration
         nodeOrderVersion = simulation.nodeOrderVersion
+        renderedNodeVersion = nodeVersion
         return changed
     }
 }
@@ -99,13 +130,46 @@ struct CentroidMembershipCache {
     private var clusterSlots: [String: Int] = [:]
     private var galaxySlots: [String: Int] = [:]
     private var galaxyProjectSlots: [GalaxyProject: Int] = [:]
+    private var projectOrder: [Int] = []
+    private var clusterOrder: [Int] = []
+    private var pairOrder: [Int] = []
     private weak var provider: AnyObject?
     private var nodeVersion: UInt64 = .max
     private var appendGeneration: UInt64 = .max
+    private(set) var membershipVisitCount: UInt64 = 0
 
     mutating func refresh(nodeCount: Int, nodeVersion: UInt64, appendGeneration: UInt64,
                           provider: AnyObject,
+                          insertionReuse: NodeInsertionReuse? = nil,
                           membership: (Int) -> (project: String, galaxy: String)) {
+        if self.provider === provider, let reuse = insertionReuse,
+           reuse.matches(fromVersion: self.nodeVersion, oldCount: members.count,
+                         toVersion: nodeVersion, newCount: nodeCount) {
+            let previous = members
+            members = reuse.remap(previous) { makeMember(membership($0)) }!
+            // Group slots stay stable, but observable group order must follow
+            // the first member in the new rendered order, just as a rebuild.
+            var seenProjects = [Bool](repeating: false, count: projects.count)
+            var seenClusters = [Bool](repeating: false, count: clusters.count)
+            var seenPairs = [Bool](repeating: false, count: galaxyProjects.count)
+            projectOrder.removeAll(keepingCapacity: true)
+            clusterOrder.removeAll(keepingCapacity: true)
+            pairOrder.removeAll(keepingCapacity: true)
+            for member in members {
+                if !seenProjects[member.project] {
+                    seenProjects[member.project] = true; projectOrder.append(member.project)
+                }
+                if !seenClusters[member.cluster] {
+                    seenClusters[member.cluster] = true; clusterOrder.append(member.cluster)
+                }
+                if !seenPairs[member.galaxyProject] {
+                    seenPairs[member.galaxyProject] = true; pairOrder.append(member.galaxyProject)
+                }
+            }
+            self.nodeVersion = nodeVersion
+            self.appendGeneration = appendGeneration
+            return
+        }
         let reset = self.provider !== provider || self.appendGeneration != appendGeneration
             || members.count > nodeCount
         if !reset, self.nodeVersion == nodeVersion, members.count == nodeCount { return }
@@ -120,43 +184,54 @@ struct CentroidMembershipCache {
             clusterSlots.removeAll(keepingCapacity: true)
             galaxySlots.removeAll(keepingCapacity: true)
             galaxyProjectSlots.removeAll(keepingCapacity: true)
+            projectOrder.removeAll(keepingCapacity: true)
+            clusterOrder.removeAll(keepingCapacity: true)
+            pairOrder.removeAll(keepingCapacity: true)
         }
         if members.capacity < nodeCount {
             members.reserveCapacity(max(nodeCount, max(64, members.capacity * 2)))
         }
         for index in members.count..<nodeCount {
-            let names = membership(index)
-            let project = projectSlots[names.project] ?? projects.count
-            if project == projects.count {
-                projectSlots[names.project] = project
-                projects.append(Project(name: names.project))
-            }
-            let galaxy = galaxySlots[names.galaxy] ?? galaxies.count
-            if galaxy == galaxies.count {
-                galaxySlots[names.galaxy] = galaxy
-                galaxies.append(GalaxyGroup(name: names.galaxy))
-            }
-            // Keep the existing concatenated-key grouping, including delimiter
-            // collisions. Exact galaxy/project counts use a separate pair slot.
-            let key = "\(names.galaxy)|\(names.project)"
-            let cluster = clusterSlots[key] ?? clusters.count
-            if cluster == clusters.count {
-                clusterSlots[key] = cluster
-                clusters.append(Cluster())
-            }
-            let pair = GalaxyProject(galaxy: galaxy, project: project)
-            let galaxyProject = galaxyProjectSlots[pair] ?? galaxyProjects.count
-            if galaxyProject == galaxyProjects.count {
-                galaxyProjectSlots[pair] = galaxyProject
-                galaxyProjects.append(pair)
-                galaxyProjectCounts.append(0)
-            }
-            members.append(Member(project: project, galaxy: galaxy,
-                                  cluster: cluster, galaxyProject: galaxyProject))
+            let member = makeMember(membership(index))
+            members.append(member)
         }
         self.provider = provider
         self.nodeVersion = nodeVersion
         self.appendGeneration = appendGeneration
+    }
+
+    private mutating func makeMember(_ names: (project: String, galaxy: String)) -> Member {
+        membershipVisitCount &+= 1
+        let project = projectSlots[names.project] ?? projects.count
+        if project == projects.count {
+            projectSlots[names.project] = project
+            projects.append(Project(name: names.project))
+            projectOrder.append(project)
+        }
+        let galaxy = galaxySlots[names.galaxy] ?? galaxies.count
+        if galaxy == galaxies.count {
+            galaxySlots[names.galaxy] = galaxy
+            galaxies.append(GalaxyGroup(name: names.galaxy))
+        }
+        // Keep the existing concatenated-key grouping, including delimiter
+        // collisions. Exact galaxy/project counts use a separate pair slot.
+        let key = "\(names.galaxy)|\(names.project)"
+        let cluster = clusterSlots[key] ?? clusters.count
+        if cluster == clusters.count {
+            clusterSlots[key] = cluster
+            clusters.append(Cluster())
+            clusterOrder.append(cluster)
+        }
+        let pair = GalaxyProject(galaxy: galaxy, project: project)
+        let galaxyProject = galaxyProjectSlots[pair] ?? galaxyProjects.count
+        if galaxyProject == galaxyProjects.count {
+            galaxyProjectSlots[pair] = galaxyProject
+            galaxyProjects.append(pair)
+            galaxyProjectCounts.append(0)
+            pairOrder.append(galaxyProject)
+        }
+        return Member(project: project, galaxy: galaxy,
+                      cluster: cluster, galaxyProject: galaxyProject)
     }
 
     mutating func reduce(positions: [SIMD3<Float>], simulationIndices: [Int],
@@ -201,7 +276,7 @@ struct CentroidMembershipCache {
             }
         }
         // Resolve names once per occupied pair, rather than once per node.
-        for index in galaxyProjects.indices where galaxyProjectCounts[index] > 0 {
+        for index in pairOrder where galaxyProjectCounts[index] > 0 {
             let pair = galaxyProjects[index]
             galaxies[pair.galaxy].projectCounts[projects[pair.project].name] = galaxyProjectCounts[index]
         }
@@ -209,14 +284,16 @@ struct CentroidMembershipCache {
 
     var projectCentroids: [String: SIMD3<Float>] {
         var result: [String: SIMD3<Float>] = [:]
-        for project in projects where project.count > 0 {
+        for index in projectOrder where projects[index].count > 0 {
+            let project = projects[index]
             result[project.name] = project.sum / Float(project.count)
         }
         return result
     }
 
     var nebulaClusters: [RKNebulaCluster] {
-        clusters.compactMap { cluster in
+        clusterOrder.compactMap { index in
+            let cluster = clusters[index]
             guard cluster.count > 0 else { return nil }
             let last = members[cluster.lastMember]
             return RKNebulaCluster(galaxyId: galaxies[last.galaxy].name,
@@ -243,6 +320,13 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     weak var registry: GalaxyRegistry? {
         didSet {
             guard registry !== oldValue else { return }
+            // An adapter can outlive its registry. Keep its public node epochs
+            // distinct even when the replacement has identical local counters.
+            // The old weak reference may already be nil. Retained publication
+            // counters still prevent a new origin from reusing its epochs.
+            nodeVersionBase &+= (lastNodesVersion == .max ? 0 : lastNodesVersion) &+ 1
+            nodeAppendBase &+= lastRegistryAppendGeneration &+ 1
+            lastRegistryAppendGeneration = 0
             // Equal revision counters from another provider cannot validate
             // this provider's snapshots, routing, or first centroid preview.
             lastTopologyVersion = .max
@@ -251,6 +335,7 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
             lastEdgesVersion = .max
             lastHubsVersion = .max
             preservesIndexPrefix = false
+            pendingIndexReuse = nil
             centroidsTopologyVersion = .max
             centroidPositionVersion = .max
             frameCentroids.removeAll(keepingCapacity: true)
@@ -272,6 +357,9 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     private var lastNodesVersion: UInt64 = .max
     private var lastEdgesVersion: UInt64 = .max
     private var lastHubsVersion: UInt64 = .max
+    private var nodeVersionBase: UInt64 = 0
+    private var nodeAppendBase: UInt64 = 0
+    private var lastRegistryAppendGeneration: UInt64 = 0
     private(set) var nodePrefixComparisonCount: UInt64 = 0
     private(set) var nodeSnapshotBuildCount: UInt64 = 0
     private(set) var edgePrefixComparisonCount: UInt64 = 0
@@ -291,7 +379,9 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     private var frameCentroids: [String: SIMD3<Float>] = [:]
     private var simulationIndices = SimulationIndexCache()
     private var centroidMembership = CentroidMembershipCache()
+    var centroidMembershipVisitCount: UInt64 { centroidMembership.membershipVisitCount }
     private var preservesIndexPrefix = true
+    private var pendingIndexReuse: NodeInsertionReuse?
     private var cachedPositionVersion: UInt64 = .max
     private var centroidPositionVersion: UInt64 = .max
 
@@ -356,10 +446,24 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     var topologyVersion: UInt64 {
         registry?.mergedTopologyVersion ?? 0
     }
-    var nodeVersion: UInt64 { registry?.mergedNodesVersion ?? 0 }
+    var nodeVersion: UInt64 { nodeVersionBase &+ (registry?.mergedNodesVersion ?? 0) }
     var hubVersion: UInt64 { registry?.mergedHubsVersion ?? 0 }
     var edgeVersion: UInt64 { registry?.mergedEdgesVersion ?? 0 }
-    var nodeAppendGeneration: UInt64 { registry?.mergedNodeAppendGeneration ?? 0 }
+    var nodeAppendGeneration: UInt64 { nodeAppendBase &+ (registry?.mergedNodeAppendGeneration ?? 0) }
+
+    func nodeInsertionReuse(since version: UInt64, count: Int) -> NodeInsertionReuse? {
+        guard version >= nodeVersionBase, let registry,
+              lastNodesVersion == registry.mergedNodesVersion,
+              let reuse = registry.nodeInsertionReuse(since: version - nodeVersionBase, count: count) else { return nil }
+        return publicReuse(reuse)
+    }
+
+    private func publicReuse(_ reuse: NodeInsertionReuse) -> NodeInsertionReuse? {
+        NodeInsertionReuse(fromVersion: nodeVersionBase &+ reuse.fromVersion,
+                           toVersion: nodeVersionBase &+ reuse.toVersion,
+                           oldCount: reuse.oldCount, newCount: reuse.newCount,
+                           retainedRanges: reuse.retainedRanges)
+    }
 
     func tick(dt: Float) {
         guard let registry else { return }
@@ -429,13 +533,16 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         guard let registry else { return }
         let sim = registry.unifiedSimulation
 
-        // Reuse indices for the validated render prefix. The simulation owns
-        // the UUID lookup; no duplicate full-graph dictionary is needed here.
+        // Reuse validated simulation indices, remapping retained rows across
+        // certified insertions. Only new or unresolved rows need UUID lookups;
+        // incompatible changes retain the conservative rebuild path.
         let n = cachedNodes.count
         let nodes = cachedNodes
         let indicesChanged = simulationIndices.refresh(
-            nodeCount: n, preservingPrefix: preservesIndexPrefix, simulation: sim
+            nodeCount: n, preservingPrefix: preservesIndexPrefix, simulation: sim,
+            insertionReuse: pendingIndexReuse, nodeVersion: nodeVersion
         ) { nodes[$0].id }
+        pendingIndexReuse = nil
         preservesIndexPrefix = true
         if framePositionArray.count != n {
             framePositionArray = [SIMD3<Float>](repeating: .zero, count: n)
@@ -476,15 +583,26 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         }
         let topologyNeedsCentroids = lastTopologyVersion != centroidsTopologyVersion
             && (!isLoading || frameCentroids.isEmpty || frameCounter % 30 == 0)
-        if topologyNeedsCentroids
-            || (frameCounter % 30 == 0 && centroidPositionVersion != sim.positionVersion) {
+        let shouldReduce = topologyNeedsCentroids
+            || (frameCounter % 30 == 0 && centroidPositionVersion != sim.positionVersion)
+        let membershipReuse = nodeInsertionReuse(since: centroidMembershipVersion,
+                                                 count: centroidMembershipCount)
+        // Consume compatible insertions while their exact proof is available.
+        // An edit, takeover or missed publication keeps the old loading cadence
+        // for a full membership rebuild as well as the numeric reduction.
+        if shouldReduce || membershipReuse != nil {
             centroidMembership.refresh(
-                nodeCount: cachedNodes.count, nodeVersion: registry.mergedNodesVersion,
-                appendGeneration: registry.mergedNodeAppendGeneration, provider: registry
+                nodeCount: cachedNodes.count, nodeVersion: nodeVersion,
+                appendGeneration: nodeAppendGeneration, provider: self,
+                insertionReuse: membershipReuse
             ) { index in
                 let node = cachedNodes[index]
                 return (node.project, registry.nodeToGalaxy[node.id] ?? "personal")
             }
+            centroidMembershipVersion = nodeVersion
+            centroidMembershipCount = cachedNodes.count
+        }
+        if shouldReduce {
             centroidMembership.reduce(positions: framePositionArray,
                                       simulationIndices: simulationIndices.indices,
                                       galaxyCenters: registry.galaxies.mapValues { $0.worldCenter })
@@ -510,6 +628,8 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         }
     }
     private var centroidsTopologyVersion: UInt64 = .max
+    private var centroidMembershipVersion: UInt64 = .max
+    private var centroidMembershipCount = 0
     private var frameCounter: UInt64 = 0
     private var frameNebulaClusters: [RKNebulaCluster] = []
     private var frameGalaxySnapshots: [RKGalaxySnapshot] = []
@@ -526,60 +646,83 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         let hubsChanged = lastHubsVersion != registry.mergedHubsVersion
         if lastNodesVersion != registry.mergedNodesVersion {
             let nodes = registry.mergedNodes
-            // Only store-certified continuity can bypass comparisons. Arbitrary
-            // edits, missed publications and replacement retain complete node
-            // metadata validation. Independent hub flags are patched below.
-            let prefix = registry.preservedNodePrefix(
-                since: lastNodesVersion, count: cachedNodes.count)
-            let canAppendNodes = prefix == nil && nodes.count >= cachedNodes.count
-                && cachedNodes.indices.allSatisfy { index in
-                    nodePrefixComparisonCount &+= 1
-                    let old = cachedNodes[index], node = nodes[index]
-                    return old.id == node.id && old.project == node.project
-                        && old.topic == node.topic && old.label == node.label
-                        && old.content == node.content && old.importance == node.importance
-                        && old.createdAt == node.createdAt && old.lastAccessedAt == node.lastAccessedAt
-                }
-            let retained = prefix ?? (canAppendNodes ? cachedNodes.count : 0)
-            if retained < cachedNodes.count {
-                preservesIndexPrefix = false
-                if cachedNodeIDsAreUnique {
-                    for node in cachedNodes.dropFirst(retained) {
-                        cachedNodeIndices.removeValue(forKey: node.id)
+            if let reuse = registry.nodeInsertionReuse(since: lastNodesVersion, count: cachedNodes.count),
+               cachedNodeIDsAreUnique {
+                cachedNodeIndices = cachedNodeIndices.mapValues { reuse.newIndex(forOldIndex: $0)! }
+                let oldNodes = cachedNodes
+                cachedNodes = reuse.remap(oldNodes) { index in
+                    let node = nodes[index]
+                    nodeSnapshotBuildCount &+= 1
+                    if cachedNodeIndices.updateValue(index, forKey: node.id) != nil {
+                        cachedNodeIDsAreUnique = false
                     }
+                    return RKNodeSnapshot(id: node.id, project: node.project, topic: node.topic,
+                        label: node.label, content: node.content, importance: node.importance,
+                        isHub: mergedHubs.contains(node.id), createdAt: node.createdAt,
+                        lastAccessedAt: node.lastAccessedAt)
+                }!
+                pendingIndexReuse = publicReuse(reuse)
+                preservesIndexPrefix = preservesIndexPrefix && reuse.insertedRanges.allSatisfy {
+                    $0.lowerBound >= reuse.oldCount
                 }
-                cachedNodes.removeSubrange(retained...)
-                if !cachedNodeIDsAreUnique {
-                    cachedNodeIndices.removeAll(keepingCapacity: true)
-                    cachedNodeIDsAreUnique = true
-                    for (index, node) in cachedNodes.enumerated() {
-                        if cachedNodeIndices.updateValue(index, forKey: node.id) != nil {
-                            cachedNodeIDsAreUnique = false
+            } else {
+                pendingIndexReuse = nil
+                // Only store-certified continuity can bypass comparisons. Arbitrary
+                // edits, missed publications and replacement retain complete node
+                // metadata validation. Independent hub flags are patched below.
+                let prefix = registry.preservedNodePrefix(
+                    since: lastNodesVersion, count: cachedNodes.count)
+                let canAppendNodes = prefix == nil && nodes.count >= cachedNodes.count
+                    && cachedNodes.indices.allSatisfy { index in
+                        nodePrefixComparisonCount &+= 1
+                        let old = cachedNodes[index], node = nodes[index]
+                        return old.id == node.id && old.project == node.project
+                            && old.topic == node.topic && old.label == node.label
+                            && old.content == node.content && old.importance == node.importance
+                            && old.createdAt == node.createdAt && old.lastAccessedAt == node.lastAccessedAt
+                    }
+                let retained = prefix ?? (canAppendNodes ? cachedNodes.count : 0)
+                if retained < cachedNodes.count {
+                    preservesIndexPrefix = false
+                    if cachedNodeIDsAreUnique {
+                        for node in cachedNodes.dropFirst(retained) {
+                            cachedNodeIndices.removeValue(forKey: node.id)
+                        }
+                    }
+                    cachedNodes.removeSubrange(retained...)
+                    if !cachedNodeIDsAreUnique {
+                        cachedNodeIndices.removeAll(keepingCapacity: true)
+                        cachedNodeIDsAreUnique = true
+                        for (index, node) in cachedNodes.enumerated() {
+                            if cachedNodeIndices.updateValue(index, forKey: node.id) != nil {
+                                cachedNodeIDsAreUnique = false
+                            }
                         }
                     }
                 }
-            }
-            if cachedNodes.capacity < nodes.count {
-                cachedNodes.reserveCapacity(max(nodes.count, max(64, cachedNodes.capacity * 2)))
-            }
-            for node in nodes.dropFirst(cachedNodes.count) {
-                nodeSnapshotBuildCount &+= 1
-                if cachedNodeIndices.updateValue(cachedNodes.count, forKey: node.id) != nil {
-                    cachedNodeIDsAreUnique = false
+                if cachedNodes.capacity < nodes.count {
+                    cachedNodes.reserveCapacity(max(nodes.count, max(64, cachedNodes.capacity * 2)))
                 }
-                cachedNodes.append(RKNodeSnapshot(
-                    id: node.id,
-                    project: node.project,
-                    topic: node.topic,
-                    label: node.label,
-                    content: node.content,
-                    importance: node.importance,
-                    isHub: mergedHubs.contains(node.id),
-                    createdAt: node.createdAt,
-                    lastAccessedAt: node.lastAccessedAt
-                ))
+                for node in nodes.dropFirst(cachedNodes.count) {
+                    nodeSnapshotBuildCount &+= 1
+                    if cachedNodeIndices.updateValue(cachedNodes.count, forKey: node.id) != nil {
+                        cachedNodeIDsAreUnique = false
+                    }
+                    cachedNodes.append(RKNodeSnapshot(
+                        id: node.id,
+                        project: node.project,
+                        topic: node.topic,
+                        label: node.label,
+                        content: node.content,
+                        importance: node.importance,
+                        isHub: mergedHubs.contains(node.id),
+                        createdAt: node.createdAt,
+                        lastAccessedAt: node.lastAccessedAt
+                    ))
+                }
             }
             lastNodesVersion = registry.mergedNodesVersion
+            lastRegistryAppendGeneration = registry.mergedNodeAppendGeneration
         }
 
         if lastEdgesVersion != registry.mergedEdgesVersion {

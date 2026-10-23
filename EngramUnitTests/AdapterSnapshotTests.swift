@@ -1631,6 +1631,423 @@ final class AdapterSnapshotTests: XCTestCase {
         XCTAssertTrue(registry.galaxyForNode(b.id) === group)
     }
 
+    func testCrossGalaxyInsertionReusePreservesRenderedOrderAndLivePositions() async throws {
+        let (lattice, registry, group, groupGeneration, personal, personalGeneration, adapter) =
+            try await crossGalaxyStreamingFixture()
+        defer { lattice.close() }
+        let a = node(label: "Group"), b = node(label: "Personal")
+        let c = node(label: "Inserted group"), d = node(label: "Appended personal")
+        group.applyLoadChunk(nodes: [(1, a)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: [(1, b)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        let retained = adapter.nodes, oldVersion = adapter.nodeVersion
+        let built = adapter.nodeSnapshotBuildCount, compared = adapter.nodePrefixComparisonCount
+        let routed = registry.routingNodeVisitCount
+
+        group.applyLoadChunk(nodes: [(2, c)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: [(2, d)], generation: personalGeneration)
+        for (index, value) in [a, c, b, d].enumerated() {
+            registry.unifiedSimulation.setPosition(value.id, to: SIMD3<Float>(Float(index + 1), 0, 0))
+        }
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, c.id, b.id, d.id])
+        XCTAssertEqual(adapter.nodes.map(\.label), [a.label, c.label, b.label, d.label])
+        XCTAssertEqual(adapter.positionArray, [1, 2, 3, 4].map { SIMD3<Float>(Float($0), 0, 0) })
+        XCTAssertEqual(retained.map(\.id), [a.id, b.id], "Previously published snapshots remain unchanged")
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount - built, 2)
+        XCTAssertEqual(adapter.nodePrefixComparisonCount, compared)
+        XCTAssertEqual(registry.routingNodeVisitCount - routed, 2)
+        XCTAssertTrue(registry.galaxyForNode(a.id) === group)
+        XCTAssertTrue(registry.galaxyForNode(b.id) === personal)
+
+        let reuse = try XCTUnwrap(registry.nodeInsertionReuse(since: oldVersion, count: 2))
+        XCTAssertEqual(reuse.fromVersion, oldVersion)
+        XCTAssertEqual(reuse.toVersion, adapter.nodeVersion)
+        XCTAssertEqual(reuse.oldCount, 2)
+        XCTAssertEqual(reuse.newCount, 4)
+        XCTAssertEqual(reuse.insertedRanges, [1..<2, 3..<4])
+        XCTAssertEqual(reuse.newIndex(forOldIndex: 0), 0)
+        XCTAssertEqual(reuse.newIndex(forOldIndex: 1), 2)
+        let erased: any SceneDataProvider = adapter
+        let forwarded = try XCTUnwrap(erased.nodeInsertionReuse(since: oldVersion, count: 2))
+        XCTAssertEqual(forwarded.insertedRanges, reuse.insertedRanges)
+        XCTAssertEqual(forwarded.toVersion, reuse.toVersion)
+    }
+
+    func testCrossGalaxyInsertionBuildsOnlyNewSnapshotsAcrossLargeRetainedSuffix() async throws {
+        let (lattice, registry, group, groupGeneration, personal, personalGeneration, adapter) =
+            try await crossGalaxyStreamingFixture()
+        defer { lattice.close() }
+        let a = node(label: "Group"), c = node(label: "New group"), d = node(label: "New personal")
+        let suffix = (0..<1_024).map { node(label: "Personal \($0)") }
+        group.applyLoadChunk(nodes: [(1, a)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: suffix.enumerated().map { (Int64($0.offset + 1), $0.element) },
+                                generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        let previous = adapter.nodes, version = adapter.nodeVersion
+        let built = adapter.nodeSnapshotBuildCount, compared = adapter.nodePrefixComparisonCount
+        let routed = registry.routingNodeVisitCount
+
+        group.applyLoadChunk(nodes: [(2, c)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: [(1_025, d)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, c.id] + suffix.map(\.id) + [d.id])
+        XCTAssertEqual(Array(adapter.nodes.dropFirst(2).prefix(suffix.count)).map(\.label), suffix.map(\.label))
+        XCTAssertEqual(previous.map(\.id), [a.id] + suffix.map(\.id))
+        XCTAssertEqual(adapter.nodeSnapshotBuildCount - built, 2, "An unchanged suffix is moved, not rebuilt")
+        XCTAssertEqual(adapter.nodePrefixComparisonCount, compared)
+        XCTAssertEqual(registry.routingNodeVisitCount - routed, 2, "Retained routing entries need no UUID visits")
+        let reuse = try XCTUnwrap(registry.nodeInsertionReuse(since: version, count: previous.count))
+        XCTAssertEqual(reuse.insertedRanges, [1..<2, 1_026..<1_027])
+        XCTAssertEqual(reuse.newIndex(forOldIndex: 1_024), 1_025)
+    }
+
+    func testCrossGalaxyInsertionProofRejectsTakeoverAndMissedPublication() async throws {
+        let (lattice, registry, group, groupGeneration, personal, personalGeneration, adapter) =
+            try await crossGalaxyStreamingFixture()
+        defer { lattice.close() }
+        let a = node(label: "Group"), b = node(label: "Personal")
+        group.applyLoadChunk(nodes: [(1, a)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: [(1, b)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        let oldVersion = adapter.nodeVersion
+        let winner = node(id: b.id, label: "Group wins", topic: "New owner")
+        let d = node(label: "Personal suffix")
+        group.applyLoadChunk(nodes: [(2, winner)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: [(2, d)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertNil(registry.nodeInsertionReuse(since: oldVersion, count: 2),
+                     "A higher-priority duplicate changes retained metadata and ownership")
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id, d.id])
+        XCTAssertEqual(adapter.nodes[1].label, winner.label)
+        XCTAssertEqual(adapter.nodes[1].topic, winner.topic)
+        XCTAssertTrue(registry.galaxyForNode(b.id) === group)
+
+        let missedVersion = adapter.nodeVersion, missedCount = adapter.nodes.count
+        let c = node(label: "Another group"), e = node(label: "Another personal")
+        group.applyLoadChunk(nodes: [(3, c)], generation: groupGeneration)
+        registry.mergeRenderData()
+        let intermediateVersion = registry.mergedNodesVersion
+        let intermediateCount = registry.mergedNodes.count
+        XCTAssertNotNil(registry.nodeInsertionReuse(since: missedVersion, count: missedCount))
+        personal.applyLoadChunk(nodes: [(3, e)], generation: personalGeneration)
+        registry.mergeRenderData()
+        XCTAssertNil(registry.nodeInsertionReuse(since: missedVersion, count: missedCount))
+        XCTAssertNil(registry.nodeInsertionReuse(since: intermediateVersion, count: intermediateCount - 1))
+        XCTAssertNotNil(registry.nodeInsertionReuse(since: intermediateVersion, count: intermediateCount))
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id, c.id, d.id, e.id])
+        XCTAssertEqual(adapter.nodes[1].label, winner.label)
+        XCTAssertEqual(Set(registry.nodeToGalaxy.keys), Set([a.id, b.id, c.id, d.id, e.id]))
+    }
+
+    func testAdapterInsertionOriginChangesWhenRegistryLocalCountersMatch() throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        defer { lattice.close() }
+        let original = GalaxyRegistry(), replacement = GalaxyRegistry()
+        original.unifiedSimulation.isActive = false
+        replacement.unifiedSimulation.isActive = false
+        let oldGalaxy = Galaxy(id: "personal", displayName: "Old", lattice: lattice.sendableReference)
+        let newGalaxy = Galaxy(id: "personal", displayName: "New", lattice: lattice.sendableReference)
+        original.register(oldGalaxy)
+        replacement.register(newGalaxy)
+        let a = node(label: "Old A"), b = node(label: "Old B")
+        let changedA = node(id: a.id, label: "New A", project: "Replacement")
+        let changedB = node(id: b.id, label: "New B", project: "Replacement")
+        oldGalaxy.insertNodeBatch([a], config: config)
+        newGalaxy.insertNodeBatch([changedA], config: config)
+        oldGalaxy.renderStore.bumpTopology()
+        newGalaxy.renderStore.bumpTopology()
+        let adapter = GalaxyRegistryAdapter(registry: original)
+        let erased: any SceneDataProvider = adapter
+        adapter.tick(dt: 1 / 60)
+        replacement.mergeRenderData()
+        let oldFromVersion = erased.nodeVersion, oldLocalFromVersion = original.mergedNodesVersion
+
+        oldGalaxy.insertNodeBatch([b], config: config)
+        newGalaxy.insertNodeBatch([changedB], config: config)
+        oldGalaxy.renderStore.bumpTopology()
+        newGalaxy.renderStore.bumpTopology()
+        replacement.unifiedSimulation.setPosition(a.id, to: SIMD3<Float>(10, 0, 0))
+        replacement.unifiedSimulation.setPosition(b.id, to: SIMD3<Float>(20, 0, 0))
+        adapter.tick(dt: 1 / 60)
+        replacement.mergeRenderData()
+        XCTAssertEqual(original.mergedNodesVersion, replacement.mergedNodesVersion)
+        XCTAssertEqual(original.mergedNodeAppendGeneration, replacement.mergedNodeAppendGeneration)
+        XCTAssertEqual(original.mergedNodes.count, replacement.mergedNodes.count)
+        let oldReuse = try XCTUnwrap(erased.nodeInsertionReuse(since: oldFromVersion, count: 1))
+        XCTAssertNotNil(replacement.nodeInsertionReuse(since: oldLocalFromVersion, count: 1),
+                        "The replacement deliberately has a numerically matching local certificate")
+        let oldVersion = erased.nodeVersion, oldAppendGeneration = erased.nodeAppendGeneration
+
+        adapter.registry = replacement
+        XCTAssertGreaterThan(erased.nodeVersion, oldVersion)
+        XCTAssertGreaterThan(erased.nodeAppendGeneration, oldAppendGeneration)
+        XCTAssertNil(erased.nodeInsertionReuse(since: oldReuse.fromVersion, count: oldReuse.oldCount))
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id])
+        XCTAssertEqual(adapter.nodes.map(\.label), [changedA.label, changedB.label])
+        XCTAssertEqual(adapter.positionArray, [SIMD3<Float>(10, 0, 0), SIMD3<Float>(20, 0, 0)])
+        XCTAssertNil(erased.nodeInsertionReuse(since: oldReuse.fromVersion, count: oldReuse.oldCount))
+        XCTAssertNil(erased.nodeInsertionReuse(since: oldVersion, count: 2))
+
+        let replacementVersion = erased.nodeVersion
+        let c = node(label: "New C", project: "Replacement")
+        newGalaxy.insertNodeBatch([c], config: config)
+        newGalaxy.renderStore.bumpTopology()
+        adapter.tick(dt: 1 / 60)
+        let currentReuse = try XCTUnwrap(erased.nodeInsertionReuse(since: replacementVersion, count: 2))
+        XCTAssertEqual(currentReuse.fromVersion, replacementVersion)
+        XCTAssertEqual(currentReuse.toVersion, erased.nodeVersion)
+        XCTAssertGreaterThan(currentReuse.toVersion, replacement.mergedNodesVersion,
+                             "Public certificates use the adapter origin, not bare registry counters")
+        XCTAssertEqual(currentReuse.insertedRanges, [2..<3])
+        XCTAssertEqual(adapter.nodes.map(\.label), [changedA.label, changedB.label, c.label])
+    }
+
+    func testAdapterInsertionOriginSurvivesDeallocatedRegistry() throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        defer { lattice.close() }
+        var original: GalaxyRegistry? = GalaxyRegistry()
+        original!.unifiedSimulation.isActive = false
+        let oldGalaxy = Galaxy(id: "personal", displayName: "Old", lattice: lattice.sendableReference)
+        original!.register(oldGalaxy)
+        let a = node(label: "Old A"), b = node(label: "Old B")
+        oldGalaxy.insertNodeBatch([a], config: config)
+        oldGalaxy.renderStore.bumpTopology()
+        let adapter = GalaxyRegistryAdapter(registry: original!)
+        let erased: any SceneDataProvider = adapter
+        adapter.tick(dt: 1 / 60)
+        oldGalaxy.renderStore.nodes[0] = node(id: a.id, label: "Old edited A")
+        oldGalaxy.renderStore.bumpTopology()
+        adapter.tick(dt: 1 / 60)
+        let oldFromVersion = erased.nodeVersion
+        oldGalaxy.insertNodeBatch([b], config: config)
+        oldGalaxy.renderStore.bumpTopology()
+        adapter.tick(dt: 1 / 60)
+        XCTAssertNotNil(erased.nodeInsertionReuse(since: oldFromVersion, count: 1))
+        let oldVersion = erased.nodeVersion, oldAppend = erased.nodeAppendGeneration
+        weak var released = original
+        original = nil
+        XCTAssertNil(released)
+        XCTAssertNil(adapter.registry)
+
+        let replacement = GalaxyRegistry()
+        replacement.unifiedSimulation.isActive = false
+        let galaxy = Galaxy(id: "personal", displayName: "Replacement", lattice: lattice.sendableReference)
+        replacement.register(galaxy)
+        let newA = node(id: a.id, label: "Replacement A"), newB = node(id: b.id, label: "Replacement B")
+        galaxy.insertNodeBatch([newA], config: config)
+        galaxy.renderStore.bumpTopology()
+        replacement.mergeRenderData()
+        galaxy.insertNodeBatch([newB], config: config)
+        galaxy.renderStore.bumpTopology()
+        replacement.mergeRenderData()
+        XCTAssertEqual(replacement.mergedNodesVersion + 1, oldVersion,
+                       "Using a nil weak oldValue would collide with the former node epoch")
+        XCTAssertEqual(replacement.mergedNodeAppendGeneration + 1, oldAppend,
+                       "The same weak-origin bug would collide with append continuity")
+        adapter.registry = replacement
+        XCTAssertGreaterThan(erased.nodeVersion, oldVersion)
+        XCTAssertGreaterThan(erased.nodeAppendGeneration, oldAppend)
+        adapter.tick(dt: 1 / 60)
+        XCTAssertNil(erased.nodeInsertionReuse(since: oldFromVersion, count: 1))
+        XCTAssertNil(erased.nodeInsertionReuse(since: oldVersion, count: 2))
+        XCTAssertEqual(adapter.nodes.map(\.label), [newA.label, newB.label])
+    }
+
+    func testLoadingCentroidInsertionReuseDoesNotScanPastUnconsumedEdit() async throws {
+        let (lattice, registry, galaxy, generation, adapter) = try await streamingFixture()
+        defer { lattice.close() }
+        let a = node(project: "Original"), b = node(project: "Other")
+        galaxy.applyLoadChunk(nodes: [(1, a), (2, b)], generation: generation)
+        registry.unifiedSimulation.setPosition(a.id, to: SIMD3<Float>(1, 0, 0))
+        registry.unifiedSimulation.setPosition(b.id, to: SIMD3<Float>(9, 0, 0))
+        adapter.tick(dt: 1 / 60) // Frame 1 publishes the initial preview.
+        let visited = adapter.centroidMembershipVisitCount
+        XCTAssertEqual(visited, 2)
+        XCTAssertEqual(adapter.projectCentroids["Original"], SIMD3<Float>(1, 0, 0))
+        let edited = node(id: a.id, label: "Edited", project: "Edited")
+        galaxy.applyLoadChunk(nodes: [(1, edited)], generation: generation)
+        registry.unifiedSimulation.setPosition(a.id, to: SIMD3<Float>(5, 0, 0))
+        adapter.tick(dt: 1 / 60) // Frame 2 cannot reuse old membership through the edit.
+        XCTAssertEqual(adapter.nodes.first?.project, "Edited")
+        XCTAssertEqual(adapter.centroidMembershipVisitCount, visited)
+        XCTAssertNil(adapter.projectCentroids["Edited"])
+
+        let beforeInsertion = adapter.nodeVersion
+        let c = node(project: "Inserted")
+        galaxy.applyLoadChunk(nodes: [(3, c)], generation: generation)
+        registry.unifiedSimulation.setPosition(c.id, to: SIMD3<Float>(13, 0, 0))
+        adapter.tick(dt: 1 / 60) // Frame 3 has a proof, but the centroid consumer missed its predecessor.
+        XCTAssertNotNil(adapter.nodeInsertionReuse(since: beforeInsertion, count: 2))
+        XCTAssertEqual(adapter.centroidMembershipVisitCount, visited)
+        XCTAssertEqual(adapter.nodes.map(\.id), [a.id, b.id, c.id])
+        for _ in 4...29 { adapter.tick(dt: 1 / 60) }
+        XCTAssertEqual(adapter.centroidMembershipVisitCount, visited)
+        XCTAssertEqual(adapter.projectCentroids["Original"], SIMD3<Float>(1, 0, 0))
+        XCTAssertNil(adapter.projectCentroids["Edited"])
+        XCTAssertNil(adapter.projectCentroids["Inserted"])
+
+        adapter.tick(dt: 1 / 60) // Frame 30 performs the deferred full refresh once.
+        XCTAssertEqual(adapter.centroidMembershipVisitCount - visited, 3)
+        XCTAssertNil(adapter.projectCentroids["Original"])
+        XCTAssertEqual(adapter.projectCentroids["Edited"], SIMD3<Float>(5, 0, 0))
+        XCTAssertEqual(adapter.projectCentroids["Other"], SIMD3<Float>(9, 0, 0))
+        XCTAssertEqual(adapter.projectCentroids["Inserted"], SIMD3<Float>(13, 0, 0))
+        XCTAssertEqual(adapter.galaxySnapshots.first?.nodeCount, 3)
+    }
+
+    func testIndexInsertionReuseVisitsOnlyInsertedAndPreviouslyMissingNodes() throws {
+        let sim = ForceSimulation3D()
+        let oldIDs = (0..<1_024).map { _ in UUID() }
+        for id in oldIDs.dropLast() { sim.addNode(id, project: "P", topic: "T") }
+        var cache = SimulationIndexCache()
+        _ = cache.refresh(nodeCount: oldIDs.count, preservingPrefix: false, simulation: sim,
+                          nodeVersion: 1) { oldIDs[$0] }
+        XCTAssertEqual(cache.indices.last, -1)
+        let inserted = UUID(), appended = UUID()
+        for id in [inserted, oldIDs.last!, appended] { sim.addNode(id, project: "P", topic: "T") }
+        let ids = [oldIDs[0], inserted] + Array(oldIDs.dropFirst()) + [appended]
+        let reuse = try XCTUnwrap(NodeInsertionReuse(
+            fromVersion: 1, toVersion: 2, oldCount: oldIDs.count, newCount: ids.count,
+            retainedRanges: [.init(oldRange: 0..<1, newStart: 0),
+                             .init(oldRange: 1..<oldIDs.count, newStart: 2)]))
+        var visited: [Int] = []
+        XCTAssertTrue(cache.refresh(nodeCount: ids.count, preservingPrefix: false, simulation: sim,
+                                    insertionReuse: reuse, nodeVersion: 2) {
+            visited.append($0); return ids[$0]
+        })
+        XCTAssertEqual(visited.count, 3)
+        XCTAssertEqual(Set(visited), Set([1, 1_024, 1_025]))
+        XCTAssertEqual(cache.indices, ids.map { sim.index(for: $0) ?? -1 })
+        visited.removeAll()
+        XCTAssertFalse(cache.refresh(nodeCount: ids.count, preservingPrefix: true, simulation: sim,
+                                     nodeVersion: 2) {
+            visited.append($0); return ids[$0]
+        })
+        XCTAssertTrue(visited.isEmpty)
+    }
+
+    func testIndexInsertionReuseRejectsVersionCountIdentityAndCompactionMismatch() throws {
+        let a = UUID(), b = UUID(), c = UUID()
+        let oldIDs = [a, b], ids = [a, c, b]
+        let valid = try XCTUnwrap(NodeInsertionReuse(
+            fromVersion: 1, toVersion: 2, oldCount: 2, newCount: 3,
+            retainedRanges: [.init(oldRange: 0..<1, newStart: 0), .init(oldRange: 1..<2, newStart: 2)]))
+        let invalidBindings = [
+            NodeInsertionReuse(fromVersion: 0, toVersion: 2, oldCount: 2, newCount: 3,
+                               retainedRanges: valid.retainedRanges),
+            NodeInsertionReuse(fromVersion: 1, toVersion: 3, oldCount: 2, newCount: 3,
+                               retainedRanges: valid.retainedRanges),
+            NodeInsertionReuse(fromVersion: 1, toVersion: 2, oldCount: 1, newCount: 3,
+                               retainedRanges: [.init(oldRange: 0..<1, newStart: 0)]),
+            NodeInsertionReuse(fromVersion: 1, toVersion: 2, oldCount: 2, newCount: 4,
+                               retainedRanges: valid.retainedRanges),
+        ]
+        for candidate in invalidBindings {
+            let proof = try XCTUnwrap(candidate)
+            let sim = ForceSimulation3D()
+            for id in oldIDs { sim.addNode(id, project: "P", topic: "T") }
+            var cache = SimulationIndexCache()
+            _ = cache.refresh(nodeCount: 2, preservingPrefix: false, simulation: sim,
+                              nodeVersion: 1) { oldIDs[$0] }
+            sim.addNode(c, project: "P", topic: "T")
+            var visited: [Int] = []
+            _ = cache.refresh(nodeCount: 3, preservingPrefix: false, simulation: sim,
+                              insertionReuse: proof, nodeVersion: 2) {
+                visited.append($0); return ids[$0]
+            }
+            XCTAssertEqual(visited, [0, 1, 2])
+            XCTAssertEqual(cache.indices, [0, 2, 1])
+        }
+
+        for replaceSimulation in [false, true] {
+            let original = ForceSimulation3D()
+            for id in oldIDs { original.addNode(id, project: "P", topic: "T") }
+            var cache = SimulationIndexCache()
+            _ = cache.refresh(nodeCount: 2, preservingPrefix: false, simulation: original,
+                              nodeVersion: 1) { oldIDs[$0] }
+            let current = replaceSimulation ? ForceSimulation3D() : original
+            if replaceSimulation {
+                for id in [b, c, a] { current.addNode(id, project: "P", topic: "T") }
+                XCTAssertEqual(current.nodeIndexGeneration, original.nodeIndexGeneration)
+            } else {
+                current.removeNodes([a])
+                for id in [c, a] { current.addNode(id, project: "P", topic: "T") }
+            }
+            var visited: [Int] = []
+            _ = cache.refresh(nodeCount: 3, preservingPrefix: false, simulation: current,
+                              insertionReuse: valid, nodeVersion: 2) {
+                visited.append($0); return ids[$0]
+            }
+            XCTAssertEqual(visited, [0, 1, 2])
+            XCTAssertEqual(cache.indices, [2, 1, 0])
+        }
+    }
+
+    func testCentroidInsertionReuseVisitsOnlyNewMembershipAndRejectsStaleOwners() throws {
+        let provider = GalaxyRegistry(), replacement = GalaxyRegistry()
+        var cache = CentroidMembershipCache()
+        let oldGroups = [(project: "P", galaxy: "g")]
+            + Array(repeating: (project: "Q", galaxy: "h"), count: 1_023)
+        cache.refresh(nodeCount: oldGroups.count, nodeVersion: 1, appendGeneration: 1,
+                      provider: provider) { oldGroups[$0] }
+        var groups = [oldGroups[0], (project: "Inserted", galaxy: "g")]
+            + Array(oldGroups.dropFirst()) + [(project: "Q", galaxy: "h")]
+        let reuse = try XCTUnwrap(NodeInsertionReuse(
+            fromVersion: 1, toVersion: 2, oldCount: oldGroups.count, newCount: groups.count,
+            retainedRanges: [.init(oldRange: 0..<1, newStart: 0),
+                             .init(oldRange: 1..<oldGroups.count, newStart: 2)]))
+        var visited: [Int] = []
+        cache.refresh(nodeCount: groups.count, nodeVersion: 2, appendGeneration: 2,
+                      provider: provider, insertionReuse: reuse) {
+            visited.append($0); return groups[$0]
+        }
+        XCTAssertEqual(visited, [1, 1_025])
+        let positions = [SIMD3<Float>.zero, SIMD3<Float>(9, 0, 0)]
+            + Array(repeating: SIMD3<Float>(4, 0, 0), count: 1_023) + [SIMD3<Float>(8, 0, 0)]
+        cache.reduce(positions: positions, simulationIndices: Array(groups.indices), galaxyCenters: [:])
+        var reference = CentroidMembershipCache()
+        reference.refresh(nodeCount: groups.count, nodeVersion: 2, appendGeneration: 2,
+                          provider: provider) { groups[$0] }
+        reference.reduce(positions: positions, simulationIndices: Array(groups.indices), galaxyCenters: [:])
+        XCTAssertEqual(cache.projectCentroids, reference.projectCentroids)
+        XCTAssertEqual(cache.projectCentroids["Inserted"], SIMD3<Float>(9, 0, 0))
+        XCTAssertEqual(cache.galaxyAggregate(for: "g").count, 2)
+        XCTAssertEqual(cache.galaxyAggregate(for: "h").count, 1_024)
+
+        // An older descriptor cannot hide a same-count membership edit.
+        groups[2] = (project: "Edited", galaxy: "new owner")
+        visited.removeAll()
+        cache.refresh(nodeCount: groups.count, nodeVersion: 3, appendGeneration: 3,
+                      provider: provider, insertionReuse: reuse) {
+            visited.append($0); return groups[$0]
+        }
+        XCTAssertEqual(visited, Array(groups.indices))
+        cache.reduce(positions: positions, simulationIndices: Array(groups.indices), galaxyCenters: [:])
+        XCTAssertEqual(cache.projectCentroids["Edited"], positions[2])
+        XCTAssertEqual(cache.galaxyAggregate(for: "h").count, 1_023)
+
+        let oldCount = groups.count
+        groups[0] = (project: "Replacement", galaxy: "replacement")
+        groups.append((project: "Tail", galaxy: "replacement"))
+        let matchingNumbers = try XCTUnwrap(NodeInsertionReuse(
+            fromVersion: 3, toVersion: 4, oldCount: oldCount, newCount: groups.count,
+            retainedRanges: [.init(oldRange: 0..<oldCount, newStart: 0)]))
+        visited.removeAll()
+        cache.refresh(nodeCount: groups.count, nodeVersion: 4, appendGeneration: 4,
+                      provider: replacement, insertionReuse: matchingNumbers) {
+            visited.append($0); return groups[$0]
+        }
+        XCTAssertEqual(visited, Array(groups.indices), "Equal descriptor counters cannot certify another provider")
+        cache.reduce(positions: positions + [SIMD3<Float>(20, 0, 0)],
+                     simulationIndices: Array(groups.indices), galaxyCenters: [:])
+        XCTAssertNil(cache.projectCentroids["P"])
+        XCTAssertEqual(cache.projectCentroids["Replacement"], .zero)
+        XCTAssertEqual(cache.galaxyAggregate(for: "replacement").count, 2)
+    }
+
     private func crossGalaxyStreamingFixture() async throws
         -> (Lattice, GalaxyRegistry, Galaxy, UInt64, Galaxy, UInt64, GalaxyRegistryAdapter) {
         let (lattice, registry, personal, personalGeneration, adapter) = try await streamingFixture()

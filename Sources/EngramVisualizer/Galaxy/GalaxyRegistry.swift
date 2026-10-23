@@ -90,6 +90,7 @@ final class GalaxyRegistry {
     @ObservationIgnored private var previousNodeVersion: UInt64 = 0
     @ObservationIgnored private var previousNodeCount = 0
     @ObservationIgnored private var retainedNodePrefix: Int?
+    @ObservationIgnored private var lastNodeInsertionReuse: NodeInsertionReuse?
     @ObservationIgnored private(set) var mergedTopologyVersion: UInt64 = 0
     @ObservationIgnored private(set) var mergedNodesVersion: UInt64 = 0
     @ObservationIgnored private(set) var mergedEdgesVersion: UInt64 = 0
@@ -106,6 +107,13 @@ final class GalaxyRegistry {
         if version == mergedNodesVersion, count == lastMergedNodeCount { return count }
         guard version == previousNodeVersion, count == previousNodeCount else { return nil }
         return retainedNodePrefix
+    }
+
+    func nodeInsertionReuse(since version: UInt64, count: Int) -> NodeInsertionReuse? {
+        guard let reuse = lastNodeInsertionReuse,
+              reuse.matches(fromVersion: version, oldCount: count,
+                            toVersion: mergedNodesVersion, newCount: mergedNodes.count) else { return nil }
+        return reuse
     }
 
     // MARK: - Galaxy Management
@@ -379,6 +387,7 @@ final class GalaxyRegistry {
             previousNodeVersion = mergedNodesVersion
             previousNodeCount = lastMergedNodeCount
             retainedNodePrefix = nil
+            lastNodeInsertionReuse = nil
             if let only = ordered.first, ordered.count == 1 {
                 // The borrow below may have restored newer store arrays already;
                 // previous.nodeCount is the retained publication's count.
@@ -390,7 +399,16 @@ final class GalaxyRegistry {
                 }
                 mergedNodes = only.renderStore.nodes
                 mergedNodeEnds = [only.id: mergedNodes.count]
-                if appendOnly { retainedNodePrefix = start }
+                if appendOnly {
+                    retainedNodePrefix = start
+                    lastNodeInsertionReuse = NodeInsertionReuse(
+                        fromVersion: mergedNodesVersion, toVersion: mergedNodesVersion &+ 1,
+                        oldCount: start, newCount: mergedNodes.count,
+                        retainedRanges: start == 0 ? [] : [.init(oldRange: 0..<start, newStart: 0)])
+                }
+            } else if appendOnly, mergeInsertedNodes(ordered, previous: previous) {
+                // Existing rows retain their metadata and precedence; only
+                // their rendered indices move around the new galaxy suffixes.
             } else {
                 // Appending to an earlier galaxy inserts BEFORE later galaxies.
                 // Keep only the proven old prefix through that galaxy, then redo
@@ -523,6 +541,64 @@ final class GalaxyRegistry {
         if publishesRenderChange && !galaxies.values.contains(where: { $0.isDrainingInitialSnapshot }) {
             panelSnapshot.refresh(from: self)
         }
+    }
+
+    /// Preserve unchanged galaxy segments through insertion-only loading.
+    /// A new higher-priority copy changes an old winner and deliberately falls
+    /// back to the complete precedence merge. No live routing is changed until
+    /// every new row and the complete old segment coverage have been checked.
+    private func mergeInsertedNodes(_ ordered: [Galaxy], previous: [String: RenderRevision]) -> Bool {
+        guard mergedNodes.count == previousNodeCount else { return false }
+        let ranks = Dictionary(uniqueKeysWithValues: ordered.enumerated().map { ($0.element.id, $0.offset) })
+        var appended = [[NodeData]](repeating: [], count: ordered.count)
+        var newOwners: [UUID: String] = [:]
+        for (rank, galaxy) in ordered.enumerated() {
+            guard let old = previous[galaxy.id], old.nodeCount <= galaxy.renderStore.nodes.count else { return false }
+            for node in galaxy.renderStore.nodes.dropFirst(old.nodeCount) {
+                routingNodeVisitCount &+= 1
+                if let owner = nodeToGalaxy[node.id] {
+                    guard let oldRank = ranks[owner], oldRank <= rank else { return false }
+                    continue
+                }
+                guard newOwners[node.id] == nil else { continue }
+                newOwners[node.id] = galaxy.id
+                appended[rank].append(node)
+            }
+        }
+        var ranges: [NodeInsertionReuse.RetainedRange] = []
+        var oldEnd = 0
+        var newEnd = 0
+        var ends: [String: Int] = [:]
+        var oldEnds: [Int] = []
+        for (index, galaxy) in ordered.enumerated() {
+            guard let end = mergedNodeEnds[galaxy.id], end >= oldEnd, end <= previousNodeCount else { return false }
+            oldEnds.append(end)
+            if end > oldEnd { ranges.append(.init(oldRange: oldEnd..<end, newStart: newEnd)) }
+            newEnd += end - oldEnd
+            newEnd += appended[index].count
+            ends[galaxy.id] = newEnd
+            oldEnd = end
+        }
+        guard oldEnd == previousNodeCount,
+              let reuse = NodeInsertionReuse(fromVersion: mergedNodesVersion,
+                    toVersion: mergedNodesVersion &+ 1, oldCount: previousNodeCount,
+                    newCount: newEnd, retainedRanges: ranges) else { return false }
+        var nodes: [NodeData] = []
+        nodes.reserveCapacity(newEnd)
+        oldEnd = 0
+        for index in ordered.indices {
+            // Bounds were checked above before any publication or mutation.
+            let end = oldEnds[index]
+            nodes.append(contentsOf: mergedNodes[oldEnd..<end])
+            nodes.append(contentsOf: appended[index])
+            oldEnd = end
+        }
+        for (id, owner) in newOwners { nodeToGalaxy[id] = owner }
+        mergedNodes = nodes
+        mergedNodeEnds = ends
+        lastNodeInsertionReuse = reuse
+        retainedNodePrefix = reuse.insertedRanges.first?.lowerBound ?? previousNodeCount
+        return true
     }
 
     /// A synchronous borrow around a bulk mutation. No suspension or external

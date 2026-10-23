@@ -272,13 +272,27 @@ class Runner:
         reason, code, child_code = "exit", None, None
         silence_captured = False
         next_snapshot = 0
+        inventory = {"timeout_count": 0, "recovery_count": 0, "pending_timeout": False}
         try:
             while True:
                 now = time.monotonic()
+                snapshot_succeeded = False
                 if now >= next_snapshot:
-                    self.refresh()
+                    try:
+                        self.refresh()
+                        snapshot_succeeded = True
+                    except subprocess.TimeoutExpired:
+                        # An unavailable observation does not revoke Popen or
+                        # remembered ownership. Retry at the normal cadence.
+                        inventory["timeout_count"] += 1
+                        inventory["pending_timeout"] = True
+                        inventory["last_timeout_elapsed_seconds"] = time.monotonic() - self.started
                     next_snapshot = now + 1
                 child_code = self.child.poll()
+                if snapshot_succeeded and child_code is None and inventory["pending_timeout"]:
+                    inventory["recovery_count"] += 1
+                    inventory["pending_timeout"] = False
+                    inventory["last_recovery_elapsed_seconds"] = time.monotonic() - self.started
                 if child_code is not None and child_code != 0:
                     code = child_code if child_code >= 0 else 128 - child_code
                     break
@@ -292,7 +306,12 @@ class Runner:
                     reason, code = "timeout", 124
                     break
                 if child_code == 0:
-                    code = 0
+                    # A post-exit snapshot cannot recover observation of the
+                    # running child. Cleanup still needs fresh ownership proof.
+                    if inventory["pending_timeout"]:
+                        reason, code = "inventory_unresolved", 125
+                    else:
+                        code = 0
                     break
                 if not silence_captured and now - self.last_output >= self.silence:
                     silence_captured = True
@@ -335,6 +354,7 @@ class Runner:
                        "output_bytes": self.output_bytes, "saved_log_bytes": self.log_bytes,
                        "log_truncated": self.output_bytes > self.log_bytes,
                        "reader_complete": reader_complete, "reader_error": self.reader_error,
+                       "monitoring_inventory": inventory,
                        "diagnostics": self.diagnostics, "cleanup": cleanup,
                        "signals_received": self.signals, "errors": self.errors}
             if required is not None:

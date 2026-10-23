@@ -1,4 +1,5 @@
 import Foundation
+import EngramSceneKit
 import Testing
 @testable import EngramRealityKit
 
@@ -191,4 +192,127 @@ struct EdgeEndpointIndexCacheTests {
         #expect(cache.indices == [b.id: 0])
         #expect(cache.projects == [b.id: "renamed"])
     }
+    @Test("Insertion certificates rebase resolved endpoints, repair missing nodes and retain duplicate last wins")
+    func insertionEndpointsMatchFullRebuild() {
+        let a = node(), b = node(), late = node(), x = node()
+        let links = [edge(a, b), edge(late, a)]
+        for duplicates in [false, true] {
+            let owner = NSObject()
+            let old = duplicates ? [a, b, a] : [a, b]
+            let next = duplicates ? [a, a, late, b, a, a] : [x, a, late, b]
+            let reuse = NodeInsertionReuse(fromVersion: 1, toVersion: 2, oldCount: old.count, newCount: next.count,
+                retainedRanges: [.init(oldRange: 0..<1, newStart: 1), .init(oldRange: 1..<old.count, newStart: 3)])
+            var cache = EdgeEndpointIndexCache(), reference = EdgeEndpointIndexCache()
+            cache.update(nodes: old, edges: links, provider: owner, nodeVersion: 1, edgeVersion: 1, nodeAppendGeneration: 1)
+            let reads = cache.nodeMetadataReadCount
+            cache.update(nodes: next, edges: links, provider: owner, nodeVersion: 2, edgeVersion: 1,
+                         nodeAppendGeneration: 2, nodeInsertionReuse: reuse)
+            reference.update(nodes: next, edges: links)
+            #expect(cache.sourceIndices == reference.sourceIndices)
+            #expect(cache.targetIndices == reference.targetIndices)
+            #expect(cache.sourceIndices == [duplicates ? 5 : 1, 2])
+            #expect(cache.targetIndices == [3, duplicates ? 5 : 1])
+            if !duplicates {
+                #expect(cache.nodeMetadataReadCount - reads == next.count - old.count)
+                #expect(cache.nodePrefixComparisonCount == 0 && cache.edgePrefixComparisonCount == 0)
+            }
+        }
+    }
+
+    @Test("Insertion endpoints fall back on stale certificates, replacement, removal and edge edits")
+    func insertionEndpointFallbacksMatchFullRebuild() {
+        let a = node(), b = node(), c = node(), original = edge(a, b)
+        for mode in 0..<5 {
+            let owner = NSObject(), replacement = NSObject()
+            var cache = EdgeEndpointIndexCache(), reference = EdgeEndpointIndexCache()
+            cache.update(nodes: [a, b], edges: [original], provider: owner,
+                         nodeVersion: 1, edgeVersion: 1, nodeAppendGeneration: 1)
+            let next = mode == 3 ? [b] : mode == 2 ? [a, b, c] : [c, a, b]
+            let links = mode == 2 ? [edge(c, a, id: original.id)] : [original]
+            let reuse = NodeInsertionReuse(fromVersion: mode == 0 || mode == 4 ? 2 : 1, toVersion: 3,
+                oldCount: 2, newCount: 3,
+                retainedRanges: [.init(oldRange: 0..<2, newStart: mode == 2 ? 0 : 1)])
+            cache.update(nodes: next, edges: links, provider: mode == 1 ? replacement : owner,
+                         nodeVersion: 3, edgeVersion: mode == 2 ? 2 : 1, nodeAppendGeneration: 3,
+                         nodeInsertionReuse: mode == 4 ? nil : reuse)
+            reference.update(nodes: next, edges: links)
+            #expect(cache.sourceIndices == reference.sourceIndices)
+            #expect(cache.targetIndices == reference.targetIndices)
+        }
+    }
+
+
+    @Test("Duplicate insertions preserve conservative resolved and unresolved endpoint policy")
+    func insertionDuplicateCompatibility() {
+        let a = node(), b = node(), late = node(), x = node()
+        let links = [edge(a, b), edge(a, late), edge(a, a)]
+        let cases: [([RKNodeSnapshot], [RKNodeSnapshot], [NodeInsertionReuse.RetainedRange], UInt64)] = [
+            ([a, b], [a, b, a, late], [.init(oldRange: 0..<2, newStart: 0)], 1),
+            ([a, b], [a, b, a, late], [.init(oldRange: 0..<2, newStart: 0)], 2),
+            ([a, a], [a, a, a], [.init(oldRange: 0..<2, newStart: 1)], 2),
+            ([a, b], [a, a, b, late], [.init(oldRange: 0..<2, newStart: 1)], 2),
+            ([a, b, a], [a, a, b, a, late], [.init(oldRange: 0..<3, newStart: 1)], 2),
+            ([a, b], [x, x, a, b], [.init(oldRange: 0..<2, newStart: 2)], 2),
+        ]
+        for (old, next, ranges, generation) in cases {
+            let owner = NSObject()
+            var cache = EdgeEndpointIndexCache(), reference = EdgeEndpointIndexCache()
+            cache.update(nodes: old, edges: links, provider: owner,
+                         nodeVersion: 1, edgeVersion: 1, nodeAppendGeneration: 1)
+            reference.update(nodes: old, edges: links, provider: owner,
+                             nodeVersion: 1, edgeVersion: 1, nodeAppendGeneration: 1)
+            let reuse = NodeInsertionReuse(fromVersion: 1, toVersion: 2,
+                oldCount: old.count, newCount: next.count, retainedRanges: ranges)!
+            let nextLinks = links + [edge(a, b)]
+            let result = cache.update(nodes: next, edges: nextLinks, provider: owner,
+                nodeVersion: 2, edgeVersion: 2, nodeAppendGeneration: generation, nodeInsertionReuse: reuse)
+            let expected = reference.update(nodes: next, edges: nextLinks, provider: owner,
+                nodeVersion: 2, edgeVersion: 2, nodeAppendGeneration: generation)
+            #expect(result == expected)
+            #expect(cache.sourceIndices == reference.sourceIndices)
+            #expect(cache.targetIndices == reference.targetIndices)
+        }
+        // A prior duplicate tail append leaves a resolved winner older than
+        // the lookup winner. A later unique interior insertion must rebuild it.
+        let owner = NSObject()
+        var cache = EdgeEndpointIndexCache(), reference = EdgeEndpointIndexCache()
+        let retained = [edge(a, b)]
+        for (version, nodes) in [[a, b], [a, b, a]].enumerated() {
+            cache.update(nodes: nodes, edges: retained, provider: owner,
+                nodeVersion: UInt64(version + 1), edgeVersion: 1, nodeAppendGeneration: 1)
+            reference.update(nodes: nodes, edges: retained, provider: owner,
+                nodeVersion: UInt64(version + 1), edgeVersion: 1, nodeAppendGeneration: 1)
+        }
+        #expect(cache.sourceIndices == [0])
+        let reuse = NodeInsertionReuse(fromVersion: 2, toVersion: 3,
+            oldCount: 3, newCount: 4, retainedRanges: [.init(oldRange: 0..<3, newStart: 1)])!
+        let result = cache.update(nodes: [x, a, b, a], edges: retained, provider: owner,
+            nodeVersion: 3, edgeVersion: 1, nodeAppendGeneration: 2, nodeInsertionReuse: reuse)
+        let expected = reference.update(nodes: [x, a, b, a], edges: retained, provider: owner,
+            nodeVersion: 3, edgeVersion: 1, nodeAppendGeneration: 2)
+        #expect(result == expected && result == .rebuilt)
+        #expect(cache.sourceIndices == reference.sourceIndices && cache.sourceIndices == [3])
+        #expect(cache.targetIndices == reference.targetIndices)
+
+    }
+
+    @Test("No visible node or edge growth retains the unchanged update kind")
+    func insertionWithoutGrowthIsUnchanged() {
+        let a = node(), b = node()
+        for nodes in [[], [a, b]] {
+            let owner = NSObject(), links = [edge(a, b)]
+            var cache = EdgeEndpointIndexCache()
+            cache.update(nodes: nodes, edges: links, provider: owner,
+                         nodeVersion: 1, edgeVersion: 1, nodeAppendGeneration: 1)
+            let source = cache.sourceIndices, target = cache.targetIndices
+            let reuse = NodeInsertionReuse(fromVersion: 1, toVersion: 2,
+                oldCount: nodes.count, newCount: nodes.count,
+                retainedRanges: nodes.isEmpty ? [] : [.init(oldRange: 0..<nodes.count, newStart: 0)])!
+            let result = cache.update(nodes: nodes, edges: links, provider: owner,
+                nodeVersion: 2, edgeVersion: 1, nodeAppendGeneration: 1, nodeInsertionReuse: reuse)
+            #expect(result == .unchanged)
+            #expect(cache.sourceIndices == source && cache.targetIndices == target)
+        }
+    }
+
 }

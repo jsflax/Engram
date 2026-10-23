@@ -196,7 +196,7 @@ with open(os.environ['CALL_LOG'],'a') as output:
             self.assertTrue(any('clusters_statementBudget' in call for call in tests))
             self.assertEqual(tests[0], [
                 'swift', 'test', '--force-resolved-versions', '--skip-build', '--filter',
-                'EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests|LockedSnapshotTests',
+                'EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests|LockedSnapshotTests|NodeInsertionReuseModelTests',
                 '--skip', 'PerfTests', '--skip', 'keyBERTKeywordExtraction',
                 '--skip', 'recall_semanticRelevanceOrdering',
                 '--skip', 'recall_connectedMemory_showsEdgeRelation',
@@ -754,7 +754,7 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
 
     def test_native_validation_shell_commands_collect_independent_failures(self):
         workflow = 'native-validation.yml'
-        full_filter = 'EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests|LockedSnapshotTests'
+        full_filter = 'EngramTests|EngramMemoryCoreTests|EngramRealityKitTests|PositionVersionTests|LockedSnapshotTests|NodeInsertionReuseModelTests'
         with tempfile.TemporaryDirectory(prefix='engram independent workflow ') as temporary:
             root = Path(temporary).resolve()
             validation = root / 'validation'

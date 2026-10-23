@@ -120,6 +120,7 @@ class HostPreparationTests(unittest.TestCase):
                           mirrored, flags=re.M)
         mirrored = mirrored.replace('    func testTick(dt: Float)', '    func tick(dt: Float)')
         mirrored = mirrored.replace('    func testPosition(for id: UUID)', '    func position(for id: UUID)')
+        mirrored = mirrored.replace('    func testNodeInsertionReuse(', '    func nodeInsertionReuse(')
         mirrored = mirrored.replace('#expect(', 'XCTAssertTrue(')
         self.assertEqual((repo / 'EngramUnitTests/FrameLookupInvalidationTests.swift').read_text(), mirrored)
         expected = ['FrameLookupInvalidationTests/' + name for name in (
@@ -136,9 +137,12 @@ class HostPreparationTests(unittest.TestCase):
             'testFlowProviderCountAndCap', 'testLabelMembershipSeparatesDomainsAndExtendsAppendPrefix',
             'testLabelMembershipRejectsInvalidContinuity', 'testLabelNumericRescanFollowsMotion',
             'testLabelNumericRescanPreservesMissingPositionSemantics',
-            'testLabelNumericSlotsFollowReorderAndTopicChanges')]
+            'testLabelNumericSlotsFollowReorderAndTopicChanges',
+            'testLabelInsertionRangesMatchFullRebuild',
+            'testMascotInsertionRangesMatchFullRebuild',
+            'testInsertionMembershipFallbacksMatchFullRebuild')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 110)
+        self.assertEqual(len(inventory), 126)
         self.assertIn('AdapterSnapshotTests/testSparsePositionsFollowSimulationChangesAndRegistryReplacement', inventory)
         self.assertIn('AdapterSnapshotTests/testMascotVisibilityReachesSceneAndPreservesExistingEntities', inventory)
         for name in (
@@ -148,6 +152,15 @@ class HostPreparationTests(unittest.TestCase):
             'testCrossGalaxyAppendsWithEdgeEditsDeletesAndFiltersUseFullMerge',
             'testCrossGalaxyPrefixEditsReorderFilteringAndShrinkInvalidateReuse',
             'testCrossGalaxyReplacementPrecedenceAndSingleGalaxyTransitionsResetReuse',
+            'testCrossGalaxyInsertionReusePreservesRenderedOrderAndLivePositions',
+            'testCrossGalaxyInsertionBuildsOnlyNewSnapshotsAcrossLargeRetainedSuffix',
+            'testCrossGalaxyInsertionProofRejectsTakeoverAndMissedPublication',
+            'testAdapterInsertionOriginChangesWhenRegistryLocalCountersMatch',
+            'testAdapterInsertionOriginSurvivesDeallocatedRegistry',
+            'testIndexInsertionReuseVisitsOnlyInsertedAndPreviouslyMissingNodes',
+            'testIndexInsertionReuseRejectsVersionCountIdentityAndCompactionMismatch',
+            'testCentroidInsertionReuseVisitsOnlyNewMembershipAndRejectsStaleOwners',
+            'testLoadingCentroidInsertionReuseDoesNotScanPastUnconsumedEdit',
         ):
             self.assertIn('AdapterSnapshotTests/' + name, inventory)
         self.assertEqual([name for name in inventory if name.startswith('FrameLookupInvalidationTests/')],
@@ -160,7 +173,11 @@ class HostPreparationTests(unittest.TestCase):
             'testRoutingDomainsExtendOnlyCertifiedNodeSuffixes',
             'testRoutingDomainsRebuildForEditsRemovalAndReplacement',
             'testMetadataDomainsMatchConservativeVisibilityAcrossMutations',
-            'testMetadataReusePreservesMotionAndLivePriorityOverrides')]
+            'testMetadataReusePreservesMotionAndLivePriorityOverrides',
+            'testInsertionEndpointsMatchFullRebuild',
+            'testInsertionEndpointFallbacksMatchFullRebuild',
+            'testInsertionDuplicateCompatibility',
+            'testInsertionWithoutGrowthIsUnchanged')]
         self.assertEqual([name for name in inventory if name.startswith('SceneMetadataDomainTests/')],
                          sorted(domain_controls))
         self.assertEqual(M.CLASSES.count('SceneMetadataDomainTests'), 1)

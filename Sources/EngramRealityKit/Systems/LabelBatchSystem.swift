@@ -4,7 +4,7 @@ import simd
 import EngramSceneKit
 
 /// Project/topic membership follows node contents, not edges or load status.
-/// A certified append can extend the sets and dense group slots across several
+/// Certified insertions rebase memberships; certified appends extend them across several
 /// skipped frames; replacement, prefix edits and removals rebuild them. Moving
 /// positions reduce into reusable numeric arrays without hashing group names
 /// for every node on every rescan.
@@ -43,43 +43,36 @@ struct LabelProjectTopicCache {
            appendGeneration == dataProvider.nodeAppendGeneration, nodeCount == nodes.count {
             return (projects, topics)
         }
-        let append = provider === dataProvider
-            && appendGeneration == dataProvider.nodeAppendGeneration && nodeCount <= nodes.count
-        if !append {
-            projects.removeAll(keepingCapacity: true)
-            topics.removeAll(keepingCapacity: true)
-            projectSlots.removeAll(keepingCapacity: true)
-            topicSlots.removeAll(keepingCapacity: true)
-            projectNames.removeAll(keepingCapacity: true)
-            topicNames.removeAll(keepingCapacity: true)
-            memberships.removeAll(keepingCapacity: true)
-            projectMaxima.removeAll(keepingCapacity: true)
-            topicReductions.removeAll(keepingCapacity: true)
-            nodeCount = 0
-        }
-        for node in nodes.dropFirst(nodeCount) {
-            nodesVisited &+= 1
-            let project: Int
-            if let existing = projectSlots[node.project] {
-                project = existing
-            } else {
-                project = projectNames.count
-                projects.insert(node.project)
-                projectSlots[node.project] = project
-                projectNames.append(node.project)
-                projectMaxima.append(nil)
+        let reuse = provider === dataProvider ? nodeVersion.flatMap {
+            dataProvider.nodeInsertionReuse(since: $0, count: nodeCount)
+        } : nil
+        if let reuse, let nodeVersion,
+           reuse.matches(fromVersion: nodeVersion, oldCount: nodeCount,
+                         toVersion: dataProvider.nodeVersion, newCount: nodes.count) {
+            let previous = memberships
+            memberships = reuse.remap(previous) { membership(for: nodes[$0]) }!
+            // Inserting before a group's old first row can change its slot order.
+            // Reorder numeric memberships without revisiting old node strings.
+            restoreFirstAppearanceSlots()
+        } else {
+            let append = provider === dataProvider
+                && appendGeneration == dataProvider.nodeAppendGeneration && nodeCount <= nodes.count
+            if !append {
+                projects.removeAll(keepingCapacity: true)
+                topics.removeAll(keepingCapacity: true)
+                projectSlots.removeAll(keepingCapacity: true)
+                topicSlots.removeAll(keepingCapacity: true)
+                projectNames.removeAll(keepingCapacity: true)
+                topicNames.removeAll(keepingCapacity: true)
+                memberships.removeAll(keepingCapacity: true)
+                projectMaxima.removeAll(keepingCapacity: true)
+                topicReductions.removeAll(keepingCapacity: true)
+                nodeCount = 0
             }
-            let topic: Int
-            if let existing = topicSlots[node.topic] {
-                topic = existing
-            } else {
-                topic = topicNames.count
-                topics.insert(node.topic)
-                topicSlots[node.topic] = topic
-                topicNames.append(node.topic)
-                topicReductions.append(TopicReduction())
+            for node in nodes.dropFirst(nodeCount) {
+                let value = membership(for: node)
+                memberships.append(value)
             }
-            memberships.append(Membership(project: project, topic: topic))
         }
         provider = dataProvider
         nodeVersion = dataProvider.nodeVersion
@@ -87,6 +80,55 @@ struct LabelProjectTopicCache {
         nodeCount = nodes.count
         revision &+= 1
         return (projects, topics)
+    }
+
+    private mutating func membership(for node: RKNodeSnapshot) -> Membership {
+        nodesVisited &+= 1
+        let project: Int
+        if let existing = projectSlots[node.project] {
+            project = existing
+        } else {
+            project = projectNames.count
+            projects.insert(node.project)
+            projectSlots[node.project] = project
+            projectNames.append(node.project)
+            projectMaxima.append(nil)
+        }
+        let topic: Int
+        if let existing = topicSlots[node.topic] {
+            topic = existing
+        } else {
+            topic = topicNames.count
+            topics.insert(node.topic)
+            topicSlots[node.topic] = topic
+            topicNames.append(node.topic)
+            topicReductions.append(TopicReduction())
+        }
+        return Membership(project: project, topic: topic)
+    }
+
+    private mutating func restoreFirstAppearanceSlots() {
+        var projectRemap = [Int](repeating: -1, count: projectNames.count)
+        var topicRemap = [Int](repeating: -1, count: topicNames.count)
+        var orderedProjects: [String] = [], orderedTopics: [String] = []
+        for index in memberships.indices {
+            let old = memberships[index]
+            if projectRemap[old.project] < 0 {
+                projectRemap[old.project] = orderedProjects.count
+                orderedProjects.append(projectNames[old.project])
+            }
+            if topicRemap[old.topic] < 0 {
+                topicRemap[old.topic] = orderedTopics.count
+                orderedTopics.append(topicNames[old.topic])
+            }
+            memberships[index] = Membership(project: projectRemap[old.project], topic: topicRemap[old.topic])
+        }
+        projectNames = orderedProjects
+        topicNames = orderedTopics
+        projectSlots = Dictionary(uniqueKeysWithValues: projectNames.enumerated().map { ($1, $0) })
+        topicSlots = Dictionary(uniqueKeysWithValues: topicNames.enumerated().map { ($1, $0) })
+        projectMaxima = [Float?](repeating: nil, count: projectNames.count)
+        topicReductions = [TopicReduction](repeating: TopicReduction(), count: topicNames.count)
     }
 
     /// Call after membership is updated. A flat-array position (including zero)
