@@ -632,6 +632,12 @@ extension MemoryTools {
             let nearest = results
                 .nearest(to: embedding, on: \.embedding, limit: fetchLimit, distance: .l2)
                 .snapshot()
+            // Read the sealed query error on this thread before another
+            // query or materialization can clear it. Failure is not absence.
+            if let queryError = db.lastQueryError() {
+                log("[recall] nearest() failed: \(queryError)")
+                throw MemoryOperationError.storageUnavailable
+            }
             log("[recall] nearest() returned \(nearest.count) results")
             sessionLog("[recall] nearest() returned \(nearest.count) results")
 

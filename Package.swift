@@ -41,7 +41,7 @@ let package = Package(
         // Preserve the Codex client-capability decoding fix in the owned SDK.
         .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.0"),
         // Published checked transactions and matching Core/MCP requirements.
-        .package(url: "https://github.com/jsflax/lattice.git", exact: "2.2.3"),
+        .package(url: "https://github.com/jsflax/lattice.git", exact: "2.2.4"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),

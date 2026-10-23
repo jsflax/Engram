@@ -60,12 +60,15 @@ public enum SyncService {
         return filter
     }
 
-    /// Busy timeout for the sync daemon's HUB handle.
+    /// Busy timeout requested for the daemon hub and its sync connections.
     ///
     /// Match the MCP server's 2 s acquisition wait instead of inheriting
-    /// Lattice's 30 s default. This bounds each BEGIN's lock acquisition;
-    /// it does not set writer priority, lock-holding time or a whole-delivery
-    /// deadline. The pinned Core retries a failed apply chunk once and
+    /// Lattice's 30 s default. Core must carry this value into the dedicated
+    /// WSS/IPC connections it creates; the real IPC contention fixture checks
+    /// that behavior beyond the parent configuration. SQLite uses this budget
+    /// for busy waits during BEGIN; it does not bound same-connection mutex
+    /// admission, writer priority, lock-holding time or a whole delivery.
+    /// The pinned Core retries a failed apply chunk once and
     /// acknowledges only committed entries. Cold-apply initialization runs
     /// before that chunk retry, so its failure behavior needs separate
     /// coverage from the warmed relay's BEGIN contention path.
