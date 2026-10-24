@@ -4,6 +4,19 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.25] - 2026-10-24
+
+### Fixed
+
+- Automatically retry Codex session learning after a temporary load, cooldown,
+  or concurrency refusal, with one coalesced waiter per learner state directory
+  and a maximum 15-minute retry window.
+- Recheck current policy, runtime, and session identity before retrying, and
+  release worker, enqueue, provider, and shared admission locks while waiting.
+  Existing provider budgets and paused-work protections remain in effect.
+- Keep refused work pending if admission remains unavailable or the waiting
+  process exits; a later lifecycle event can retry it.
+
 ## [0.15.24] - 2026-10-24
 
 ### Fixed
