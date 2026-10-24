@@ -142,7 +142,14 @@ class HostPreparationTests(unittest.TestCase):
             'testMascotInsertionRangesMatchFullRebuild',
             'testInsertionMembershipFallbacksMatchFullRebuild')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 142)
+        self.assertEqual(len(inventory), 146)
+        self.assertIn('AdapterSnapshotTests/testCurrentNodeLookupPreservesPrecedenceAndIndependentSnapshots', inventory)
+        for name in (
+            'testAccessOnlyLoaderCompletionPreservesFreshLookupsWithoutWakingSimulation',
+            'testStructuralLoaderCompletionPreservesAccessMetadataAndRefreshesDerivedData',
+            'testLoaderCompletionRejectsPendingRescanRevisionAndRetiredGeneration',
+        ):
+            self.assertIn('GalaxyDrainTests/' + name, inventory)
         self.assertIn('AdapterSnapshotTests/testSparsePositionsFollowSimulationChangesAndRegistryReplacement', inventory)
         self.assertIn('AdapterSnapshotTests/testMascotVisibilityReachesSceneAndPreservesExistingEntities', inventory)
         for name in (

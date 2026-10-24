@@ -713,6 +713,53 @@ final class AdapterSnapshotTests: XCTestCase {
         XCTAssertTrue(registry.galaxyForNode(shared.id) === synced)
     }
 
+    func testCurrentNodeLookupPreservesPrecedenceAndIndependentSnapshots() throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        defer { lattice.close() }
+        let registry = GalaxyRegistry()
+        let synced = Galaxy(id: "synced", displayName: "Synced", lattice: lattice.sendableReference)
+        let groupID = "group:team"
+        let group = Galaxy(id: groupID, displayName: "Team", lattice: lattice.sendableReference)
+        registry.register(synced)
+        registry.register(group)
+        let lower = node(label: "Synced copy")
+        let winner = node(id: lower.id, label: "Team wins")
+        let lookupOnly = node(label: "Lookup-only row")
+        synced.renderStore.nodeById[lower.id] = lower
+        group.renderStore.nodeById[winner.id] = winner
+        group.renderStore.nodeById[lookupOnly.id] = lookupOnly
+        registry.mergeRenderData()
+        let topology = registry.mergedTopologyVersion
+        let snapshot = registry.mergedNodeById
+        XCTAssertTrue(registry.mergedNodes.isEmpty)
+        XCTAssertEqual(registry.node(for: winner.id)?.label, "Team wins")
+        XCTAssertEqual(registry.node(for: lookupOnly.id)?.label, "Lookup-only row")
+        XCTAssertNil(registry.node(for: UUID()))
+
+        let accessed = winner.lastAccessedAt.addingTimeInterval(60)
+        group.renderStore.nodeById[winner.id]?.lastAccessedAt = accessed
+        // Metadata lookup is current even before the next render callback.
+        XCTAssertEqual(registry.node(for: winner.id)?.lastAccessedAt, accessed)
+        registry.mergeRenderData()
+        XCTAssertEqual(registry.mergedTopologyVersion, topology)
+        XCTAssertEqual(snapshot[winner.id]?.lastAccessedAt, winner.lastAccessedAt)
+        XCTAssertEqual(registry.mergedNodeById[winner.id]?.lastAccessedAt, accessed)
+
+        // Removing a winning lookup reveals the lower-priority copy without
+        // needing a visible-node owner or a whole-graph lookup publication.
+        group.renderStore.nodeById.removeValue(forKey: winner.id)
+        XCTAssertEqual(registry.node(for: winner.id)?.label, "Synced copy")
+        XCTAssertEqual(snapshot[winner.id]?.label, "Team wins")
+        let replacement = Galaxy(id: groupID, displayName: "Replacement", lattice: lattice.sendableReference)
+        replacement.renderStore.nodeById[winner.id] = node(id: winner.id, label: "Replacement wins")
+        registry.register(replacement)
+        XCTAssertEqual(registry.node(for: winner.id)?.label, "Replacement wins")
+        XCTAssertNil(registry.node(for: lookupOnly.id))
+        registry.remove(groupID)
+        XCTAssertEqual(registry.node(for: winner.id)?.label, "Synced copy")
+        XCTAssertEqual(registry.mergedNodeById[winner.id]?.label, "Synced copy")
+    }
+
     func testStreamingCrossGalaxyEdgesAndLookupRespectIndependentRevisions() async throws {
         let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
         defer { lattice.close() }
