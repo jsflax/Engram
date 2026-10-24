@@ -72,6 +72,8 @@ final class GalaxyRegistry {
         let hubs: UInt64
         let lookup: UInt64
         let allEdges: UInt64
+        let edgeInsertionGeneration: UInt64
+        let insertedEdgeCount: Int
         let nodeAppendGeneration: UInt64
         let lookupAppendGeneration: UInt64
         let nodeCount: Int
@@ -81,9 +83,11 @@ final class GalaxyRegistry {
     @ObservationIgnored private var lastMergedRevisions: [String: RenderRevision] = [:]
     @ObservationIgnored private var lastMergedOrder: [String] = []
     @ObservationIgnored private var lastHiddenRelations: Set<String> = []
-    // Absent endpoints of first-wins, non-hidden edges from the last full
+    // Absent endpoints of first-wins, non-hidden edges from the last
     // multi-galaxy merge. Unrelated certified node appends cannot reveal them.
     @ObservationIgnored private var missingEdgeEndpoints: Set<UUID> = []
+    // Includes hidden/dangling winners: precedence is resolved BEFORE filters.
+    @ObservationIgnored private var winningEdgeIDs: Set<UUID> = []
     @ObservationIgnored private var mergedNodeEnds: [String: Int] = [:]
     @ObservationIgnored private var lookupOwners: [UUID: Int] = [:]
     @ObservationIgnored private var lastMergedNodeCount = 0
@@ -94,6 +98,9 @@ final class GalaxyRegistry {
     @ObservationIgnored private(set) var mergedTopologyVersion: UInt64 = 0
     @ObservationIgnored private(set) var mergedNodesVersion: UInt64 = 0
     @ObservationIgnored private(set) var mergedEdgesVersion: UInt64 = 0
+    @ObservationIgnored private(set) var mergedEdgeAppendGeneration: UInt64 = 0
+    @ObservationIgnored private(set) var edgeMergeVisitCount: UInt64 = 0
+    @ObservationIgnored private(set) var edgeTailMergeCount: UInt64 = 0
     @ObservationIgnored private(set) var mergedHubsVersion: UInt64 = 0
     @ObservationIgnored private(set) var mergedNodeAppendGeneration: UInt64 = 0
     @ObservationIgnored private(set) var mergedColorMapVersion: UInt64 = 0
@@ -320,6 +327,8 @@ final class GalaxyRegistry {
                                   nodes: store.nodesVersion, edges: store.edgesVersion,
                                   hubs: store.hubsVersion, lookup: store.nodeLookupVersion,
                                   allEdges: store.allEdgesVersion,
+                                  edgeInsertionGeneration: store.edgeInsertionGeneration,
+                                  insertedEdgeCount: store.insertedEdgeIDs.count,
                                   nodeAppendGeneration: store.nodeAppendGeneration,
                                   lookupAppendGeneration: store.nodeLookupAppendGeneration,
                                   nodeCount: store.nodes.count,
@@ -358,16 +367,30 @@ final class GalaxyRegistry {
                 return ordered.count == 1 ? previous[$0.id]?.edges != store.edgesVersion
                     : previous[$0.id]?.allEdges != store.allEdgesVersion
             }
-        let edgesChanged: Bool
-        if ordered.count > 1, nodesChanged, appendOnly, !edgeInputsChanged {
-            edgesChanged = !missingEdgeEndpoints.isEmpty && ordered.contains { galaxy in
+        let revealsMissingEndpoint = nodesChanged && appendOnly && !missingEdgeEndpoints.isEmpty
+            && ordered.contains { galaxy in
                 galaxy.renderStore.nodes.dropFirst(previous[galaxy.id]!.nodeCount).contains {
                     missingEdgeEndpoints.contains($0.id)
                 }
             }
+        let edgesChanged: Bool
+        if ordered.count > 1, nodesChanged, appendOnly, !edgeInputsChanged {
+            edgesChanged = revealsMissingEndpoint
         } else {
             edgesChanged = edgeInputsChanged || (ordered.count > 1 && nodesChanged)
         }
+        // Only the lowest-precedence source can extend the published tail.
+        // Earlier sources might insert in the middle or replace an old winner.
+        // Keep the published order explicitly: a Dictionary may reorder on insert.
+        let canAppendEdgeTail = ordered.count > 1 && !identitiesChanged
+            && hiddenRelations == lastHiddenRelations && appendOnly && !revealsMissingEndpoint
+            && ordered.enumerated().allSatisfy { index, galaxy in
+                guard let old = previous[galaxy.id] else { return false }
+                let store = galaxy.renderStore
+                return old.edgeInsertionGeneration == store.edgeInsertionGeneration
+                    && old.insertedEdgeCount <= store.insertedEdgeIDs.count
+                    && (index == ordered.count - 1 || old.allEdges == store.allEdgesVersion)
+            }
         // Access-only lookup changes and singleton hidden-edge bookkeeping do
         // not publish new render inputs. Explicit topology/status and layout
         // changes still refresh aggregates, as do cross-galaxy visible edges.
@@ -496,21 +519,20 @@ final class GalaxyRegistry {
             mergedColorMapVersion &+= 1
         }
         if edgesChanged {
-            missingEdgeEndpoints.removeAll(keepingCapacity: true)
-            if let only = ordered.first, ordered.count == 1 { mergedEdges = only.renderStore.edges }
-            else {
-                var seen: Set<UUID> = []
-                mergedEdges.removeAll(keepingCapacity: true)
-                for galaxy in ordered {
-                    for (id, edge) in galaxy.renderStore.allEdges {
-                        guard seen.insert(id).inserted,
-                              !hiddenRelations.contains(edge.relation) else { continue }
-                        let sourceVisible = nodeToGalaxy[edge.sourceId] != nil
-                        let targetVisible = nodeToGalaxy[edge.targetId] != nil
-                        if !sourceVisible { missingEdgeEndpoints.insert(edge.sourceId) }
-                        if !targetVisible { missingEdgeEndpoints.insert(edge.targetId) }
-                        guard sourceVisible, targetVisible else { continue }
-                        mergedEdges.append(edge)
+            if canAppendEdgeTail, let last = ordered.last, let old = previous[last.id] {
+                edgeTailMergeCount &+= 1
+                for id in last.renderStore.insertedEdgeIDs.dropFirst(old.insertedEdgeCount) {
+                    if let edge = last.renderStore.allEdges[id] { mergeEdge(edge, id: id) }
+                }
+            } else {
+                mergedEdgeAppendGeneration &+= 1
+                missingEdgeEndpoints.removeAll(keepingCapacity: true)
+                winningEdgeIDs.removeAll(keepingCapacity: true)
+                if let only = ordered.first, ordered.count == 1 { mergedEdges = only.renderStore.edges }
+                else {
+                    mergedEdges.removeAll(keepingCapacity: true)
+                    for galaxy in ordered {
+                        for (id, edge) in galaxy.renderStore.allEdges { mergeEdge(edge, id: id) }
                     }
                 }
             }
@@ -543,6 +565,18 @@ final class GalaxyRegistry {
         if publishesRenderChange && !galaxies.values.contains(where: { $0.isDrainingInitialSnapshot }) {
             panelSnapshot.refresh(from: self)
         }
+    }
+
+    private func mergeEdge(_ edge: EdgeData, id: UUID) {
+        edgeMergeVisitCount &+= 1
+        guard winningEdgeIDs.insert(id).inserted,
+              !hiddenRelations.contains(edge.relation) else { return }
+        let sourceVisible = nodeToGalaxy[edge.sourceId] != nil
+        let targetVisible = nodeToGalaxy[edge.targetId] != nil
+        if !sourceVisible { missingEdgeEndpoints.insert(edge.sourceId) }
+        if !targetVisible { missingEdgeEndpoints.insert(edge.targetId) }
+        guard sourceVisible, targetVisible else { return }
+        mergedEdges.append(edge)
     }
 
     /// Preserve unchanged galaxy segments through insertion-only loading.

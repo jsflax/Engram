@@ -124,6 +124,9 @@ public protocol SceneDataProvider: AnyObject {
     var hubVersion: UInt64 { get }
     /// Changes when visible edge identity, order, endpoints or metadata changes.
     var edgeVersion: UInt64 { get }
+    /// Present only when every existing edge row (including relation/order)
+    /// remains unchanged until the generation advances. Check provider + count.
+    var edgeAppendGeneration: UInt64? { get }
     /// Stable only while the complete prior node prefix remains unchanged.
     /// Consumers must also check provider identity and a nonshrinking count.
     var nodeAppendGeneration: UInt64 { get }
@@ -161,6 +164,7 @@ extension SceneDataProvider {
     public var nodeVersion: UInt64 { topologyVersion }
     public var hubVersion: UInt64 { topologyVersion }
     public var edgeVersion: UInt64 { topologyVersion }
+    public var edgeAppendGeneration: UInt64? { nil }
     public var nodeAppendGeneration: UInt64 { nodeVersion }
     public func nodeInsertionReuse(since version: UInt64, count: Int) -> NodeInsertionReuse? { nil }
 

@@ -142,10 +142,13 @@ class HostPreparationTests(unittest.TestCase):
             'testMascotInsertionRangesMatchFullRebuild',
             'testInsertionMembershipFallbacksMatchFullRebuild')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 139)
+        self.assertEqual(len(inventory), 142)
         self.assertIn('AdapterSnapshotTests/testSparsePositionsFollowSimulationChangesAndRegistryReplacement', inventory)
         self.assertIn('AdapterSnapshotTests/testMascotVisibilityReachesSceneAndPreservesExistingEntities', inventory)
         for name in (
+            'testCertifiedEdgeTailBatchesVisitOnlyNewRows',
+            'testEdgeTailPreservesHiddenAndDanglingWinnersAndRevealsLateEndpoints',
+            'testUnsafeEdgeTailChangesMatchConservativeMerge',
             'testCertifiedCrossGalaxyNodeAppendsReuseUnchangedEdges',
             'testCrossGalaxyMissingEndpointsArriveSeparatelyWithoutReorderingEdges',
             'testCrossGalaxyHiddenAndDanglingWinnersSuppressVisibleDuplicates',

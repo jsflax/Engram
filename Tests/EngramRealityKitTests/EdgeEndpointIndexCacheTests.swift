@@ -4,6 +4,52 @@ import Testing
 @testable import EngramRealityKit
 
 struct EdgeEndpointIndexCacheTests {
+    @Test("Certified edge tails read only new rows across skipped revisions and node insertion")
+    func certifiedEdgeTailsAvoidHistoricalReads() {
+        let owner = NSObject(), a = node(), b = node(), c = node()
+        let first = edge(a, b), second = edge(b, a), third = edge(a, c)
+        var cache = EdgeEndpointIndexCache()
+        cache.update(nodes: [a, b], edges: [first], provider: owner,
+            nodeVersion: 1, edgeVersion: 1, nodeAppendGeneration: 1, edgeAppendGeneration: 1)
+        let reads = cache.edgeMetadataReadCount
+        cache.update(nodes: [a, b, c], edges: [first, second, third], provider: owner,
+            nodeVersion: 3, edgeVersion: 4, nodeAppendGeneration: 1, edgeAppendGeneration: 1)
+        #expect(cache.edgeMetadataReadCount - reads == 2)
+        #expect(cache.edgePrefixComparisonCount == 0)
+        #expect(cache.sourceIndices == [0, 1, 0] && cache.targetIndices == [1, 0, 2])
+        let d = node(), fourth = edge(d, a)
+        let reuse = NodeInsertionReuse(fromVersion: 3, toVersion: 4, oldCount: 3, newCount: 4,
+            retainedRanges: [.init(oldRange: 0..<3, newStart: 1)])!
+        cache.update(nodes: [d, a, b, c], edges: [first, second, third, fourth], provider: owner,
+            nodeVersion: 4, edgeVersion: 5, nodeAppendGeneration: 2,
+            nodeInsertionReuse: reuse, edgeAppendGeneration: 1)
+        #expect(cache.edgeMetadataReadCount - reads == 3)
+        #expect(cache.edgePrefixComparisonCount == 0)
+        #expect(cache.sourceIndices == [1, 2, 1, 0] && cache.targetIndices == [2, 1, 3, 1])
+    }
+
+    @Test("Edge continuity requires the same live provider and nonshrinking unchanged generation")
+    func edgeTailFallbacksMatchConservativeIndexing() {
+        let a = node(), b = node(), c = node(), first = edge(a, b), extra = edge(b, c)
+        for mode in 0..<5 {
+            var owner: NSObject? = NSObject()
+            let replacement = NSObject()
+            var cache = EdgeEndpointIndexCache(), reference = EdgeEndpointIndexCache()
+            cache.update(nodes: [a, b, c], edges: [first, extra], provider: owner,
+                nodeVersion: 1, edgeVersion: 1, nodeAppendGeneration: 1, edgeAppendGeneration: 1)
+            let next = mode == 2 ? [edge(c, a, id: first.id)]
+                : [edge(c, a, id: first.id), extra, edge(a, c)]
+            if mode == 4 { owner = nil } // The cache must not retain its origin.
+            cache.update(nodes: [a, b, c], edges: next,
+                provider: mode == 1 || mode == 4 ? replacement : owner,
+                nodeVersion: 1, edgeVersion: 2, nodeAppendGeneration: 1,
+                edgeAppendGeneration: mode == 0 ? 2 : mode == 3 ? nil : 1)
+            reference.update(nodes: [a, b, c], edges: next)
+            #expect(cache.sourceIndices == reference.sourceIndices)
+            #expect(cache.targetIndices == reference.targetIndices)
+        }
+    }
+
     @Test
     func revisionDomainsPreserveLateEndpointsAndSkipUnchangedPrefixes() {
         let owner = NSObject()
