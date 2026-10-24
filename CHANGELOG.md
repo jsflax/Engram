@@ -4,6 +4,15 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.27] - 2026-10-24
+
+### Fixed
+
+- Explicitly disable both Codex collaboration feature versions for isolated,
+  ephemeral session learners, whose temporary sessions have no saved rollout.
+- Preserve the selected model and reasoning effort, including Ultra, together
+  with the learner's existing tool limits and verified-completion requirements.
+
 ## [0.15.26] - 2026-10-24
 
 ### Fixed
