@@ -2,7 +2,8 @@
 
 One background worker across providers, plus the existing global 600s spacing.
 This throttle does not guarantee inter-provider fairness. Codex's existing fair
-scheduler still orders its pending work; refusals leave it for a natural event.
+scheduler still orders its pending work. Callers may retry a refusal after a
+later event or a bounded wait, outside this lease context.
 The Swift SpawnAdmission implementation uses the same files and JSON protocol.
 """
 from __future__ import annotations
@@ -162,7 +163,8 @@ def lease(*, directory=None, now=None, load=None, processors=None, cooldown=600.
     The guard retains admission until its actual provider child is reaped, even
     when that provider closes unknown descriptors. Worker death therefore does
     not release the guard's lease. The state file is
-    cooldown only, never an active marker. No timer loop or live PID probing.
+    cooldown only, never an active marker. This lease does not poll, wait for
+    admission, or probe live PIDs; a caller must exit it before waiting to retry.
     """
     fd, token = None, None
     try:

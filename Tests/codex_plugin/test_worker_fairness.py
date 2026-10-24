@@ -311,5 +311,289 @@ class WorkerFairnessTests(unittest.TestCase):
             self.assertEqual(event, expected)
 
 
+class WorkerAdmissionRetryTests(unittest.TestCase):
+    """Actual worker and private flocks; fake waiting, no providers or live queue."""
+
+    def setUp(self):
+        production = R.spawn_admission.lease
+        self.fixture = WorkerFairnessTests(methodName="runTest")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.root = self.fixture.root
+        self.load, self.cooldown = 3, 0
+        self.clock, self.sleeps = 500.0, []
+        self.on_sleep = lambda: None
+        self.gate = self.root / "retry-gate"
+        self.enterContext(mock.patch.object(R.spawn_admission, "lease", side_effect=lambda:
+            production(directory=self.gate, now=self.fixture.now, load=lambda: self.load,
+                       processors=1, cooldown=self.cooldown)))
+        self.enterContext(mock.patch.object(R.time, "monotonic", side_effect=lambda: self.clock))
+        self.enterContext(mock.patch.object(R.time, "sleep", side_effect=self.sleep))
+
+    def sleep(self, seconds):
+        self.assertGreater(seconds, 0)
+        self.assertLessEqual(seconds, 60)
+        # Every wait is outside all execution/publication locks, even when a
+        # refused lease had acquired spawn.lock before noticing high load.
+        self.assertEqual(R.spawn_admission.pass_fds(), ())
+        self.assertIsNone(R._PROVIDER_LOCK_FD.get())
+        held = R._HELD_LOCKS.get()
+        self.assertEqual([Path(row[0]).name for row in held], ["worker-retry.lock"])
+        self.assertFalse(os.get_inheritable(held[0][1]))
+        for path in (self.root / "worker.lock", self.root / "enqueue.lock", self.gate / "spawn.lock"):
+            with R.lock_file(path, blocking=False) as acquired:
+                self.assertTrue(acquired, path.name)
+        self.sleeps.append(seconds)
+        self.clock += seconds
+        self.fixture.now += seconds
+        self.on_sleep()
+
+    def test_load_refusal_retries_without_an_event_and_excludes_retry_fd_from_provider(self):
+        sid = self.fixture.add(1)
+        self.on_sleep = lambda: setattr(self, "load", 0)
+        original = self.fixture.process
+        def process(root, request, config):
+            retry_fd = next(row[1] for row in R._HELD_LOCKS.get() if Path(row[0]).name == "worker-retry.lock")
+            self.assertNotIn(retry_fd, R.spawn_admission.pass_fds())
+            self.assertFalse(os.get_inheritable(retry_fd))
+            self.assertFalse(R.publication_locks_owned(root))
+            with R.lock_file(root / "enqueue.lock"):
+                self.assertTrue(R.publication_locks_owned(root))
+            return original(root, request, config)
+        with mock.patch.object(R, "process_request", side_effect=process):
+            self.assertEqual(R.worker(self.root), 0)
+        self.assertEqual(self.fixture.attempts, [("pending", sid)])
+        self.assertEqual(self.sleeps, [30])
+        self.assertEqual(self.fixture.spawns, [])
+        self.assertFalse((self.root / "pending" / (sid + ".json")).exists())
+
+    def test_cooldown_rechecks_at_bounded_intervals_then_admits(self):
+        sid = self.fixture.add(1)
+        self.load = 0
+        with R.spawn_admission.lease() as admitted:
+            self.assertTrue(admitted.admitted)
+        self.cooldown = 61
+        self.assertEqual(R.worker(self.root), 0)
+        self.assertEqual(self.sleeps, [60, 30])
+        self.assertEqual(self.fixture.attempts, [("pending", sid)])
+
+    def test_concurrency_refusal_retries_after_foreign_lease_closes(self):
+        sid = self.fixture.add(1)
+        self.load = 0
+        foreign = R.spawn_admission.lease()
+        held = foreign.__enter__()
+        self.assertTrue(held.admitted)
+        def release_then_wait(seconds):
+            foreign.__exit__(None, None, None)
+            self.sleep(seconds)
+        try:
+            with mock.patch.object(R.time, "sleep", side_effect=release_then_wait):
+                self.assertEqual(R.worker(self.root), 0)
+        finally:
+            foreign.__exit__(None, None, None)
+        self.assertEqual(self.sleeps, [30])
+        self.assertEqual(self.fixture.attempts, [("pending", sid)])
+
+    def test_permanent_refusal_exhausts_without_changing_pending_holds_or_schedule(self):
+        ids = [self.fixture.add(1, recovery=True, failed=True), self.fixture.add(2)]
+        schedule = self.root / S.NAME
+        schedule.write_bytes(b"{invalid"); schedule.chmod(0o600)
+        before = self.fixture.protected(ids)
+        self.assertEqual(R.worker(self.root), 0)
+        self.assertEqual(sum(self.sleeps), R.ADMISSION_RETRY_SECONDS)
+        self.assertEqual(len(self.sleeps), R.ADMISSION_RETRY_ATTEMPTS)
+        self.assertEqual(self.fixture.protected(ids), before)
+        self.assertEqual(schedule.read_bytes(), b"{invalid")
+        self.assertEqual(self.fixture.attempts, [])
+        self.assertEqual(self.fixture.spawns, [])
+        self.assertEqual(self.fixture.events[-1][0], "worker_admission_retry_exhausted")
+        with R.lock_file(self.root / "worker-retry.lock", blocking=False) as acquired:
+            self.assertTrue(acquired)
+
+    def test_attempt_cap_also_bounds_waiting_if_monotonic_clock_does_not_advance(self):
+        self.fixture.add(1)
+        self.on_sleep = lambda: setattr(self, "clock", 500.0)
+        self.assertEqual(R.worker(self.root), 0)
+        self.assertEqual(len(self.sleeps), R.ADMISSION_RETRY_ATTEMPTS)
+        self.assertEqual(self.fixture.attempts, [])
+        self.assertEqual(self.fixture.spawns, [])
+
+    def test_second_worker_refuses_then_loses_coalescing_lock_without_sleep(self):
+        sid = self.fixture.add(1)
+        def compete():
+            count = len(self.sleeps)
+            self.assertEqual(R.worker(self.root), 0)
+            self.assertEqual(len(self.sleeps), count)
+            self.load = 0
+        self.on_sleep = compete
+        self.assertEqual(R.worker(self.root), 0)
+        self.assertEqual(self.sleeps, [30])
+        self.assertEqual(self.fixture.attempts, [("pending", sid)])
+
+    def test_busy_waiter_survives_natural_worker_refusal_and_retry_lock_loss(self):
+        sid = self.fixture.add(1)
+        original, calls = R._worker_once, []
+        def once(root, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 2:
+                # B owns worker.lock when waiting A wakes. Then B refuses
+                # shared admission and loses retry.lock while A still owns it.
+                with R.lock_file(root / "worker.lock"):
+                    result = original(root, **kwargs)
+                    self.assertEqual(result.outcome, "busy")
+                self.assertEqual(R.worker(root), 0)
+                self.load = 0
+                return result
+            return original(root, **kwargs)
+        with mock.patch.object(R, "_worker_once", side_effect=once):
+            self.assertEqual(R.worker(self.root), 0)
+        self.assertEqual(self.sleeps, [30, 30])
+        self.assertEqual(self.fixture.attempts, [("pending", sid)])
+
+    def test_natural_worker_drains_queue_during_wait_without_duplicate_admission(self):
+        sid = self.fixture.add(1)
+        def drain():
+            self.load = 0
+            self.assertEqual(R.worker(self.root), 0)
+        self.on_sleep = drain
+        self.assertEqual(R.worker(self.root), 0)
+        self.assertEqual(self.sleeps, [30])
+        self.assertEqual(self.fixture.attempts, [("pending", sid)])
+        self.assertEqual(sum(name == "worker_admitted" for name, _ in self.fixture.events), 1)
+        self.assertEqual(self.fixture.events[-1], ("worker_admission_retry_finished", {"outcome": "idle"}))
+
+    def test_fresh_selection_uses_replaced_request_and_rechecks_pause_backoff(self):
+        sid = self.fixture.add(1)
+        path = self.root / "pending" / (sid + ".json")
+        seen = []
+        def replace():
+            request = json.loads(path.read_bytes())
+            R.atomic_json(path, {**request, "request_id": "replacement"})
+            self.load = 0
+        self.on_sleep = replace
+        original = self.fixture.process
+        def process(root, request, config):
+            seen.append(request["request_id"])
+            return original(root, request, config)
+        with mock.patch.object(R, "process_request", side_effect=process):
+            self.assertEqual(R.worker(self.root), 0)
+        self.assertEqual(seen, ["replacement"])
+        for number, reason in enumerate(("pause", "backoff", "invalid"), 2):
+            sid = self.fixture.add(number)
+            path = self.root / "pending" / (sid + ".json")
+            self.load = 3
+            def make_ineligible():
+                if reason == "pause":
+                    request = json.loads(path.read_bytes())
+                    R.atomic_json(path, {**request, "paused_request_id": request["request_id"], "pause_reason": "reconciliation_required"})
+                elif reason == "backoff":
+                    state = self.root / "sessions" / (sid + ".json")
+                    R.atomic_json(state, {**json.loads(state.read_bytes()), "retry_after": self.fixture.now + 10_000})
+                else:
+                    path.write_bytes(b"{invalid")
+                self.load = 0
+            self.on_sleep = make_ineligible
+            with self.subTest(reason=reason):
+                self.assertEqual(R.worker(self.root), 0)
+                self.assertNotIn(("pending", sid), self.fixture.attempts)
+                self.assertTrue(path.exists())
+
+    def test_changed_or_disabled_policy_stops_before_attempting_pending_work(self):
+        sid = self.fixture.add(1)
+        before = self.fixture.protected([sid])
+        for value in ({"changed": True}, ValueError("inactive_policy")):
+            checks = mock.Mock(side_effect=[{}, value])
+            with self.subTest(value=value), mock.patch.object(R.admission, "check_activation", checks):
+                self.assertEqual(R.worker(self.root), 0)
+                self.assertEqual(checks.call_count, 2)
+                self.assertEqual(self.fixture.protected([sid]), before)
+                self.assertEqual(self.fixture.attempts, [])
+
+    def test_selected_runtime_change_stops_without_exec_or_resetting_wait_budget(self):
+        sid = self.fixture.add(1)
+        before = self.fixture.protected([sid])
+        with mock.patch.object(R.runtime_routing, "maybe_exec", side_effect=[None,
+                R.runtime_routing.Refused("routing_selection_changed")]) as route:
+            self.assertEqual(R.worker(self.root), 0)
+        self.assertEqual(route.call_count, 2)
+        self.assertFalse(route.call_args.kwargs["allow_handoff"])
+        self.assertEqual(route.call_args.kwargs["deadline"], 500 + R.ADMISSION_RETRY_SECONDS)
+        self.assertEqual(self.sleeps, [30])
+        self.assertEqual(self.fixture.protected([sid]), before)
+        self.assertEqual(self.fixture.attempts, [])
+
+    def test_replaced_retry_lock_stops_without_executing_on_old_inode(self):
+        self.fixture.add(1)
+        def replace_lock():
+            path = self.root / "worker-retry.lock"
+            path.rename(self.root / "old-retry.lock")
+            path.touch(mode=0o600)
+            self.load = 0
+        self.on_sleep = replace_lock
+        self.assertEqual(R.worker(self.root), 0)
+        self.assertEqual(self.sleeps, [30])
+        self.assertEqual(self.fixture.attempts, [])
+        self.assertEqual(self.fixture.events[-1], ("worker_admission_retry_stopped", {"reason": "admission_retry_lock_changed"}))
+
+    def test_unavailable_load_does_not_wait(self):
+        self.fixture.add(1)
+        self.load = None
+        self.assertEqual(R.worker(self.root), 0)
+        self.assertEqual(self.sleeps, [])
+        self.assertEqual(self.fixture.attempts, [])
+
+    def test_first_admission_stops_retrying_and_preserves_batch_pause(self):
+        sid = self.fixture.add(1)
+        self.on_sleep = lambda: setattr(self, "load", 0)
+        self.fixture.config["max_runs_per_worker"] = 1
+        original = self.fixture.process
+        def process(root, request, config):
+            original(root, request, config)
+            return "more"
+        with mock.patch.object(R, "process_request", side_effect=process):
+            self.assertEqual(R.worker(self.root), 0)
+        self.assertEqual(self.fixture.attempts, [("pending", sid)])
+        self.assertEqual(self.sleeps, [30])
+        self.assertEqual(self.fixture.spawns, [])
+        pending = json.loads((self.root / "pending" / (sid + ".json")).read_bytes())
+        self.assertEqual(pending["pause_reason"], "batch_limit")
+        self.assertEqual(pending["paused_request_id"], pending["request_id"])
+
+    def test_terminal_race_successor_can_take_retry_lock_before_parent_returns(self):
+        self.fixture.add(1)
+        self.on_sleep = lambda: setattr(self, "load", 0)
+        event = self.fixture.event
+        successor = []
+        def enqueue_at_exit(root, name, **fields):
+            if name == "worker_idle":
+                successor.append(self.fixture.add(2))
+            event(root, name, **fields)
+        def spawn(root):
+            self.fixture.spawns.append(root)
+            # A new worker may immediately refuse admission and must be able
+            # to coordinate a retry while this parent's call is still active.
+            with R.lock_file(root / "worker-retry.lock", blocking=False) as acquired:
+                self.assertTrue(acquired)
+        with mock.patch.object(R, "event_log", side_effect=enqueue_at_exit), \
+                mock.patch.object(R, "spawn_worker", side_effect=spawn):
+            self.assertEqual(R.worker(self.root), 0)
+        self.assertEqual(self.sleeps, [30])
+        self.assertEqual(len(self.fixture.spawns), 1)
+        self.assertTrue((self.root / "pending" / (successor[0] + ".json")).exists())
+
+    def test_advisory_retry_logging_failure_does_not_strand_eligible_work(self):
+        sid = self.fixture.add(1)
+        self.on_sleep = lambda: setattr(self, "load", 0)
+        original = self.fixture.event
+        def event(root, name, **fields):
+            if name.startswith("worker_admission_"):
+                raise OSError("fixture log unavailable")
+            return original(root, name, **fields)
+        with mock.patch.object(R, "event_log", side_effect=event):
+            self.assertEqual(R.worker(self.root), 0)
+        self.assertEqual(self.fixture.attempts, [("pending", sid)])
+        self.assertEqual(self.sleeps, [30])
+
+
 if __name__ == "__main__":
     unittest.main()

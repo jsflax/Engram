@@ -234,7 +234,7 @@ struct LearnerHealthSnapshot: Decodable, Sendable {
             case "recover_publication": "Recover the unfinished progress update before learning from this task again."
             case "inspect_processing_attempt": "Inspect the recorded processing attempt before retrying."
             case "wait_for_backoff_then_resume": "Wait for backoff to expire, then resume the pending request."
-            case "wait_for_eligible_event": "Another eligible lifecycle event can attempt a launch. No timed retry is scheduled."
+            case "wait_for_eligible_event": "An eligible lifecycle event or bounded Codex worker retry can attempt admission. This receipt does not establish a scheduled retry or current worker activity."
             case "inspect_admission": "Inspect the shared worker's launch state before retrying."
             case "resume_pending": "The pending request needs a supported resume."
             case "inspect_failure": "Inspect the failure before resuming."

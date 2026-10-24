@@ -342,7 +342,7 @@ def worker_admission_view(record, sid, pending, *, now=None):
     """
     out = {"state": "not_observed", "scope": "shared_worker",
            "evidence": "recorded_admission_not_worker_liveness",
-           "next_attempt": {"policy": "next_eligible_lifecycle_event", "scheduled_at": None}}
+           "next_attempt": {"policy": "not_established_by_admission_receipt", "scheduled_at": None}}
     if record is None:
         return out
     out["state"] = "unknown"

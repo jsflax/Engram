@@ -78,7 +78,7 @@ class StatusTests(unittest.TestCase):
              patch.object(STATUS.os, "getloadavg", side_effect=AssertionError("status must not sample load")):
             return self.report()
 
-    def test_selected_worker_load_deferral_has_facts_age_and_no_scheduled_wake(self):
+    def test_selected_worker_load_deferral_does_not_prove_scheduled_wake(self):
         value = self.admission_report([self.admission_event()])
         health = value["learner"]["health"]
         decision = health["worker_admission"]
@@ -90,7 +90,7 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(decision["decision"]["load_average"], 50)
         self.assertEqual(decision["decision"]["load_limit"], 32)
         self.assertEqual(decision["next_attempt"],
-                         {"policy": "next_eligible_lifecycle_event", "scheduled_at": None})
+                         {"policy": "not_established_by_admission_receipt", "scheduled_at": None})
         self.assertEqual(health["outcomes"]["queue"]["state"], "queued")
         self.assertEqual(health["failure"]["class"], "none_observed")
 

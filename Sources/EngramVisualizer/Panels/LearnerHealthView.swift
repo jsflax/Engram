@@ -117,7 +117,7 @@ struct LearnerHealthView: View {
                     if let time = launch.nextAttempt?.eligibilityTimeText {
                         row("Earliest eligibility", time)
                     }
-                    Text("This recorded check does not establish current worker activity. An eligible lifecycle event can attempt another launch; no timed retry is scheduled.")
+                    Text("This recorded check does not establish current worker activity or a scheduled retry. An eligible lifecycle event or bounded Codex worker retry can attempt admission.")
                 }
                 .foregroundStyle(.secondary)
             }
