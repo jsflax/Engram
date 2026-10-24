@@ -4,6 +4,21 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.28] - 2026-10-24
+
+### Fixed
+
+- Let initialized Codex hooks continue while another hook holds the setup lock,
+  preventing setup contention from dropping Stop work before it reaches the
+  learner queue. First-time setup waits within the existing hook deadline.
+
+### Added
+
+- Add optional GPU force timing diagnostics to distinguish preparation,
+  submission delay, GPU execution, readback, and MainActor delivery when
+  investigating visualizer delays. Logging is disabled by default and uses
+  a bounded background writer.
+
 ## [0.15.27] - 2026-10-24
 
 ### Fixed
