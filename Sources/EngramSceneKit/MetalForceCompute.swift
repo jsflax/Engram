@@ -142,13 +142,15 @@ public final class MetalForceCompute: @unchecked Sendable {
         edgeRangeBuffer = device.makeBuffer(length: cap * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared)
         centroidMappingBuffer = device.makeBuffer(length: cap * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared)
         nodeCapacity = cap
-        // The new group buffer is empty — force a re-upload next encode.
+        // Replacing node storage invalidates even an equal group input key.
+        preparedGroupInputs = nil
         groupsDirty = true
     }
 
     private func ensureCentroidCapacity(_ totalGroups: Int) {
         guard totalGroups > centroidCapacity else { return }
         let cap = max(totalGroups * 2, 64)
+        preparedGroupInputs = nil
         centroidBuffer = device.makeBuffer(length: cap * MemoryLayout<SIMD4<Float>>.stride, options: .storageModeShared)
         refRadiusBuffer = device.makeBuffer(length: cap * MemoryLayout<Float>.stride, options: .storageModeShared)
         centroidCapacity = cap
@@ -162,13 +164,32 @@ public final class MetalForceCompute: @unchecked Sendable {
         groupsDirty = true
     }
 
-    /// Per-node group assignments (project/topic/galaxy) only change on
-    /// topology edits, but the group buffer + project/topic counts were being
-    /// re-uploaded/rescanned every frame (3× O(nodes) at 42k). Upload once
-    /// per topology change instead.
+    /// Edge edits always rebuild adjacency. Static group mappings can survive
+    /// those edits only when every input is equal and their storage is valid.
+    private struct GroupInputs: Equatable {
+        let nodeCount: Int
+        let projects: [Int]
+        let topics: [Int]
+        let topicProjects: [Int]
+        let galaxies: [Int]
+        let galaxyCount: Int
+    }
+
+    private var preparedGroupInputs: GroupInputs?
     private var groupsDirty = true
     private var cachedNumProjects = 1
     private var cachedNumTopics = 1
+
+    private func groupBuffersAreValid(nodeCount: Int, totalGroups: Int) -> Bool {
+        guard let groups = groupBuffer, let mapping = centroidMappingBuffer,
+              let metadata = groupMetadataBuffer, let centroids = centroidBuffer,
+              let radii = refRadiusBuffer else { return false }
+        return groups.length >= nodeCount * MemoryLayout<SIMD4<Int32>>.stride
+            && mapping.length >= nodeCount * MemoryLayout<SIMD2<UInt32>>.stride
+            && metadata.length >= 256 * MemoryLayout<UInt32>.stride
+            && centroids.length >= totalGroups * MemoryLayout<SIMD4<Float>>.stride
+            && radii.length >= totalGroups * MemoryLayout<Float>.stride
+    }
 
     /// Rebuild CSR edge buffers and per-node group/centroid mapping.
     public func rebuildTopology(
@@ -223,8 +244,44 @@ public final class MetalForceCompute: @unchecked Sendable {
         }
         csrEdgeCount = e
 
+        let groupInputs = GroupInputs(
+            nodeCount: n, projects: projectGroups, topics: topicGroups,
+            topicProjects: topicProjectGroup, galaxies: galaxyGroups,
+            galaxyCount: galaxyCenters.count)
+        let previousTotalGroups = cachedNumProjects + cachedNumTopics + max(galaxyCenters.count, 1)
+        if preparedGroupInputs != groupInputs
+            || !groupBuffersAreValid(nodeCount: n, totalGroups: previousTotalGroups) {
+            // Never retain a certificate for an incomplete preparation.
+            preparedGroupInputs = nil
+            guard prepareGroups(groupInputs) else { return }
+            preparedGroupInputs = groupInputs
+        }
+
+        groupsDirty = false
+        topologyDirtyForDispatch = false
+        // Even edge-only edits reset the cadence: centroids and radii depend on
+        // current positions, not just the reusable static group membership.
+        tickCount = 0
+    }
+
+    private func prepareGroups(_ inputs: GroupInputs) -> Bool {
+        let n = inputs.nodeCount
+        let projectGroups = inputs.projects
+        let topicGroups = inputs.topics
+        let topicProjectGroup = inputs.topicProjects
+        let galaxyGroups = inputs.galaxies
+        let numProjects = max((projectGroups.max() ?? 0) + 1, 1)
+        let numTopics = max((topicGroups.max() ?? 0) + 1, 1)
+        let totalGroups = numProjects + numTopics + max(inputs.galaxyCount, 1)
+        ensureCentroidCapacity(totalGroups)
+        if groupMetadataBuffer == nil || groupMetadataBuffer!.length < 256 * MemoryLayout<UInt32>.stride {
+            groupMetadataBuffer = device.makeBuffer(length: 256 * MemoryLayout<UInt32>.stride, options: .storageModeShared)
+        }
+        guard groupBuffersAreValid(nodeCount: n, totalGroups: totalGroups),
+              let gBuf = groupBuffer, let cmBuf = centroidMappingBuffer,
+              let gmBuf = groupMetadataBuffer else { return false }
+
         // Build per-node group buffer (int4: projId, topicId, galaxyId, 0)
-        guard let gBuf = groupBuffer else { return }
         let gPtr = gBuf.contents().bindMemory(to: SIMD4<Int32>.self, capacity: n)
         for i in 0..<n {
             gPtr[i] = SIMD4<Int32>(
@@ -236,15 +293,7 @@ public final class MetalForceCompute: @unchecked Sendable {
         }
         groupUploadCount &+= 1
 
-        // Build centroid mapping and group metadata
-        let numProjects = max((projectGroups.max() ?? 0) + 1, 1)
-        let numTopics = max((topicGroups.max() ?? 0) + 1, 1)
-        let numGalaxies = max(galaxyCenters.count, 1)
-        let totalGroups = numProjects + numTopics + numGalaxies
-        ensureCentroidCapacity(totalGroups)
-
         // Per-node centroid mapping: (projCentroidIdx, topicCentroidIdx)
-        guard let cmBuf = centroidMappingBuffer else { return }
         let cmPtr = cmBuf.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: n)
         for i in 0..<n {
             let projIdx = UInt32(projectGroups[i])
@@ -253,43 +302,32 @@ public final class MetalForceCompute: @unchecked Sendable {
         }
 
         // Group metadata: [0..numTopics) = topicToProject, [128..128+numProjects) = projectToGalaxy
-        if groupMetadataBuffer == nil || groupMetadataBuffer!.length < 256 * MemoryLayout<UInt32>.stride {
-            groupMetadataBuffer = device.makeBuffer(length: 256 * MemoryLayout<UInt32>.stride, options: .storageModeShared)
+        let gmPtr = gmBuf.contents().bindMemory(to: UInt32.self, capacity: 256)
+        memset(gmPtr, 0, 256 * MemoryLayout<UInt32>.stride)
+        // topicToProject[t] at index t
+        for (t, projGroup) in topicProjectGroup.enumerated() where t < 128 {
+            gmPtr[t] = UInt32(projGroup)
         }
-        if let gmBuf = groupMetadataBuffer {
-            let gmPtr = gmBuf.contents().bindMemory(to: UInt32.self, capacity: 256)
-            memset(gmPtr, 0, 256 * MemoryLayout<UInt32>.stride)
-            // topicToProject[t] at index t
-            for (t, projGroup) in topicProjectGroup.enumerated() where t < 128 {
-                gmPtr[t] = UInt32(projGroup)
+        // projectToGalaxy[p] at index 128 + p
+        if !galaxyGroups.isEmpty {
+            // Build from node data: first node of each project determines its galaxy
+            var projGalaxy = [Int](repeating: 0, count: numProjects)
+            var projSeen = [Bool](repeating: false, count: numProjects)
+            for i in 0..<n {
+                let pg = projectGroups[i]
+                if !projSeen[pg] {
+                    projSeen[pg] = true
+                    projGalaxy[pg] = i < galaxyGroups.count ? galaxyGroups[i] : 0
+                }
             }
-            // projectToGalaxy[p] at index 128 + p
-            if !galaxyGroups.isEmpty {
-                // Build from node data: first node of each project determines its galaxy
-                var projGalaxy = [Int](repeating: 0, count: numProjects)
-                var projSeen = [Bool](repeating: false, count: numProjects)
-                for i in 0..<n {
-                    let pg = projectGroups[i]
-                    if !projSeen[pg] {
-                        projSeen[pg] = true
-                        projGalaxy[pg] = i < galaxyGroups.count ? galaxyGroups[i] : 0
-                    }
-                }
-                for p in 0..<numProjects where p + 128 < 256 {
-                    gmPtr[128 + p] = UInt32(projGalaxy[p])
-                }
+            for p in 0..<numProjects where p + 128 < 256 {
+                gmPtr[128 + p] = UInt32(projGalaxy[p])
             }
         }
 
-        // Publish the groups prepared above only after the rebuild completes.
-        // The next encode must not upload them or rescan their counts again.
         cachedNumProjects = numProjects
         cachedNumTopics = numTopics
-        groupsDirty = false
-        topologyDirtyForDispatch = false
-        // First encode computes centroids from its current positions. Computing
-        // them here too repeated the full scan/radius sort on every loading edit.
-        tickCount = 0
+        return true
     }
 
     /// Rebuild topology from stashed edges (convenience for ForceEngine).
@@ -433,6 +471,9 @@ public final class MetalForceCompute: @unchecked Sendable {
         // Group buffer + project/topic counts change ONLY on topology edits.
         // Recompute + re-upload just then, not every frame.
         if groupsDirty {
+            // This fallback does not prepare mapping/metadata together, so it
+            // cannot preserve a complete static-group certificate.
+            preparedGroupInputs = nil
             cachedNumProjects = max((projectGroups.max() ?? 0) + 1, 1)
             cachedNumTopics = max((topicGroups.max() ?? 0) + 1, 1)
             let gPtr = grpBuf.contents().bindMemory(to: SIMD4<Int32>.self, capacity: n)

@@ -145,22 +145,28 @@ struct ForceEngineTests {
         #expect(engine.isFullSimAvailable, "Full sim should be available with proper shaders")
     }
 
-    /// Only project/topic cohesion and galaxy centering are active. Each test
-    /// group fits within its reference radius, giving a simple force oracle
-    /// while still using the packaged Metal kernels and their real buffers.
-    private func preparationSnapshot(x: [Float], groups: [Int], dirty: Bool) -> ForceEngine.SimulationSnapshot {
+    /// Defaults isolate cohesion and galaxy centering for the analytical oracle.
+    /// Overrides exercise springs and metadata through the same packaged kernels.
+    private func preparationSnapshot(
+        x: [Float], groups: [Int], dirty: Bool,
+        topics: [Int]? = nil, topicProjects: [Int] = [0, 1, 2],
+        galaxies: [Int]? = nil,
+        centers: [SIMD3<Float>] = [.zero, SIMD3(100, 0, 0), SIMD3(200, 0, 0)],
+        edges: [(Int, Int)]? = nil, springs: Float = 0,
+        projectRepulsion: Float = 0, topicRepulsion: Float = 0
+    ) -> ForceEngine.SimulationSnapshot {
         ForceEngine.SimulationSnapshot(
             nodeCount: x.count, isSettled: false,
             posX: x, posY: Array(repeating: 0, count: x.count), posZ: Array(repeating: 0, count: x.count),
-            projectGroups: groups, topicGroups: groups,
-            topicProjectGroup: [0, 1, 2],
-            galaxyGroups: groups, galaxyCenters: [.zero, SIMD3(100, 0, 0), SIMD3(200, 0, 0)],
-            edgeIndices: (1..<x.count).map { ($0 - 1, $0) }, topologyDirty: dirty,
+            projectGroups: groups, topicGroups: topics ?? groups,
+            topicProjectGroup: topicProjects,
+            galaxyGroups: galaxies ?? groups, galaxyCenters: centers,
+            edgeIndices: edges ?? (1..<x.count).map { ($0 - 1, $0) }, topologyDirty: dirty,
             chargeStrength: 0, crossChargeMultiplier: 1,
             sameTopicChargeScale: 1, sameProjectChargeScale: 1,
-            springLength: 1, crossProjectSpringLength: 1, springStrength: 0,
-            cohesionStrength: 0.02, centroidRepulsion: 0,
-            topicCohesionStrength: 0.03, topicCentroidRepulsion: 0,
+            springLength: 1, crossProjectSpringLength: 1, springStrength: springs,
+            cohesionStrength: 0.02, centroidRepulsion: projectRepulsion,
+            topicCohesionStrength: 0.03, topicCentroidRepulsion: topicRepulsion,
             centerStrength: 0.001,
             alpha: 1, damping: 0.78, maxSpeed: 12)
     }
@@ -185,6 +191,85 @@ struct ForceEngineTests {
                     "Node \(i) must use the current group, centroid and galaxy-center offsets")
             #expect(result.fy[i].isFinite && abs(result.fy[i]) < 0.0001)
             #expect(result.fz[i].isFinite && abs(result.fz[i]) < 0.0001)
+        }
+    }
+
+    private func expectSameForces(_ actual: ForceResult, _ expected: ForceResult) throws {
+        for (actualAxis, expectedAxis) in [(actual.fx, expected.fx), (actual.fy, expected.fy), (actual.fz, expected.fz)] {
+            try #require(actualAxis.count == expectedAxis.count)
+            for (a, e) in zip(actualAxis, expectedAxis) {
+                #expect(a.isFinite && e.isFinite && abs(a - e) < 0.0001)
+            }
+        }
+    }
+
+    @MainActor private func freshlyPreparedForces(_ snapshot: ForceEngine.SimulationSnapshot) throws -> ForceResult {
+        let (fresh, queue) = try makeForceEngine()
+        if snapshot.edgeIndices.isEmpty {
+            // The existing zero-edge contract retains a previously allocated
+            // edge buffer. Seed only that storage; a different group key forces
+            // the following real dispatch to prepare all static mappings anew.
+            let seed = preparationSnapshot(
+                x: snapshot.posX, groups: Array(repeating: 1, count: snapshot.nodeCount), dirty: true,
+                edges: [(0, 1)])
+            fresh.forceCompute.rebuildTopology(
+                nodeCount: seed.nodeCount, edges: seed.edgeIndices,
+                projectGroups: seed.projectGroups, topicGroups: seed.topicGroups,
+                topicProjectGroup: seed.topicProjectGroup,
+                galaxyGroups: seed.galaxyGroups, galaxyCenters: seed.galaxyCenters,
+                x: seed.posX, y: seed.posY, z: seed.posZ)
+        }
+        return try #require(fresh.encodeForcePassSync(queue: queue, snapshot: snapshot))
+    }
+
+    @Test
+    @MainActor func testPreparationEdgeOnlyReusesGroupsAndUpdatesSprings() throws {
+        let (engine, queue) = try makeForceEngine()
+        let fc = engine.forceCompute
+        let x: [Float] = [0, 3, 9, 15, 21, 27]
+        let groups = Array(repeating: 0, count: x.count)
+        let batches: [[(Int, Int)]] = [
+            [(0, 1), (1, 2)],
+            [(0, 1), (1, 2), (2, 5)],
+            [(2, 5), (1, 2), (0, 1)], // same edges, different CSR accumulation order
+            [(2, 5), (2, 5), (3, 3)], // duplicate endpoint references and a self-loop
+            [], // remove every edge after storage has already been allocated
+            [(5, 0)]
+        ]
+        var results: [ForceResult] = []
+        for (index, edges) in batches.enumerated() {
+            let snapshot = preparationSnapshot(x: x, groups: groups, dirty: true, edges: edges, springs: 0.07)
+            let result = try #require(engine.encodeForcePassSync(queue: queue, snapshot: snapshot))
+            try expectSameForces(result, freshlyPreparedForces(snapshot))
+            #expect(fc.groupUploadCount == 1, "Edge-only edits must retain the exact static mappings")
+            #expect(fc.centroidUpdateCount == index + 1)
+            results.append(result)
+        }
+        // Nonzero springs must actually distinguish adding and removing edges.
+        #expect(abs(results[0].fx[5] - results[1].fx[5]) > 0.1)
+        #expect(abs(results[3].fx[5] - results[4].fx[5]) > 0.1)
+        try expectPreparationForces(results[4], snapshot: preparationSnapshot(x: x, groups: groups, dirty: true))
+    }
+
+    @Test
+    @MainActor func testPreparationEdgeOnlyKeepsCurrentCentroids() throws {
+        let (engine, queue) = try makeForceEngine()
+        let fc = engine.forceCompute
+        let groups = Array(repeating: 0, count: 6)
+        let positions: [[Float]] = [[0, 10, 20, 30, 40, 300], [0, 20, 30, 50, 60, 900], [10, 13, 19, 25, 31, 37]]
+        var previous: ForceResult?
+        for (index, x) in positions.enumerated() {
+            // Change center values without changing their count as well. Both
+            // centers and the p75 radii must refresh on this dirty dispatch.
+            let snapshot = preparationSnapshot(
+                x: x, groups: groups, dirty: true,
+                centers: [SIMD3(Float(index * 100), 0, 0)])
+            let result = try #require(engine.encodeForcePassSync(queue: queue, snapshot: snapshot))
+            try expectSameForces(result, freshlyPreparedForces(snapshot))
+            if let previous { #expect(abs(result.fx[5] - previous.fx[5]) > 0.1) }
+            #expect(fc.groupUploadCount == 1)
+            #expect(fc.centroidUpdateCount == index + 1)
+            previous = result
         }
     }
 
@@ -255,6 +340,53 @@ struct ForceEngineTests {
         try expectPreparationForces(grownResult, snapshot: grown)
         #expect(fc.centroidUpdateCount == 3)
         #expect(fc.groupUploadCount == 3)
+
+        // Shrinking within the retained allocation must rewrite mappings too.
+        let shrunk = preparationSnapshot(x: x, groups: [0, 0, 0, 1, 1, 1], dirty: true)
+        let shrunkResult = try #require(engine.encodeForcePassSync(queue: queue, snapshot: shrunk))
+        try expectPreparationForces(shrunkResult, snapshot: shrunk)
+        #expect(fc.groupUploadCount == 4)
+        #expect(fc.centroidUpdateCount == 4)
+
+        // Exercise each exact-key field independently at a fixed node count.
+        // Nonzero repulsions make topic-to-project and project-to-galaxy
+        // metadata observable, rather than checking upload counts alone.
+        let projects = [0, 0, 0, 1, 1, 1]
+        let topics = [0, 0, 1, 2, 2, 2]
+        let galaxies = Array(repeating: 0, count: 6)
+        let variants = [
+            preparationSnapshot(x: x, groups: projects, dirty: true, topics: topics,
+                                topicProjects: [0, 0, 1], galaxies: galaxies,
+                                projectRepulsion: 400, topicRepulsion: 400),
+            preparationSnapshot(x: x, groups: projects, dirty: true, topics: topics,
+                                topicProjects: [0, 1, 1], galaxies: galaxies,
+                                projectRepulsion: 400, topicRepulsion: 400),
+            preparationSnapshot(x: x, groups: projects, dirty: true, topics: topics,
+                                topicProjects: [0, 1, 1], galaxies: [0, 0, 0, 1, 1, 1],
+                                projectRepulsion: 400, topicRepulsion: 400),
+            preparationSnapshot(x: x, groups: projects, dirty: true, topics: topics,
+                                topicProjects: [0, 1, 1], galaxies: [0, 0, 0, 1, 1, 1],
+                                centers: [.zero, SIMD3(100, 0, 0), SIMD3(200, 0, 0), SIMD3(300, 0, 0)],
+                                projectRepulsion: 400, topicRepulsion: 400),
+            preparationSnapshot(x: x, groups: projects, dirty: true, topics: [0, 1, 1, 2, 2, 2],
+                                topicProjects: [0, 1, 1], galaxies: [0, 0, 0, 1, 1, 1],
+                                centers: [.zero, SIMD3(100, 0, 0), SIMD3(200, 0, 0), SIMD3(300, 0, 0)],
+                                projectRepulsion: 400, topicRepulsion: 400),
+            preparationSnapshot(x: x, groups: [0, 0, 1, 1, 1, 1], dirty: true, topics: [0, 1, 1, 2, 2, 2],
+                                topicProjects: [0, 1, 1], galaxies: [0, 0, 0, 1, 1, 1],
+                                centers: [.zero, SIMD3(100, 0, 0), SIMD3(200, 0, 0), SIMD3(300, 0, 0)],
+                                projectRepulsion: 400, topicRepulsion: 400)
+        ]
+        var variantResults: [ForceResult] = []
+        for (index, snapshot) in variants.enumerated() {
+            let result = try #require(engine.encodeForcePassSync(queue: queue, snapshot: snapshot))
+            try expectSameForces(result, freshlyPreparedForces(snapshot))
+            #expect(fc.groupUploadCount == 5 + index)
+            #expect(fc.centroidUpdateCount == 5 + index)
+            variantResults.append(result)
+        }
+        #expect(abs(variantResults[0].fx[0] - variantResults[1].fx[0]) > 0.001)
+        #expect(abs(variantResults[1].fx[3] - variantResults[2].fx[3]) > 0.001)
     }
 
     @Test
@@ -275,7 +407,7 @@ struct ForceEngineTests {
             #expect(command.status == .completed)
             try expectPreparationForces(result, snapshot: snapshot)
             #expect(fc.centroidUpdateCount == pass)
-            #expect(fc.groupUploadCount == pass)
+            #expect(fc.groupUploadCount == 1)
             #expect(!engine.isInFlight)
         }
     }

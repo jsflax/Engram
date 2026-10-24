@@ -651,7 +651,9 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
 
     def test_force_preparation_requires_exact_runtime_passes_and_propagates_failure(self):
         names = ['testPreparationCentroidsUseFirstEncodePositionsAndCadence',
-                 'testPreparationRegroupAndCapacityGrowth', 'testPreparationAsyncDirtyDispatch']
+                 'testPreparationRegroupAndCapacityGrowth', 'testPreparationAsyncDirtyDispatch',
+                 'testPreparationEdgeOnlyReusesGroupsAndUpdatesSprings',
+                 'testPreparationEdgeOnlyKeepsCurrentCentroids']
         selected = '|'.join(names)
         name = 'Run force preparation regressions (serial)'
         source = (ROOT / 'Tests/EngramVisualizerTests/ForceEngineTests.swift').read_text()
