@@ -718,7 +718,8 @@ final class AdapterSnapshotTests: XCTestCase {
         defer { lattice.close() }
         let registry = GalaxyRegistry()
         let synced = Galaxy(id: "synced", displayName: "Synced", lattice: lattice.sendableReference)
-        let group = Galaxy(id: "group:team", displayName: "Team", lattice: lattice.sendableReference)
+        let groupID = "group:team"
+        let group = Galaxy(id: groupID, displayName: "Team", lattice: lattice.sendableReference)
         registry.register(synced)
         registry.register(group)
         let lower = node(label: "Synced copy")
@@ -749,12 +750,12 @@ final class AdapterSnapshotTests: XCTestCase {
         group.renderStore.nodeById.removeValue(forKey: winner.id)
         XCTAssertEqual(registry.node(for: winner.id)?.label, "Synced copy")
         XCTAssertEqual(snapshot[winner.id]?.label, "Team wins")
-        let replacement = Galaxy(id: group.id, displayName: "Replacement", lattice: lattice.sendableReference)
+        let replacement = Galaxy(id: groupID, displayName: "Replacement", lattice: lattice.sendableReference)
         replacement.renderStore.nodeById[winner.id] = node(id: winner.id, label: "Replacement wins")
         registry.register(replacement)
         XCTAssertEqual(registry.node(for: winner.id)?.label, "Replacement wins")
         XCTAssertNil(registry.node(for: lookupOnly.id))
-        registry.remove(group.id)
+        registry.remove(groupID)
         XCTAssertEqual(registry.node(for: winner.id)?.label, "Synced copy")
         XCTAssertEqual(registry.mergedNodeById[winner.id]?.label, "Synced copy")
     }
