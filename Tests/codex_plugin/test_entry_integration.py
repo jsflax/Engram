@@ -1,5 +1,7 @@
 """Actual package composition with denied MCP policy and suppressed worker spawn."""
 import importlib.util
+import fcntl
+import io
 import json
 import os
 from pathlib import Path
@@ -14,6 +16,7 @@ from unittest import mock
 HERE = REPOSITORY_ROOT
 sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 import engram_hook
+import recall_hook
 from codex_learner import runner, file_identity
 
 
@@ -77,6 +80,70 @@ class EntryIntegration(unittest.TestCase):
             spawn.assert_not_called()
         receipt=json.loads((self.root/"router-receipts.jsonl").read_text().splitlines()[-1])
         self.assertEqual(receipt["status"],"rejected")
+
+    def test_main_stop_queues_while_other_hook_holds_setup_lock(self):
+        with mock.patch.object(runner, "spawn_worker"):
+            self.event("SessionStart", source="startup")
+        self.append()
+        policy = self.root / "learner/admission.json"
+        cursor = self.root / "learner/sessions" / (self.sid + ".json")
+        enrollment = self.root / "learner/enrollments" / (self.sid + ".json")
+        before_policy, before_enrollment = policy.read_bytes(), enrollment.read_bytes()
+        fd = os.open(self.root / "setup.lock", os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with tempfile.TemporaryFile() as output, \
+                 mock.patch.object(sys, "stdout", output), \
+                 mock.patch.object(engram_hook.runtime_routing, "maybe_exec"), \
+                 mock.patch.object(recall_hook, "read_input", return_value={**self.payload, "hook_event_name": "Stop"}), \
+                 mock.patch.object(engram_hook, "initial_json", side_effect=AssertionError("warm bootstrap write")), \
+                 mock.patch.object(engram_hook, "private_dir", side_effect=AssertionError("warm directory write")), \
+                 mock.patch.object(runner, "spawn_worker") as spawn:
+                self.assertEqual(engram_hook.main([]), 0)
+                output.seek(0)
+                self.assertEqual(json.loads(output.read()), {})
+            spawn.assert_called_once()
+        finally:
+            os.close(fd)
+        request = json.loads((self.root / "learner/pending" / (self.sid + ".json")).read_bytes())
+        self.assertEqual(request["event"], "Stop")
+        events = [json.loads(line) for line in (self.root / "learner/events.jsonl").read_text().splitlines()]
+        queued = [event for event in events if event["event"] == "queued"]
+        self.assertEqual([event["request_id"] for event in queued], [request["request_id"]])
+        self.assertEqual(policy.read_bytes(), before_policy)
+        self.assertEqual(enrollment.read_bytes(), before_enrollment)
+        self.assertEqual(json.loads(cursor.read_bytes())["offset"], json.loads(before_enrollment)["frontier_offset"])
+
+    def test_main_incomplete_setup_stops_at_inherited_deadline(self):
+        missing = self.root / "lifecycle.json"
+        missing.unlink()
+        policy = self.root / "learner/admission.json"
+        before = policy.read_bytes()
+        fd = os.open(self.root / "setup.lock", os.O_RDWR)
+        now = [10.0]
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with tempfile.TemporaryFile() as output, \
+                 mock.patch.object(sys, "stdout", output), \
+                 mock.patch.object(sys, "stderr", io.StringIO()) as errors, \
+                 mock.patch.object(engram_hook.runtime_routing, "maybe_exec"), \
+                 mock.patch.object(engram_hook.runtime_routing, "hook_deadline", return_value=10.025), \
+                 mock.patch.object(engram_hook.time, "monotonic", side_effect=lambda: now[0]), \
+                 mock.patch.object(engram_hook.time, "sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)), \
+                 mock.patch.object(recall_hook, "read_input") as read_input, \
+                 mock.patch.object(engram_hook, "dispatch") as dispatch:
+                self.assertEqual(engram_hook.main([]), 0)
+                read_input.assert_not_called()
+                dispatch.assert_not_called()
+                self.assertEqual(errors.getvalue(), "Engram: hook unavailable; inspect Engram hook-status.\n")
+                output.seek(0)
+                self.assertEqual(json.loads(output.read()), {})
+        finally:
+            os.close(fd)
+        self.assertAlmostEqual(now[0], 10.025)
+        self.assertFalse(missing.exists())
+        self.assertEqual(policy.read_bytes(), before)
+        self.assertFalse((self.root / "learner/pending").exists())
 
 
 if __name__ == "__main__":

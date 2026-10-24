@@ -1,4 +1,5 @@
 import importlib.util
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,13 @@ class BootstrapTests(unittest.TestCase):
             "scheme": "macos_volume_uuid_inode_v1",
             "volume_uuid": "11111111-2222-4333-8444-555555555555", "inode": os.fstat(fd).st_ino})
         capture.start(); self.addCleanup(capture.stop)
+
+    def held_setup_lock(self, root):
+        root.mkdir(mode=0o700, exist_ok=True)
+        fd = os.open(root / "setup.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
 
     def test_portable_state_and_no_pilot_pins(self):
         root = module.initialize(self.home)
@@ -102,6 +110,81 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.initialize(self.home)
         self.assertEqual(root.stat().st_mode & 0o777, 0o755)
+
+    def test_cold_setup_waits_only_until_lock_release(self):
+        root = self.home / "engram"
+        fd = self.held_setup_lock(root)
+        now, waits = [10.0], []
+
+        def release(seconds):
+            self.assertFalse(list(root.glob("*.json")))
+            waits.append(seconds)
+            now[0] += seconds
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+        with mock.patch.object(module.time, "monotonic", side_effect=lambda: now[0]), \
+             mock.patch.object(module.time, "sleep", side_effect=release):
+            self.assertEqual(module.initialize(self.home, deadline=10.05), root)
+        self.assertEqual(waits, [0.01])
+        self.assertTrue(module.initialized(root))
+
+    def test_cold_setup_timeout_creates_no_policy_or_queue(self):
+        root = self.home / "engram"
+        self.held_setup_lock(root)
+        now, waits = [10.0], []
+
+        def advance(seconds):
+            waits.append(seconds)
+            now[0] += seconds
+
+        with mock.patch.object(module.time, "monotonic", side_effect=lambda: now[0]), \
+             mock.patch.object(module.time, "sleep", side_effect=advance):
+            with self.assertRaisesRegex(ValueError, "^setup_lock_timeout$"):
+                module.initialize(self.home, deadline=10.025)
+        self.assertAlmostEqual(sum(waits), 0.025)
+        self.assertFalse(list(root.glob("*.json")))
+        self.assertFalse((root / "learner").exists())
+
+    def test_waiter_uses_completed_state_without_acquiring_lock_or_writing(self):
+        root = module.initialize(self.home)
+        path = root / "lifecycle.json"
+        previous = path.read_bytes()
+        path.unlink()
+        self.held_setup_lock(root)
+        now = [10.0]
+
+        def finish_setup(seconds):
+            now[0] += seconds
+            path.write_bytes(previous)
+            path.chmod(0o600)
+
+        with mock.patch.object(module.time, "monotonic", side_effect=lambda: now[0]), \
+             mock.patch.object(module.time, "sleep", side_effect=finish_setup) as wait, \
+             mock.patch.object(module, "initial_json", side_effect=AssertionError("unexpected bootstrap write")):
+            self.assertEqual(module.initialize(self.home, deadline=10.05), root)
+        wait.assert_called_once_with(0.01)
+
+    def test_complete_state_does_not_bypass_unsafe_setup_lock_or_policy(self):
+        root = module.initialize(self.home)
+        lock = root / "setup.lock"
+        lock.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "^setup_lock_not_private$"):
+            module.initialize(self.home)
+        self.assertEqual(lock.stat().st_mode & 0o777, 0o644)
+        lock.chmod(0o600)
+        policy = root / "learner/admission.json"
+        original = policy.read_bytes()
+        value = json.loads(original)
+        value["mode"] = "unsupported"
+        policy.write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, "^unsupported_existing_host_policy$"):
+            module.initialize(self.home)
+        policy.write_bytes(original)
+        lock.unlink()
+        lock.symlink_to(policy)
+        with self.assertRaisesRegex(ValueError, "^setup_lock_not_private$"):
+            module.initialize(self.home)
+        self.assertEqual(policy.read_bytes(), original)
 
 
 if __name__ == "__main__":

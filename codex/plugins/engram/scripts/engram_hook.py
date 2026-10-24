@@ -28,19 +28,27 @@ MAX_INPUT = 65536
 
 def private_dir(path: Path) -> None:
     path.mkdir(mode=0o700, exist_ok=True)
+    existing_private_dir(path)
+
+
+def existing_private_dir(path: Path) -> None:
     info = path.lstat()
     if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
             or info.st_mode & 0o077):
         raise ValueError("state_directory_not_private")
 
 
+def existing_private_file(path: Path, reason="state_file_not_private") -> None:
+    info = path.lstat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_nlink != 1 or info.st_mode & 0o077):
+        raise ValueError(reason)
+
+
 def initial_json(path: Path, value: dict) -> None:
     """Called while holding setup.lock; never replace existing user policy."""
     if path.exists() or path.is_symlink():
-        info = path.lstat()
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_nlink != 1 or info.st_mode & 0o077):
-            raise ValueError("state_file_not_private")
+        existing_private_file(path)
         return
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -55,7 +63,35 @@ def initial_json(path: Path, value: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def initialize(codex_home: Path) -> Path:
+def existing_policy(root: Path) -> dict:
+    from codex_learner import admission, host_admission
+    raw, _ = admission._owned_bytes(root / "learner/admission.json", private=True)
+    current = admission._json(raw)
+    # Preserve an existing host's identity scheme, including disabled policy.
+    if (current.get("mode"), current.get("schema_version")) not in {
+            (host_admission.MODE, 1), (host_admission.MODE_V2, 2)}:
+        raise ValueError("unsupported_existing_host_policy")
+    return current
+
+
+def initialized(root: Path) -> bool:
+    """Read-only bootstrap validation; adapters still validate effective policy."""
+    try:
+        for path in (root, *(root / name for name in ("recall-state", "lifecycle", "learner"))):
+            existing_private_dir(path)
+        existing_private_file(root / "setup.lock", "setup_lock_not_private")
+        for name in ("recall.json", "learner/admission.json", "learner-routes.json",
+                     "learner/settings.json", "lifecycle.json"):
+            existing_private_file(root / name)
+        existing_policy(root)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def initialize(codex_home: Path, *, deadline: float | None = None) -> Path:
+    if deadline is None:
+        deadline = time.monotonic() + 2.8
     if not codex_home.is_absolute() or codex_home.resolve(strict=True) != codex_home:
         raise ValueError("codex_home_not_canonical")
     sessions = codex_home / "sessions"
@@ -63,6 +99,8 @@ def initialize(codex_home: Path) -> Path:
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
         raise ValueError("sessions_not_owned_directory")
     root = codex_home / "engram"
+    if initialized(root):
+        return root
     private_dir(root)
     fd = os.open(root / "setup.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
@@ -70,7 +108,24 @@ def initialize(codex_home: Path) -> Path:
         if (not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != os.getuid()
                 or lock_info.st_nlink != 1 or lock_info.st_mode & 0o077):
             raise ValueError("setup_lock_not_private")
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError("setup_lock_timeout")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                # Another invocation can finish setup without releasing its
+                # lock yet. Complete private state is safe to use read-only.
+                if initialized(root):
+                    return root
+                time.sleep(min(0.01, remaining))
+        current_lock = (root / "setup.lock").lstat()
+        if (current_lock.st_dev, current_lock.st_ino) != (lock_info.st_dev, lock_info.st_ino):
+            raise ValueError("setup_lock_changed")
+        if time.monotonic() >= deadline:
+            raise ValueError("setup_lock_timeout")
         for name in ("recall-state", "lifecycle", "learner"):
             private_dir(root / name)
         initial_json(root / "recall.json", {
@@ -91,12 +146,7 @@ def initialize(codex_home: Path) -> Path:
                 "sessions_dir": admission._directory_binding(sessions, stable_identity=True)})
         else:
             initial_json(policy_path, {})  # Validate existing ownership; never replace it.
-        raw, _ = admission._owned_bytes(policy_path, private=True)
-        current = admission._json(raw)
-        # Preserve an existing host's identity scheme, including disabled policy.
-        if (current.get("mode"), current.get("schema_version")) not in {
-                (host_admission.MODE, 1), (host_admission.MODE_V2, 2)}:
-            raise ValueError("unsupported_existing_host_policy")
+        current = existing_policy(root)
         initial_json(root / "learner-routes.json", {
             "schema_version": current["schema_version"], "mode": current["mode"], "enabled": True,
             "state_dir": str(root / "learner")})
@@ -158,7 +208,7 @@ def main(argv=None) -> int:
         start = deadline - 2.8
         runtime_routing.maybe_exec(Path(__file__).absolute().parents[1], "engram_hook.py", args, deadline=deadline)
         codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser().resolve(strict=True)
-        root = initialize(codex_home)
+        root = initialize(codex_home, deadline=deadline)
         if args == ["--initialize"]:
             result = {"state_root": str(root), "initialized": True}
         elif not args:
