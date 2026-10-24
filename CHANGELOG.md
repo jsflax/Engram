@@ -4,6 +4,28 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.21] - 2026-10-24
+
+### Fixed
+
+- Apply sidebar tab selections immediately in app state and save the preference
+  in the background. Selecting a tab no longer waits for a database write.
+  Windows share the selection, newer choices stay current while older saves
+  finish, and failed saves offer Retry.
+- Avoid repeatedly comparing unchanged graph edges during eligible loading
+  batches: new edges appended by the lowest-priority galaxy in merge order,
+  with existing nodes and filters preserved. Duplicate precedence, hidden
+  relations, and late endpoints remain correct; edits, removals, visibility
+  changes, and galaxy changes retain conservative rebuilding.
+- Preserve paragraphs and lists in Slack release announcements, including
+  wrapped prose. Skip confirmed deliveries on repeated workflow runs and hold
+  ambiguous delivery failures for inspection before retrying.
+
+### Notes
+
+- The latest tab preference may remain unsaved if Engram exits while its
+  background save is pending.
+
 ## [0.15.20] - 2026-10-23
 
 ### Fixed
