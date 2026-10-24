@@ -142,7 +142,7 @@ class HostPreparationTests(unittest.TestCase):
             'testMascotInsertionRangesMatchFullRebuild',
             'testInsertionMembershipFallbacksMatchFullRebuild')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 150)
+        self.assertEqual(len(inventory), 152)
         self.assertIn('AdapterSnapshotTests/testCurrentNodeLookupPreservesPrecedenceAndIndependentSnapshots', inventory)
         for name in (
             'testAccessOnlyLoaderCompletionPreservesFreshLookupsWithoutWakingSimulation',
@@ -160,6 +160,8 @@ class HostPreparationTests(unittest.TestCase):
             'testSimultaneousEdgeDuplicatesKeepFilteredPrecedenceBeforeEndpointReveal',
             'testHigherPriorityFilteredEdgeTakeoverFallsBackBeforePublishingInsertions',
             'testUnsafeEdgeInsertionChangesMatchConservativeMerge',
+            'testEdgeInsertionProofRejectsMissedPublicationsAndUnconsumedEdits',
+            'testEdgeInsertionProofSeparatesReplacementRegistryEpochs',
             'testCertifiedCrossGalaxyNodeAppendsReuseUnchangedEdges',
             'testCrossGalaxyMissingEndpointsArriveSeparatelyWithoutReorderingEdges',
             'testCrossGalaxyHiddenAndDanglingWinnersSuppressVisibleDuplicates',

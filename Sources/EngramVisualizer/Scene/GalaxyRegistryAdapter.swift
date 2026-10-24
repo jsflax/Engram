@@ -397,6 +397,7 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     private(set) var retainedNodeIndexRemapCount: UInt64 = 0
     private(set) var edgePrefixComparisonCount: UInt64 = 0
     private(set) var edgeSnapshotBuildCount: UInt64 = 0
+    private(set) var retainedEdgeSnapshotCopyCount: UInt64 = 0
 
     // Visual state — elapsed times tracked per-frame
     private var glowStartTimes: [UUID: Date] = [:]
@@ -497,6 +498,16 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
                            toVersion: nodeVersionBase &+ reuse.toVersion,
                            oldCount: reuse.oldCount, newCount: reuse.newCount,
                            retainedRanges: reuse.retainedRanges)
+    }
+
+    func edgeInsertionReuse(since version: UInt64, count: Int) -> EdgeInsertionReuse? {
+        guard version >= edgeVersionBase, let registry,
+              lastEdgesVersion == registry.mergedEdgesVersion,
+              let reuse = registry.edgeInsertionReuse(since: version - edgeVersionBase, count: count) else { return nil }
+        return EdgeInsertionReuse(fromVersion: edgeVersionBase &+ reuse.fromVersion,
+                                  toVersion: edgeVersionBase &+ reuse.toVersion,
+                                  oldCount: reuse.oldCount, newCount: reuse.newCount,
+                                  retainedRanges: reuse.retainedRanges)
     }
 
     func tick(dt: Float) {
@@ -778,26 +789,39 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
 
         if lastEdgesVersion != registry.mergedEdgesVersion {
             let edges = registry.mergedEdges
-            let canAppendEdges = edges.count >= cachedEdges.count
-                && (lastRegistryEdgeAppendGeneration == registry.mergedEdgeAppendGeneration
-                    || cachedEdges.indices.allSatisfy { index in
-                    edgePrefixComparisonCount &+= 1
-                    let old = cachedEdges[index], edge = edges[index]
-                    return old.id == edge.id && old.sourceId == edge.sourceId
-                        && old.targetId == edge.targetId && old.relation == edge.relation
-                })
-            if !canAppendEdges { cachedEdges.removeAll(keepingCapacity: true) }
-            if cachedEdges.capacity < edges.count {
-                cachedEdges.reserveCapacity(max(edges.count, max(64, cachedEdges.capacity * 2)))
+            let makeSnapshot = { (index: Int) -> RKEdgeSnapshot in
+                let edge = edges[index]
+                self.edgeSnapshotBuildCount &+= 1
+                return RKEdgeSnapshot(id: edge.id, sourceId: edge.sourceId,
+                                      targetId: edge.targetId, relation: edge.relation)
             }
-            for edge in edges.dropFirst(cachedEdges.count) {
-                edgeSnapshotBuildCount &+= 1
-                cachedEdges.append(RKEdgeSnapshot(
-                    id: edge.id,
-                    sourceId: edge.sourceId,
-                    targetId: edge.targetId,
-                    relation: edge.relation
-                ))
+            if let reuse = registry.edgeInsertionReuse(since: lastEdgesVersion, count: cachedEdges.count),
+               !reuse.preservesExistingIndices {
+                // Only this exact insertion publication can reuse interior
+                // segments without comparing every retained edge's metadata.
+                let oldEdges = cachedEdges
+                retainedEdgeSnapshotCopyCount &+= UInt64(oldEdges.count)
+                cachedEdges = reuse.remap(oldEdges, inserting: makeSnapshot)!
+            } else {
+                // True tails retain the generation across publications. Edits,
+                // removals, missed interior insertions and registry replacement
+                // still validate all retained values before using a prefix.
+                let canAppendEdges = edges.count >= cachedEdges.count
+                    && (lastRegistryEdgeAppendGeneration == registry.mergedEdgeAppendGeneration
+                        || cachedEdges.indices.allSatisfy { index in
+                        edgePrefixComparisonCount &+= 1
+                        let old = cachedEdges[index], edge = edges[index]
+                        return old.id == edge.id && old.sourceId == edge.sourceId
+                            && old.targetId == edge.targetId && old.relation == edge.relation
+                    })
+                if !canAppendEdges { cachedEdges.removeAll(keepingCapacity: true) }
+                if cachedEdges.capacity < edges.count {
+                    cachedEdges.reserveCapacity(max(edges.count, max(64, cachedEdges.capacity * 2)))
+                }
+                for index in cachedEdges.count..<edges.count {
+                    let snapshot = makeSnapshot(index)
+                    cachedEdges.append(snapshot)
+                }
             }
             lastEdgesVersion = registry.mergedEdgesVersion
             lastRegistryEdgeAppendGeneration = registry.mergedEdgeAppendGeneration

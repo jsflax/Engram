@@ -1,5 +1,6 @@
-/// A single publication that inserts nodes without changing or removing any
-/// existing row. Consumers must also establish the same provider identity.
+/// A single publication that inserts rows without changing or removing any
+/// existing row. Used for nodes and, via EdgeInsertionReuse, edges. Consumers
+/// must also establish the same provider identity and correct revision domain.
 /// Retained ranges cover the complete old array, in its original order.
 public struct NodeInsertionReuse: Equatable, Sendable {
     public struct RetainedRange: Equatable, Sendable {
@@ -73,7 +74,7 @@ public struct NodeInsertionReuse: Equatable, Sendable {
         return nil
     }
 
-    /// Copies retained values without reading node metadata. The closure is
+    /// Copies retained values without reading row metadata. The closure is
     /// evaluated in rendered order, only for newly inserted indices.
     public func remap<Value>(_ previous: [Value], inserting: (Int) -> Value) -> [Value]? {
         guard previous.count == oldCount else { return nil }
@@ -87,3 +88,8 @@ public struct NodeInsertionReuse: Equatable, Sendable {
         return result
     }
 }
+
+/// The same validated insertion mapping for an edge publication. Retained rows
+/// keep their identity, endpoints, relation and relative order; consumers must
+/// join the edge versions/counts and separately establish provider identity.
+public typealias EdgeInsertionReuse = NodeInsertionReuse
