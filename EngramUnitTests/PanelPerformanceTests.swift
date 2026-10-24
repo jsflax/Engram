@@ -128,9 +128,9 @@ final class PanelPerformanceTests: XCTestCase {
         row.dematerialize()
 
         let initialStatements = Lattice.threadSQLStatementCount
-        let first = SidebarRenderConfiguration(config: row)
-        XCTAssertEqual(Lattice.threadSQLStatementCount - initialStatements, 4,
-                       "Graph rendering reads the selected tab, hidden sets, and layout exactly once")
+        let first = SidebarRenderConfiguration(config: row, selectedTab: .visualizer)
+        XCTAssertEqual(Lattice.threadSQLStatementCount - initialStatements, 3,
+                       "Graph rendering reads hidden sets and layout exactly once; the tab is local UI state")
         let graph = try XCTUnwrap(first.graph)
         XCTAssertEqual(first.selectedTab, .visualizer)
         XCTAssertEqual(graph.hiddenProjects, ["Project 7"])
@@ -154,8 +154,8 @@ final class PanelPerformanceTests: XCTestCase {
         config.hiddenRelations = ["supersedes"]
         config.layoutMode = .embedding
         let updatedStatements = Lattice.threadSQLStatementCount
-        let updated = SidebarRenderConfiguration(config: row)
-        XCTAssertEqual(Lattice.threadSQLStatementCount - updatedStatements, 4)
+        let updated = SidebarRenderConfiguration(config: row, selectedTab: .visualizer)
+        XCTAssertEqual(Lattice.threadSQLStatementCount - updatedStatements, 3)
         XCTAssertEqual(updated.graph?.hiddenProjects, ["Project 42"])
         XCTAssertEqual(updated.graph?.hiddenRelations, ["supersedes"])
         XCTAssertEqual(updated.graph?.layoutMode, .embedding)
@@ -163,16 +163,15 @@ final class PanelPerformanceTests: XCTestCase {
         XCTAssertFalse(row.isMaterialized)
     }
 
-    func testSidebarNonGraphRenderingOnlyReadsSelectedTab() throws {
+    func testSidebarNonGraphRenderConfigurationDoesNotReadDatabase() throws {
         let lattice = try Lattice(VisualizerConfig.self, configuration: .init(storage: .memory()))
         let config = VisualizerConfig()
         try lattice.add(config)
         for tab in [SidebarTab.logs, .settings, .account] {
-            config.selectedTab = tab
             let statements = Lattice.threadSQLStatementCount
-            let snapshot = SidebarRenderConfiguration(config: config)
-            XCTAssertEqual(Lattice.threadSQLStatementCount - statements, 1,
-                           "Other tabs must not read unused Graph configuration")
+            let snapshot = SidebarRenderConfiguration(config: config, selectedTab: tab)
+            XCTAssertEqual(Lattice.threadSQLStatementCount - statements, 0,
+                           "Other tabs use local selection without reading unused Graph configuration")
             XCTAssertEqual(snapshot.selectedTab, tab)
             XCTAssertNil(snapshot.graph)
         }

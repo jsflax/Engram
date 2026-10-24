@@ -17,6 +17,7 @@ struct EngramApp: App {
     @State private var accountService: AccountService
     @State private var groupService: GroupService
     @State private var syncManager = SyncManager()
+    @State private var sidebarSelection: SidebarSelection
 
     #if SWIFT_PACKAGE && os(macOS)
     private final class Delegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
@@ -103,6 +104,7 @@ struct EngramApp: App {
             try! local.add(c)
             return c
         }()
+        _sidebarSelection = State(initialValue: SidebarSelection(config: config, lattice: local))
         // Allow tests to force sound on via environment
         if ProcessInfo.processInfo.environment["ENGRAM_FORCE_SOUND"] == "1" {
             config.soundEnabled = true
@@ -160,6 +162,7 @@ struct EngramApp: App {
             GraphView(syncManager: syncManager)
                 .environment(\.lattice, lattice)
                 .environment(config)
+                .environment(sidebarSelection)
                 .environment(accountService)
                 .environment(groupService)
                 .environment(syncManager)

@@ -5,15 +5,15 @@ import UserNotifications
 
 // MARK: - Sidebar (hover-to-peek, click-to-pin)
 
-@LatticeEnum enum SidebarTab: String, CaseIterable, Equatable {
+@LatticeEnum enum SidebarTab: String, CaseIterable, Equatable, Sendable {
     case visualizer = "Graph"
     case logs = "Logs"
     case settings = "Settings"
     case account = "Account"
 }
 
-/// Read live configuration once in the parent's observation scope. Lazy rows
-/// receive values, not a long-lived materialized model or per-row SQL getters.
+/// Capture Graph configuration once in the parent's observation scope. The tab
+/// itself is immediate UI state; lazy rows receive values, not SQL getters.
 struct SidebarRenderConfiguration {
     struct Graph {
         let hiddenProjects: Set<String>
@@ -24,8 +24,8 @@ struct SidebarRenderConfiguration {
     let selectedTab: SidebarTab
     let graph: Graph?
 
-    @MainActor init(config: VisualizerConfig) {
-        selectedTab = config.selectedTab
+    @MainActor init(config: VisualizerConfig, selectedTab: SidebarTab) {
+        self.selectedTab = selectedTab
         if selectedTab == .visualizer {
             graph = Graph(hiddenProjects: config.hiddenProjects,
                           hiddenRelations: config.hiddenRelations,
@@ -40,6 +40,7 @@ struct SidebarView: View {
     typealias Tab = SidebarTab
 
     @Environment(VisualizerConfig.self) private var config
+    @Environment(SidebarSelection.self) private var selection
     @Environment(\.lattice) var lattice
     @Environment(SyncManager.self) var syncManager
     @Environment(GroupService.self) var groupService
@@ -76,10 +77,20 @@ struct SidebarView: View {
     var projectCounts: [String: Int] { galaxyRegistry.panelSnapshot.projectCounts }
 
     var body: some View {
-        let renderConfig = SidebarRenderConfiguration(config: config)
+        let renderConfig = SidebarRenderConfiguration(config: config, selectedTab: selection.selectedTab)
         return VStack(spacing: 0) {
             Spacer().frame(height: 28) // clear traffic light buttons
             tabBar(selectedTab: renderConfig.selectedTab)
+            if selection.persistenceError != nil {
+                HStack {
+                    Text("Couldn't save this tab.")
+                    Spacer()
+                    Button("Retry", action: selection.retryPersistence)
+                }
+                .font(.caption)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 6)
+            }
             Divider().overlay(Color.white.opacity(0.08))
 
             switch renderConfig.selectedTab {
@@ -143,10 +154,9 @@ struct SidebarView: View {
         HStack(spacing: 2) {
             ForEach(Tab.allCases, id: \.self) { tab in
                 Button {
-                    guard config.selectedTab != tab else { return }
-                    // Timing begins after the live guard, not at action entry.
+                    guard selection.selectedTab != tab else { return }
                     PanelResponseRecorder.begin("sidebar.\(tab.rawValue)")
-                    config.selectedTab = tab
+                    selection.select(tab)
                     PanelResponseRecorder.mutationReturned("sidebar.\(tab.rawValue)")
                 } label: {
                     HStack(spacing: 4) {

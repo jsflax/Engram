@@ -11,7 +11,8 @@ import re
 import subprocess
 
 CLASSES = ('GalaxyLoadChangesTests', 'GalaxyDrainTests', 'VisualizerHostIsolationTests', 'AdapterSnapshotTests',
-           'FrameLookupInvalidationTests', 'SceneMetadataDomainTests', 'LogsViewTests', 'NebulaLODVisibilityTests')
+           'FrameLookupInvalidationTests', 'SceneMetadataDomainTests', 'LogsViewTests', 'NebulaLODVisibilityTests',
+           'SidebarSelectionTests')
 # These functional regressions share a class with device-dependent performance
 # budgets. Select their methods explicitly rather than widening that class.
 METHODS = {'PanelPerformanceTests': (
@@ -19,6 +20,8 @@ METHODS = {'PanelPerformanceTests': (
     'testSidebarHoverDismissalCanBeCancelledByReentryAndPinning',
     'testPanelSnapshotTracksInitialAndLiveChangesWithoutSidebarAppearance',
     'testLogTailBoundsBytesAndLinesWithoutBreakingUnicode',
+    'testSidebarRenderConfigurationBoundsSQLAndKeepsLiveConfigFresh',
+    'testSidebarNonGraphRenderConfigurationDoesNotReadDatabase',
 )}
 
 def test_identifiers():
