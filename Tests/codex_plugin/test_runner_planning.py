@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import tomllib
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -242,6 +243,47 @@ class RunnerPlanningTests(unittest.TestCase):
 
     def invoke(self):
         return R.run_planner(self.root, self.run, self.request, self.excerpt, self.config)
+
+    def test_planner_disables_both_collaboration_versions_without_changing_model_or_effort(self):
+        config_path = self.host / "config.toml"
+        config_path.write_text('model="configured-model"\nmodel_reasoning_effort="ultra"\n'
+                               + config_path.read_text())
+        request = {**self.request, "model": "selected-request-model"}
+        argv = R.learner_command(self.root, self.run, request, self.config, planning=True)
+        disabled = [argv[index + 1] for index, arg in enumerate(argv[:-1]) if arg == "--disable"]
+        overrides = {}
+        for index, arg in enumerate(argv[:-1]):
+            if arg == "-c":
+                overrides.update(tomllib.loads(argv[index + 1]))
+        self.assertEqual(disabled.count("multi_agent"), 1)
+        self.assertEqual(disabled.count("multi_agent_v2"), 1)
+        self.assertNotIn("--enable", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "selected-request-model")
+        self.assertEqual(overrides["model_reasoning_effort"], "ultra")
+        self.assertIn("--ignore-user-config", argv)
+        self.assertIn("--ephemeral", argv)
+        self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
+        self.assertEqual(set(overrides["mcp_servers"]), {"memory"})
+        self.assertEqual(set(overrides["mcp_servers"]["memory"]["enabled_tools"]), M.READ_TOOLS)
+        transport = json.loads((self.run / "transport.json").read_text())
+        self.assertEqual((transport["max_tool_calls"], transport["max_writes"]), (4, 2))
+        R.subprocess.Popen.assert_not_called()
+
+    def test_completed_turn_with_failed_proposal_cannot_authorize_memory_operations(self):
+        self.proposal = {"schema_version": 1, "outcome": "failed",
+                         "summary": "A tool error interrupted the review.", "operations": []}
+        result = self.invoke()
+        self.assertTrue(result["turn_completed"])
+        self.assertEqual(result["returncode"], 0)
+        self.assertEqual(result["successful_recalls"], 1)
+        self.assertEqual(result["tool_errors"], 0)
+        self.assertEqual((result["status"], result["reason"]), ("failed", "unverified_completion"))
+        self.assertEqual((result["write_calls"], result["writes"]), (0, []))
+        with self.assertRaisesRegex(ValueError, "proposal_failed"):
+            L.seal_plan(self.run, verify_fence=self.fence.verify, validate_inputs=lambda *args: True)
+        settled = R.settlement._compute(self.run, self.manifest, self.context.manifest_sha256)
+        self.assertEqual((settled["status"], settled["reason"]), ("failed", "planning_not_complete"))
+        self.assertFalse(list(self.run.glob("operation-*")))
 
     def test_new_manifest_selects_project_prompt_schema_and_preserves_false(self):
         # Construct a fresh manifest before provider dispatch; never migrate one.
