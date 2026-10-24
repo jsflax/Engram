@@ -4,6 +4,17 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.26] - 2026-10-24
+
+### Fixed
+
+- Reuse unchanged project and topic mappings during graph edge updates, reducing
+  repeated layout preparation while keeping springs and moving group centers current.
+- Use measured CPU availability and memory pressure for background learning on
+  macOS, allowing work when capacity is available despite a high load average.
+- Recheck admission after sampling without holding learner locks; preserve
+  existing cooldowns, concurrency limits, retry windows, and pending work.
+
 ## [0.15.25] - 2026-10-24
 
 ### Fixed
