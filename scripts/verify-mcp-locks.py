@@ -815,6 +815,14 @@ def run(binary, case, migration_binary=None):
             tools = client.response(client.send("tools/list"))["tools"]
             assert any(tool["name"] == "recall" for tool in tools)
             print(json.dumps({"initialize_seconds": elapsed, "tools": len(tools)}), flush=True)
+            if case == "smoke":
+                assert any(tool["name"] == "runtime_info" for tool in tools)
+                diagnostic = client.call("runtime_info", {})
+                blocks = diagnostic["content"]
+                assert len(blocks) == 1 and blocks[0]["type"] == "text", diagnostic
+                runtime = json.loads(blocks[0]["text"])
+                assert type(runtime.get("pid")) is int and runtime == {"pid": client.process.pid}, runtime
+                print(json.dumps({"runtime_info_matches_serving_child": True}), flush=True)
             arguments = {"query": "isolated database contention regression",
                          "project": "LockRegression", "limit": 1, "depth": 0}
             client.call("remember", {"content": "Isolated database contention regression fixture.",

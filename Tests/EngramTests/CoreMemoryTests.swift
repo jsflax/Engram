@@ -400,12 +400,12 @@ import Foundation
 
 // MARK: - Tool Definitions
 
-@Test func definitions_hasTwentyTools() async throws {
+@Test func definitions_hasExpectedTools() async throws {
     let tools = try await makeTools()
     let defs = await tools.definitions
-    #expect(defs.count == 24)
+    #expect(defs.count == 25)
     let names = defs.map(\.name).sorted()
-    #expect(names == ["begin_episode", "checkpoint", "connect", "consolidate", "detect_communities", "disconnect", "end_episode", "find_clusters", "forget", "graph", "list_episodes", "list_tasks", "list_topics", "merge", "organize", "recall", "recall_episode", "remember", "resume", "stats", "timeline", "train_vectors", "update", "vacuum"])
+    #expect(names == ["begin_episode", "checkpoint", "connect", "consolidate", "detect_communities", "disconnect", "end_episode", "find_clusters", "forget", "graph", "list_episodes", "list_tasks", "list_topics", "merge", "organize", "recall", "recall_episode", "remember", "resume", "runtime_info", "stats", "timeline", "train_vectors", "update", "vacuum"])
 }
 
 // MARK: - Remember with force creates new
