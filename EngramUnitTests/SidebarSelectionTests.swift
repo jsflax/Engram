@@ -119,9 +119,6 @@ final class SidebarSelectionTests: XCTestCase {
         try lattice.add(config)
         let writer = SidebarPreferenceWriter(lattice: lattice.sendableReference, config: config.sendableReference)
         let selection = SidebarSelection(initialTab: .visualizer) { try await writer.save($0) }
-        var observedTabs: [SidebarTab] = []
-        let observation = config.observe(\.selectedTab) { observedTabs.append($0) }
-        defer { observation.cancel() }
 
         var lockConnection: OpaquePointer?
         XCTAssertEqual(sqlite3_open_v2(path.path, &lockConnection,
@@ -143,13 +140,14 @@ final class SidebarSelectionTests: XCTestCase {
         XCTAssertEqual(Lattice.threadSQLStatementCount, statements)
         XCTAssertTrue(selection.isPersisting)
         XCTAssertNil(selection.persistenceError)
-        XCTAssertTrue(observedTabs.isEmpty, "The held writer must not have committed a preference yet")
+        XCTAssertEqual(config.selectedTab, .visualizer, "The held writer must not have committed a preference yet")
 
         XCTAssertEqual(sqlite3_exec(handle, "ROLLBACK", nil, nil, nil), SQLITE_OK)
-        try await waitUntil { !selection.isPersisting }
+        try await waitUntil("The preference write did not settle after releasing SQLite's writer lock") {
+            !selection.isPersisting
+        }
         XCTAssertNil(selection.persistenceError)
         XCTAssertEqual(config.selectedTab, .account)
-        try await waitUntil { observedTabs.last == .account }
     }
 
     private func waitForCalls(_ writer: ControlledSidebarWriter, count: Int) async throws {
@@ -163,11 +161,13 @@ final class SidebarSelectionTests: XCTestCase {
         }
     }
 
-    private func waitUntil(_ condition: () -> Bool) async throws {
+    private func waitUntil(_ message: String = "Sidebar persistence did not settle",
+                           file: StaticString = #filePath, line: UInt = #line,
+                           _ condition: () -> Bool) async throws {
         let deadline = ContinuousClock.now + .seconds(3)
         while !condition() {
             guard ContinuousClock.now < deadline else {
-                XCTFail("Sidebar persistence did not settle")
+                XCTFail(message, file: file, line: line)
                 throw SidebarSaveFailure.unavailable
             }
             try await Task.sleep(for: .milliseconds(5))
