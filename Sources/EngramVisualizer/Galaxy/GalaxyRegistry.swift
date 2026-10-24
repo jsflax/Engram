@@ -82,7 +82,8 @@ final class GalaxyRegistry {
     // multi-galaxy merge. Unrelated certified node appends cannot reveal them.
     @ObservationIgnored private var missingEdgeEndpoints: Set<UUID> = []
     // Includes hidden/dangling winners: precedence is resolved BEFORE filters.
-    @ObservationIgnored private var winningEdgeIDs: Set<UUID> = []
+    @ObservationIgnored private var winningEdgeOwners: [UUID: String] = [:]
+    @ObservationIgnored private var mergedEdgeEnds: [String: Int] = [:]
     @ObservationIgnored private var mergedNodeEnds: [String: Int] = [:]
     @ObservationIgnored private var lastMergedNodeCount = 0
     @ObservationIgnored private var previousNodeVersion: UInt64 = 0
@@ -369,17 +370,16 @@ final class GalaxyRegistry {
         } else {
             edgesChanged = edgeInputsChanged || (ordered.count > 1 && nodesChanged)
         }
-        // Only the lowest-precedence source can extend the published tail.
-        // Earlier sources might insert in the middle or replace an old winner.
-        // Keep the published order explicitly: a Dictionary may reorder on insert.
-        let canAppendEdgeTail = ordered.count > 1 && !identitiesChanged
+        // Journals certify new IDs in any source, not Dictionary iteration order.
+        // The insertion merge checks ownership before retaining old segments;
+        // a new higher-priority winner still requires the complete merge.
+        let canMergeInsertedEdges = ordered.count > 1 && !identitiesChanged
             && hiddenRelations == lastHiddenRelations && appendOnly && !revealsMissingEndpoint
-            && ordered.enumerated().allSatisfy { index, galaxy in
+            && ordered.allSatisfy { galaxy in
                 guard let old = previous[galaxy.id] else { return false }
                 let store = galaxy.renderStore
                 return old.edgeInsertionGeneration == store.edgeInsertionGeneration
                     && old.insertedEdgeCount <= store.insertedEdgeIDs.count
-                    && (index == ordered.count - 1 || old.allEdges == store.allEdgesVersion)
             }
         // Access-only lookup changes and singleton hidden-edge bookkeeping do
         // not publish new render inputs. Explicit topology/status and layout
@@ -478,20 +478,20 @@ final class GalaxyRegistry {
             mergedColorMapVersion &+= 1
         }
         if edgesChanged {
-            if canAppendEdgeTail, let last = ordered.last, let old = previous[last.id] {
-                edgeTailMergeCount &+= 1
-                for id in last.renderStore.insertedEdgeIDs.dropFirst(old.insertedEdgeCount) {
-                    if let edge = last.renderStore.allEdges[id] { mergeEdge(edge, id: id) }
-                }
+            if canMergeInsertedEdges, mergeInsertedEdges(ordered, previous: previous) {
+                // Source-local arrivals preserve the previously published order
+                // within each retained segment, even if its Dictionary rehashed.
             } else {
                 mergedEdgeAppendGeneration &+= 1
                 missingEdgeEndpoints.removeAll(keepingCapacity: true)
-                winningEdgeIDs.removeAll(keepingCapacity: true)
+                winningEdgeOwners.removeAll(keepingCapacity: true)
+                mergedEdgeEnds.removeAll(keepingCapacity: true)
                 if let only = ordered.first, ordered.count == 1 { mergedEdges = only.renderStore.edges }
                 else {
                     mergedEdges.removeAll(keepingCapacity: true)
                     for galaxy in ordered {
-                        for (id, edge) in galaxy.renderStore.allEdges { mergeEdge(edge, id: id) }
+                        for (id, edge) in galaxy.renderStore.allEdges { mergeEdge(edge, id: id, owner: galaxy.id) }
+                        mergedEdgeEnds[galaxy.id] = mergedEdges.count
                     }
                 }
             }
@@ -526,16 +526,83 @@ final class GalaxyRegistry {
         }
     }
 
-    private func mergeEdge(_ edge: EdgeData, id: UUID) {
+    private func mergeEdge(_ edge: EdgeData, id: UUID, owner: String) {
         edgeMergeVisitCount &+= 1
-        guard winningEdgeIDs.insert(id).inserted,
-              !hiddenRelations.contains(edge.relation) else { return }
+        guard winningEdgeOwners[id] == nil else { return }
+        winningEdgeOwners[id] = owner
+        guard !hiddenRelations.contains(edge.relation) else { return }
         let sourceVisible = nodeToGalaxy[edge.sourceId] != nil
         let targetVisible = nodeToGalaxy[edge.targetId] != nil
         if !sourceVisible { missingEdgeEndpoints.insert(edge.sourceId) }
         if !targetVisible { missingEdgeEndpoints.insert(edge.targetId) }
         guard sourceVisible, targetVisible else { return }
         mergedEdges.append(edge)
+    }
+
+    /// Inspect only journal suffixes, retaining each source's published segment.
+    /// Ownership includes filtered winners, so a hidden or dangling edge cannot
+    /// accidentally yield to a lower-priority visible copy. A takeover falls back
+    /// before any ownership, missing-endpoint or published-array mutation.
+    private func mergeInsertedEdges(_ ordered: [Galaxy], previous: [String: RenderRevision]) -> Bool {
+        let ranks = Dictionary(uniqueKeysWithValues: ordered.enumerated().map { ($0.element.id, $0.offset) })
+        var appended = [[EdgeData]](repeating: [], count: ordered.count)
+        var newOwners: [UUID: String] = [:]
+        var newMissingEndpoints: Set<UUID> = []
+        for (rank, galaxy) in ordered.enumerated() {
+            guard let old = previous[galaxy.id] else { return false }
+            for id in galaxy.renderStore.insertedEdgeIDs.dropFirst(old.insertedEdgeCount) {
+                edgeMergeVisitCount &+= 1
+                guard let edge = galaxy.renderStore.allEdges[id] else { return false }
+                if let owner = winningEdgeOwners[id] {
+                    guard let oldRank = ranks[owner], oldRank <= rank else { return false }
+                    continue
+                }
+                guard newOwners[id] == nil else { continue }
+                newOwners[id] = galaxy.id
+                guard !hiddenRelations.contains(edge.relation) else { continue }
+                let sourceVisible = nodeToGalaxy[edge.sourceId] != nil
+                let targetVisible = nodeToGalaxy[edge.targetId] != nil
+                if !sourceVisible { newMissingEndpoints.insert(edge.sourceId) }
+                if !targetVisible { newMissingEndpoints.insert(edge.targetId) }
+                if sourceVisible && targetVisible { appended[rank].append(edge) }
+            }
+        }
+        var oldEnd = 0
+        var newEnd = 0
+        var oldEnds: [Int] = []
+        var ends: [String: Int] = [:]
+        var preservesExistingIndices = true
+        for (index, galaxy) in ordered.enumerated() {
+            guard let end = mergedEdgeEnds[galaxy.id], end >= oldEnd, end <= mergedEdges.count else { return false }
+            oldEnds.append(end)
+            if end > oldEnd && newEnd != oldEnd { preservesExistingIndices = false }
+            newEnd += end - oldEnd + appended[index].count
+            ends[galaxy.id] = newEnd
+            oldEnd = end
+        }
+        guard oldEnd == mergedEdges.count else { return false }
+        if preservesExistingIndices {
+            // Empty later segments do not turn a real tail append into an
+            // interior insertion. Consumers may keep their old edge indices.
+            for additions in appended { mergedEdges.append(contentsOf: additions) }
+            edgeTailMergeCount &+= 1
+        } else {
+            var edges: [EdgeData] = []
+            edges.reserveCapacity(newEnd)
+            oldEnd = 0
+            for index in ordered.indices {
+                let end = oldEnds[index]
+                edges.append(contentsOf: mergedEdges[oldEnd..<end])
+                edges.append(contentsOf: appended[index])
+                oldEnd = end
+            }
+            mergedEdges = edges
+            mergedEdgeAppendGeneration &+= 1
+        }
+        for (id, owner) in newOwners { winningEdgeOwners[id] = owner }
+        missingEdgeEndpoints.formUnion(newMissingEndpoints)
+        mergedEdgeEnds = ends
+        return true
     }
 
     /// Preserve unchanged galaxy segments through insertion-only loading.
