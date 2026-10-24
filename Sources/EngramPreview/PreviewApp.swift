@@ -19,8 +19,8 @@ struct EngramPreviewApp: App {
                     options: .userInitiatedAllowingIdleSystemSleep,
                     reason: "Measure Engram preview rendering performance")
             }
-            // ENGRAM_GPU_LOG=<path> — per-frame GPU timing + charge algorithm
-            // (GPULog.configure has no other caller since the refactor).
+            // ENGRAM_GPU_LOG=<path> opts into the same per-dispatch diagnostics
+            // configured by EngramApp in the ordinary visualizer.
             if let gpuLogPath = ProcessInfo.processInfo.environment["ENGRAM_GPU_LOG"] {
                 GPULog.configure(path: gpuLogPath)
             }

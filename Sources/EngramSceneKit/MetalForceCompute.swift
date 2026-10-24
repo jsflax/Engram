@@ -75,19 +75,27 @@ public final class MetalForceCompute: @unchecked Sendable {
     public var isFullSimAvailable: Bool { springPipeline != nil }
 
     /// Initialize with an external device and library.
-    public init?(device: MTLDevice, library: MTLLibrary) {
+    public convenience init?(device: MTLDevice, library: MTLLibrary) {
+        self.init(device: device, library: library,
+                  makePipeline: { try? device.makeComputePipelineState(function: $0) })
+    }
+
+    // Tests can model an unavailable optional BH pipeline while retaining the
+    // actual packaged charge/structural kernels and unchanged fallback policy.
+    init?(device: MTLDevice, library: MTLLibrary,
+          makePipeline: (MTLFunction) -> MTLComputePipelineState?) {
         guard let chargeFn = library.makeFunction(name: "compute_charge_forces"),
-              let chargePL = try? device.makeComputePipelineState(function: chargeFn)
+              let chargePL = makePipeline(chargeFn)
         else { return nil }
 
         self.device = device
         self.chargePipeline = chargePL
 
         if let fn = library.makeFunction(name: "compute_spring_and_structural") {
-            springPipeline = try? device.makeComputePipelineState(function: fn)
+            springPipeline = makePipeline(fn)
         }
         if let fn = library.makeFunction(name: "compute_charge_forces_bh") {
-            bhChargePipeline = try? device.makeComputePipelineState(function: fn)
+            bhChargePipeline = makePipeline(fn)
         }
     }
 
@@ -434,6 +442,7 @@ public final class MetalForceCompute: @unchecked Sendable {
 
     /// Encode all 2 force compute passes into a compute encoder.
     /// (Charge + Spring+Structural. Integration is encoded separately by GPUSimulationState.)
+    @discardableResult
     public func encodeForces(
         encoder: MTLComputeCommandEncoder,
         x: [Float], y: [Float], z: [Float],
@@ -445,12 +454,14 @@ public final class MetalForceCompute: @unchecked Sendable {
         cohesionStrength: Float, centroidRepulsion: Float,
         topicCohesionStrength: Float, topicCentroidRepulsion: Float,
         centerStrength: Float,
-        alpha: Float, damping: Float, maxSpeed: Float
-    ) {
+        alpha: Float, damping: Float, maxSpeed: Float,
+        recordDiagnostics: Bool = false
+    ) -> GPULog.ForceMetadata? {
         let n = x.count
+        var diagnostics = recordDiagnostics ? GPULog.ForceMetadata(nodes: n) : nil
         guard n > 1, isFullSimAvailable else {
             GPULog.log("ENCODE SKIP n=\(n) ready=\(isFullSimAvailable)")
-            return
+            return diagnostics
         }
 
         ensureNodeCapacity(n)
@@ -461,7 +472,7 @@ public final class MetalForceCompute: @unchecked Sendable {
 
         // Upload positions to GPU
         guard let posBuf = positionBuffer, let forceBuf = forceBuffer,
-              let grpBuf = groupBuffer else { return }
+              let grpBuf = groupBuffer else { return diagnostics }
 
         let posPtr = posBuf.contents().bindMemory(to: SIMD3<Float>.self, capacity: n)
         for i in 0..<n {
@@ -490,6 +501,10 @@ public final class MetalForceCompute: @unchecked Sendable {
         }
         let numProjects = cachedNumProjects
         let numTopics = cachedNumTopics
+        diagnostics?.csrEdges = csrEdgeCount
+        diagnostics?.projects = numProjects
+        diagnostics?.topics = numTopics
+        diagnostics?.galaxies = numGalaxies
 
         // Update centroids every 10 ticks (matches JS)
         if tickCount % 10 == 0 || tickCount <= 1 {
@@ -571,6 +586,8 @@ public final class MetalForceCompute: @unchecked Sendable {
                 let chargeTg = min(Int(bhPL.maxTotalThreadsPerThreadgroup), tgSize)
                 encoder.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
                                        threadsPerThreadgroup: MTLSize(width: chargeTg, height: 1, depth: 1))
+                diagnostics?.charge = .barnesHut
+                diagnostics?.treeNodes = treeCount
                 encoder.memoryBarrier(scope: .buffers)
             }
         } else {
@@ -596,6 +613,7 @@ public final class MetalForceCompute: @unchecked Sendable {
             let chargeTg = min(Int(chargePipeline.maxTotalThreadsPerThreadgroup), tgSize)
             encoder.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
                                    threadsPerThreadgroup: MTLSize(width: chargeTg, height: 1, depth: 1))
+            diagnostics?.charge = .bruteForce
             encoder.memoryBarrier(scope: .buffers)
         }
 
@@ -604,7 +622,7 @@ public final class MetalForceCompute: @unchecked Sendable {
               let eBuf = edgeBuffer, let erBuf = edgeRangeBuffer,
               let cBuf = centroidBuffer, let cmBuf = centroidMappingBuffer,
               let spBuf = springParamsBuffer, let gmBuf = groupMetadataBuffer,
-              let rBuf = refRadiusBuffer else { return }
+              let rBuf = refRadiusBuffer else { return diagnostics }
 
         spBuf.contents().bindMemory(to: SpringParams.self, capacity: 1).pointee = SpringParams(
             nodeCount: UInt32(n),
@@ -638,9 +656,11 @@ public final class MetalForceCompute: @unchecked Sendable {
         let springTg = min(Int(springPL.maxTotalThreadsPerThreadgroup), tgSize)
         encoder.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: springTg, height: 1, depth: 1))
+        diagnostics?.structural = true
         encoder.memoryBarrier(scope: .buffers)
 
         GPULog.log("ENCODE END n=\(n) algo=\(lastChargeAlgorithm)")
+        return diagnostics
     }
 
     // MARK: - Force Buffer Access
