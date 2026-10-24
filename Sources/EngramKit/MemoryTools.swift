@@ -12,6 +12,7 @@ import Foundation
 /// - **list_topics**: List all memory topics with counts, optionally filtered by project.
 /// - **update**: Edit existing memories by ID or similarity.
 /// - **stats**: Overview of the memory database.
+/// - **runtime_info**: PID of the process serving this tool request.
 /// - **merge**: Consolidate multiple memories into one (cleans up source edges).
 /// - **connect**: Create a directed edge between two memories.
 /// - **disconnect**: Remove edges by ID or by (from, to) pair.
@@ -618,6 +619,16 @@ public actor MemoryTools {
 
     public var definitions: [Tool] {
         [
+            Tool(
+                name: "runtime_info",
+                description: "Return the serving Engram process PID as JSON for host-local process inspection. Does not read memory storage.",
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([:]),
+                    "additionalProperties": .bool(false),
+                ]),
+                annotations: .init(readOnlyHint: true)
+            ),
             Tool(
                 name: "remember",
                 description: """
@@ -1337,6 +1348,17 @@ public actor MemoryTools {
     // MARK: - Dispatch
 
     public func handle(_ params: CallTool.Parameters) async throws -> CallTool.Result {
+        // This process diagnostic must not open storage, retire database read
+        // marks, or write the ordinary tool-call log.
+        if params.name == "runtime_info" {
+            guard params.arguments?.isEmpty != false else {
+                throw MCPError.invalidParams("runtime_info takes no arguments.")
+            }
+            return CallTool.Result(
+                content: [.text("{\"pid\":\(ProcessInfo.processInfo.processIdentifier)}")],
+                isError: false
+            )
+        }
         log("Tool call: \(params.name)")
         // Release WAL read marks after EVERY tool call (H2.2, Aug 2026
         // incident): an MCP process that answered one call and then sat
