@@ -1,0 +1,62 @@
+name: Slack release announcement
+
+on:
+  # Release jobs call this directly: GITHUB_TOKEN publications do not emit a
+  # second workflow run. The event also covers releases published by a person.
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing published release tag to announce or retry'
+        required: true
+        type: string
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Shared across direct calls, manual retries, and publication events.
+    concurrency:
+      group: slack-release-${{ inputs.tag || github.event.release.tag_name }}
+      cancel-in-progress: false
+    steps:
+      - name: Fetch notification source into owned localdev directory
+        shell: bash
+        env:
+          SOURCE_REF: main
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          NOTIFY_ROOT="$HOME/localdev/slack-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          test ! -e "$NOTIFY_ROOT"
+          mkdir -p "$NOTIFY_ROOT/tmp"
+          {
+            echo "NOTIFY_ROOT=$NOTIFY_ROOT"
+            echo "TMPDIR=$NOTIFY_ROOT/tmp"
+            echo "TMP=$NOTIFY_ROOT/tmp"
+            echo "TEMP=$NOTIFY_ROOT/tmp"
+          } >> "$GITHUB_ENV"
+          git init "$NOTIFY_ROOT/source"
+          git -C "$NOTIFY_ROOT/source" sparse-checkout set .github/scripts
+          git -C "$NOTIFY_ROOT/source" fetch --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$SOURCE_REF"
+          git -C "$NOTIFY_ROOT/source" checkout --detach FETCH_HEAD
+      - name: Announce published release
+        working-directory: ${{ env.NOTIFY_ROOT }}/source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: python3 -B .github/scripts/notify_slack_release.py --tag "$RELEASE_TAG"

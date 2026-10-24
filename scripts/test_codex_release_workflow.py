@@ -999,10 +999,53 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
 
     def test_slack_dispatch_announces_publication_and_checks_acknowledgment(self):
         workflow = (ROOT / '.github/workflows/release.yml').read_text()
-        step = workflow.split('      - name: Notify Slack\n', 1)[1].split('\n      - ', 1)[0]
-        self.assertIn("steps.publish.outcome == 'success'", step)
-        self.assertNotIn("github.event_name", step)
+        build = workflow.split('\n  build:\n', 1)[1].split('\n  notify-slack:\n', 1)[0]
+        self.assertIn('      release_published: ${{ steps.publish.outcome }}', build)
+        job = workflow.split('\n  notify-slack:\n', 1)[1]
+        self.assertIn('    needs: [preflight, build]', job)
+        # Gate on the publication step, not the entire build job: a later
+        # appcast/tap failure must still announce the release that exists.
+        self.assertIn("if: ${{ !cancelled() && needs.build.outputs.release_published == 'success' }}", job)
+        self.assertNotIn('needs.build.result', job)
+        self.assertNotIn('success()', job)
+        self.assertNotIn('github.event_name', job)
+        self.assertIn('    uses: ./.github/workflows/slack-release.yml', job)
+        self.assertIn('      tag: ${{ needs.preflight.outputs.tag }}', job)
+        self.assertIn('      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}', job)
+        self.assertIn('      contents: read', job)
+        self.assertIn('      statuses: write', job)
         self.assertIn("SWIFTLM SLACK; do", workflow)
+        reusable = (ROOT / '.github/workflows/slack-release.yml').read_text()
+        self.assertIn('  workflow_call:', reusable)
+        self.assertIn('  workflow_dispatch:', reusable)
+        self.assertIn('    types: [published]', reusable)
+        step = step_section('slack-release.yml', 'Announce published release')
+        self.assertIn('SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}', step)
+        self.assertIn('RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}', step)
+        self.assertEqual(run_block('slack-release.yml', 'Announce published release'),
+                         'python3 -B .github/scripts/notify_slack_release.py --tag "$RELEASE_TAG"\n')
+
+        # Exercise the actual Python delivery path now used by the workflow.
+        # These focused tests mock HTTP and require exactly HTTP 200 + b'ok',
+        # reject unpublished releases, and preserve uncertain-delivery receipts.
+        tests = [
+            'test_delivers_published_body_and_records_receipts_in_order',
+            'test_all_repository_products_and_icons',
+            'test_refuses_draft_or_unpublished_release',
+            'test_requires_exact_slack_acknowledgement',
+            'test_ambiguous_network_or_server_error_never_retries',
+            'test_cli_failure_contains_no_credentials',
+        ]
+        result = subprocess.run(
+            [sys.executable, '-B', '-m', 'unittest', '-v',
+             *('test_notify_slack_release.NotifyReleaseTests.' + name for name in tests)],
+            cwd=ROOT / '.github/scripts/tests', capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_slack_failure_notifier_checks_http_and_acknowledgment(self):
+        step = step_section('release.yml', 'Notify Slack (failure)')
+        self.assertIn("failure() && steps.publish.outcome != 'success'", step)
+        self.assertIn("env.SLACK_WEBHOOK_URL != ''", step)
         with tempfile.TemporaryDirectory(prefix='engram-slack-') as temporary:
             root = Path(temporary)
             bin_dir = root / 'bin'
@@ -1021,8 +1064,10 @@ sys.exit(int(os.environ.get('FAKE_EXIT','0')))
             command.write_text(fake)
             command.chmod(0o755)
             log = root / 'payload.json'
-            (root / 'CHANGELOG.md').write_text('## [0.14.9]\n### Fixed\n- A "quoted" fix\n## [0.14.8]\n- Old\n')
-            block = run_block('release.yml', 'Notify Slack').replace('${{ github.repository }}', 'owner/Engram')
+            block = (run_block('release.yml', 'Notify Slack (failure)')
+                     .replace('${{ github.server_url }}', 'https://github.com')
+                     .replace('${{ github.repository }}', 'owner/Engram')
+                     .replace('${{ github.run_id }}', '12345'))
             env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
                        RELEASE_TAG='v0.14.9', SLACK_WEBHOOK_URL='https://example.invalid/webhook')
             for ack, exit_code, expected in [('ok', '0', 0), ('invalid_payload', '0', 1), ('ok', '22', 22)]:
@@ -1032,11 +1077,8 @@ sys.exit(int(os.environ.get('FAKE_EXIT','0')))
                                             capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
             payload = json.loads(log.read_text())
-            self.assertIn('v0.14.9', payload['blocks'][0]['text']['text'])
-            self.assertEqual(payload['blocks'][1]['accessory']['url'],
-                             'https://github.com/owner/Engram/releases/tag/v0.14.9')
-            self.assertIn('A "quoted" fix', payload['blocks'][1]['text']['text'])
-            self.assertNotIn('Old', payload['blocks'][1]['text']['text'])
+            self.assertEqual(payload['text'],
+                             '❌ Engram v0.14.9 release FAILED — https://github.com/owner/Engram/actions/runs/12345')
 
 
 if __name__ == '__main__':
