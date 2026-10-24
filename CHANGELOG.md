@@ -4,6 +4,22 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.22] - 2026-10-24
+
+### Fixed
+
+- Reuse unchanged edge endpoint/project lookups and GPU tree uploads as large
+  graphs update. Current positions, duplicate precedence, colors and physics
+  cadence remain unchanged.
+- Prevent cleanup failures from hiding the original advice error or leaving
+  success bookkeeping; expose both failure causes in hook status.
+
+### Added
+
+- Add the `runtime_info` MCP tool to identify the process serving the current
+  connection, making it easier to check which running Engram instance a
+  session is using.
+
 ## [0.15.21] - 2026-10-24
 
 ### Fixed
