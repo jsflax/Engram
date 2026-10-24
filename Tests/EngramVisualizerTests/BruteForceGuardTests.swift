@@ -49,7 +49,7 @@ struct BruteForceGuardTests {
 
     // MARK: - Brute force guard at scale
 
-    @Test("dispatchForces at 8K nodes: brute force must NOT fire")
+    @Test
     @MainActor func testBruteForceGuard8K() async throws {
         let device = try #require(Self.device)
         let library = try EngramMetalShaders.makeLibrary(device: device)
@@ -108,7 +108,7 @@ struct BruteForceGuardTests {
 
     // MARK: - Brute force IS allowed for small n
 
-    @Test("dispatchForces at 1K nodes uses real brute fallback when BH is unavailable")
+    @Test
     @MainActor func testBruteForceAllowed1K() async throws {
         let device = try #require(Self.device)
         let library = try EngramMetalShaders.makeLibrary(device: device)

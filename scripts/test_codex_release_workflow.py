@@ -670,7 +670,7 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
         charge_names = ['testBruteForceGuard8K', 'testBruteForceAllowed1K']
         charge_source = (ROOT / 'Tests/EngramVisualizerTests/BruteForceGuardTests.swift').read_text()
         for method in charge_names:
-            self.assertRegex(charge_source, r'@Test\([^\n]+\)\s+@MainActor\s+func ' + method + r'\(\)')
+            self.assertRegex(charge_source, r'@Test\s+@MainActor\s+func ' + method + r'\(\)')
         names += charge_names
         selected = '|'.join(names)
         for workflow in ('native-validation.yml', 'release.yml'):
