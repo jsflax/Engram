@@ -2,8 +2,8 @@ import Foundation
 import EngramSceneKit
 
 /// Maintains flat edge endpoints while a graph arrives in batches. Provider
-/// revisions and certified edge tails avoid rechecking retained rows; other changed prefixes and
-/// callers without continuity still receive the compact-key validation.
+/// revisions and certified insertions avoid rechecking retained rows. Other
+/// changed prefixes and callers without continuity receive compact-key validation.
 /// Keep compact keys rather than retaining the provider arrays: a retained
 /// snapshot would force those arrays to copy on their next append.
 struct EdgeEndpointIndexCache {
@@ -43,7 +43,8 @@ struct EdgeEndpointIndexCache {
         nodes: [RKNodeSnapshot], edges: [RKEdgeSnapshot],
         provider: AnyObject? = nil, nodeVersion: UInt64? = nil,
         edgeVersion: UInt64? = nil, nodeAppendGeneration: UInt64? = nil,
-        nodeInsertionReuse: NodeInsertionReuse? = nil, edgeAppendGeneration: UInt64? = nil
+        nodeInsertionReuse: NodeInsertionReuse? = nil, edgeAppendGeneration: UInt64? = nil,
+        edgeInsertionReuse: EdgeInsertionReuse? = nil
     ) -> UpdateKind {
         let sameProvider = provider != nil && cachedProvider === provider
         let unchangedNodes = sameProvider && nodeVersion != nil
@@ -54,6 +55,39 @@ struct EdgeEndpointIndexCache {
             && cachedEdgeVersion == edgeVersion && edges.count == edgeKeys.count
         let certifiedEdgeAppend = sameProvider && edgeAppendGeneration != nil
             && cachedEdgeAppendGeneration == edgeAppendGeneration && edges.count >= edgeKeys.count
+        if unchangedNodes, nodeIndices.count == nodeIDs.count,
+           let fromVersion = cachedEdgeVersion, let toVersion = edgeVersion,
+           let reuse = edgeInsertionReuse,
+           reuse.matches(fromVersion: fromVersion, oldCount: edgeKeys.count,
+                         toVersion: toVersion, newCount: edges.count),
+           !reuse.preservesExistingIndices {
+            // An earlier galaxy can insert edges before another galaxy's
+            // retained segment. Copy compact retained rows, but read/hash only
+            // the newly inserted endpoints. A true tail keeps the cheaper
+            // append path below. Node changes and duplicate-node histories
+            // also use that existing path, including its winner policy.
+            var inserted: [Int: (key: EdgeKey, source: Int32, target: Int32)] = [:]
+            for range in reuse.insertedRanges {
+                for index in range {
+                    let key = EdgeKey(edges[index])
+                    edgeMetadataReadCount += 1
+                    inserted[index] = (key, nodeIndices[key.source] ?? -1, nodeIndices[key.target] ?? -1)
+                }
+            }
+            edgeKeys = reuse.remap(edgeKeys) { inserted[$0]!.key }!
+            sourceIndices = reuse.remap(sourceIndices) { inserted[$0]!.source }!
+            targetIndices = reuse.remap(targetIndices) { inserted[$0]!.target }!
+            unresolvedEdges = unresolvedEdges.map { reuse.newIndex(forOldIndex: $0)! }
+            // Repair order is immaterial: each unresolved entry writes only
+            // its own endpoint slots when a missing node arrives later.
+            for (index, row) in inserted where row.source < 0 || row.target < 0 {
+                unresolvedEdges.append(index)
+            }
+            cachedAppendGeneration = nodeAppendGeneration
+            cachedEdgeVersion = edgeVersion
+            cachedEdgeAppendGeneration = edgeAppendGeneration
+            return .appended
+        }
         if sameProvider, let fromVersion = cachedNodeVersion, let toVersion = nodeVersion,
            let reuse = nodeInsertionReuse,
            reuse.matches(fromVersion: fromVersion, oldCount: nodeIDs.count,
@@ -190,9 +224,13 @@ struct EdgeEndpointIndexCache {
         let reuse = cachedProvider === dataProvider ? cachedNodeVersion.flatMap {
             dataProvider.nodeInsertionReuse(since: $0, count: nodeIDs.count)
         } : nil
+        let edgeReuse = cachedProvider === dataProvider ? cachedEdgeVersion.flatMap {
+            dataProvider.edgeInsertionReuse(since: $0, count: edgeKeys.count)
+        } : nil
         return update(nodes: nodes, edges: edges, provider: dataProvider, nodeVersion: nodeVersion,
                       edgeVersion: edgeVersion, nodeAppendGeneration: nodeAppendGeneration,
-                      nodeInsertionReuse: reuse, edgeAppendGeneration: dataProvider.edgeAppendGeneration)
+                      nodeInsertionReuse: reuse, edgeAppendGeneration: dataProvider.edgeAppendGeneration,
+                      edgeInsertionReuse: edgeReuse)
     }
 
 }

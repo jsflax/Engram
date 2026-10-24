@@ -2352,6 +2352,8 @@ final class AdapterSnapshotTests: XCTestCase {
         let initialHigh = initial.filter { $0.relation == "high" }.map(\.id)
         let initialLow = initial.filter { $0.relation == "low" }.map(\.id)
         let visits = registry.edgeMergeVisitCount, generation = adapter.edgeAppendGeneration
+        let version = adapter.edgeVersion, builds = adapter.edgeSnapshotBuildCount
+        let comparisons = adapter.edgePrefixComparisonCount, copies = adapter.retainedEdgeSnapshotCopyCount
         let earlier = (0..<3).map { _ in
             EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "earlier")
         }
@@ -2361,14 +2363,32 @@ final class AdapterSnapshotTests: XCTestCase {
         group.applyLoadChunk(edges: [(129, earlier[0])], generation: groupGeneration)
         group.applyLoadChunk(edges: [(130, earlier[1]), (131, earlier[2])], generation: groupGeneration)
         personal.applyLoadChunk(edges: [(129, later)], generation: personalGeneration)
+        let moved = SIMD3<Float>(7, 8, 9)
+        registry.unifiedSimulation.setPosition(a.id, to: moved)
         adapter.tick(dt: 1 / 60)
         XCTAssertEqual(adapter.edges.map(\.id), initialHigh + earlier.map(\.id) + initialLow + [later.id])
         XCTAssertEqual(initial.map(\.id), initialHigh + initialLow, "Independent snapshots remain unchanged")
         XCTAssertEqual(registry.edgeMergeVisitCount - visits, 4, "Retained rows require no UUID rescan")
+        XCTAssertEqual(adapter.edgeSnapshotBuildCount - builds, 4, "Only inserted snapshots are constructed")
+        XCTAssertEqual(adapter.edgePrefixComparisonCount, comparisons)
+        XCTAssertEqual(adapter.retainedEdgeSnapshotCopyCount - copies, UInt64(initial.count))
+        let erased: any SceneDataProvider = adapter
+        let reuse = try XCTUnwrap(erased.edgeInsertionReuse(since: version, count: initial.count))
+        XCTAssertTrue(reuse.matches(fromVersion: version, oldCount: initial.count,
+                                   toVersion: adapter.edgeVersion, newCount: initial.count + 4))
+        XCTAssertEqual(reuse.retainedRanges, [
+            .init(oldRange: 0..<128, newStart: 0), .init(oldRange: 128..<256, newStart: 131)
+        ])
+        XCTAssertEqual(reuse.insertedRanges, [128..<131, 259..<260])
+        XCTAssertNil(erased.edgeInsertionReuse(since: version, count: initial.count - 1))
+        XCTAssertEqual(erased.position(for: a.id), moved, "Edge reuse does not freeze moving positions")
+        let movedIndex = try XCTUnwrap(adapter.nodes.firstIndex { $0.id == a.id })
+        XCTAssertEqual(adapter.positionArray[movedIndex], moved)
         XCTAssertNotEqual(adapter.edgeAppendGeneration, generation, "Interior insertion moves old edge indices")
         XCTAssertEqual(registry.edgeTailMergeCount, 0)
 
         let interiorGeneration = adapter.edgeAppendGeneration
+        let interiorVersion = adapter.edgeVersion
         let tail = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "tail")
         personal.applyLoadChunk(edges: [(130, tail)], generation: personalGeneration)
         adapter.tick(dt: 1 / 60)
@@ -2376,6 +2396,14 @@ final class AdapterSnapshotTests: XCTestCase {
         XCTAssertEqual(registry.edgeMergeVisitCount - visits, 5)
         XCTAssertEqual(adapter.edgeAppendGeneration, interiorGeneration)
         XCTAssertEqual(registry.edgeTailMergeCount, 1)
+        XCTAssertEqual(adapter.edgeSnapshotBuildCount - builds, 5)
+        XCTAssertEqual(adapter.edgePrefixComparisonCount, comparisons)
+        XCTAssertEqual(adapter.retainedEdgeSnapshotCopyCount - copies, UInt64(initial.count),
+                       "A true tail does not copy retained snapshots")
+        let tailReuse = try XCTUnwrap(erased.edgeInsertionReuse(since: interiorVersion, count: 260))
+        XCTAssertTrue(tailReuse.preservesExistingIndices)
+        XCTAssertNil(erased.edgeInsertionReuse(since: version, count: initial.count),
+                     "The descriptor covers one publication, not an accumulated history")
     }
 
     func testEarlierEdgeAppendWithEmptyTrailingSourcePreservesTailCertificate() async throws {
@@ -2389,6 +2417,7 @@ final class AdapterSnapshotTests: XCTestCase {
         group.applyLoadChunk(edges: [(1, first)], generation: groupGeneration)
         adapter.tick(dt: 1 / 60)
         let generation = adapter.edgeAppendGeneration, visits = registry.edgeMergeVisitCount
+        let version = adapter.edgeVersion, copies = adapter.retainedEdgeSnapshotCopyCount
         let next = EdgeData(id: UUID(), sourceId: b.id, targetId: a.id, relation: "next")
         group.applyLoadChunk(edges: [(2, next)], generation: groupGeneration)
         adapter.tick(dt: 1 / 60)
@@ -2396,6 +2425,10 @@ final class AdapterSnapshotTests: XCTestCase {
         XCTAssertEqual(registry.edgeMergeVisitCount - visits, 1)
         XCTAssertEqual(adapter.edgeAppendGeneration, generation)
         XCTAssertEqual(registry.edgeTailMergeCount, 1)
+        let reuse = try XCTUnwrap(adapter.edgeInsertionReuse(since: version, count: 1))
+        XCTAssertTrue(reuse.preservesExistingIndices)
+        XCTAssertEqual(reuse.insertedRanges, [1..<2])
+        XCTAssertEqual(adapter.retainedEdgeSnapshotCopyCount, copies)
     }
 
     func testSimultaneousEdgeDuplicatesKeepFilteredPrecedenceBeforeEndpointReveal() async throws {
@@ -2412,7 +2445,7 @@ final class AdapterSnapshotTests: XCTestCase {
         let dangling = EdgeData(id: UUID(), sourceId: a.id, targetId: missing.id, relation: "dangling")
         let winners = [visible, hidden, dangling]
         let lower = winners.map { EdgeData(id: $0.id, sourceId: b.id, targetId: a.id, relation: "lower") }
-        let visits = registry.edgeMergeVisitCount
+        let visits = registry.edgeMergeVisitCount, version = adapter.edgeVersion
         group.applyLoadChunk(edges: winners.enumerated().map { (Int64($0.offset + 1), $0.element) },
                              generation: groupGeneration)
         personal.applyLoadChunk(edges: lower.enumerated().map { (Int64($0.offset + 1), $0.element) },
@@ -2421,12 +2454,17 @@ final class AdapterSnapshotTests: XCTestCase {
         XCTAssertEqual(adapter.edges.map(\.id), [visible.id])
         XCTAssertEqual(adapter.edges.map(\.relation), ["winner"])
         XCTAssertEqual(registry.edgeMergeVisitCount - visits, 6)
+        let reuse = try XCTUnwrap(adapter.edgeInsertionReuse(since: version, count: 0))
+        XCTAssertEqual(reuse.insertedRanges, [0..<1], "Only the visible first-wins row is inserted")
         let generation = adapter.edgeAppendGeneration
+        let beforeReveal = adapter.edgeVersion
         personal.applyLoadChunk(nodes: [(2, missing)], generation: personalGeneration)
         adapter.tick(dt: 1 / 60)
         XCTAssertEqual(Set(adapter.edges.map(\.id)), [visible.id, dangling.id])
         XCTAssertFalse(adapter.edges.contains { $0.relation == "lower" })
         XCTAssertNotEqual(adapter.edgeAppendGeneration, generation)
+        XCTAssertNil(adapter.edgeInsertionReuse(since: beforeReveal, count: 1),
+                     "Endpoint revelation must use the full precedence merge")
         registry.hiddenRelations = []
         adapter.tick(dt: 1 / 60)
         XCTAssertEqual(Set(adapter.edges.map(\.id)), Set(winners.map(\.id)))
@@ -2473,6 +2511,7 @@ final class AdapterSnapshotTests: XCTestCase {
             personal.applyLoadChunk(edges: [(1, original)], generation: personalGeneration)
             adapter.tick(dt: 1 / 60)
             let generation = adapter.edgeAppendGeneration
+            let version = adapter.edgeVersion
             let extra = EdgeData(id: UUID(), sourceId: b.id, targetId: a.id, relation: "new")
             let edited = EdgeData(id: original.id, sourceId: c.id, targetId: a.id, relation: "edited")
             personal.applyLoadChunk(edges: [(2, extra)], generation: personalGeneration)
@@ -2514,7 +2553,103 @@ final class AdapterSnapshotTests: XCTestCase {
             XCTAssertEqual(adapter.edges.map(\.relation), expected.map(\.relation), "mode \(mode)")
             XCTAssertNotEqual(adapter.edgeAppendGeneration, generation, "mode \(mode)")
             XCTAssertEqual(registry.edgeTailMergeCount, 0, "mode \(mode)")
+            XCTAssertNil(adapter.edgeInsertionReuse(since: version, count: 1), "mode \(mode)")
         }
+    }
+
+    func testEdgeInsertionProofRejectsMissedPublicationsAndUnconsumedEdits() async throws {
+        let (lattice, registry, group, groupGeneration, personal, personalGeneration, adapter) =
+            try await crossGalaxyStreamingFixture()
+        defer { lattice.close() }
+        let a = node(), b = node()
+        group.applyLoadChunk(nodes: [(1, a)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: [(1, b)], generation: personalGeneration)
+        let first = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "first")
+        let low = EdgeData(id: UUID(), sourceId: b.id, targetId: a.id, relation: "low")
+        group.applyLoadChunk(edges: [(1, first)], generation: groupGeneration)
+        personal.applyLoadChunk(edges: [(1, low)], generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        let version = adapter.edgeVersion, builds = adapter.edgeSnapshotBuildCount
+        let comparisons = adapter.edgePrefixComparisonCount, copies = adapter.retainedEdgeSnapshotCopyCount
+        let second = EdgeData(id: UUID(), sourceId: b.id, targetId: a.id, relation: "second")
+        group.applyLoadChunk(edges: [(2, second)], generation: groupGeneration)
+        registry.mergeRenderData()
+        XCTAssertNotNil(registry.edgeInsertionReuse(since: version, count: 2))
+        XCTAssertNil(adapter.edgeInsertionReuse(since: version, count: 2),
+                     "The public snapshot has not consumed the registry publication")
+        let intermediateVersion = registry.mergedEdgesVersion
+        let third = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "third")
+        group.applyLoadChunk(edges: [(3, third)], generation: groupGeneration)
+        registry.mergeRenderData()
+        XCTAssertNil(registry.edgeInsertionReuse(since: version, count: 2))
+        XCTAssertNotNil(registry.edgeInsertionReuse(since: intermediateVersion, count: 3))
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), [first.id, second.id, third.id, low.id])
+        XCTAssertEqual(adapter.edgeSnapshotBuildCount - builds, 4, "Missed interior publications rebuild")
+        XCTAssertGreaterThan(adapter.edgePrefixComparisonCount, comparisons)
+        XCTAssertEqual(adapter.retainedEdgeSnapshotCopyCount, copies)
+
+        let beforeEdit = adapter.edgeVersion
+        let edited = EdgeData(id: first.id, sourceId: b.id, targetId: a.id, relation: "edited")
+        group.applyLoadChunk(edges: [(1, edited)], generation: groupGeneration)
+        registry.mergeRenderData()
+        XCTAssertNil(registry.edgeInsertionReuse(since: beforeEdit, count: 4))
+        let afterEdit = registry.mergedEdgesVersion
+        let tail = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "tail")
+        personal.applyLoadChunk(edges: [(2, tail)], generation: personalGeneration)
+        registry.mergeRenderData()
+        XCTAssertNotNil(registry.edgeInsertionReuse(since: afterEdit, count: 4))
+        XCTAssertNil(registry.edgeInsertionReuse(since: beforeEdit, count: 4))
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(adapter.edges.map(\.id), registry.mergedEdges.map(\.id))
+        XCTAssertEqual(adapter.edges.map(\.sourceId), registry.mergedEdges.map(\.sourceId))
+        XCTAssertEqual(adapter.edges.map(\.targetId), registry.mergedEdges.map(\.targetId))
+        XCTAssertEqual(adapter.edges.map(\.relation), registry.mergedEdges.map(\.relation))
+        XCTAssertEqual(adapter.retainedEdgeSnapshotCopyCount, copies)
+    }
+
+    func testEdgeInsertionProofSeparatesReplacementRegistryEpochs() async throws {
+        let (lattice, original, group, groupGeneration, personal, personalGeneration, adapter) =
+            try await crossGalaxyStreamingFixture()
+        defer { lattice.close() }
+        // Keep both registry identities alive while comparing equal local epochs.
+        let (otherLattice, replacement, otherGroup, otherGroupGeneration,
+             otherPersonal, otherPersonalGeneration, otherAdapter) = try await crossGalaxyStreamingFixture()
+        defer { otherLattice.close() }
+        let a = node(), b = node()
+        let first = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "first")
+        let low = EdgeData(id: UUID(), sourceId: b.id, targetId: a.id, relation: "low")
+        let inserted = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "inserted")
+        for (high, highGeneration, lowSource, lowGeneration, current) in [
+            (group, groupGeneration, personal, personalGeneration, adapter),
+            (otherGroup, otherGroupGeneration, otherPersonal, otherPersonalGeneration, otherAdapter)
+        ] {
+            high.applyLoadChunk(nodes: [(1, a)], generation: highGeneration)
+            lowSource.applyLoadChunk(nodes: [(1, b)], generation: lowGeneration)
+            high.applyLoadChunk(edges: [(1, first)], generation: highGeneration)
+            lowSource.applyLoadChunk(edges: [(1, low)], generation: lowGeneration)
+            current.tick(dt: 1 / 60)
+            high.applyLoadChunk(edges: [(2, inserted)], generation: highGeneration)
+            current.tick(dt: 1 / 60)
+        }
+        XCTAssertEqual(original.mergedEdgesVersion, replacement.mergedEdgesVersion)
+        let fromVersion = adapter.edgeVersion - 1, previousVersion = adapter.edgeVersion
+        let erased: any SceneDataProvider = adapter
+        XCTAssertNotNil(erased.edgeInsertionReuse(since: fromVersion, count: 2))
+        adapter.registry = replacement
+        XCTAssertNil(erased.edgeInsertionReuse(since: fromVersion, count: 2))
+        adapter.tick(dt: 1 / 60)
+        XCTAssertNotEqual(adapter.edgeVersion, previousVersion)
+        XCTAssertNil(erased.edgeInsertionReuse(since: fromVersion, count: 2))
+        let version = adapter.edgeVersion
+        let next = EdgeData(id: UUID(), sourceId: b.id, targetId: a.id, relation: "next")
+        otherGroup.applyLoadChunk(edges: [(3, next)], generation: otherGroupGeneration)
+        adapter.tick(dt: 1 / 60)
+        let reuse = try XCTUnwrap(erased.edgeInsertionReuse(since: version, count: 3))
+        XCTAssertTrue(reuse.matches(fromVersion: version, oldCount: 3,
+                                   toVersion: adapter.edgeVersion, newCount: 4))
+        XCTAssertEqual(reuse.insertedRanges, [2..<3])
+        XCTAssertEqual(adapter.edges.map(\.id), [first.id, inserted.id, next.id, low.id])
     }
 
     private func crossGalaxyStreamingFixture() async throws

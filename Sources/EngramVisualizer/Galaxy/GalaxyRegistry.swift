@@ -90,6 +90,7 @@ final class GalaxyRegistry {
     @ObservationIgnored private var previousNodeCount = 0
     @ObservationIgnored private var retainedNodePrefix: Int?
     @ObservationIgnored private var lastNodeInsertionReuse: NodeInsertionReuse?
+    @ObservationIgnored private var lastEdgeInsertionReuse: EdgeInsertionReuse?
     @ObservationIgnored private(set) var mergedTopologyVersion: UInt64 = 0
     @ObservationIgnored private(set) var mergedNodesVersion: UInt64 = 0
     @ObservationIgnored private(set) var mergedEdgesVersion: UInt64 = 0
@@ -117,6 +118,13 @@ final class GalaxyRegistry {
         guard let reuse = lastNodeInsertionReuse,
               reuse.matches(fromVersion: version, oldCount: count,
                             toVersion: mergedNodesVersion, newCount: mergedNodes.count) else { return nil }
+        return reuse
+    }
+
+    func edgeInsertionReuse(since version: UInt64, count: Int) -> EdgeInsertionReuse? {
+        guard let reuse = lastEdgeInsertionReuse,
+              reuse.matches(fromVersion: version, oldCount: count,
+                            toVersion: mergedEdgesVersion, newCount: mergedEdges.count) else { return nil }
         return reuse
     }
 
@@ -478,6 +486,7 @@ final class GalaxyRegistry {
             mergedColorMapVersion &+= 1
         }
         if edgesChanged {
+            lastEdgeInsertionReuse = nil
             if canMergeInsertedEdges, mergeInsertedEdges(ordered, previous: previous) {
                 // Source-local arrivals preserve the previously published order
                 // within each retained segment, even if its Dictionary rehashed.
@@ -571,17 +580,20 @@ final class GalaxyRegistry {
         var newEnd = 0
         var oldEnds: [Int] = []
         var ends: [String: Int] = [:]
-        var preservesExistingIndices = true
+        var ranges: [EdgeInsertionReuse.RetainedRange] = []
         for (index, galaxy) in ordered.enumerated() {
             guard let end = mergedEdgeEnds[galaxy.id], end >= oldEnd, end <= mergedEdges.count else { return false }
             oldEnds.append(end)
-            if end > oldEnd && newEnd != oldEnd { preservesExistingIndices = false }
+            if end > oldEnd { ranges.append(.init(oldRange: oldEnd..<end, newStart: newEnd)) }
             newEnd += end - oldEnd + appended[index].count
             ends[galaxy.id] = newEnd
             oldEnd = end
         }
-        guard oldEnd == mergedEdges.count else { return false }
-        if preservesExistingIndices {
+        guard oldEnd == mergedEdges.count,
+              let reuse = EdgeInsertionReuse(fromVersion: mergedEdgesVersion,
+                    toVersion: mergedEdgesVersion &+ 1, oldCount: mergedEdges.count,
+                    newCount: newEnd, retainedRanges: ranges) else { return false }
+        if reuse.preservesExistingIndices {
             // Empty later segments do not turn a real tail append into an
             // interior insertion. Consumers may keep their old edge indices.
             for additions in appended { mergedEdges.append(contentsOf: additions) }
@@ -602,6 +614,7 @@ final class GalaxyRegistry {
         for (id, owner) in newOwners { winningEdgeOwners[id] = owner }
         missingEdgeEndpoints.formUnion(newMissingEndpoints)
         mergedEdgeEnds = ends
+        lastEdgeInsertionReuse = reuse
         return true
     }
 

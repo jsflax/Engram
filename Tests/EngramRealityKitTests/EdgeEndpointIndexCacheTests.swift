@@ -4,6 +4,129 @@ import Testing
 @testable import EngramRealityKit
 
 struct EdgeEndpointIndexCacheTests {
+
+    @Test("Certified interior edge insertions reuse retained endpoints and repair later missing nodes")
+    func certifiedEdgeInsertionsAvoidHistoricalReads() {
+        let owner = NSObject(), a = node(), b = node(), c = node(), late = node()
+        let nodes = [a, b, c]
+        let old = (0..<2048).map { index in
+            edge(nodes[index % 3], index % 17 == 0 ? late : nodes[(index + 1) % 3])
+        }
+        // A new row may share an edge ID while having different endpoints;
+        // the proof retains the old row, not a global edge-ID dictionary.
+        let inserted = [edge(c, a, id: old[0].id), edge(late, b), edge(b, a), edge(a, c)]
+        let next = [inserted[0]] + Array(old.prefix(1000))
+            + [inserted[1], inserted[2]] + Array(old.dropFirst(1000)) + [inserted[3]]
+        let proof = EdgeInsertionReuse(fromVersion: 1, toVersion: 4,
+            oldCount: old.count, newCount: next.count, retainedRanges: [
+                .init(oldRange: 0..<1000, newStart: 1),
+                .init(oldRange: 1000..<old.count, newStart: 1003),
+            ])!
+        var actual = EdgeEndpointIndexCache(), reference = EdgeEndpointIndexCache()
+        actual.update(nodes: nodes, edges: old, provider: owner,
+            nodeVersion: 1, edgeVersion: 1, nodeAppendGeneration: 1, edgeAppendGeneration: 1)
+        reference.update(nodes: nodes, edges: old)
+        let oldSources = actual.sourceIndices, oldTargets = actual.targetIndices
+        let nodeReads = actual.nodeMetadataReadCount, edgeReads = actual.edgeMetadataReadCount
+        let result = actual.update(nodes: nodes, edges: next, provider: owner,
+            nodeVersion: 1, edgeVersion: 4, nodeAppendGeneration: 1,
+            edgeAppendGeneration: 2, edgeInsertionReuse: proof)
+        reference.update(nodes: nodes, edges: next)
+        #expect(result == .appended)
+        #expect(actual.sourceIndices == reference.sourceIndices)
+        #expect(actual.targetIndices == reference.targetIndices)
+        #expect(actual.nodeMetadataReadCount == nodeReads)
+        #expect(actual.edgeMetadataReadCount - edgeReads == inserted.count)
+        #expect(actual.nodePrefixComparisonCount == 0 && actual.edgePrefixComparisonCount == 0)
+        #expect(Array(actual.sourceIndices[1..<1001]) == Array(oldSources.prefix(1000)))
+        #expect(Array(actual.targetIndices[1003..<2051]) == Array(oldTargets.dropFirst(1000)))
+        // Retained result arrays remain value snapshots after the remap.
+        #expect(oldSources.count == old.count && oldTargets[0] == -1)
+        actual.update(nodes: nodes + [late], edges: next, provider: owner,
+            nodeVersion: 2, edgeVersion: 4, nodeAppendGeneration: 1, edgeAppendGeneration: 2)
+        reference.update(nodes: nodes + [late], edges: next)
+        #expect(actual.sourceIndices == reference.sourceIndices)
+        #expect(actual.targetIndices == reference.targetIndices)
+        #expect(actual.sourceIndices[1001] == 3 && actual.targetIndices[1] == 3)
+        #expect(oldTargets[0] == -1)
+    }
+
+    @Test("Invalid or unavailable edge insertion continuity keeps conservative endpoint behavior")
+    func edgeInsertionFallbacksMatchConservativeIndexing() {
+        let a = node(), b = node(), c = node()
+        for mode in 0..<10 {
+            var owner: NSObject? = NSObject()
+            let replacement = NSObject()
+            let original = [edge(a, b), edge(b, c)]
+            var nextNodes = [a, b, c]
+            var next = [edge(c, a)] + original
+            var nodeRevision: UInt64 = 1
+            if mode == 5 { nextNodes.swapAt(0, 2); nodeRevision = 2 }
+            if mode == 6 { nextNodes.append(node()); nodeRevision = 2 }
+            if mode == 7 { next = [original[1]] } // deletion
+            if mode == 8 { next = [original[1], original[0]] } // reorder
+            let proof = EdgeInsertionReuse(fromVersion: mode == 1 ? 2 : 1,
+                toVersion: mode == 2 ? 5 : 4, oldCount: 2,
+                newCount: mode == 3 ? 4 : 3,
+                retainedRanges: [.init(oldRange: 0..<2, newStart: 1)])
+            var actual = EdgeEndpointIndexCache(), reference = EdgeEndpointIndexCache()
+            actual.update(nodes: [a, b, c], edges: original, provider: owner,
+                nodeVersion: 1, edgeVersion: 1, nodeAppendGeneration: 1, edgeAppendGeneration: 1)
+            reference.update(nodes: [a, b, c], edges: original)
+            if mode == 9 { owner = nil } // A proof cannot retain its provider.
+            actual.update(nodes: nextNodes, edges: next,
+                provider: mode == 0 || mode == 9 ? replacement : owner,
+                nodeVersion: nodeRevision, edgeVersion: 4, nodeAppendGeneration: nodeRevision,
+                edgeAppendGeneration: 2, edgeInsertionReuse: mode == 4 ? nil : proof)
+            reference.update(nodes: nextNodes, edges: next)
+            #expect(actual.sourceIndices == reference.sourceIndices)
+            #expect(actual.targetIndices == reference.targetIndices)
+        }
+        // Structurally invalid proofs are rejected before reaching a consumer.
+        #expect(EdgeInsertionReuse(fromVersion: 1, toVersion: 2, oldCount: 2,
+            newCount: 3, retainedRanges: []) == nil)
+        // Empty and true-tail proofs retain the existing append/no-op path.
+        let owner = NSObject()
+        var empty = EdgeEndpointIndexCache()
+        empty.update(nodes: [a, b], edges: [], provider: owner, nodeVersion: 1, edgeVersion: 1)
+        let zero = EdgeInsertionReuse(fromVersion: 1, toVersion: 2,
+            oldCount: 0, newCount: 0, retainedRanges: [])!
+        let unchanged = empty.update(nodes: [a, b], edges: [], provider: owner,
+            nodeVersion: 1, edgeVersion: 2, edgeInsertionReuse: zero)
+        #expect(unchanged == .unchanged)
+        let tail = EdgeInsertionReuse(fromVersion: 2, toVersion: 3,
+            oldCount: 0, newCount: 1, retainedRanges: [])!
+        let appended = empty.update(nodes: [a, b], edges: [edge(a, b)], provider: owner,
+            nodeVersion: 1, edgeVersion: 3, edgeInsertionReuse: tail)
+        #expect(appended == .appended)
+        #expect(empty.sourceIndices == [0] && empty.targetIndices == [1])
+    }
+
+    @Test("Interior edge insertion retains conservative duplicate-node winner semantics")
+    func edgeInsertionWithDuplicateNodeHistoryFallsBack() {
+        let owner = NSObject(), a = node(), b = node(), duplicate = node(id: a.id)
+        let first = edge(a, b), second = edge(b, a), inserted = edge(a, a)
+        var actual = EdgeEndpointIndexCache(), reference = EdgeEndpointIndexCache()
+        for (version, nodes, edges) in [
+            (UInt64(1), [a, b], [first]),
+            (UInt64(2), [a, b, duplicate], [first, second]),
+        ] {
+            actual.update(nodes: nodes, edges: edges, provider: owner,
+                nodeVersion: version, edgeVersion: version, nodeAppendGeneration: 1, edgeAppendGeneration: 1)
+            reference.update(nodes: nodes, edges: edges)
+        }
+        #expect(actual.sourceIndices == [0, 1])
+        let proof = EdgeInsertionReuse(fromVersion: 2, toVersion: 3,
+            oldCount: 2, newCount: 3, retainedRanges: [.init(oldRange: 0..<2, newStart: 1)])!
+        let result = actual.update(nodes: [a, b, duplicate], edges: [inserted, first, second], provider: owner,
+            nodeVersion: 2, edgeVersion: 3, nodeAppendGeneration: 1,
+            edgeAppendGeneration: 2, edgeInsertionReuse: proof)
+        reference.update(nodes: [a, b, duplicate], edges: [inserted, first, second])
+        #expect(result == .rebuilt)
+        #expect(actual.sourceIndices == [2, 2, 1] && actual.targetIndices == [2, 1, 2])
+        #expect(actual.sourceIndices == reference.sourceIndices)
+        #expect(actual.targetIndices == reference.targetIndices)
+    }
     @Test("Certified edge tails read only new rows across skipped revisions and node insertion")
     func certifiedEdgeTailsAvoidHistoricalReads() {
         let owner = NSObject(), a = node(), b = node(), c = node()

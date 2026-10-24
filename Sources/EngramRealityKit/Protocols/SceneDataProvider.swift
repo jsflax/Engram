@@ -133,6 +133,9 @@ public protocol SceneDataProvider: AnyObject {
     /// Exact insertion-only reuse from one node publication. A consumer must
     /// separately verify provider identity and the descriptor's versions/counts.
     func nodeInsertionReuse(since version: UInt64, count: Int) -> NodeInsertionReuse?
+    /// Exact insertion-only reuse from one edge publication, including unchanged
+    /// endpoints and relation. Provider identity and versions/counts must match.
+    func edgeInsertionReuse(since version: UInt64, count: Int) -> EdgeInsertionReuse?
     /// Increments when positions or their node ordering change; stable while idle.
     var positionVersion: UInt64 { get }
 
@@ -167,6 +170,7 @@ extension SceneDataProvider {
     public var edgeAppendGeneration: UInt64? { nil }
     public var nodeAppendGeneration: UInt64 { nodeVersion }
     public func nodeInsertionReuse(since version: UInt64, count: Int) -> NodeInsertionReuse? { nil }
+    public func edgeInsertionReuse(since version: UInt64, count: Int) -> EdgeInsertionReuse? { nil }
 
     public var positionArray: [SIMD3<Float>] {
         nodes.map { positions[$0.id] ?? .zero }
