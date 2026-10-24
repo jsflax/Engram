@@ -659,6 +659,13 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
             self.assertRegex(source, r'@Test\s+@MainActor\s+func ' + method + r'\(\)')
             self.assertIsNotNone(re.search(selected, 'EngramVisualizerTests.ForceEngineTests/' + method + '()'))
         self.assertIsNone(re.search(selected, 'EngramVisualizerTests.ForceEngineTests/testHistoricalGPUCase()'))
+        tree_names = ['testOctreeUploadReusesAcceptedTree',
+                      'testOctreeUploadReplacesEqualCountTree', 'testOctreeUploadGrowsThenShrinks']
+        tree_source = (ROOT / 'Tests/EngramSceneKitTests/BHOctreeUploadCacheTests.swift').read_text()
+        for method in tree_names:
+            self.assertRegex(tree_source, r'@Test\s+func ' + method + r'\(\)')
+        names += tree_names
+        selected = '|'.join(names)
         for workflow in ('native-validation.yml', 'release.yml'):
             with self.subTest(workflow=workflow), tempfile.TemporaryDirectory(prefix='engram force gate ') as temporary:
                 root = Path(temporary).resolve()

@@ -70,4 +70,17 @@ struct EdgeInstanceValueCacheTests {
         _ = cache.value(at: 2) { calculations += 1; return .hidden }
         #expect(calculations == 2)
     }
+
+    @Test("Independent metadata invalidation refreshes values even with equal frame inputs")
+    func explicitInvalidation() {
+        var cache = EdgeInstanceValueCache()
+        var calculations = 0
+        cache.prepare(state: state(), count: 1)
+        _ = cache.value(at: 0) { calculations += 1; return .hidden }
+        cache.invalidate()
+        cache.prepare(state: state(), count: 1)
+        _ = cache.value(at: 0) { calculations += 1; return .hidden }
+        _ = cache.value(at: 0) { calculations += 1; return .hidden }
+        #expect(calculations == 2)
+    }
 }

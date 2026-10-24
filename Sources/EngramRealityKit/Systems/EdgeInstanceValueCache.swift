@@ -36,6 +36,10 @@ struct EdgeInstanceValueCache {
     private var generations: [UInt64] = []
     private var values: [Value] = []
 
+    /// Provider replacement or an independent metadata revision can invalidate
+    /// values even when the broad render state happens to compare equal.
+    mutating func invalidate() { inputs = nil }
+
     mutating func prepare(state: BatchRenderState, count: Int) {
         let next = Inputs(state)
         if next != inputs {
