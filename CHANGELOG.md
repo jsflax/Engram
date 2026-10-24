@@ -4,6 +4,16 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.20] - 2026-10-23
+
+### Fixed
+- Suspend fully transparent near and far nebula emitters so hidden effects do
+  not continue particle simulation. Restore opacity before reactivating an
+  emitter, including small positive fades, and preserve visible particle density.
+
+### Changed
+- Update Lattice Swift SDK to 2.2.5 while retaining LatticeCore 2.2.8.
+
 ## [0.15.19] - 2026-10-23
 
 ### Fixed
