@@ -223,11 +223,13 @@ jobs:
             --require-swift-test testPreparationCentroidsUseFirstEncodePositionsAndCadence \
             --require-swift-test testPreparationRegroupAndCapacityGrowth \
             --require-swift-test testPreparationAsyncDirtyDispatch \
+            --require-swift-test testPreparationEdgeOnlyReusesGroupsAndUpdatesSprings \
+            --require-swift-test testPreparationEdgeOnlyKeepsCurrentCentroids \
             --require-swift-test testOctreeUploadReusesAcceptedTree \
             --require-swift-test testOctreeUploadReplacesEqualCountTree \
             --require-swift-test testOctreeUploadGrowsThenShrinks -- \
             "$VALIDATION_ROOT/bin/swift-validation" test --force-resolved-versions --disable-index-store --skip-build --no-parallel \
-            --filter 'testPreparationCentroidsUseFirstEncodePositionsAndCadence|testPreparationRegroupAndCapacityGrowth|testPreparationAsyncDirtyDispatch|testOctreeUploadReusesAcceptedTree|testOctreeUploadReplacesEqualCountTree|testOctreeUploadGrowsThenShrinks'
+            --filter 'testPreparationCentroidsUseFirstEncodePositionsAndCadence|testPreparationRegroupAndCapacityGrowth|testPreparationAsyncDirtyDispatch|testPreparationEdgeOnlyReusesGroupsAndUpdatesSprings|testPreparationEdgeOnlyKeepsCurrentCentroids|testOctreeUploadReusesAcceptedTree|testOctreeUploadReplacesEqualCountTree|testOctreeUploadGrowsThenShrinks'
 
       # Keep the existing <2s held-writer assertion, but isolate its scheduling
       # window from the parallel suite. The matching skip above is not a waiver.

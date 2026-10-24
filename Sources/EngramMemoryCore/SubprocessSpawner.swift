@@ -35,7 +35,7 @@ public func rotateFileIfNeeded(_ path: String, maxBytes: Int = 256 * 1024) {
 ///     the provider, including when kernel I/O delays termination.
 ///   - learnerLogContext: Optional per-session launch/exit attribution. Child
 ///     exit status is not a memory-write or persistence receipt.
-///   - admission: Concurrency/cooldown/load gate (SpawnAdmission). The default
+///   - admission: Concurrency/cooldown/capacity gate (SpawnAdmission). The default
 ///     is the shared on-disk gate; pass nil to bypass it (tests only).
 ///   - beforeLaunch: Optional observational-state callback after admission and
 ///     immediately before process launch. A refused admission never invokes it.

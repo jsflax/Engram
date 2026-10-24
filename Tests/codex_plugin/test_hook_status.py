@@ -151,7 +151,7 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(expired["learner"]["health"]["headline"], "queued")
 
     def test_concurrency_and_unavailable_decisions_do_not_claim_provider_failure(self):
-        for reason in ("concurrency", "load_unavailable", "state_unavailable"):
+        for reason in ("concurrency", "load_unavailable", "state_unavailable", "resource_unavailable"):
             with self.subTest(reason=reason):
                 value = self.admission_report([self.admission_event(reason)])
                 health = value["learner"]["health"]
@@ -159,6 +159,19 @@ class StatusTests(unittest.TestCase):
                 self.assertEqual(health["worker_admission"]["reason"], reason)
                 self.assertEqual(health["failure"]["class"], "none_observed")
                 self.assertFalse(health["recovery"]["automatic_replay_authorized"])
+
+    def test_capacity_decisions_are_bounded_receipts_not_live_health_claims(self):
+        for reason, idle, pressure in (("admitted", .4, "normal"), ("cpu_pressure", .1, "normal"),
+                                       ("memory_pressure", .8, "critical")):
+            row = self.admission_event(reason, cpu_idle_fraction=idle, memory_pressure=pressure, load_average=95)
+            value = self.admission_report([row])["learner"]["worker_admission"]
+            self.assertEqual(value["state"], "admitted" if reason == "admitted" else "deferred")
+            self.assertEqual(value["decision"]["memory_pressure"], pressure)
+        for reason, idle, pressure in (("admitted", .1, "normal"), ("cpu_pressure", .4, "normal"),
+                                       ("memory_pressure", .8, "normal"), ("admitted", True, "normal"),
+                                       ("admitted", float("nan"), "normal"), ("admitted", .9, "SECRET")):
+            row = self.admission_event(reason, cpu_idle_fraction=idle, memory_pressure=pressure)
+            self.assertEqual(self.admission_report([row])["learner"]["worker_admission"]["state"], "unknown")
 
     def test_malformed_latest_decision_blocks_fallback_without_leaking_content(self):
         row = self.admission_event()

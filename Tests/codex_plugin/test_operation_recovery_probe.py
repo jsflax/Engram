@@ -186,7 +186,8 @@ for candidate in range(3, 256):
 assert found, 'actual recovery child lost admission lease'
 """
         self.script.write_text(SERVER.replace("def read():", proof + "\ndef read():"))
-        with spawn_admission.lease(directory=lease_dir, load=lambda: 0) as held:
+        with mock.patch.object(spawn_admission.resources, "is_darwin", return_value=False), \
+                spawn_admission.lease(directory=lease_dir, load=lambda: 0) as held:
             self.assertTrue(held.admitted)
             result = self.probe()
             self.assertIsNotNone(result)

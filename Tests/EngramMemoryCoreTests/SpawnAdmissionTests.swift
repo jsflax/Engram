@@ -18,8 +18,10 @@ struct SpawnAdmissionTests {
         return dir
     }
     private func gate(_ dir: String, time: Double = 10_000, load: Double? = 1) -> SpawnAdmission {
-        SpawnAdmission(stateDirectory: dir, now: { Date(timeIntervalSince1970: time) },
-                       loadAverage: { load }, processorCount: 8)
+        var admission = SpawnAdmission(stateDirectory: dir, now: { Date(timeIntervalSince1970: time) },
+                                       loadAverage: { load }, processorCount: 8)
+        admission.resourceMode = .legacyLoad
+        return admission
     }
     private func privateState(_ text: String, dir: String) throws {
         let path = dir + "/spawn-state.json"
