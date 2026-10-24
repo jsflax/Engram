@@ -587,6 +587,30 @@ class PersistenceHarnessTests(unittest.TestCase):
                         client.response_message(1)
                 self.assertAlmostEqual(now[0], 100 + effective)
 
+    def test_busy_response_retains_existing_nine_second_deadline(self):
+        for reply_at, accepted in ((6.431, True), (9.001, False)):
+            with self.subTest(reply_at=reply_at):
+                now = [100.0]
+                client = HARNESS.Client.__new__(HARNESS.Client)
+                client.deadline, client.messages, client.stderr = None, [], []
+                client.process = Mock()
+                client.process.poll.return_value = None
+                reply = {"jsonrpc": "2.0", "id": 1,
+                         "result": self.result("database is busy", isError=True)}
+                def pump(timeout):
+                    self.assertGreater(timeout, 0)
+                    now[0] += timeout
+                    if now[0] - 100 >= reply_at:
+                        client.messages.append(reply)
+                client.pump = pump
+                with patch.object(HARNESS.time, "monotonic", side_effect=lambda: now[0]):
+                    if accepted:
+                        self.assertEqual(client.response_message(1, timeout=9), reply)
+                    else:
+                        with self.assertRaisesRegex(AssertionError, "exceeded 9.000s effective budget"):
+                            client.response_message(1, timeout=9)
+                self.assertLessEqual(now[0], 109)
+
     def fixture_run(self, dishonest=False):
         with self.temporary_directory() as directory:
             binary = self.fake_binary(directory, dishonest)
@@ -609,6 +633,30 @@ class PersistenceHarnessTests(unittest.TestCase):
     def test_client_gate_rejects_acknowledged_but_unpersisted_busy_write(self):
         with self.assertRaisesRegex(AssertionError, "Busy remember reported success"):
             self.fixture_run(dishonest=True)
+
+    def test_retry_budget_response_still_checks_absence_recovery_and_reopen(self):
+        # Advance a fake clock after the fixture's busy response; avoid a real
+        # six-second sleep while exercising the complete three-process case.
+        original_response = HARNESS.Client.response_message
+        original_clock = time.monotonic
+        adjustment = [0.0]
+        def response(client, request_id, timeout=15):
+            message = original_response(client, request_id, timeout)
+            if message.get("result", {}).get("isError") is True:
+                self.assertEqual(timeout, 9)
+                adjustment[0] += 6.431
+            return message
+        with patch.object(HARNESS.Client, "response_message", response), \
+             patch.object(HARNESS.time, "monotonic", side_effect=lambda: original_clock() + adjustment[0]):
+            receipt = self.fixture_run()
+        self.assertTrue(receipt["passed"])
+        self.assertGreaterEqual(receipt["busy_write_seconds"], 6.431)
+        # This total includes send/validation overhead; the response deadline
+        # is exercised separately with a fully controlled clock above.
+        self.assertTrue(receipt["rejected_write_absent"])
+        self.assertEqual(receipt["separate_process_reopens"], 2)
+        self.assertEqual(len(set(receipt["process_ids"])), 3)
+        self.assertEqual(receipt["clean_exits"], [0, 0, 0])
 
     def hanging_binary(self, directory, receipt):
         binary = Path(directory) / "hanging-fake-mcp"

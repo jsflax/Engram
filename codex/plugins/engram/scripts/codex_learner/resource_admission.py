@@ -37,6 +37,18 @@ class Sample:
     measured_at: float
 
 
+class SampleExpired(Exception):
+    """A valid past-age sample may be measured again outside execution locks."""
+
+
+def _check_age(measured_at, current):
+    if not _number(current) or current < measured_at:
+        return False
+    if current - measured_at > MAX_AGE:
+        raise SampleExpired()
+    return True
+
+
 def _number(value):
     return type(value) in (int, float) and -2**53 <= value <= 2**53 and math.isfinite(value)
 
@@ -131,15 +143,16 @@ def sample(*, probe=None, clock=None, sleep=None):
 
 
 def decision(observation, *, probe=None, clock=None):
-    """Fast final validation under the lifetime lease; never sleeps."""
+    """Fast final validation; only valid past-age samples raise SampleExpired."""
     try:
         current = (clock or time.monotonic)()
         if (not isinstance(observation, Sample) or not _number(observation.idle_fraction)
                 or not 0 <= observation.idle_fraction <= 1 or not _number(observation.measured_at)
                 or observation.measured_at < 0
-                or not _number(current) or not 0 <= current - observation.measured_at <= MAX_AGE
                 or type(observation.processors) is not int or not 0 < observation.processors <= 65536
                 or type(observation.pressure) is not int or observation.pressure not in PRESSURES):
+            return "resource_unavailable", {}
+        if not _check_age(observation.measured_at, current):
             return "resource_unavailable", {}
         probe = probe or DarwinProbe()
         processors, pressure = probe.processors(), probe.pressure()
@@ -147,7 +160,7 @@ def decision(observation, *, probe=None, clock=None):
                 or type(pressure) is not int or pressure not in PRESSURES):
             return "resource_unavailable", {}
         # Include the time spent in final OS reads in the freshness check.
-        if not 0 <= (clock or time.monotonic)() - observation.measured_at <= MAX_AGE:
+        if not _check_age(observation.measured_at, (clock or time.monotonic)()):
             return "resource_unavailable", {}
         pressure = max(pressure, observation.pressure)
         fields = {"cpu_idle_fraction": observation.idle_fraction, "memory_pressure": PRESSURES[pressure]}

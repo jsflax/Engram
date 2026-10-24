@@ -64,12 +64,14 @@ class ResourceAdmissionTests(unittest.TestCase):
         for observation in values:
             with self.subTest(observation=observation), self.final(observation) as result:
                 self.assertEqual(result.reason, "resource_unavailable")
+                self.assertEqual(result.sample_expired, observation == self.observation(at=98.99))
         self.probe.pressure.return_value = 2
         with self.final(self.observation()) as result:
             self.assertEqual(result.reason, "memory_pressure")
         self.probe.pressure.side_effect = OSError("unavailable")
         with self.final(self.observation()) as result:
             self.assertEqual(result.reason, "resource_unavailable")
+            self.assertFalse(result.sample_expired)
         self.assertFalse((self.gate / "spawn-state.json").exists())
 
     def test_concurrency_cooldown_and_persistence_still_precede_launch(self):
@@ -124,7 +126,29 @@ class ResourceAdmissionTests(unittest.TestCase):
             self.clock += 2.01
             return 1
         self.probe.pressure.side_effect = slow_pressure
-        self.assertEqual(C.decision(self.observation())[0], "resource_unavailable")
+        with self.assertRaises(C.SampleExpired):
+            C.decision(self.observation())
+
+    def test_final_expiry_is_private_and_invalid_samples_never_request_retry(self):
+        def slow_pressure():
+            self.clock += 2.01
+            return 1
+        self.probe.pressure.side_effect = slow_pressure
+        with self.final(self.observation()) as result:
+            self.assertTrue(result.sample_expired)
+            self.assertEqual(result.diagnostic, {"schema_version": 1, "reason": "resource_unavailable"})
+            self.assertFalse(result.admitted)
+        self.probe.pressure.side_effect = None
+        self.probe.pressure.return_value = 1
+        for observation, clock in [(self.observation(at=102), 101),
+                                   (self.observation(float('nan'), at=90), 101),
+                                   (C.Sample(.4, 0, 1, 90), 101),
+                                   (self.observation(at=90), float('nan'))]:
+            self.clock = clock
+            with self.subTest(observation=observation, clock=clock), self.final(observation) as result:
+                self.assertEqual(result.reason, "resource_unavailable")
+                self.assertFalse(result.sample_expired)
+        self.assertFalse((self.gate / 'spawn-state.json').exists())
 
     def test_probe_initialization_time_counts_toward_sample_budget(self):
         self.clock = 100
@@ -145,6 +169,8 @@ class ResourceWorkerTests(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.root, self.gate = self.fixture.root, self.fixture.root / "resource-gate"
+        self.enterContext(mock.patch.object(R.admission, "check_activation",
+                                            return_value={"mode": "host_sessions_v2"}))
         self.enterContext(mock.patch.object(C, "is_darwin", return_value=True))
         self.enterContext(mock.patch.object(G, "lease", side_effect=lambda **kwargs: production(
             directory=self.gate, now=self.fixture.now, load=lambda: 95, cooldown=0, **kwargs)))
@@ -271,6 +297,193 @@ class ResourceWorkerTests(unittest.TestCase):
         self.assertEqual(self.fixture.protected([sid]), before)
         self.assertEqual(self.fixture.attempts, [])
         self.assertEqual(self.samples, 1)
+
+    def slow_selection_case(self, *, recovery):
+        sid = self.fixture.add(1, recovery=recovery, paused=recovery)
+        decided = False
+        decision_ages, phases = [], []
+        original_decision = C.decision
+
+        def scan(kind):
+            # Expensive scans are allowed before sampling and after admission,
+            # never in the sample-to-lease interval which previously expired.
+            self.assertFalse(self.samples and not decided, kind)
+            phases.append((kind, 'post_admission' if decided else 'pre_sample'))
+            self.clock += 3
+
+        def enrollments(root, policy):
+            scan('enrollments')
+            return sorted(self.fixture.ids)
+
+        def recoverable(root, current):
+            scan('recovery')
+            return current in self.fixture.recoverable
+
+        def decide(observation):
+            nonlocal decided
+            decision_ages.append(self.clock - observation.measured_at)
+            result = original_decision(observation)
+            decided = result[0] is None
+            return result
+
+        with mock.patch.object(self.R.admission, 'enrollment_ids', side_effect=enrollments), \
+             mock.patch.object(self.R, 'has_recoverable_transition', side_effect=recoverable), \
+             mock.patch.object(C, 'decision', side_effect=decide), \
+             mock.patch.object(self.R.host_admission, '_validate_entry',
+                               side_effect=AssertionError('full enrollment validation forbidden in hint')):
+            self.assertEqual(self.R.worker(self.root), 0)
+        self.assertEqual(self.fixture.attempts, [('recovery' if recovery else 'pending', sid)])
+        self.assertEqual((self.samples, self.waits, decision_ages), (1, [], [0]))
+        self.assertIn(('recovery', 'post_admission'), phases)
+
+    def test_slow_global_selection_does_not_expire_fresh_sample(self):
+        self.slow_selection_case(recovery=False)
+
+    def test_slow_recovery_selection_is_not_repeated_before_admission(self):
+        self.slow_selection_case(recovery=True)
+
+    def test_post_admission_schedule_can_choose_other_work_than_hint(self):
+        first, second = self.fixture.add(1), self.fixture.add(2)
+        self.fixture.config['max_runs_per_worker'] = 1
+        def move_cursor():
+            schedule = self.R.worker_schedule.Schedule(self.root)
+            schedule.reserve('pending', first, self.fixture.now, 60)
+        self.on_sample = move_cursor
+        self.assertEqual(self.R.worker(self.root), 0)
+        self.assertEqual(self.fixture.attempts, [('pending', second)])
+        self.assertEqual((self.samples, self.waits), (1, []))
+
+    def test_missing_hint_enrollment_reselects_before_new_sample(self):
+        first, second = self.fixture.add(1), self.fixture.sid(2)
+        def replace_work():
+            self.assertFalse((self.gate / 'spawn-state.json').exists())
+            if self.samples == 1:
+                (self.root / 'enrollments' / (first + '.json')).unlink()
+                (self.root / 'pending' / (first + '.json')).unlink()
+                self.fixture.ids.remove(first)
+                self.fixture.add(2)
+        self.on_sample = replace_work
+        self.assertEqual(self.R.worker(self.root), 0)
+        self.assertEqual(self.fixture.attempts, [('pending', second)])
+        self.assertEqual((self.samples, self.waits), (2, []))
+
+    def test_disappearing_ordinary_work_spends_no_cooldown(self):
+        sid = self.fixture.add(1)
+        self.on_sample = lambda: (self.root / 'pending' / (sid + '.json')).unlink()
+        self.assertEqual(self.R.worker(self.root), 0)
+        self.assertEqual((self.samples, self.waits, self.fixture.attempts), (1, [], []))
+        self.assertFalse((self.gate / 'spawn-state.json').exists())
+
+    def test_failed_probe_with_replaced_hint_never_requests_another_sample(self):
+        first, second = self.fixture.add(1), self.fixture.sid(2)
+        selections = []
+        def enrollments(root, policy):
+            self.assertEqual(self.samples, 0, 'failed probe must not start another full selection')
+            selections.append(True)
+            return sorted(self.fixture.ids)
+        def failed_sample():
+            self.sample()
+            (self.root / 'pending' / (first + '.json')).unlink()
+            self.fixture.add(2)
+            return None
+        with mock.patch.object(C, 'sample', side_effect=failed_sample), \
+             mock.patch.object(self.R.admission, 'enrollment_ids', side_effect=enrollments):
+            self.assertEqual(self.R.worker(self.root), 0)
+        self.assertTrue(selections)
+        self.assertEqual((self.samples, self.waits, self.fixture.attempts), (1, [], []))
+        self.assertTrue((self.root / 'pending' / (second + '.json')).exists())
+        self.assertFalse((self.gate / 'spawn-state.json').exists())
+        self.assertEqual(self.fixture.events[-1][1]['reason'], 'resource_unavailable')
+
+    def test_recovery_marker_disappearance_requires_authoritative_reselection(self):
+        gone = self.fixture.add(1, recovery=True, paused=True)
+        residual = self.fixture.add(2, recovery=True, paused=True)
+        marker = self.root / 'publications' / gone / 'active.json'
+        marker.parent.mkdir(parents=True, mode=0o700)
+        self.R.atomic_json(marker, {'fixture': True})
+        before = self.fixture.protected([gone])
+        def disappear():
+            marker.unlink()
+            self.fixture.recoverable.remove(gone)
+        self.on_sample = disappear
+        self.assertEqual(self.R.worker(self.root), 0)
+        # The hint cannot execute vanished recovery. Conversely, absence of
+        # active.json cannot hide residual recovery found by full selection.
+        self.assertEqual(self.fixture.attempts, [('recovery', residual)])
+        self.assertEqual(self.fixture.protected([gone]), before)
+        self.assertEqual((self.samples, self.waits), (1, []))
+        self.assertTrue((self.gate / 'spawn-state.json').exists())
+        self.assertFalse((self.root / 'publications' / residual / 'active.json').exists())
+
+    def test_new_recovery_backoff_spends_no_cooldown(self):
+        sid = self.fixture.add(1, recovery=True, paused=True)
+        before = self.fixture.protected([sid])
+        self.on_sample = lambda: self.R.worker_schedule.Schedule(self.root).reserve(
+            'recovery', sid, self.fixture.now, 60)
+        self.assertEqual(self.R.worker(self.root), 0)
+        self.assertEqual(self.fixture.protected([sid]), before)
+        self.assertEqual((self.samples, self.waits, self.fixture.attempts), (1, [], []))
+        self.assertFalse((self.gate / 'spawn-state.json').exists())
+
+    def test_new_ordinary_backoff_spends_no_cooldown(self):
+        sid = self.fixture.add(1)
+        path = self.root / 'sessions' / (sid + '.json')
+        def backoff():
+            self.R.atomic_json(path, {**json.loads(path.read_bytes()),
+                                     'retry_after': self.fixture.now + 60})
+        self.on_sample = backoff
+        self.assertEqual(self.R.worker(self.root), 0)
+        self.assertEqual((self.samples, self.waits, self.fixture.attempts), (1, [], []))
+        self.assertFalse((self.gate / 'spawn-state.json').exists())
+
+    def test_unsafe_hint_enrollment_stops_without_admission(self):
+        sid = self.fixture.add(1)
+        before = self.fixture.protected([sid])
+        def unsafe():
+            path = self.root / 'enrollments' / (sid + '.json')
+            path.chmod(0o666)
+        self.on_sample = unsafe
+        self.assertEqual(self.R.worker(self.root), 0)
+        self.assertEqual(self.fixture.protected([sid]), before)
+        self.assertEqual(self.fixture.attempts, [])
+        self.assertFalse((self.gate / 'spawn-state.json').exists())
+        self.assertEqual(self.fixture.events[-1][1]['reason'], 'admission_sample_enrollment_unsafe')
+
+    def test_expiry_during_remaining_setup_retries_after_unlocking(self):
+        sid = self.fixture.add(1)
+        before = self.fixture.protected([sid])
+        delayed = False
+        def settings(root):
+            nonlocal delayed
+            if self.samples and not delayed:
+                self.clock += 2.01
+                delayed = True
+            return self.fixture.config
+        def still_pending():
+            self.assertEqual(self.fixture.protected([sid]), before)
+            self.assertFalse((self.gate / 'spawn-state.json').exists())
+        self.on_wait = still_pending  # Fixture also asserts all execution locks released.
+        with mock.patch.object(self.R, 'settings', side_effect=settings):
+            self.assertEqual(self.R.worker(self.root), 0)
+        self.assertEqual(self.fixture.attempts, [('pending', sid)])
+        self.assertEqual((self.samples, self.waits), (2, [30]))
+
+    def test_repeated_expiry_uses_original_retry_deadline(self):
+        sid = self.fixture.add(1)
+        before = self.fixture.protected([sid])
+        def settings(root):
+            if self.samples:
+                self.clock += 2.01
+            return self.fixture.config
+        with mock.patch.object(self.R, 'settings', side_effect=settings), \
+             mock.patch.object(self.R, 'ADMISSION_RETRY_SECONDS', 65):
+            self.assertEqual(self.R.worker(self.root), 0)
+        self.assertEqual(self.fixture.attempts, [])
+        self.assertEqual(self.fixture.protected([sid]), before)
+        self.assertEqual(self.samples, 2)
+        self.assertEqual(self.clock, 565)
+        self.assertEqual(self.fixture.events[-1][0], 'worker_admission_retry_exhausted')
+        self.assertFalse((self.gate / 'spawn-state.json').exists())
 
 
 if __name__ == "__main__":

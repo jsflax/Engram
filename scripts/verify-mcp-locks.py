@@ -744,10 +744,13 @@ def run_persistence(binary):
                     busy_started = time.monotonic()
                     request_id = client.send("tools/call", {"name": "remember", "arguments": {
                         "content": rejected, "project": project, "force": True}})
+                    # LatticeBeginRetry may admit three 2-second BEGIN waits
+                    # plus backoff within its 6.5-second admission budget. That
+                    # budget is not a wall deadline; retain this fixture's
+                    # existing 9-second response deadline for transport/overhead.
                     failed = client.response_message(request_id, timeout=9)
                     assert_failed_write(failed)
                     busy_seconds = time.monotonic() - busy_started
-                    assert busy_seconds < 6, f"Busy remember took {busy_seconds:.3f}s"
                     assert persisted_memories(db) == {original_id: original}
                 finally:
                     writer.rollback()
