@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import contextvars
 import datetime as dt
+from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
@@ -40,6 +41,10 @@ _HELD_LOCKS = contextvars.ContextVar("engram_held_locks", default=())
 READ_TOOLS = {"recall", "graph", "list_topics", "stats", "timeline"}
 WRITE_TOOLS = {"remember", "update", "connect"}
 DEFAULTS = learner_settings.DEFAULTS
+# Admission retries never extend a provider/batch budget or resume paused work.
+ADMISSION_RETRY_SECONDS = 900
+ADMISSION_RETRY_INTERVAL = 30
+ADMISSION_RETRY_ATTEMPTS = 30
 
 
 def utc() -> str:
@@ -1324,6 +1329,32 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=None,
     return outcome
 
 
+@dataclass(frozen=True)
+class WorkerAttempt:
+    outcome: str  # busy, idle, admitted, or deferred
+    diagnostic: dict | None = None
+    policy: dict | None = None
+
+
+def _retry_event(root, event, **fields):
+    # Logging is advisory, including before an admission has been obtained.
+    with contextlib.suppress(OSError):
+        event_log(root, event, **fields)
+
+
+def _check_retry_lock(root, fd, directory_identity):
+    directory = root.lstat()
+    held, named = os.fstat(fd), (root / "worker-retry.lock").lstat()
+    if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid()
+            or directory.st_mode & 0o077
+            or (directory.st_dev, directory.st_ino) != directory_identity
+            or not stat.S_ISREG(named.st_mode) or named.st_uid != os.getuid()
+            or named.st_nlink != 1 or named.st_mode & 0o077
+            or (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino)
+            or os.get_inheritable(fd)):
+        raise ValueError("admission_retry_lock_changed")
+
+
 def worker(root: Path) -> int:
     try:
         runtime_routing.maybe_exec(Path(__file__).absolute().parents[2], "codex_learner.py",
@@ -1332,8 +1363,64 @@ def worker(root: Path) -> int:
         # Refusal is not leadership or progress; preserve every queued plan.
         print("Engram: " + str(exc), file=sys.stderr)
         return 0
+    attempt = _worker_once(root)
+    if attempt.outcome != "deferred" or attempt.diagnostic["reason"] not in {"load", "cooldown", "concurrency"}:
+        return 0
+    # The one-attempt body has unwound worker/enqueue/provider/shared admission
+    # contexts. In particular, even a refused lease may own spawn.lock until
+    # context exit; no execution lease may be retained while this process sleeps.
+    deadline = time.monotonic() + ADMISSION_RETRY_SECONDS
+    policy = attempt.policy
+    try:
+        directory = root.lstat()
+        directory_identity = (directory.st_dev, directory.st_ino)
+        with lock_file(root / "worker-retry.lock", blocking=False, descriptor=True) as retry_fd:
+            if retry_fd is False:
+                return 0  # Another bounded waiter owns the next attempt.
+            for number in range(1, ADMISSION_RETRY_ATTEMPTS + 1):
+                _check_retry_lock(root, retry_fd, directory_identity)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                delay = ADMISSION_RETRY_INTERVAL
+                if attempt.outcome == "deferred" and attempt.diagnostic["reason"] == "cooldown":
+                    eligible = attempt.diagnostic.get("cooldown_eligible_after")
+                    if eligible is not None:
+                        delay = min(60, max(ADMISSION_RETRY_INTERVAL, eligible - time.time()))
+                delay = min(delay, remaining)
+                _retry_event(root, "worker_admission_retry_wait", attempt=number, delay_seconds=delay)
+                time.sleep(delay)
+                if time.monotonic() >= deadline:
+                    break
+                _check_retry_lock(root, retry_fd, directory_identity)
+                runtime_routing.maybe_exec(Path(__file__).absolute().parents[2], "codex_learner.py",
+                    ["worker", "--state-dir", str(root)], state_root=root,
+                    deadline=deadline, allow_handoff=False)
+                attempt = _worker_once(root, expected_policy=policy, retry_fd=retry_fd)
+                if attempt.outcome == "busy":
+                    # A natural worker may be about to refuse admission and
+                    # lose retry.lock to us. Do not drop the only wakeup owner.
+                    continue
+                if attempt.outcome != "deferred":
+                    _retry_event(root, "worker_admission_retry_finished", outcome=attempt.outcome)
+                    return 0  # One actual admission retains its ordinary batch cap.
+                if attempt.diagnostic["reason"] not in {"load", "cooldown", "concurrency"}:
+                    _retry_event(root, "worker_admission_retry_stopped", reason=attempt.diagnostic["reason"])
+                    return 0
+            _retry_event(root, "worker_admission_retry_exhausted")
+    except (OSError, ValueError) as exc:
+        # No policy/identity failure may become permission to retry old work.
+        code = str(exc)
+        _retry_event(root, "worker_admission_retry_stopped",
+                     reason=code if re.fullmatch(r"[a-z][a-z0-9_]{0,127}", code) else type(exc).__name__)
+    return 0
+
+
+def _worker_once(root: Path, *, expected_policy=None, retry_fd=None) -> WorkerAttempt:
     # A missing/inactive policy must not even inspect or pause an old queue.
     active_policy = admission.check_activation(root)
+    if expected_policy is not None and active_policy != expected_policy:
+        raise ValueError("admission_retry_policy_changed")
     invalid_pending = set()
     recovery_failures = set()
     deferred_plans = set()
@@ -1400,7 +1487,7 @@ def worker(root: Path) -> int:
     more = {}
     with lock_file(root / "worker.lock", blocking=False) as acquired, contextlib.ExitStack() as shared_slot:
         if not acquired:
-            return 0
+            return WorkerAttempt("busy")
         shared_lease = None
         config = settings(root)
         # Selection before admission is read-only, including corrupt/oversized
@@ -1426,8 +1513,9 @@ def worker(root: Path) -> int:
                     if re.fullmatch(r"[0-9a-f]{32}", candidate_request):
                         diagnostic["request_id"] = candidate_request
                 if not shared_lease.admitted:
-                    event_log(root, "worker_admission_deferred", reason=shared_lease.reason, **diagnostic)
-                    return 0  # Pending/cursor/holds and schedule bytes untouched.
+                    _retry_event(root, "worker_admission_deferred", reason=shared_lease.reason, **diagnostic)
+                    # Pending/cursor/holds and schedule bytes are untouched.
+                    return WorkerAttempt("deferred", shared_lease.diagnostic, active_policy)
                 # Supersede prior deferrals even when the candidate changes or
                 # disappears before the post-admission selection.
                 try:
@@ -1536,15 +1624,21 @@ def worker(root: Path) -> int:
                     atomic_json(pending, {**current, "paused_request_id": request_id, "pause_reason": "batch_limit"})
         event_log(root, "worker_idle", handled=handled, pending=len(list(pending_dir.glob("*.json"))),
                   invalid_pending=len(invalid_pending))
+    if retry_fd is not None:
+        # This attempt is complete, and all execution leases have unwound.
+        # Let a successor own retry coordination BEFORE the terminal race
+        # recheck can spawn it. Otherwise a fast-refusing successor could lose
+        # retry.lock to this exiting process and leave no wakeup owner.
+        fcntl.flock(retry_fd, fcntl.LOCK_UN)
     # Recheck after releasing the leader lock: a concurrent hook may have queued
     # work while its own worker lost that lock. Recheck recovery eligibility too,
-    # without respawning solely for unchanged held/cooling work. No timer loop:
-    # a later natural event wakes expired backoff.
+    # without respawning solely for unchanged held/cooling work. Admission retry
+    # does not resume expired recovery backoff or a deliberately paused request.
     with lock_file(root / "enqueue.lock"):
         recovery_cache.clear()
         if select_work(schedule) is not None:
             spawn_worker(root)
-    return 0
+    return WorkerAttempt("admitted" if shared_lease is not None else "idle")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -69,11 +69,19 @@ class RuntimeRoutingTests(unittest.TestCase):
     def select(self):
         return T.successor(self.old, home=self.home, environ=self.inherited)
 
-    def route(self, argv=None, *, plugin=None, state=None):
+    def route(self, argv=None, *, plugin=None, state=None, allow_handoff=True):
         real = T.successor
         # Inject the host path at the API seam, never via process-global env.
         with mock.patch.object(T, "successor", side_effect=lambda root, **kw: real(root, home=self.home, settings_path=kw["settings_path"] if state else None, environ=self.inherited)):
-            return T.maybe_exec(plugin or self.old, "codex_learner.py", argv or ["worker"], state_root=state)
+            return T.maybe_exec(plugin or self.old, "codex_learner.py", argv or ["worker"],
+                                state_root=state, allow_handoff=allow_handoff)
+
+    def test_waiting_worker_revalidates_selection_without_execing_away_retry_ownership(self):
+        self.assertIsNone(self.route(plugin=self.new, allow_handoff=False))
+        with self.assertRaisesRegex(T.Refused, "routing_selection_changed"):
+            self.route(plugin=self.old, allow_handoff=False)
+        self.exec.assert_not_called()
+        self.process.assert_not_called()
 
     def test_selected_installed_version_not_marketplace_or_highest_directory(self):
         self.package("99.0.0")

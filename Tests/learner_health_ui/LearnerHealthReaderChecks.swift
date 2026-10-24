@@ -32,7 +32,7 @@ enum LearnerHealthReaderChecks {
         var launch: [String: Any] = ["state": "deferred", "reason": "load",
             "candidate_binding": "selected_pending_request", "age_seconds": 10, "freshness": "recent",
             "decision": ["schema_version": 1, "reason": "load", "load_average": 50.36, "load_limit": 32],
-            "next_attempt": ["policy": "next_eligible_lifecycle_event", "scheduled_at": NSNull()]]
+            "next_attempt": ["policy": "not_established_by_admission_receipt", "scheduled_at": NSNull()]]
         model["worker_admission"] = launch
         learner["health"] = model
         object["learner"] = learner

@@ -268,7 +268,7 @@ def hook_deadline(start):
     return deadline
 
 
-def maybe_exec(plugin_root, script_name, argv, *, state_root=None, deadline=None):
+def maybe_exec(plugin_root, script_name, argv, *, state_root=None, deadline=None, allow_handoff=True):
     """Same-PID handoff before stdin, state mutation, or worker lock acquisition."""
     try:
         home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser().absolute()
@@ -286,6 +286,9 @@ def maybe_exec(plugin_root, script_name, argv, *, state_root=None, deadline=None
             require(math.isfinite(deadline) and time.monotonic() < deadline, "routing_hook_deadline")
         if target == Path(plugin_root).absolute():
             return
+        # A waiting worker must not exec away its CLOEXEC retry ownership and
+        # silently restart a fresh waiting budget in another package.
+        require(allow_handoff, "routing_selection_changed")
         require(HOP not in os.environ, "routing_hop_limit")
         env = dict(os.environ, CLAUDE_PLUGIN_ROOT=str(target))
         env[HOP] = "1"  # A second handoff refuses; it never authorizes a target.

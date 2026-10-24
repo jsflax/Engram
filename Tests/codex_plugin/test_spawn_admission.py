@@ -290,7 +290,7 @@ with G.lease(directory=sys.argv[2], now=10000, load=lambda:0) as lease:
                 self.assertTrue(held.admitted)
                 with mock.patch.object(R.spawn_admission, "lease", side_effect=lambda:
                         production(directory=self.directory, load=lambda: 0, cooldown=0)):
-                    self.assertEqual(R.worker(fixture.root), 0)
+                    self.assertEqual(R._worker_once(fixture.root).outcome, "deferred")
             after = {str(p.relative_to(fixture.root)): p.read_bytes()
                      for p in fixture.root.rglob("*") if p.is_file()}
             # The coordination lock itself is created before admission.
