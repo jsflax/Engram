@@ -2,7 +2,7 @@ import Foundation
 import EngramSceneKit
 
 /// Maintains flat edge endpoints while a graph arrives in batches. Provider
-/// revisions avoid rechecking unchanged domains; changed edge prefixes and
+/// revisions and certified edge tails avoid rechecking retained rows; other changed prefixes and
 /// callers without continuity still receive the compact-key validation.
 /// Keep compact keys rather than retaining the provider arrays: a retained
 /// snapshot would force those arrays to copy on their next append.
@@ -29,9 +29,11 @@ struct EdgeEndpointIndexCache {
     private var cachedNodeVersion: UInt64?
     private var cachedEdgeVersion: UInt64?
     private var cachedAppendGeneration: UInt64?
+    private var cachedEdgeAppendGeneration: UInt64?
     private(set) var nodeMetadataReadCount = 0
     private(set) var nodePrefixComparisonCount = 0
     private(set) var edgePrefixComparisonCount = 0
+    private(set) var edgeMetadataReadCount = 0
     private(set) var sourceIndices: [Int32] = []
     private(set) var targetIndices: [Int32] = []
     var nodeCount: Int { nodeIDs.count }
@@ -41,7 +43,7 @@ struct EdgeEndpointIndexCache {
         nodes: [RKNodeSnapshot], edges: [RKEdgeSnapshot],
         provider: AnyObject? = nil, nodeVersion: UInt64? = nil,
         edgeVersion: UInt64? = nil, nodeAppendGeneration: UInt64? = nil,
-        nodeInsertionReuse: NodeInsertionReuse? = nil
+        nodeInsertionReuse: NodeInsertionReuse? = nil, edgeAppendGeneration: UInt64? = nil
     ) -> UpdateKind {
         let sameProvider = provider != nil && cachedProvider === provider
         let unchangedNodes = sameProvider && nodeVersion != nil
@@ -50,6 +52,8 @@ struct EdgeEndpointIndexCache {
             && cachedAppendGeneration == nodeAppendGeneration && nodes.count >= nodeIDs.count
         let unchangedEdges = sameProvider && edgeVersion != nil
             && cachedEdgeVersion == edgeVersion && edges.count == edgeKeys.count
+        let certifiedEdgeAppend = sameProvider && edgeAppendGeneration != nil
+            && cachedEdgeAppendGeneration == edgeAppendGeneration && edges.count >= edgeKeys.count
         if sameProvider, let fromVersion = cachedNodeVersion, let toVersion = nodeVersion,
            let reuse = nodeInsertionReuse,
            reuse.matches(fromVersion: fromVersion, oldCount: nodeIDs.count,
@@ -74,7 +78,7 @@ struct EdgeEndpointIndexCache {
             }
             if !duplicateInserted {
                 let oldEdgeCount = edgeKeys.count
-                let keepsEdges = edges.count >= oldEdgeCount && (unchangedEdges || edgeKeys.indices.allSatisfy {
+                let keepsEdges = edges.count >= oldEdgeCount && (unchangedEdges || certifiedEdgeAppend || edgeKeys.indices.allSatisfy {
                     edgePrefixComparisonCount += 1
                     return edgeKeys[$0] == EdgeKey(edges[$0])
                 })
@@ -104,6 +108,7 @@ struct EdgeEndpointIndexCache {
                 cachedNodeVersion = nodeVersion
                 cachedEdgeVersion = edgeVersion
                 cachedAppendGeneration = nodeAppendGeneration
+                cachedEdgeAppendGeneration = edgeAppendGeneration
                 if !keepsEdges { return .rebuilt }
                 return reuse.oldCount == reuse.newCount && edges.count == oldEdgeCount ? .unchanged : .appended
             }
@@ -114,7 +119,7 @@ struct EdgeEndpointIndexCache {
                 nodePrefixComparisonCount += 1
                 return nodeIDs[$0] == nodes[$0].id
             })
-            && (unchangedEdges || edgeKeys.indices.allSatisfy {
+            && (unchangedEdges || certifiedEdgeAppend || edgeKeys.indices.allSatisfy {
                 edgePrefixComparisonCount += 1
                 return edgeKeys[$0] == EdgeKey(edges[$0])
             })
@@ -156,12 +161,14 @@ struct EdgeEndpointIndexCache {
         cachedNodeVersion = nodeVersion
         cachedEdgeVersion = edgeVersion
         cachedAppendGeneration = nodeAppendGeneration
+        cachedEdgeAppendGeneration = edgeAppendGeneration
         if !keepsPrefix { return .rebuilt }
         return nodes.count == oldNodeCount && edges.count == oldEdgeCount ? .unchanged : .appended
     }
 
     private mutating func appendEdges(_ edges: [RKEdgeSnapshot]) {
         for index in edgeKeys.count..<edges.count {
+            edgeMetadataReadCount += 1
             let key = EdgeKey(edges[index])
             edgeKeys.append(key)
             let source = nodeIndices[key.source] ?? -1
@@ -185,7 +192,7 @@ struct EdgeEndpointIndexCache {
         } : nil
         return update(nodes: nodes, edges: edges, provider: dataProvider, nodeVersion: nodeVersion,
                       edgeVersion: edgeVersion, nodeAppendGeneration: nodeAppendGeneration,
-                      nodeInsertionReuse: reuse)
+                      nodeInsertionReuse: reuse, edgeAppendGeneration: dataProvider.edgeAppendGeneration)
     }
 
 }

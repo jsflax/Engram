@@ -87,7 +87,7 @@ class HostPreparationTests(unittest.TestCase):
             original = products / 'Engram.xctestrun'
             original.write_bytes(plistlib.dumps(self.original))
             result = M.prepare(root)
-            self.assertEqual(result['expected_tests'], 12)
+            self.assertEqual(result['expected_tests'], 15)
             output = plistlib.loads(Path(result['prepared']).read_bytes())
             environment = output['TestConfigurations'][0]['TestTargets'][0]['EnvironmentVariables']
             self.assertEqual(environment['CLAUDE_MEMORY_DB'], str(root / 'fixtures/app-memory.sqlite'))
@@ -142,10 +142,13 @@ class HostPreparationTests(unittest.TestCase):
             'testMascotInsertionRangesMatchFullRebuild',
             'testInsertionMembershipFallbacksMatchFullRebuild')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 131)
+        self.assertEqual(len(inventory), 142)
         self.assertIn('AdapterSnapshotTests/testSparsePositionsFollowSimulationChangesAndRegistryReplacement', inventory)
         self.assertIn('AdapterSnapshotTests/testMascotVisibilityReachesSceneAndPreservesExistingEntities', inventory)
         for name in (
+            'testCertifiedEdgeTailBatchesVisitOnlyNewRows',
+            'testEdgeTailPreservesHiddenAndDanglingWinnersAndRevealsLateEndpoints',
+            'testUnsafeEdgeTailChangesMatchConservativeMerge',
             'testCertifiedCrossGalaxyNodeAppendsReuseUnchangedEdges',
             'testCrossGalaxyMissingEndpointsArriveSeparatelyWithoutReorderingEdges',
             'testCrossGalaxyHiddenAndDanglingWinnersSuppressVisibleDuplicates',
@@ -213,7 +216,9 @@ class HostPreparationTests(unittest.TestCase):
             'testSidebarPresentationDoesNotReevaluateItsGraphParent',
             'testSidebarHoverDismissalCanBeCancelledByReentryAndPinning',
             'testPanelSnapshotTracksInitialAndLiveChangesWithoutSidebarAppearance',
-            'testLogTailBoundsBytesAndLinesWithoutBreakingUnicode')]
+            'testLogTailBoundsBytesAndLinesWithoutBreakingUnicode',
+            'testSidebarRenderConfigurationBoundsSQLAndKeepsLiveConfigFresh',
+            'testSidebarNonGraphRenderConfigurationDoesNotReadDatabase')]
         self.assertEqual(sorted(name for name in M.inventory(Path(__file__).parents[1])
                                 if name.startswith('PanelPerformanceTests/')), sorted(expected))
         selection = M.test_identifiers()

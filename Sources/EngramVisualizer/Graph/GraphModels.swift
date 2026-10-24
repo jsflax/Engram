@@ -108,6 +108,9 @@ final class GraphRenderStore {
     private(set) var hubsVersion: UInt64 = 0
     private(set) var nodeLookupVersion: UInt64 = 0
     private(set) var allEdgesVersion: UInt64 = 0
+    private(set) var edgeInsertionGeneration: UInt64 = 0
+    private(set) var insertedEdgeIDs: [UUID] = []
+    private var insertingNewEdge = false
     private(set) var nodeAppendGeneration: UInt64 = 0
     private(set) var nodeLookupAppendGeneration: UInt64 = 0
     private var appendingVisibleNode = false
@@ -160,7 +163,29 @@ final class GraphRenderStore {
 
     // Internal data — never triggers SwiftUI body re-evaluation.
     var allNodes: [UUID: NodeData] = [:]
-    var allEdges: [UUID: EdgeData] = [:] { didSet { allEdgesVersion &+= 1 } }
+    var allEdges: [UUID: EdgeData] = [:] {
+        didSet {
+            allEdgesVersion &+= 1
+            if !insertingNewEdge {
+                edgeInsertionGeneration &+= 1
+                insertedEdgeIDs.removeAll(keepingCapacity: true)
+            }
+        }
+    }
+
+    /// Certifies only new IDs. Replacements and arbitrary dictionary writes
+    /// invalidate the journal, even if the dictionary's count keeps growing.
+    /// The journal records arrival order; Dictionary iteration is not a prefix.
+    func insertAllEdge(_ edge: EdgeData) {
+        guard allEdges[edge.id] == nil else {
+            allEdges[edge.id] = edge
+            return
+        }
+        insertingNewEdge = true
+        allEdges[edge.id] = edge
+        insertedEdgeIDs.append(edge.id)
+        insertingNewEdge = false
+    }
     var edgesByNode: [UUID: [EdgeData]] = [:]
     var pkToGlobalId: [Int64: UUID] = [:]
     var edgePkToGlobalId: [Int64: UUID] = [:]

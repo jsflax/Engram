@@ -1078,7 +1078,7 @@ actor Galaxy: Identifiable {
         var addedVisibleEdge = false
 
         for (_, data) in entries {
-            store.allEdges[data.id] = data
+            store.insertAllEdge(data)
             store.edgesByNode[data.sourceId, default: []].append(data)
             store.edgesByNode[data.targetId, default: []].append(data)
             store.edgeCountByNode[data.sourceId, default: 0] += 1

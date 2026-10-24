@@ -345,13 +345,16 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     weak var registry: GalaxyRegistry? {
         didSet {
             guard registry !== oldValue else { return }
-            // An adapter can outlive its registry. Keep its public node epochs
+            // An adapter can outlive its registry. Keep its public row epochs
             // distinct even when the replacement has identical local counters.
             // The old weak reference may already be nil. Retained publication
             // counters still prevent a new origin from reusing its epochs.
             nodeVersionBase &+= (lastNodesVersion == .max ? 0 : lastNodesVersion) &+ 1
             nodeAppendBase &+= lastRegistryAppendGeneration &+ 1
             lastRegistryAppendGeneration = 0
+            edgeVersionBase &+= (lastEdgesVersion == .max ? 0 : lastEdgesVersion) &+ 1
+            edgeAppendBase &+= (lastRegistryEdgeAppendGeneration ?? 0) &+ 1
+            lastRegistryEdgeAppendGeneration = nil
             // Equal revision counters from another provider cannot validate
             // this provider's snapshots, routing, or first centroid preview.
             lastTopologyVersion = .max
@@ -385,6 +388,9 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     private var nodeVersionBase: UInt64 = 0
     private var nodeAppendBase: UInt64 = 0
     private var lastRegistryAppendGeneration: UInt64 = 0
+    private var edgeVersionBase: UInt64 = 0
+    private var edgeAppendBase: UInt64 = 0
+    private var lastRegistryEdgeAppendGeneration: UInt64?
     private(set) var nodePrefixComparisonCount: UInt64 = 0
     private(set) var nodeSnapshotBuildCount: UInt64 = 0
     private(set) var retainedSnapshotCopyCount: UInt64 = 0
@@ -475,7 +481,8 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     }
     var nodeVersion: UInt64 { nodeVersionBase &+ (registry?.mergedNodesVersion ?? 0) }
     var hubVersion: UInt64 { registry?.mergedHubsVersion ?? 0 }
-    var edgeVersion: UInt64 { registry?.mergedEdgesVersion ?? 0 }
+    var edgeVersion: UInt64 { edgeVersionBase &+ (registry?.mergedEdgesVersion ?? 0) }
+    var edgeAppendGeneration: UInt64? { edgeAppendBase &+ (registry?.mergedEdgeAppendGeneration ?? 0) }
     var nodeAppendGeneration: UInt64 { nodeAppendBase &+ (registry?.mergedNodeAppendGeneration ?? 0) }
 
     func nodeInsertionReuse(since version: UInt64, count: Int) -> NodeInsertionReuse? {
@@ -772,12 +779,13 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         if lastEdgesVersion != registry.mergedEdgesVersion {
             let edges = registry.mergedEdges
             let canAppendEdges = edges.count >= cachedEdges.count
-                && cachedEdges.indices.allSatisfy { index in
+                && (lastRegistryEdgeAppendGeneration == registry.mergedEdgeAppendGeneration
+                    || cachedEdges.indices.allSatisfy { index in
                     edgePrefixComparisonCount &+= 1
                     let old = cachedEdges[index], edge = edges[index]
                     return old.id == edge.id && old.sourceId == edge.sourceId
                         && old.targetId == edge.targetId && old.relation == edge.relation
-                }
+                })
             if !canAppendEdges { cachedEdges.removeAll(keepingCapacity: true) }
             if cachedEdges.capacity < edges.count {
                 cachedEdges.reserveCapacity(max(edges.count, max(64, cachedEdges.capacity * 2)))
@@ -792,6 +800,7 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
                 ))
             }
             lastEdgesVersion = registry.mergedEdgesVersion
+            lastRegistryEdgeAppendGeneration = registry.mergedEdgeAppendGeneration
         }
 
         // Do not pin the mutable render store's Set storage via this cache or
