@@ -65,6 +65,8 @@ jobs:
     secrets:
       SWIFTLM_CLONE_TOKEN: ${{ secrets.SWIFTLM_CLONE_TOKEN }}
   build:
+    outputs:
+      release_published: ${{ steps.publish.outcome }}
     needs: [preflight, portable]
     runs-on: macos-26
     # SwiftLM is a private dependency (since the mascot-chat work) — SwiftPM
@@ -636,52 +638,6 @@ jobs:
           git add Formula/engram.rb
           git diff --cached --quiet || (git commit -m "Update engram to ${VERSION}" && git push)
 
-      - name: Notify Slack
-        # Both tag pushes and release-train dispatches announce a published release.
-        # A later appcast/tap failure must not suppress the announcement.
-        if: ${{ !cancelled() && steps.publish.outcome == 'success' }}
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          TAG="${RELEASE_TAG}"
-          VERSION="${TAG#v}"
-          REPO="${{ github.repository }}"
-          URL="https://github.com/${REPO}/releases/tag/${TAG}"
-
-          # Extract changelog section and convert Markdown → Slack mrkdwn
-          CHANGES=$(awk "/^## \\[${VERSION}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md \
-            | sed '/^$/d' \
-            | sed 's/^### \(.*\)/*\1*/' \
-            | sed 's/\*\*\([^*]*\)\*\*/*\1*/g' \
-            | sed 's/^- /• /' \
-            | sed 's/`\([^`]*\)`/`\1`/g' \
-            | head -20)
-
-          # Escape for JSON
-          CHANGES_ESCAPED=$(echo "$CHANGES" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read())[1:-1])')
-
-          SLACK_RESPONSE=$(curl --fail --silent --show-error --connect-timeout 10 --max-time 30 -X POST "$SLACK_WEBHOOK_URL" \
-            -H 'Content-Type: application/json' \
-            -d "{
-              \"blocks\": [
-                {
-                  \"type\": \"header\",
-                  \"text\": {\"type\": \"plain_text\", \"text\": \"✅ Engram ${TAG} released\"}
-                },
-                {
-                  \"type\": \"section\",
-                  \"text\": {\"type\": \"mrkdwn\", \"text\": \"${CHANGES_ESCAPED}\"},
-                  \"accessory\": {
-                    \"type\": \"button\",
-                    \"text\": {\"type\": \"plain_text\", \"text\": \"View Release\"},
-                    \"url\": \"${URL}\"
-                  }
-                }
-              ]
-            }")
-          test "$SLACK_RESPONSE" = "ok" || { echo "::error::Slack did not acknowledge the release announcement"; exit 1; }
-          echo "Slack acknowledged the release announcement."
-
       # Failed releases were silent (the success notifier is if: success()) —
       # announce failures too, with a link to the run.
       - name: Notify Slack (failure)
@@ -700,3 +656,16 @@ jobs:
           if [ -f "$RUNNER_TEMP/signing.keychain-db" ]; then
             security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
           fi
+
+  notify-slack:
+    needs: [preflight, build]
+    # Announce a published release even if the later appcast/tap update failed.
+    if: ${{ !cancelled() && needs.build.outputs.release_published == 'success' }}
+    permissions:
+      contents: read
+      statuses: write
+    uses: ./.github/workflows/slack-release.yml
+    with:
+      tag: ${{ needs.preflight.outputs.tag }}
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
