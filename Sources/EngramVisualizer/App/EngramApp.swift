@@ -1,6 +1,7 @@
 import SwiftUI
 import Lattice
 import EngramKit
+import EngramSceneKit
 import GoogleSignIn
 import UniformTypeIdentifiers
 import ScreenCaptureKit
@@ -53,6 +54,9 @@ struct EngramApp: App {
     #endif
 
     init() {
+        if let path = ProcessInfo.processInfo.environment["ENGRAM_GPU_LOG"], !path.isEmpty {
+            GPULog.configure(path: path)
+        }
         PerformanceLaunch.beginBenchmarkActivity()
         // ENGRAM_FRAME_STATS (the perf-instrumentation harness) and headless
         // launches never want Sparkle: a terminal-launched unsigned binary

@@ -11,10 +11,18 @@ public final class ForceEngine {
     public let forceCompute: MetalForceCompute
     /// GPU simulation state for integration (position/velocity buffers).
     public let simState: GPUSimulationState?
+    private var diagnosticWriter: GPULog.Writer?
 
     public init(forceCompute: MetalForceCompute, simState: GPUSimulationState? = nil) {
         self.forceCompute = forceCompute
         self.simState = simState
+    }
+
+    // Instance-scoped sink for deterministic tests, without changing process
+    // logging configuration or another engine's diagnostics.
+    convenience init(forceCompute: MetalForceCompute, diagnosticWriter: GPULog.Writer) {
+        self.init(forceCompute: forceCompute)
+        self.diagnosticWriter = diagnosticWriter
     }
 
     /// Whether the underlying force compute pipeline is ready.
@@ -181,6 +189,8 @@ public final class ForceEngine {
               forceCompute.isFullSimAvailable,
               !forceCompute.inFlight else { return nil }
 
+        let diagnostic = GPULog.beginForce(writer: diagnosticWriter)
+
         if snapshot.topologyDirty {
             forceCompute.setTopologyDirty(edges: snapshot.edgeIndices)
         }
@@ -200,7 +210,7 @@ public final class ForceEngine {
 
         forceCompute.inFlight = true
 
-        forceCompute.encodeForces(
+        var diagnosticMetadata = forceCompute.encodeForces(
             encoder: encoder,
             x: snapshot.posX, y: snapshot.posY, z: snapshot.posZ,
             projectGroups: snapshot.projectGroups, topicGroups: snapshot.topicGroups,
@@ -217,7 +227,8 @@ public final class ForceEngine {
             topicCohesionStrength: snapshot.topicCohesionStrength,
             topicCentroidRepulsion: snapshot.topicCentroidRepulsion,
             centerStrength: snapshot.centerStrength,
-            alpha: snapshot.alpha, damping: snapshot.damping, maxSpeed: snapshot.maxSpeed)
+            alpha: snapshot.alpha, damping: snapshot.damping, maxSpeed: snapshot.maxSpeed,
+            recordDiagnostics: diagnostic != nil)
 
         let hasGPUIntegration: Bool
         if let ss = simState, let forceBuf = forceCompute.outputForceBuffer {
@@ -225,6 +236,7 @@ public final class ForceEngine {
             ss.encodeIntegration(encoder: encoder, forceBuffer: forceBuf,
                                  damping: snapshot.damping, maxSpeed: snapshot.maxSpeed)
             hasGPUIntegration = true
+            diagnosticMetadata?.integrationRequested = true
         } else {
             hasGPUIntegration = false
         }
@@ -232,39 +244,64 @@ public final class ForceEngine {
 
         let fc = forceCompute
         let ss = simState
-        let nodeCount = snapshot.nodeCount
+        let metadata = diagnosticMetadata
+        let snapshotEdges = snapshot.edgeIndices.count
         cmdBuf.addCompletedHandler { @Sendable cb in
-            GPULog.log("FORCE CB complete status=\(cb.status.rawValue)")
-            // True GPU occupancy + which charge path ran — the BH-vs-BRUTE
-            // question decides where the 42k optimization effort goes.
-            let gpuMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000
-            GPULog.log("FORCE GPU \(String(format: "%.2f", gpuMs))ms algo=\(fc.lastChargeAlgorithm) n=\(nodeCount)")
+            var timing = diagnostic.map { token in
+                GPULog.ForceTiming(id: token.id, metadata: metadata, snapshotEdges: snapshotEdges,
+                                  status: Int(cb.status.rawValue), preparationStarted: token.preparationStarted,
+                                  committed: token.committed, gpuStarted: cb.gpuStartTime, gpuEnded: cb.gpuEndTime,
+                                  completionEntered: GPULog.hostTime())
+            }
             if cb.status == .error {
                 GPULog.log("FORCE ERROR: \(cb.error?.localizedDescription ?? "unknown")")
-                Task { @MainActor in fc.inFlight = false }
+                timing?.mainActorEnqueued = diagnostic.map { _ in GPULog.hostTime() }
+                let deliveredTiming = timing
+                Task { @MainActor in
+                    fc.inFlight = false
+                    if let deliveredTiming { diagnostic?.finish(deliveredTiming) }
+                }
                 return
             }
 
+            timing?.readbackStarted = diagnostic.map { _ in GPULog.hostTime() }
             if hasGPUIntegration, let ss {
                 ss.readBackPositions()
                 let positions = ss.cpuPositions
                 let result = ForceResult(positions: positions,
                                          diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
+                timing?.readbackEnded = diagnostic.map { _ in GPULog.hostTime() }
+                timing?.mainActorEnqueued = diagnostic.map { _ in GPULog.hostTime() }
+                let deliveredTiming = timing
                 Task { @MainActor in
                     fc.inFlight = false
+                    if let deliveredTiming { diagnostic?.finish(deliveredTiming) }
                     onComplete(result)
                 }
             } else if let forces = fc.readBackForces() {
                 let result = ForceResult(fx: forces.fx, fy: forces.fy, fz: forces.fz,
                                          diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
+                timing?.readbackEnded = diagnostic.map { _ in GPULog.hostTime() }
+                timing?.mainActorEnqueued = diagnostic.map { _ in GPULog.hostTime() }
+                let deliveredTiming = timing
                 Task { @MainActor in
                     fc.inFlight = false
+                    if let deliveredTiming { diagnostic?.finish(deliveredTiming) }
                     onComplete(result)
                 }
             } else {
-                Task { @MainActor in fc.inFlight = false }
+                timing?.readbackEnded = diagnostic.map { _ in GPULog.hostTime() }
+                timing?.mainActorEnqueued = diagnostic.map { _ in GPULog.hostTime() }
+                let deliveredTiming = timing
+                Task { @MainActor in
+                    fc.inFlight = false
+                    if let deliveredTiming { diagnostic?.finish(deliveredTiming) }
+                }
             }
         }
+        // Record only after handler registration, immediately before commit.
+        // The token publishes this value safely to the completion queue.
+        diagnostic?.willCommit()
         cmdBuf.commit()
         return cmdBuf
     }

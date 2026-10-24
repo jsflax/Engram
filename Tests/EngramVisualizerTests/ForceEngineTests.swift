@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import os
 import simd
 import CEngramSceneTypes
 @preconcurrency import Metal
@@ -16,12 +17,14 @@ struct ForceEngineTests {
 
     static let device: MTLDevice? = MTLCreateSystemDefaultDevice()
 
-    @MainActor private func makeForceEngine() throws -> (ForceEngine, MTLCommandQueue) {
+    @MainActor private func makeForceEngine(diagnosticWriter: GPULog.Writer? = nil) throws -> (ForceEngine, MTLCommandQueue) {
         let device = try #require(Self.device)
         let library = try EngramMetalShaders.makeLibrary(device: device)
         let queue = try #require(device.makeCommandQueue())
         let fc = try #require(MetalForceCompute(device: device, library: library))
-        return (ForceEngine(forceCompute: fc), queue)
+        let engine = diagnosticWriter.map { ForceEngine(forceCompute: fc, diagnosticWriter: $0) }
+            ?? ForceEngine(forceCompute: fc)
+        return (engine, queue)
     }
 
     private func makeSnapshot(
@@ -391,7 +394,10 @@ struct ForceEngineTests {
 
     @Test
     @MainActor func testPreparationAsyncDirtyDispatch() async throws {
-        let (engine, queue) = try makeForceEngine()
+        let logQueue = DispatchQueue(label: "force-test.diagnostics")
+        let lines = OSAllocatedUnfairLock<[String]>(initialState: [])
+        let writer = GPULog.Writer(queue: logQueue) { line in lines.withLock { $0.append(line) } }
+        let (engine, queue) = try makeForceEngine(diagnosticWriter: writer)
         let fc = engine.forceCompute
         for pass in 1...2 {
             let snapshot = preparationSnapshot(
@@ -409,6 +415,30 @@ struct ForceEngineTests {
             #expect(fc.centroidUpdateCount == pass)
             #expect(fc.groupUploadCount == 1)
             #expect(!engine.isInFlight)
+            logQueue.sync {}
+            let saved = lines.withLock { $0 }
+            try #require(saved.count == pass)
+            let row = try #require(JSONSerialization.jsonObject(with: Data(saved[pass - 1].utf8)) as? [String: Any])
+            let metadata = try #require(row["metadata"] as? [String: Any])
+            #expect(metadata["nodes"] as? Int == 6)
+            #expect(metadata["csrEdges"] as? Int == 5)
+            #expect(metadata["projects"] as? Int == 3)
+            #expect(metadata["topics"] as? Int == 3)
+            #expect(metadata["galaxies"] as? Int == 3)
+            #expect(metadata["charge"] as? String == "barnesHut")
+            #expect(try #require(metadata["treeNodes"] as? Int) > 0)
+            #expect(metadata["structural"] as? Bool == true)
+            #expect(metadata["integrationRequested"] as? Bool == false)
+            #expect(row["snapshotEdges"] as? Int == 5)
+            #expect(row["status"] as? Int == Int(MTLCommandBufferStatus.completed.rawValue))
+            let intervals = try #require(row["intervalsMs"] as? [String: Double])
+            #expect(intervals["preparation_to_commit"] != nil)
+            #expect(intervals["readback"] != nil)
+            #expect(intervals["mainactor_delivery"] != nil)
+            // Metal may leave GPU timestamps unavailable. Never turn that into
+            // a zero-duration success or require hardware timing support.
+            let validGPU = try #require(row["gpuTimingValid"] as? Bool)
+            #expect((intervals["gpu_execution"] != nil) == validGPU)
         }
     }
 }
