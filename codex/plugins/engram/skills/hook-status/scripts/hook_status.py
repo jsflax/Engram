@@ -522,7 +522,9 @@ def metadata(record):
             and type(diagnostic["stage"]) is str and diagnostic["stage"] in STARTUP_STAGES
             and type(diagnostic["reason"]) is str and diagnostic["reason"] in STARTUP_REASONS):
         out["gateway_startup_failure"] = dict(diagnostic)
-    for key, allowed in (("failure_phase", FAILURE_PHASES), ("error_kind", ERROR_KINDS)):
+    for key, allowed in (("failure_phase", FAILURE_PHASES), ("error_kind", ERROR_KINDS),
+                         ("cleanup_status", {"completed", "timeout", "failed"}),
+                         ("cleanup_error_kind", ERROR_KINDS)):
         if isinstance(record.get(key), str) and record[key] in allowed:
             out[key] = record[key]
     for key, allowed in (("failure_kind", {"mcp_error", "nonzero_exit", "success", "unknown"}),
