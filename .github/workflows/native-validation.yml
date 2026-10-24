@@ -209,7 +209,7 @@ jobs:
             --skip busyBeginDoesNotInvokeBodyOrPublishReceipt \
             --skip beginContentionTimingDiagnostics
 
-      # Require actual Metal execution of the three preparation regressions.
+      # Require actual Metal execution of preparation and tree-upload regressions.
       # The runner rejects zero matches, skipped tests and incomplete pass IDs.
       - name: Run force preparation regressions (serial)
         if: ${{ !cancelled() && steps.native_build.outcome == 'success' }}
@@ -222,9 +222,12 @@ jobs:
             --timeout-seconds 120 --silence-seconds 60 \
             --require-swift-test testPreparationCentroidsUseFirstEncodePositionsAndCadence \
             --require-swift-test testPreparationRegroupAndCapacityGrowth \
-            --require-swift-test testPreparationAsyncDirtyDispatch -- \
+            --require-swift-test testPreparationAsyncDirtyDispatch \
+            --require-swift-test testOctreeUploadReusesAcceptedTree \
+            --require-swift-test testOctreeUploadReplacesEqualCountTree \
+            --require-swift-test testOctreeUploadGrowsThenShrinks -- \
             "$VALIDATION_ROOT/bin/swift-validation" test --force-resolved-versions --disable-index-store --skip-build --no-parallel \
-            --filter 'testPreparationCentroidsUseFirstEncodePositionsAndCadence|testPreparationRegroupAndCapacityGrowth|testPreparationAsyncDirtyDispatch'
+            --filter 'testPreparationCentroidsUseFirstEncodePositionsAndCadence|testPreparationRegroupAndCapacityGrowth|testPreparationAsyncDirtyDispatch|testOctreeUploadReusesAcceptedTree|testOctreeUploadReplacesEqualCountTree|testOctreeUploadGrowsThenShrinks'
 
       # Keep the existing <2s held-writer assertion, but isolate its scheduling
       # window from the parallel suite. The matching skip above is not a waiver.

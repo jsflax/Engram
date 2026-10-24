@@ -4,6 +4,53 @@ import CEngramSceneTypes
 import simd
 import os
 
+/// An accepted octree is immutable until the next replacement. Keep its GPU
+/// representation across encodes, including replacements that fit the buffer.
+struct BHOctreeUploadCache {
+    private(set) var nodes: [OctreeNode]?
+    private var buffer: MTLBuffer?
+    private var capacity = 0
+    private var needsUpload = true
+    private(set) var uploadCount = 0
+
+    mutating func replace(with nodes: [OctreeNode]) {
+        self.nodes = nodes
+        needsUpload = true
+    }
+
+    mutating func prepare(device: MTLDevice) -> MTLBuffer? {
+        guard let nodes, !nodes.isEmpty else { return nil }
+        if buffer == nil || nodes.count > capacity {
+            // A failed allocation must not leave the old tree marked ready.
+            buffer = nil
+            capacity = 0
+            needsUpload = true
+            let newCapacity = max(nodes.count * 2, 512)
+            guard let allocated = device.makeBuffer(
+                length: newCapacity * MemoryLayout<BHOctreeNode>.stride,
+                options: .storageModeShared
+            ) else { return nil }
+            buffer = allocated
+            capacity = newCapacity
+        }
+        guard let buffer else { return nil }
+        guard needsUpload else { return buffer }
+
+        let treePtr = buffer.contents().bindMemory(to: BHOctreeNode.self, capacity: nodes.count)
+        for (i, src) in nodes.enumerated() {
+            treePtr[i] = BHOctreeNode(
+                cx: src.cx, cy: src.cy, cz: src.cz, halfSize: src.halfSize,
+                comX: src.comX, comY: src.comY, comZ: src.comZ, mass: src.mass,
+                children: (src.child(0), src.child(1), src.child(2), src.child(3),
+                           src.child(4), src.child(5), src.child(6), src.child(7)),
+                bodyIndex: src.bodyIndex, _pad: 0)
+        }
+        uploadCount &+= 1
+        needsUpload = false
+        return buffer
+    }
+}
+
 // MARK: - Metal Force Compute
 
 /// GPU-accelerated force simulation — 3-pass architecture matching JS reference.
@@ -64,11 +111,9 @@ public final class MetalForceCompute: @unchecked Sendable {
     private var lastEncodedNodeCount: Int = 0
 
     // Barnes-Hut octree (CPU-built, GPU-walked)
-    private var bhTreeBuffer: MTLBuffer?
+    private var bhTree = BHOctreeUploadCache()
     private var bhParamBuffer: MTLBuffer?
-    private var bhTreeCapacity: Int = 0
     private var bhTreeDirty: Bool = true
-    private var cachedTreeNodes: [OctreeNode]?
     private let pendingTreeNodes = OSAllocatedUnfairLock<[OctreeNode]?>(initialState: nil)
     private let treeRebuildInFlight = OSAllocatedUnfairLock<Bool>(initialState: false)
     private var treeCacheFrameAge: Int = 0
@@ -444,46 +489,30 @@ public final class MetalForceCompute: @unchecked Sendable {
         if let newTree = pendingTreeNodes.withLock({ val -> [OctreeNode]? in
             let r = val; val = nil; return r
         }) {
-            cachedTreeNodes = newTree
+            bhTree.replace(with: newTree)
             treeCacheFrameAge = 0
         } else {
             treeCacheFrameAge += 1
         }
 
-        if useBH, cachedTreeNodes == nil || bhTreeDirty || treeCacheFrameAge >= treeCacheMaxAge {
+        if useBH, bhTree.nodes == nil || bhTreeDirty || treeCacheFrameAge >= treeCacheMaxAge {
             rebuildOctreeAsync(x: x, y: y, z: z, n: n)
             bhTreeDirty = false
         }
 
-        if useBH, cachedTreeNodes == nil {
-            cachedTreeNodes = buildOctree(x: x, y: y, z: z, n: n)
+        if useBH, bhTree.nodes == nil {
+            bhTree.replace(with: buildOctree(x: x, y: y, z: z, n: n))
             treeCacheFrameAge = 0
         }
 
-        if useBH, let bhPL = bhChargePipeline, let treeNodes = cachedTreeNodes {
+        if useBH, let bhPL = bhChargePipeline, let treeNodes = bhTree.nodes {
             lastChargeAlgorithm = "BH"
             let treeCount = treeNodes.count
-            if treeCount > bhTreeCapacity {
-                let cap = max(treeCount * 2, 512)
-                bhTreeBuffer = device.makeBuffer(length: cap * MemoryLayout<BHOctreeNode>.stride, options: .storageModeShared)
-                bhTreeCapacity = cap
-            }
             if bhParamBuffer == nil {
                 bhParamBuffer = device.makeBuffer(length: MemoryLayout<BHChargeParams>.stride, options: .storageModeShared)
             }
 
-            if let treeBuf = bhTreeBuffer, let bhPBuf = bhParamBuffer {
-                let treePtr = treeBuf.contents().bindMemory(to: BHOctreeNode.self, capacity: treeCount)
-                for i in 0..<treeCount {
-                    let src = treeNodes[i]
-                    treePtr[i] = BHOctreeNode(
-                        cx: src.cx, cy: src.cy, cz: src.cz, halfSize: src.halfSize,
-                        comX: src.comX, comY: src.comY, comZ: src.comZ, mass: src.mass,
-                        children: (src.child(0), src.child(1), src.child(2), src.child(3),
-                                   src.child(4), src.child(5), src.child(6), src.child(7)),
-                        bodyIndex: src.bodyIndex, _pad: 0)
-                }
-
+            if let treeBuf = bhTree.prepare(device: device), let bhPBuf = bhParamBuffer {
                 let cutoff = max(500.0, chargeSpan * 0.3)
                 bhPBuf.contents().bindMemory(to: BHChargeParams.self, capacity: 1).pointee = BHChargeParams(
                     chargeStrength: chargeStrength, crossChargeMultiplier: crossChargeMultiplier,

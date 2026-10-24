@@ -25,10 +25,8 @@ public final class EdgeBatchSystem {
     // color and transform associated per EDGE across frames of LOD churn.
     private var slots = StableInstanceSlots()
     private var textureData: [SIMD4<Float16>] = []
-    private let renderCache = BatchRenderCache()
-
-    private var nodeLookup = EdgeNodeLookupCache()
-    private var lastTopologyVersion: UInt64 = .max
+    private var renderCache = BatchRenderCache()
+    private var lookups = EdgeRenderLookupCache()
 
     /// Precomputed sin/cos for 6-sided cylinder (same every frame).
     private static let sideAngles: [(c: Float, s: Float)] = (0..<sides).map { i in
@@ -46,6 +44,17 @@ public final class EdgeBatchSystem {
         scaleFactor: Float,
         commandBuffer: MTLCommandBuffer? = nil
     ) {
+        if !visibleSet.visibleEdgeIndices.isEmpty {
+            let lookupChange = lookups.prepare(
+                provider: dataProvider, topology: dataProvider.topologyVersion,
+                nodeVersion: dataProvider.nodeVersion, edgeVersion: dataProvider.edgeVersion,
+                nodes: dataProvider.nodes, edgeCount: dataProvider.edges.count)
+            if lookupChange != .unchanged {
+                renderCache = BatchRenderCache()
+                instanceValues.invalidate()
+                if lookupChange == .provider { slots = StableInstanceSlots() }
+            }
+        }
         let state = BatchRenderState(
             topology: dataProvider.topologyVersion, positions: dataProvider.positionVersion,
             visibleIndices: visibleSet.visibleEdgeIndices, selection: dataProvider.selectedNode,
@@ -100,16 +109,8 @@ public final class EdgeBatchSystem {
         let isSearchActive = dataProvider.isSearchActive
         let searchMatchIds = dataProvider.searchMatchIds
 
-        // Extend validated append-only node prefixes without rebuilding maps.
-        let topoVersion = dataProvider.topologyVersion
-        if topoVersion != lastTopologyVersion {
-            lastTopologyVersion = topoVersion
-            nodeLookup.update(nodes: nodes)
-        }
-        let nodeProject = nodeLookup.projects
         let positionArray = dataProvider.positionArray
         let positions = positionArray.count == nodes.count ? [:] : dataProvider.positions
-        let idToIndex = nodeLookup.indices
 
         let totalVerts = scene.edgeBatchCapacity * Self.vertsPerEdge
         if staging.count < totalVerts {
@@ -122,21 +123,13 @@ public final class EdgeBatchSystem {
         var instanceIdx = 0
         for edgeIdx in visibleSet.visibleEdgeIndices {
             let edge = edges[edgeIdx]
-            let srcPos: SIMD3<Float>
-            let tgtPos: SIMD3<Float>
-            if let si = idToIndex[edge.sourceId], si < positionArray.count,
-               let ti = idToIndex[edge.targetId], ti < positionArray.count {
-                srcPos = positionArray[si]
-                tgtPos = positionArray[ti]
-            } else {
-                guard let sp = positions[edge.sourceId], let tp = positions[edge.targetId] else { continue }
-                srcPos = sp; tgtPos = tp
-            }
+            let lookup = lookups.lookup(at: edgeIdx, edge: edge)
+            guard let endpoints = lookup.positions(for: edge, array: positionArray, fallback: positions) else { continue }
 
-            let src = srcPos * scaleFactor
-            let tgt = tgtPos * scaleFactor
+            let src = endpoints.source * scaleFactor
+            let tgt = endpoints.target * scaleFactor
 
-            let project = nodeProject[edge.sourceId]
+            let project = lookup.sourceProject
             var color = colorMap[project ?? ""] ?? SIMD3<Float>(0.6, 0.6, 0.6)
             color = min(color * 1.4 + 0.15, SIMD3<Float>(repeating: 1.0))
 
@@ -234,16 +227,8 @@ public final class EdgeBatchSystem {
         let isSearchActive = dataProvider.isSearchActive
         let searchMatchIds = dataProvider.searchMatchIds
 
-        // Extend validated append-only node prefixes without rebuilding maps.
-        let topoVersion = dataProvider.topologyVersion
-        if topoVersion != lastTopologyVersion {
-            lastTopologyVersion = topoVersion
-            nodeLookup.update(nodes: nodes)
-        }
-        let nodeProject = nodeLookup.projects
         let positionArray = dataProvider.positionArray
         let positions = positionArray.count == nodes.count ? [:] : dataProvider.positions
-        let idToIndex = nodeLookup.indices
 
         let texWidth = scene.edgeInstanceTextureWidth
         let bytesPerRow = texWidth * MemoryLayout<SIMD4<Float16>>.stride
@@ -275,22 +260,14 @@ public final class EdgeBatchSystem {
                 guard instanceIdx < transforms.count, instanceIdx < texData.count else { continue }
                 let value = instanceValues.value(at: edgeIdx) {
                     let edge = edges[edgeIdx]
-                    let srcPos: SIMD3<Float>
-                    let tgtPos: SIMD3<Float>
-                    if let si = idToIndex[edge.sourceId], si < positionArray.count,
-                       let ti = idToIndex[edge.targetId], ti < positionArray.count {
-                        srcPos = positionArray[si]
-                        tgtPos = positionArray[ti]
-                    } else {
-                        guard let sp = positions[edge.sourceId], let tp = positions[edge.targetId] else { return .hidden }
-                        srcPos = sp; tgtPos = tp
-                    }
+                    let lookup = lookups.lookup(at: edgeIdx, edge: edge)
+                    guard let endpoints = lookup.positions(for: edge, array: positionArray, fallback: positions) else { return .hidden }
 
                     let transform = Self.cylinderTransform(
-                        from: srcPos * scaleFactor, to: tgtPos * scaleFactor, radius: scaleFactor)
+                        from: endpoints.source * scaleFactor, to: endpoints.target * scaleFactor, radius: scaleFactor)
                     guard transform != matrix_identity_float4x4 else { return .hidden }
 
-                    let project = nodeProject[edge.sourceId]
+                    let project = lookup.sourceProject
                     var color = colorMap[project ?? ""] ?? SIMD3<Float>(0.6, 0.6, 0.6)
                     color = min(color * 1.4 + 0.15, SIMD3<Float>(repeating: 1.0))
                     var alpha: Float = 0.35
