@@ -4,6 +4,14 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.24] - 2026-10-24
+
+### Fixed
+
+- Reuse existing graph edges when any source adds new edges during loading,
+  avoiding repeated whole-graph duplicate and visibility scans. Preserve source
+  order, duplicate precedence, hidden edges, and late-arriving endpoints.
+
 ## [0.15.23] - 2026-10-24
 
 ### Fixed
