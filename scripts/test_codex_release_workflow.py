@@ -667,6 +667,11 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
         for method in tree_names:
             self.assertRegex(tree_source, r'@Test\s+func ' + method + r'\(\)')
         names += tree_names
+        charge_names = ['testBruteForceGuard8K', 'testBruteForceAllowed1K']
+        charge_source = (ROOT / 'Tests/EngramVisualizerTests/BruteForceGuardTests.swift').read_text()
+        for method in charge_names:
+            self.assertRegex(charge_source, r'@Test\([^\n]+\)\s+@MainActor\s+func ' + method + r'\(\)')
+        names += charge_names
         selected = '|'.join(names)
         for workflow in ('native-validation.yml', 'release.yml'):
             with self.subTest(workflow=workflow), tempfile.TemporaryDirectory(prefix='engram force gate ') as temporary:

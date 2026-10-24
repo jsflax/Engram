@@ -204,9 +204,11 @@ jobs:
             --require-swift-test testPreparationEdgeOnlyKeepsCurrentCentroids \
             --require-swift-test testOctreeUploadReusesAcceptedTree \
             --require-swift-test testOctreeUploadReplacesEqualCountTree \
-            --require-swift-test testOctreeUploadGrowsThenShrinks -- \
+            --require-swift-test testOctreeUploadGrowsThenShrinks \
+            --require-swift-test testBruteForceGuard8K \
+            --require-swift-test testBruteForceAllowed1K -- \
             swift test --force-resolved-versions --skip-build --no-parallel \
-            --filter 'testPreparationCentroidsUseFirstEncodePositionsAndCadence|testPreparationRegroupAndCapacityGrowth|testPreparationAsyncDirtyDispatch|testPreparationEdgeOnlyReusesGroupsAndUpdatesSprings|testPreparationEdgeOnlyKeepsCurrentCentroids|testOctreeUploadReusesAcceptedTree|testOctreeUploadReplacesEqualCountTree|testOctreeUploadGrowsThenShrinks'
+            --filter 'testPreparationCentroidsUseFirstEncodePositionsAndCadence|testPreparationRegroupAndCapacityGrowth|testPreparationAsyncDirtyDispatch|testPreparationEdgeOnlyReusesGroupsAndUpdatesSprings|testPreparationEdgeOnlyKeepsCurrentCentroids|testOctreeUploadReusesAcceptedTree|testOctreeUploadReplacesEqualCountTree|testOctreeUploadGrowsThenShrinks|testBruteForceGuard8K|testBruteForceAllowed1K'
 
       - name: Upload force preparation diagnostics
         if: ${{ always() }}

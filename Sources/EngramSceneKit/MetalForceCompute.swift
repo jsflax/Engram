@@ -75,19 +75,27 @@ public final class MetalForceCompute: @unchecked Sendable {
     public var isFullSimAvailable: Bool { springPipeline != nil }
 
     /// Initialize with an external device and library.
-    public init?(device: MTLDevice, library: MTLLibrary) {
+    public convenience init?(device: MTLDevice, library: MTLLibrary) {
+        self.init(device: device, library: library,
+                  makePipeline: { try? device.makeComputePipelineState(function: $0) })
+    }
+
+    // Tests can model an unavailable optional BH pipeline while retaining the
+    // actual packaged charge/structural kernels and unchanged fallback policy.
+    init?(device: MTLDevice, library: MTLLibrary,
+          makePipeline: (MTLFunction) -> MTLComputePipelineState?) {
         guard let chargeFn = library.makeFunction(name: "compute_charge_forces"),
-              let chargePL = try? device.makeComputePipelineState(function: chargeFn)
+              let chargePL = makePipeline(chargeFn)
         else { return nil }
 
         self.device = device
         self.chargePipeline = chargePL
 
         if let fn = library.makeFunction(name: "compute_spring_and_structural") {
-            springPipeline = try? device.makeComputePipelineState(function: fn)
+            springPipeline = makePipeline(fn)
         }
         if let fn = library.makeFunction(name: "compute_charge_forces_bh") {
-            bhChargePipeline = try? device.makeComputePipelineState(function: fn)
+            bhChargePipeline = makePipeline(fn)
         }
     }
 

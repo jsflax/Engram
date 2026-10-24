@@ -1,10 +1,11 @@
 import Foundation
 import Testing
+import os
 import simd
 import CEngramSceneTypes
 @preconcurrency import Metal
 import EngramMetalShaders
-import EngramSceneKit
+@testable import EngramSceneKit
 
 /// Tests that the O(n²) brute-force charge kernel does NOT fire at 8K+ nodes.
 /// This is the root cause of GPU starvation → 1-second drawable blocks → laptop crash.
@@ -14,18 +15,36 @@ struct BruteForceGuardTests {
 
     static let device: MTLDevice? = MTLCreateSystemDefaultDevice()
 
-    // MARK: - GPULog captures force compute decisions
+    // Each case owns its writer and drains that queue before inspecting records.
+    // No global logger configuration, environment changes or shared file paths.
+    private struct Capture {
+        let queue = DispatchQueue(label: "brute-force-guard.log")
+        let lines = OSAllocatedUnfairLock<[String]>(initialState: [])
 
-    @Test("GPULog.configure + log produces output")
-    func testGPULogWorks() throws {
-        let tmpPath = NSTemporaryDirectory() + "gpulog-test-\(UUID().uuidString).log"
-        GPULog.configure(path: tmpPath)
-        GPULog.log("TEST MESSAGE")
+        func writer() -> GPULog.Writer {
+            GPULog.Writer(queue: queue) { [lines] line in lines.withLock { $0.append(line) } }
+        }
 
-        let contents = try String(contentsOfFile: tmpPath)
-        #expect(contents.contains("TEST MESSAGE"), "GPULog should write to configured file")
-        #expect(contents.contains("APP LAUNCH"), "GPULog.configure should write launch header")
-        try? FileManager.default.removeItem(atPath: tmpPath)
+        func charge(nodeCount: Int) throws -> String {
+            queue.sync {}
+            let saved = lines.withLock { $0 }
+            try #require(saved.count == 1, "One completed dispatch must produce one actual record")
+            let row = try #require(JSONSerialization.jsonObject(with: Data(saved[0].utf8)) as? [String: Any])
+            #expect(row["kind"] as? String == "force")
+            #expect(row["status"] as? Int == Int(MTLCommandBufferStatus.completed.rawValue))
+            let metadata = try #require(row["metadata"] as? [String: Any])
+            #expect(metadata["nodes"] as? Int == nodeCount)
+            return try #require(metadata["charge"] as? String)
+        }
+    }
+
+    @Test("GPULog writer delivers queued output")
+    func testGPULogWorks() {
+        let capture = Capture()
+        let submitted = capture.writer().submit(.message("TEST MESSAGE"))
+        capture.queue.sync {}
+        #expect(submitted)
+        #expect(capture.lines.withLock { $0 } == ["TEST MESSAGE"])
     }
 
     // MARK: - Brute force guard at scale
@@ -35,13 +54,10 @@ struct BruteForceGuardTests {
         let device = try #require(Self.device)
         let library = try EngramMetalShaders.makeLibrary(device: device)
         let fc = try #require(MetalForceCompute(device: device, library: library))
-        let forceEngine = ForceEngine(forceCompute: fc)
+        let capture = Capture()
+        let forceEngine = ForceEngine(forceCompute: fc, diagnosticWriter: capture.writer())
         let queue = try #require(device.makeCommandQueue())
         #expect(fc.isFullSimAvailable)
-
-        // Configure GPULog to a temp file so we can read what happened
-        let tmpPath = NSTemporaryDirectory() + "gpulog-guard-\(UUID().uuidString).log"
-        GPULog.configure(path: tmpPath)
 
         let n = 8000
         let x = (0..<n).map { _ in Float.random(in: -500...500) }
@@ -75,44 +91,43 @@ struct BruteForceGuardTests {
         )
 
         // Dispatch forces — this is the exact code path the app uses
-        let _: ForceResult = await withCheckedContinuation { cont in
-            forceEngine.encodeForcePass(
-                queue: queue,
-                snapshot: snapshot
-            ) { result in
-                cont.resume(returning: result)
-            }
+        var delivered: ForceResult?
+        let command = try #require(forceEngine.encodeForcePass(queue: queue, snapshot: snapshot) { delivered = $0 })
+        let deadline = ContinuousClock.now + .seconds(5)
+        while delivered == nil && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
         }
+        let result = try #require(delivered, "Owned GPU pass must deliver within the test bound")
+        #expect(command.status == .completed)
+        #expect(result.fx.count == n && result.fx.allSatisfy(\.isFinite))
 
-        // Read the log and verify brute force did NOT fire
-        let log = try String(contentsOfFile: tmpPath)
-        print("[test:log] GPU log contents:\n\(log)")
-
-        #expect(!log.contains("algo=BRUTE"),
-                "Brute force O(n²) must NOT fire at n=\(n) — this crashes the laptop")
-        #expect(log.contains("ENCODE END n=\(n)"),
-                "dispatchForces should log DISPATCH")
-        // Either BH tree or SKIPPED is acceptable — brute force is the danger
-        let hasBH = log.contains("algo=BH")
-        let hasSkipped = log.contains("ENCODE SKIP")
-        #expect(hasBH || hasSkipped,
-                "At n=\(n), charge should use BH tree or be skipped (not brute force)")
-
-        try? FileManager.default.removeItem(atPath: tmpPath)
+        let charge = try capture.charge(nodeCount: n)
+        #expect(charge != "bruteForce", "The 8K production path must not dispatch brute force")
+        #expect(charge == "barnesHut", "The packaged BH pipeline must actually dispatch; an empty/skipped record is insufficient")
     }
 
     // MARK: - Brute force IS allowed for small n
 
-    @Test("dispatchForces at 1K nodes: brute force is OK")
+    @Test("dispatchForces at 1K nodes uses real brute fallback when BH is unavailable")
     @MainActor func testBruteForceAllowed1K() async throws {
         let device = try #require(Self.device)
         let library = try EngramMetalShaders.makeLibrary(device: device)
-        let fc = try #require(MetalForceCompute(device: device, library: library))
-        let forceEngine = ForceEngine(forceCompute: fc)
+        // The normal packaged pipeline uses BH even for small inputs. Model
+        // only BH construction failure to exercise the existing real fallback.
+        var declinedBH = false
+        let candidate = MetalForceCompute(device: device, library: library, makePipeline: { function in
+            if function.name == "compute_charge_forces_bh" {
+                declinedBH = true
+                return nil
+            }
+            return try? device.makeComputePipelineState(function: function)
+        })
+        let fc = try #require(candidate)
+        #expect(declinedBH)
+        #expect(fc.isFullSimAvailable)
+        let capture = Capture()
+        let forceEngine = ForceEngine(forceCompute: fc, diagnosticWriter: capture.writer())
         let queue = try #require(device.makeCommandQueue())
-
-        let tmpPath = NSTemporaryDirectory() + "gpulog-small-\(UUID().uuidString).log"
-        GPULog.configure(path: tmpPath)
 
         let n = 1000
         let x = (0..<n).map { _ in Float.random(in: -500...500) }
@@ -137,22 +152,17 @@ struct BruteForceGuardTests {
             alpha: 1.0, damping: 0.78, maxSpeed: 12.0
         )
 
-        let _: ForceResult = await withCheckedContinuation { cont in
-            forceEngine.encodeForcePass(
-                queue: queue,
-                snapshot: snapshot
-            ) { result in
-                cont.resume(returning: result)
-            }
+        var delivered: ForceResult?
+        let command = try #require(forceEngine.encodeForcePass(queue: queue, snapshot: snapshot) { delivered = $0 })
+        let deadline = ContinuousClock.now + .seconds(5)
+        while delivered == nil && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
         }
+        let result = try #require(delivered, "Owned GPU pass must deliver within the test bound")
+        #expect(command.status == .completed)
+        #expect(result.fx.count == n && result.fx.allSatisfy(\.isFinite))
 
-        let log = try String(contentsOfFile: tmpPath)
-        print("[test:log] Small-n GPU log:\n\(log)")
-
-        #expect(log.contains("algo=BRUTE"),
-                "Brute force should be used at n=\(n) (safe for small counts)")
-        #expect(log.contains("ENCODE END n=\(n)"))
-
-        try? FileManager.default.removeItem(atPath: tmpPath)
+        let charge = try capture.charge(nodeCount: n)
+        #expect(charge == "bruteForce", "A missing BH pipeline must dispatch the real packaged brute kernel")
     }
 }
