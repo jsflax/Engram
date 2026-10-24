@@ -87,7 +87,7 @@ class HostPreparationTests(unittest.TestCase):
             original = products / 'Engram.xctestrun'
             original.write_bytes(plistlib.dumps(self.original))
             result = M.prepare(root)
-            self.assertEqual(result['expected_tests'], 11)
+            self.assertEqual(result['expected_tests'], 12)
             output = plistlib.loads(Path(result['prepared']).read_bytes())
             environment = output['TestConfigurations'][0]['TestTargets'][0]['EnvironmentVariables']
             self.assertEqual(environment['CLAUDE_MEMORY_DB'], str(root / 'fixtures/app-memory.sqlite'))
@@ -142,7 +142,7 @@ class HostPreparationTests(unittest.TestCase):
             'testMascotInsertionRangesMatchFullRebuild',
             'testInsertionMembershipFallbacksMatchFullRebuild')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 128)
+        self.assertEqual(len(inventory), 131)
         self.assertIn('AdapterSnapshotTests/testSparsePositionsFollowSimulationChangesAndRegistryReplacement', inventory)
         self.assertIn('AdapterSnapshotTests/testMascotVisibilityReachesSceneAndPreservesExistingEntities', inventory)
         for name in (
@@ -183,6 +183,30 @@ class HostPreparationTests(unittest.TestCase):
         self.assertEqual([name for name in inventory if name.startswith('SceneMetadataDomainTests/')],
                          sorted(domain_controls))
         self.assertEqual(M.CLASSES.count('SceneMetadataDomainTests'), 1)
+
+    def test_nebula_lod_controls_are_mirrored_and_selected_in_exact_app_census(self):
+        repo = Path(__file__).parents[1]
+        package = (repo / 'Tests/EngramRealityKitTests/SingleGalaxyNebulaCacheTests.swift').read_text()
+        provider = package.split('@Suite("Nebula transform updates")', 1)[0]
+        cases = '@Suite("Nebula LOD visibility")' + package.split('@Suite("Nebula LOD visibility")', 1)[1]
+        mirrored = (provider + cases).replace('import Testing', 'import XCTest')
+        mirrored = re.sub(r'^@Suite\([^\n]*\)\n', '', mirrored, flags=re.M)
+        mirrored = re.sub(r'^    @Test\([^\n]*\)\n', '', mirrored, flags=re.M)
+        mirrored = mirrored.replace('struct NebulaLODVisibilityTests {',
+                                    'final class NebulaLODVisibilityTests: XCTestCase {')
+        mirrored = re.sub(r'^    func ([a-z])(\w*)\(',
+                          lambda match: '    func test' + match[1].upper() + match[2] + '(',
+                          mirrored, flags=re.M)
+        mirrored = mirrored.replace('    func testTick(dt: Float)', '    func tick(dt: Float)')
+        mirrored = mirrored.replace('#expect(', 'XCTAssertTrue(').replace('#require(', 'XCTUnwrap(')
+        self.assertEqual((repo / 'EngramUnitTests/NebulaLODVisibilityTests.swift').read_text(), mirrored)
+        expected = ['NebulaLODVisibilityTests/' + name for name in (
+            'testInitialNearAndFarVisibility',
+            'testFadeEndpointsAndTinyReentry',
+            'testHiddenMovementResizeAndRecreation')]
+        self.assertEqual([name for name in M.inventory(repo) if name.startswith('NebulaLODVisibilityTests/')],
+                         sorted(expected))
+        self.assertEqual(M.CLASSES.count('NebulaLODVisibilityTests'), 1)
 
     def test_panel_selection_requires_exact_functional_methods_without_performance_class(self):
         expected = ['PanelPerformanceTests/' + name for name in (

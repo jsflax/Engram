@@ -214,3 +214,152 @@ struct SingleGalaxyNebulaCacheTests {
         #expect(provider.dictionaryReads == 1)
     }
 }
+
+@Suite("Nebula LOD visibility")
+@MainActor
+struct NebulaLODVisibilityTests {
+    private func provider() -> NebulaTestProvider {
+        let provider = NebulaTestProvider()
+        provider.nodes = (0..<2).map { _ in
+            RKNodeSnapshot(id: UUID(), project: "A", topic: "topic", label: "A",
+                           importance: 1, isHub: false)
+        }
+        setInputs(provider, center: .zero, spread: 100, galaxyRadius: 500)
+        return provider
+    }
+
+    private func setInputs(_ provider: NebulaTestProvider, center: SIMD3<Float>,
+                           spread: Float, galaxyRadius: Float) {
+        provider.projectCentroids = ["A": center]
+        provider.storedPositions = [
+            provider.nodes[0].id: center + SIMD3<Float>(spread, 0, 0),
+            provider.nodes[1].id: center - SIMD3<Float>(spread, 0, 0),
+        ]
+        // The default cluster provider uses galaxyId "main". Match that ID
+        // so these tests exercise both sides of the actual near/far crossfade.
+        provider.galaxySnapshots = [
+            RKGalaxySnapshot(id: "main", displayName: "Main", worldCenter: center,
+                             dominantColor: SIMD3<Float>(0.3, 0.5, 0.7), nodeCount: 2,
+                             radius: galaxyRadius, parentGalaxyId: nil),
+            RKGalaxySnapshot(id: "group:test", displayName: "Group",
+                             worldCenter: center + SIMD3<Float>(1000, 0, 0),
+                             dominantColor: SIMD3<Float>(0.7, 0.5, 0.3), nodeCount: 2,
+                             radius: 500, parentGalaxyId: "main"),
+        ]
+    }
+
+    private func update(_ system: NebulaBatchSystem, _ container: Entity,
+                        _ provider: NebulaTestProvider, camera: SIMD3<Float>) {
+        system.update(container: container, dataProvider: provider, topologyChanged: false,
+                      scaleFactor: 0.01, cameraPosition: camera)
+    }
+
+    @Test("Initial near and far LOD disable only their fully transparent emitters")
+    func initialNearAndFarVisibility() throws {
+        for distance in [Float(0), Float(6000)] {
+            let provider = self.provider()
+            let system = NebulaBatchSystem()
+            let container = Entity()
+            update(system, container, provider, camera: SIMD3<Float>(distance, 0, 0))
+            let cluster = try #require(container.children.first { $0.name == "Nebula_main|A" })
+            let galaxy = try #require(container.children.first { $0.name == "GalaxyGas_main" })
+            #expect(cluster.isEnabled == (distance == 0))
+            #expect(galaxy.isEnabled == (distance != 0))
+            #expect(cluster.components[OpacityComponent.self]?.opacity == (distance == 0 ? 1 : 0))
+            #expect(galaxy.components[OpacityComponent.self]?.opacity == (distance == 0 ? 0 : 1))
+            let bridges = container.children.filter { $0.name.hasPrefix("Bridge_") }
+            #expect(bridges.count == 4)
+            for bridge in bridges {
+                #expect(bridge.isEnabled)
+                #expect(bridge.components[OpacityComponent.self] == nil)
+            }
+        }
+    }
+
+    @Test("Exact fade endpoints and tiny reentry bypass the visible opacity deadband")
+    func fadeEndpointsAndTinyReentry() throws {
+        let provider = self.provider()
+        let system = NebulaBatchSystem()
+        let container = Entity()
+        update(system, container, provider, camera: SIMD3<Float>(6000, 0, 0))
+        let cluster = try #require(container.children.first { $0.name == "Nebula_main|A" })
+        let galaxy = try #require(container.children.first { $0.name == "GalaxyGas_main" })
+
+        // Re-enter near LOD at 0.97 and far LOD at 0.03, then hit the exact
+        // endpoints. Both changes are smaller than the ordinary 0.05 deadband.
+        update(system, container, provider, camera: SIMD3<Float>(2678, 0, 0))
+        let near = try #require(cluster.components[OpacityComponent.self]?.opacity)
+        let far = try #require(galaxy.components[OpacityComponent.self]?.opacity)
+        #expect(abs(near - 0.97) < 0.0001)
+        #expect(abs(far - 0.03) < 0.0001)
+        #expect(cluster.isEnabled && galaxy.isEnabled)
+        update(system, container, provider, camera: .zero)
+        #expect(cluster.components[OpacityComponent.self]?.opacity == 1)
+        #expect(galaxy.components[OpacityComponent.self]?.opacity == 0)
+        #expect(cluster.isEnabled && !galaxy.isEnabled)
+
+        // A positive value smaller than the deadband must still restore the
+        // entity with positive opacity; it must not stay invisible at zero.
+        update(system, container, provider, camera: SIMD3<Float>(2602.6, 0, 0))
+        let tinyFar = try #require(galaxy.components[OpacityComponent.self]?.opacity)
+        #expect(tinyFar > 0 && tinyFar < 0.005)
+        #expect(galaxy.isEnabled)
+        update(system, container, provider, camera: SIMD3<Float>(5200, 0, 0))
+        #expect(!cluster.isEnabled && galaxy.isEnabled)
+        #expect(cluster.components[OpacityComponent.self]?.opacity == 0)
+        #expect(galaxy.components[OpacityComponent.self]?.opacity == 1)
+        update(system, container, provider, camera: SIMD3<Float>(5197.4, 0, 0))
+        let tinyNear = try #require(cluster.components[OpacityComponent.self]?.opacity)
+        #expect(tinyNear > 0 && tinyNear < 0.005)
+        #expect(cluster.isEnabled && galaxy.isEnabled)
+        // Ordinary positive changes below the deadband retain the last value.
+        update(system, container, provider, camera: SIMD3<Float>(5194.8, 0, 0))
+        #expect(cluster.components[OpacityComponent.self]?.opacity == tinyNear)
+        #expect(cluster.isEnabled && galaxy.isEnabled)
+    }
+
+    @Test("Hidden LOD retains live transforms and resizing and is removed and recreated with topology")
+    func hiddenMovementResizeAndRecreation() throws {
+        for distance in [Float(0), Float(6000)] {
+            let provider = self.provider()
+            let system = NebulaBatchSystem()
+            let container = Entity()
+            let camera = SIMD3<Float>(distance, 0, 0)
+            update(system, container, provider, camera: camera)
+            let name = distance == 0 ? "GalaxyGas_main" : "Nebula_main|A"
+            let hidden = try #require(container.children.first { $0.name == name })
+            #expect(!hidden.isEnabled)
+            let originalEmitter = try #require(hidden.components[ParticleEmitterComponent.self])
+            let center = SIMD3<Float>(20, 30, 40)
+            setInputs(provider, center: center, spread: 500, galaxyRadius: 1000)
+            update(system, container, provider, camera: center + camera)
+            #expect(container.children.first { $0.name == name } === hidden)
+            #expect(!hidden.isEnabled)
+            #expect(hidden.position == center * 0.01)
+            let resizedEmitter = try #require(hidden.components[ParticleEmitterComponent.self])
+            #expect(resizedEmitter.emitterShapeSize.x > originalEmitter.emitterShapeSize.x)
+            #expect(resizedEmitter.mainEmitter.lifeSpan == originalEmitter.mainEmitter.lifeSpan)
+            for bridge in container.children where bridge.name.hasPrefix("Bridge_") {
+                #expect(bridge.isEnabled)
+            }
+
+            provider.nodes.removeAll()
+            provider.projectCentroids.removeAll()
+            provider.storedPositions.removeAll()
+            provider.galaxySnapshots.removeAll()
+            update(system, container, provider, camera: camera)
+            #expect(container.children.isEmpty)
+            #expect(hidden.parent == nil)
+
+            let replacement = self.provider()
+            update(system, container, replacement, camera: camera)
+            let recreated = try #require(container.children.first { $0.name == name })
+            #expect(recreated !== hidden)
+            #expect(!recreated.isEnabled)
+            #expect(recreated.components[OpacityComponent.self]?.opacity == 0)
+            let restoredEmitter = try #require(recreated.components[ParticleEmitterComponent.self])
+            #expect(restoredEmitter.emitterShapeSize == originalEmitter.emitterShapeSize)
+            #expect(restoredEmitter.mainEmitter.birthRate == originalEmitter.mainEmitter.birthRate)
+        }
+    }
+}
