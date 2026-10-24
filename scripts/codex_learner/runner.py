@@ -278,7 +278,8 @@ def learner_command(root: Path, run_dir: Path, request: dict, config: dict) -> l
                  "notify": [], "web_search": "disabled"}
     for key, value in overrides.items():
         argv += ["-c", key + "=" + toml_value(value)]
-    for feature in ("hooks", "shell_tool", "plugins", "apps", "multi_agent", "computer_use",
+    # The two collaboration implementations have independent feature flags.
+    for feature in ("hooks", "shell_tool", "plugins", "apps", "multi_agent", "multi_agent_v2", "computer_use",
                     "browser_use", "in_app_browser", "image_generation", "view_image", "goals"):
         argv += ["--disable", feature]
     return argv + ["-"]

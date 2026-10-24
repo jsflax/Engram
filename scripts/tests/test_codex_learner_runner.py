@@ -655,6 +655,9 @@ class RunnerTests(unittest.TestCase):
     def test_command_is_ephemeral_and_has_only_memory_capability(self):
         run_dir = runner.private_dir(self.root / "runs" / "config-test")
         config = {**self.config, "codex_bin": self.fake_codex()}
+        config_path = self.home / "config.toml"
+        config_path.write_text(config_path.read_text().replace('model_reasoning_effort="medium"',
+                                                               'model_reasoning_effort="ultra"'))
         argv = runner.learner_command(self.root, run_dir, self.request(), config)
         self.assertIn("--ignore-user-config", argv)
         self.assertIn("--ephemeral", argv)
@@ -670,8 +673,10 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(set(overrides["mcp_servers"]["memory"]["enabled_tools"]), runner.READ_TOOLS | runner.WRITE_TOOLS)
         self.assertEqual(overrides["web_search"], "disabled")
         self.assertEqual(overrides["approval_policy"], "never")
-        self.assertTrue({"hooks", "shell_tool", "plugins", "apps", "multi_agent", "computer_use", "image_generation"}.issubset(disabled))
+        self.assertTrue({"hooks", "shell_tool", "plugins", "apps", "multi_agent", "multi_agent_v2", "computer_use", "image_generation"}.issubset(disabled))
+        self.assertNotIn("--enable", argv)
         self.assertEqual(argv[argv.index("--model") + 1], "configured-model")
+        self.assertEqual(overrides["model_reasoning_effort"], "ultra")
         self.assertNotIn("unrelated.invalid", " ".join(argv))
 
     def test_missing_memory_config_fails_without_provider(self):
