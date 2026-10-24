@@ -28,6 +28,18 @@ DEFAULT_ADMISSION = object()
 
 
 class StatusTests(unittest.TestCase):
+    def test_advice_cleanup_diagnostics_are_fixed_enums_only(self):
+        self.assertEqual(STATUS.metadata({
+            "status": "timeout", "failure_phase": "mcp_initialize", "error_kind": "classified",
+            "cleanup_status": "timeout", "cleanup_error_kind": "classified",
+        }), {"status": "timeout", "failure_phase": "mcp_initialize", "error_kind": "classified",
+             "cleanup_status": "timeout", "cleanup_error_kind": "classified"})
+        for value in ("private exception message", {"private": "data"}, [], None, False):
+            with self.subTest(value=value):
+                self.assertEqual(STATUS.metadata({"cleanup_status": value, "cleanup_error_kind": value}), {})
+        for status in ("completed", "timeout", "failed"):
+            self.assertEqual(STATUS.metadata({"cleanup_status": status}), {"cleanup_status": status})
+
     def setUp(self):
         self.guards = contextlib.ExitStack()
         for target in ((subprocess, "Popen"), (socket, "create_connection"), (sqlite3, "connect")):

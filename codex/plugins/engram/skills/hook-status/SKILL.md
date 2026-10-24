@@ -39,6 +39,8 @@ Report a returned learner `reason` code when present. The reader exposes only an
 
 Advice diagnostics and lifecycle failure kinds are exact enums, never exception text. Runtime identity exposes only package version, source hashes, and typed status; it identifies observed package files, not successful execution or saved memory.
 
+Advice `cleanup_status` separately records whether the owned child was reaped (`completed`) or cleanup timed out or failed. When recall and cleanup both fail, `status` and `failure_phase` preserve the primary recall failure, subject to the existing cancellation precedence that may set `status` to `cancelled`; `cleanup_error_kind` is only a fixed diagnostic category. A cleanup timeout does not prove the child remains alive after the receipt, and none of these fields establishes context delivery.
+
 The reader prefers `CODEX_HOME/engram` and its shared `learner` state. It falls back to legacy `engram-gui-hooks` only when the modern directory is absent, never when it is unsafe. Within legacy state, it selects `learners/<selected-task-id>` if present, otherwise the original `learner` root. An unsafe per-task root refuses fallback. Directory presence alone does not establish activation.
 
 This is a read-only status check. Installation, trust changes, retries, provider calls, and memory writes are separate tasks.

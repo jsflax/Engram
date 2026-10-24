@@ -544,47 +544,66 @@ def execute(config, payload, start, root, audit):
         atomic_state(root, state)  # Spawn reservation survives a killed hook.
         client = None
         try:
-            deadline = start + config["wall_seconds"] - 0.08
-            if time.monotonic() >= deadline:
-                raise Failure("timeout")
-            audit["_phase"] = "spawn"
-            client = Client(config, deadline)
-            audit["_phase"] = "mcp_initialize"
-            client.initialize()
-            items = []
-            for index, (name, arguments, pin) in enumerate(calls, 2):
-                audit["_phase"] = "mcp_recall" if name == "recall" else "mcp_graph"
-                text = client.call(index, name, arguments)
-                audit["_phase"] = "parse_recall" if name == "recall" else "parse_graph"
-                items.extend(blocks(text, pin, arguments.get("project"), allow_other_projects=allow_other_projects))
-            audit["_phase"] = "render"
-            context, ids = render(items, config["context_chars"])
+            primary_error = None
+            try:
+                deadline = start + config["wall_seconds"] - 0.08
+                if time.monotonic() >= deadline:
+                    raise Failure("timeout")
+                audit["_phase"] = "spawn"
+                client = Client(config, deadline)
+                audit["_phase"] = "mcp_initialize"
+                client.initialize()
+                items = []
+                for index, (name, arguments, pin) in enumerate(calls, 2):
+                    audit["_phase"] = "mcp_recall" if name == "recall" else "mcp_graph"
+                    text = client.call(index, name, arguments)
+                    audit["_phase"] = "parse_recall" if name == "recall" else "parse_graph"
+                    items.extend(blocks(text, pin, arguments.get("project"), allow_other_projects=allow_other_projects))
+                audit["_phase"] = "render"
+                context, ids = render(items, config["context_chars"])
+                check_cancelled()
+            except Exception as error:
+                primary_error = error
+                primary_phase = audit["_phase"]
+                raise
+            finally:
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception as error:
+                        audit["cleanup_status"] = ("timeout" if isinstance(error, Failure)
+                                                   and str(error) == "cleanup_timeout" else "failed")
+                        audit["cleanup_error_kind"] = "classified" if isinstance(error, Failure) else error_kind(error)
+                        if primary_error is None:
+                            audit["_phase"] = "cleanup"
+                            raise
+                        # Retain the operation's fixed failure and phase; cleanup
+                        # diagnostics must not hide why recall first failed.
+                        audit["_phase"] = primary_phase
+                    else:
+                        audit["cleanup_status"] = "completed"
+            # A cancellation arriving during close must not commit success or
+            # suppress a subsequent attempt through the dedupe marker.
             check_cancelled()
+        except Exception as error:
+            if (not isinstance(error, Failure) or str(error) != "cancelled"
+                    or audit.get("cleanup_status") in {"timeout", "failed"}):
+                state["failures"] = min(3, failures + 1)
+                if state["failures"] >= 3:
+                    state["next_allowed"] = now + 30
+            raise
+        else:
             state["failures"] = 0
             if dedupe:
                 state["recent"][identity] = now
             audit.update(status="emitted" if context else "empty", memory_ids=ids, context_chars=len(context))
             return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}} if context else {}
-        except Exception as error:
-            if not isinstance(error, Failure) or str(error) != "cancelled":
-                state["failures"] = min(3, failures + 1)
-                if state["failures"] >= 3:
-                    state["next_allowed"] = now + 30
-            raise
         finally:
             try:
-                if client is not None:
-                    try:
-                        client.close()
-                    except Exception:
-                        audit["_phase"] = "cleanup"
-                        raise
-            finally:
-                try:
-                    atomic_state(root, state)
-                except Exception:
-                    audit["_phase"] = "state_commit"
-                    raise
+                atomic_state(root, state)
+            except Exception:
+                audit["_phase"] = "state_commit"
+                raise
     finally:
         os.close(lock)
 
