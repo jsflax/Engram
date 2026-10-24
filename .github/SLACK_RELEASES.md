@@ -3,7 +3,9 @@
 Published releases are announced to Canary Slack's #engram channel using the
 repository secret `SLACK_WEBHOOK_URL`. Configure it for that channel; never commit
 or print the URL. The shared incoming webhook retains its Slack app identity.
-Lattice and LatticeCore identify themselves with their product icons in the card.
+Lattice and LatticeCore identify themselves with their product icons beside the
+release heading, aligned on its right. The View Release button stays beside the
+notes.
 
 The release workflow calls `slack-release.yml` directly after publication because
 GitHub suppresses new release-event runs for publications made by `GITHUB_TOKEN`.

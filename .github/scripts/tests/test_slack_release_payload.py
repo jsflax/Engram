@@ -117,12 +117,41 @@ class SlackReleasePayloadTests(unittest.TestCase):
         self.assertIn(self.url, notice)
         self.assertIn("Notes shortened", payload["text"])
 
-    def test_header_accessible_fallback_button_and_separate_icon(self):
+    def test_icon_is_right_of_heading_and_button_stays_with_notes(self):
         payload = build_payload("Lattice" * 100, "v2.0.6", self.url, "- Useful change.", "https://example.com/icon.png")
-        self.assertLessEqual(len(payload["blocks"][0]["text"]["text"]), HEADER_LIMIT)
+        heading, notes = payload["blocks"]
+        self.assertEqual(heading["type"], "section")
+        self.assertEqual(heading["text"]["type"], "mrkdwn")
+        self.assertTrue(heading["text"]["verbatim"])
+        self.assertTrue(heading["text"]["text"].startswith("*✅ Lattice"))
+        self.assertTrue(heading["text"]["text"].endswith("…*"))
+        self.assertLessEqual(len(heading["text"]["text"]), HEADER_LIMIT)
+        self.assertEqual(heading["accessory"]["type"], "image")
+        self.assertEqual(heading["accessory"]["image_url"], "https://example.com/icon.png")
         self.assertIn("Useful change.", payload["text"])
-        self.assertEqual(payload["blocks"][1]["type"], "context")
-        self.assertEqual(payload["blocks"][2]["accessory"]["text"]["text"], "View Release")
+        self.assertEqual(notes["text"]["text"], "• Useful change.")
+        self.assertEqual(notes["accessory"]["type"], "button")
+        self.assertEqual(notes["accessory"]["text"]["text"], "View Release")
+        self.assertEqual(notes["accessory"]["url"], self.url)
+
+    def test_branded_heading_escapes_slack_syntax_within_size_budget(self):
+        payload = build_payload("Lattice <!here> &", "v2.0.6", self.url, "Notes", "https://example.com/icon.png")
+        heading = payload["blocks"][0]["text"]
+        self.assertEqual(heading["text"], "*✅ Lattice &lt;!here&gt; &amp; v2.0.6 released*")
+        self.assertTrue(heading["verbatim"])
+        oversized = build_payload("&" * 100, "v2.0.6", self.url, "Notes", "https://example.com/icon.png")
+        text = oversized["blocks"][0]["text"]["text"]
+        self.assertLessEqual(len(text), HEADER_LIMIT)
+        self.assertRegex(text, r"^(?:[^&]|&amp;)*$")
+        self.assertTrue(text.endswith("…*"))
+
+    def test_unbranded_release_keeps_plain_text_header(self):
+        payload = self.payload("- Useful change.")
+        self.assertEqual(payload["blocks"][0], {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "✅ Engram v0.15.20 released"},
+        })
+        self.assertEqual(payload["blocks"][1]["accessory"]["type"], "button")
 
     def test_missing_notes_and_invalid_urls(self):
         self.assertEqual(self.sections(self.payload(" \n\r\n")), ["No release notes provided."])

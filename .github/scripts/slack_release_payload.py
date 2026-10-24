@@ -8,7 +8,7 @@ from urllib.parse import quote, urlsplit
 
 SECTION_LIMIT = 3000
 HEADER_LIMIT = 150
-MAX_NOTE_SECTIONS = 45  # Leave room for the header, optional icon, and notice.
+MAX_NOTE_SECTIONS = 45  # Leave room for the heading and truncation notice.
 
 _FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
@@ -215,9 +215,22 @@ def build_payload(product: str, tag: str, release_url: str, body: str, icon_url:
     tag = " ".join(tag.split())
     title = f"✅ {product} {tag} released"
     header = title if len(title) <= HEADER_LIMIT else title[: HEADER_LIMIT - 1] + "…"
-    blocks: list[dict] = [{"type": "header", "text": {"type": "plain_text", "text": header}}]
     if icon_url is not None:
-        blocks.append({"type": "context", "elements": [{"type": "image", "image_url": icon_url, "alt_text": f"{product[:100]} icon"}]})
+        # Section accessories sit to the right of their text. Header blocks
+        # cannot have accessories, so use a bold section for branded releases.
+        # Count escaping and the bold delimiters in the heading's size budget.
+        if len(_escape(header)) + 2 > HEADER_LIMIT:
+            header = header.removesuffix("…")
+            while len(_escape(header)) + 3 > HEADER_LIMIT:
+                header = header[:-1]
+            header += "…"
+        blocks: list[dict] = [{
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{_escape(header)}*", "verbatim": True},
+            "accessory": {"type": "image", "image_url": icon_url, "alt_text": f"{product[:100]} icon"},
+        }]
+    else:
+        blocks = [{"type": "header", "text": {"type": "plain_text", "text": header}}]
     sections = _sections(body)
     shortened = len(sections) > MAX_NOTE_SECTIONS
     for index, section in enumerate(sections[:MAX_NOTE_SECTIONS]):
