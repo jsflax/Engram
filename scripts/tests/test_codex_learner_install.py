@@ -211,7 +211,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_real_runtime_stages_provider_guard_and_imports_without_repository_fallback(self):
         assets = installer.load_assets(MODULE_PATH.parent)
-        for name in ('spawn_admission.py', 'provider_guard.py'):
+        for name in ('spawn_admission.py', 'resource_admission.py', 'provider_guard.py'):
             relative = 'codex_learner/' + name
             self.assertEqual(assets[relative], (MODULE_PATH.parent / relative).read_bytes())
         runtime = installer.stage_runtime(self.state, assets)

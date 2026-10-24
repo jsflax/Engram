@@ -113,6 +113,7 @@ class PluginPackageTests(unittest.TestCase):
         with tarfile.open(self.root / "first" / manifest["archive"]["name"]) as archive:
             for relative in ("README.md", "scripts/codex_learner/legacy_expired_update.py",
                              "scripts/codex_learner/spawn_admission.py",
+                             "scripts/codex_learner/resource_admission.py",
                              "scripts/codex_learner/provider_guard.py",
                              "scripts/codex_learner/learner_prompt_project.md",
                              "scripts/codex_learner/learner_prompt.md"):

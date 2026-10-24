@@ -24,6 +24,7 @@ class SpawnAdmissionTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
         self.directory = self.root / "gate"
+        self.enterContext(mock.patch.object(G.resources, "is_darwin", return_value=False))
 
     def lease(self, **kwargs):
         return G.lease(directory=self.directory, now=10_000, load=lambda: 0, **kwargs)
@@ -226,6 +227,7 @@ class SpawnAdmissionTests(unittest.TestCase):
 import json, subprocess, sys, time
 sys.path.insert(0, sys.argv[1])
 from codex_learner import spawn_admission as G
+G.resources.is_darwin = lambda: False  # Explicit legacy-policy lifetime fixture.
 with G.lease(directory=sys.argv[2], now=10000, load=lambda:0) as lease:
     assert lease.admitted
     argv=[sys.executable,"-I","-S","-B","-c",sys.argv[3],sys.argv[4],sys.argv[5]]
@@ -376,7 +378,7 @@ with G.lease(directory=sys.argv[2], now=10000, load=lambda:0) as lease:
         self.assertEqual(fixture.attempts, [("pending", sid)])
 
     def test_legacy_shared_gate_and_guard_are_identical(self):
-        for name in ("spawn_admission.py", "provider_guard.py"):
+        for name in ("spawn_admission.py", "resource_admission.py", "provider_guard.py"):
             self.assertEqual((PLUGIN_ROOT / "scripts/codex_learner" / name).read_bytes(),
                              (REPOSITORY_ROOT / "scripts/codex_learner" / name).read_bytes())
 

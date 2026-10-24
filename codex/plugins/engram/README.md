@@ -71,10 +71,19 @@ One queue and provider lock serialize automatic learners on each Codex home.
 Claude and Codex background workers also share a per-device lifetime lease and
 a 10-minute cooldown between worker starts. This cooldown is separate from the
 provider's configured wall-time deadline. The provider guard retains the lease
-until its owned provider child has terminated and been reaped. High or unavailable
-load, invalid state, and failed cooldown persistence defer admission while keeping
-queued work intact. A later lifecycle event can retry it; no timer guarantees a
-wakeup when the cooldown expires.
+until its owned provider child has terminated and been reaped. On macOS, admission
+requires at least 20% CPU idle time over an approximately one-second interval and
+normal memory pressure. Load average is diagnostic only. Linux retains its load
+gate. Unavailable or stale capacity measurements, invalid state, and failed
+cooldown persistence refuse admission while keeping queued work intact.
+
+The packaged Codex worker coalesces capacity sampling and transient admission
+retries within a finite 15-minute window. It releases execution locks before
+sampling or waiting, then rechecks current policy and eligible work. It stops
+after the first successful admission and preserves batch limits, pauses and holds.
+This does not guarantee completion under sustained pressure or after worker exit.
+Later lifecycle events can try again. Native Claude and the standalone legacy
+Codex worker sample once per invocation; they do not gain this retry coordinator.
 The learner has no project shell, browser, other integrations, or recursive hook
 access. Its memory proxy enforces approved tools, each new memory's explicit privacy
 choice, session provenance, bounded calls/writes, and exact write receipts. Ordinary

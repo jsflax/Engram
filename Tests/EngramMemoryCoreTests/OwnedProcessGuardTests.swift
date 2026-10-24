@@ -292,8 +292,10 @@ private struct GuardFixture {
 
     func gate() -> SpawnAdmission {
         var policy = SpawnAdmission.Policy(); policy.cooldownSeconds = 0
-        return SpawnAdmission(stateDirectory: root.path, policy: policy,
+        var admission = SpawnAdmission(stateDirectory: root.path, policy: policy,
             now: { Date(timeIntervalSince1970: 10_000) }, loadAverage: { 0 }, processorCount: 2)
+        admission.resourceMode = .legacyLoad
+        return admission
     }
 
     func attempt() throws -> SpawnAdmission.Verdict { try gate().admit(kind: .learner) { _ in 99 } }

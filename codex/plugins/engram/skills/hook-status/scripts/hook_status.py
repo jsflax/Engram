@@ -26,7 +26,8 @@ MAX_OUTPUT_BYTES = 49152
 ADMISSION_MAX_AGE_SECONDS = 600
 WORKER_ADMISSION_EVENTS = {"worker_admission_deferred", "worker_admitted"}
 WORKER_ADMISSION_REASONS = {"admitted", "cooldown", "load", "load_unavailable",
-                            "concurrency", "state_unavailable"}
+                            "concurrency", "state_unavailable", "cpu_pressure",
+                            "memory_pressure", "resource_unavailable"}
 RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}")
 UUID_TEXT = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 HASH = re.compile(r"(?:[0-9a-f]{20}|[0-9a-f]{64})")
@@ -369,7 +370,8 @@ def worker_admission_view(record, sid, pending, *, now=None):
         return out
     if (type(decision) is not dict
             or not {"schema_version", "reason"} <= set(decision)
-            or set(decision) - {"schema_version", "reason", "load_average", "load_limit", "cooldown_eligible_after"}
+            or set(decision) - {"schema_version", "reason", "load_average", "load_limit", "cooldown_eligible_after",
+                                "cpu_idle_fraction", "memory_pressure"}
             or type(decision["schema_version"]) is not int or decision["schema_version"] != 1
             or not isinstance(decision["reason"], str) or decision["reason"] not in WORKER_ADMISSION_REASONS):
         return out
@@ -381,7 +383,25 @@ def worker_admission_view(record, sid, pending, *, now=None):
         if key in decision and (type(decision[key]) not in (int, float)
                                 or not 0 <= decision[key] <= 2**53 or not math.isfinite(decision[key])):
             return out
-    if ("load_average" in decision) != ("load_limit" in decision):
+    capacity = "cpu_idle_fraction" in decision
+    if capacity != ("memory_pressure" in decision):
+        return out
+    if capacity:
+        if "load_limit" in decision:  # Darwin load is diagnostic, not an admission limit.
+            return out
+    elif ("load_average" in decision) != ("load_limit" in decision):
+        return out
+    if capacity and (type(decision["cpu_idle_fraction"]) not in (int, float)
+                     or not 0 <= decision["cpu_idle_fraction"] <= 1
+                     or decision["memory_pressure"] not in ("normal", "warning", "critical")):
+        return out
+    if reason == "cpu_pressure" and (not capacity or decision["cpu_idle_fraction"] >= .20
+                                     or decision["memory_pressure"] != "normal"):
+        return out
+    if reason == "memory_pressure" and (not capacity or decision["memory_pressure"] == "normal"):
+        return out
+    if reason == "admitted" and capacity and (decision["cpu_idle_fraction"] < .20
+                                              or decision["memory_pressure"] != "normal"):
         return out
     if (reason == "load" and ("load_average" not in decision
                                or decision["load_average"] <= decision["load_limit"])):

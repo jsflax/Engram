@@ -35,6 +35,7 @@ REQUIRED_ASSETS = (
     "codex_learner/transcript.py",
     "codex_learner/runner.py",
     "codex_learner/spawn_admission.py",
+    "codex_learner/resource_admission.py",
     "codex_learner/provider_guard.py",
     "codex_learner/memory_proxy.py",
     "codex_learner/learner_prompt.md",

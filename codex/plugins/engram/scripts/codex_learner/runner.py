@@ -45,6 +45,7 @@ DEFAULTS = learner_settings.DEFAULTS
 ADMISSION_RETRY_SECONDS = 900
 ADMISSION_RETRY_INTERVAL = 30
 ADMISSION_RETRY_ATTEMPTS = 30
+ADMISSION_TRANSIENT = {"load", "cooldown", "concurrency", "cpu_pressure", "memory_pressure"}
 
 
 def utc() -> str:
@@ -1331,9 +1332,10 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=None,
 
 @dataclass(frozen=True)
 class WorkerAttempt:
-    outcome: str  # busy, idle, admitted, or deferred
+    outcome: str  # busy, idle, admitted, deferred, or sample
     diagnostic: dict | None = None
     policy: dict | None = None
+    resource_identity: tuple | None = None
 
 
 def _retry_event(root, event, **fields):
@@ -1364,7 +1366,8 @@ def worker(root: Path) -> int:
         print("Engram: " + str(exc), file=sys.stderr)
         return 0
     attempt = _worker_once(root)
-    if attempt.outcome != "deferred" or attempt.diagnostic["reason"] not in {"load", "cooldown", "concurrency"}:
+    if attempt.outcome != "sample" and (attempt.outcome != "deferred"
+            or attempt.diagnostic["reason"] not in ADMISSION_TRANSIENT):
         return 0
     # The one-attempt body has unwound worker/enqueue/provider/shared admission
     # contexts. In particular, even a refused lease may own spawn.lock until
@@ -1382,21 +1385,37 @@ def worker(root: Path) -> int:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                delay = ADMISSION_RETRY_INTERVAL
-                if attempt.outcome == "deferred" and attempt.diagnostic["reason"] == "cooldown":
-                    eligible = attempt.diagnostic.get("cooldown_eligible_after")
-                    if eligible is not None:
-                        delay = min(60, max(ADMISSION_RETRY_INTERVAL, eligible - time.time()))
-                delay = min(delay, remaining)
-                _retry_event(root, "worker_admission_retry_wait", attempt=number, delay_seconds=delay)
-                time.sleep(delay)
+                needs_sample = attempt.outcome == "sample"
+                if not needs_sample:
+                    delay = ADMISSION_RETRY_INTERVAL
+                    if attempt.outcome == "deferred" and attempt.diagnostic["reason"] == "cooldown":
+                        eligible = attempt.diagnostic.get("cooldown_eligible_after")
+                        if eligible is not None:
+                            delay = min(60, max(ADMISSION_RETRY_INTERVAL, eligible - time.time()))
+                    delay = min(delay, remaining)
+                    _retry_event(root, "worker_admission_retry_wait", attempt=number, delay_seconds=delay)
+                    time.sleep(delay)
                 if time.monotonic() >= deadline:
                     break
                 _check_retry_lock(root, retry_fd, directory_identity)
                 runtime_routing.maybe_exec(Path(__file__).absolute().parents[2], "codex_learner.py",
                     ["worker", "--state-dir", str(root)], state_root=root,
                     deadline=deadline, allow_handoff=False)
-                attempt = _worker_once(root, expected_policy=policy, retry_fd=retry_fd)
+                if not needs_sample:
+                    attempt = _worker_once(root, expected_policy=policy, retry_fd=retry_fd)
+                if attempt.outcome == "sample":
+                    # Coalesced from the FIRST sample, under the same finite
+                    # deadline. No worker/enqueue/provider/shared lease is held.
+                    observation = spawn_admission.resources.sample()
+                    if time.monotonic() >= deadline:
+                        break
+                    _check_retry_lock(root, retry_fd, directory_identity)
+                    runtime_routing.maybe_exec(Path(__file__).absolute().parents[2], "codex_learner.py",
+                        ["worker", "--state-dir", str(root)], state_root=root,
+                        deadline=deadline, allow_handoff=False)
+                    attempt = _worker_once(root, expected_policy=policy, retry_fd=retry_fd,
+                                           resource_sample=observation if observation is not None else False,
+                                           resource_identity=attempt.resource_identity)
                 if attempt.outcome == "busy":
                     # A natural worker may be about to refuse admission and
                     # lose retry.lock to us. Do not drop the only wakeup owner.
@@ -1404,7 +1423,7 @@ def worker(root: Path) -> int:
                 if attempt.outcome != "deferred":
                     _retry_event(root, "worker_admission_retry_finished", outcome=attempt.outcome)
                     return 0  # One actual admission retains its ordinary batch cap.
-                if attempt.diagnostic["reason"] not in {"load", "cooldown", "concurrency"}:
+                if attempt.diagnostic["reason"] not in ADMISSION_TRANSIENT:
                     _retry_event(root, "worker_admission_retry_stopped", reason=attempt.diagnostic["reason"])
                     return 0
             _retry_event(root, "worker_admission_retry_exhausted")
@@ -1416,7 +1435,8 @@ def worker(root: Path) -> int:
     return 0
 
 
-def _worker_once(root: Path, *, expected_policy=None, retry_fd=None) -> WorkerAttempt:
+def _worker_once(root: Path, *, expected_policy=None, retry_fd=None,
+                 resource_sample=None, resource_identity=None) -> WorkerAttempt:
     # A missing/inactive policy must not even inspect or pause an old queue.
     active_policy = admission.check_activation(root)
     if expected_policy is not None and active_policy != expected_policy:
@@ -1501,7 +1521,11 @@ def _worker_once(root: Path, *, expected_policy=None, retry_fd=None) -> WorkerAt
             if choice is None:
                 break
             if shared_lease is None:
-                shared_lease = shared_slot.enter_context(spawn_admission.lease())
+                shared_lease = shared_slot.enter_context(spawn_admission.lease(
+                    **({"resource_sample": resource_sample, "resource_identity": resource_identity}
+                       if resource_sample is not None else {})))
+                if shared_lease.reason == "sample_required":
+                    return WorkerAttempt("sample", policy=active_policy, resource_identity=shared_lease.identity)
                 # This is the candidate seen before shared admission, not proof
                 # it executed. Re-selection below remains authoritative.
                 candidate_lane, candidate_sid, candidate_work = choice

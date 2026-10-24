@@ -139,6 +139,7 @@ esac
         (scripts / "codex_learner").mkdir()
         for name in ("codex_learner.py", "codex_learner/__init__.py", "codex_learner/transcript.py",
                      "codex_learner/runner.py", "codex_learner/spawn_admission.py",
+                     "codex_learner/resource_admission.py",
                      "codex_learner/provider_guard.py", "codex_learner/memory_proxy.py", "codex_learner/learner_prompt.md"):
             (scripts / name).write_text("# packaged fixture\n")
         health = source / "codex/plugins/engram/skills/hook-status/scripts/hook_status.py"
@@ -167,7 +168,7 @@ for binary in Engram EngramHooks EngramDaemon; do echo local-build > ".build/rel
         files = [p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_file()]
         self.assertIn("codex_learner/learner_prompt.md", files)
         self.assertIn("codex_learner/memory_proxy.py", files)
-        for name in ('spawn_admission.py', 'provider_guard.py'):
+        for name in ('spawn_admission.py', 'resource_admission.py', 'provider_guard.py'):
             relative = 'codex_learner/' + name
             self.assertIn(relative, files)
             self.assertEqual((target / relative).read_bytes(), (SCRIPTS / relative).read_bytes())

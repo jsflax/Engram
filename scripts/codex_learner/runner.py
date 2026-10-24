@@ -554,6 +554,26 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=run_codex
 
 
 def worker(root: Path) -> int:
+    attempt = _worker_once(root)
+    if not isinstance(attempt, tuple):
+        return attempt
+    # Legacy callers gain one capacity observation, not a new retry queue.
+    # The preflight has released all execution/shared locks; coalesce samplers.
+    try:
+        with spawn_admission.sampling_slot(root) as acquired:
+            if not acquired:
+                return 0
+            observation = spawn_admission.resources.sample()
+    except (OSError, ValueError):
+        event_log(root, "worker_admission_deferred", reason="state_unavailable")
+        return 0
+    # Re-select work and recheck the shared lease/cooldown after sampling.
+    # Releasing sampling leadership here also preserves the terminal handoff.
+    return _worker_once(root, resource_sample=observation if observation is not None else False,
+                        resource_identity=attempt[1])
+
+
+def _worker_once(root: Path, *, resource_sample=None, resource_identity=None):
     def ready_pending():
         values = []
         for p in (root / "pending").glob("*.json"):
@@ -582,8 +602,12 @@ def worker(root: Path) -> int:
             if not candidates:
                 break
             if shared_lease is None:
-                shared_lease = shared_slot.enter_context(spawn_admission.lease())
+                shared_lease = shared_slot.enter_context(spawn_admission.lease(
+                    **({"resource_sample": resource_sample, "resource_identity": resource_identity}
+                       if resource_sample is not None else {})))
                 if not shared_lease.admitted:
+                    if shared_lease.reason == "sample_required":
+                        return "sample_required", shared_lease.identity
                     event_log(root, "worker_admission_deferred", reason=shared_lease.reason)
                     return 0
             _, pending, request = candidates[0]

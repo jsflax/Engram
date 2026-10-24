@@ -98,6 +98,8 @@ class RunnerTests(unittest.TestCase):
         # Production cooldown/load refusal is covered by test_spawn_admission;
         # unrelated host learners must not decide whether these fixtures run.
         production_lease = runner.spawn_admission.lease
+        self.production_lease = production_lease
+        self.enterContext(mock.patch.object(runner.spawn_admission.resources, "is_darwin", return_value=False))
         admission = mock.patch.object(runner.spawn_admission, "lease", side_effect=lambda: production_lease(
             directory=self.base / "admission", now=10_000, load=lambda: 0, cooldown=0))
         admission.start()
@@ -546,6 +548,40 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(runner.worker(self.root), 0)
             self.assertEqual(process.call_count, runner.DEFAULTS["max_runs_per_worker"] + 1)
             self.assertFalse(pending_path.exists())
+
+    def test_darwin_worker_samples_once_outside_locks_and_reselects(self):
+        gate = runner.spawn_admission
+        resources = gate.resources
+        runner.enqueue(self.root, self.payload(), spawn=False)
+        pending = self.root / "pending" / (self.sid + ".json")
+        seen = []
+        def sample():
+            self.assertEqual(gate.pass_fds(), ())
+            for path in (self.root / "worker.lock", self.root / "enqueue.lock", self.base / "admission/spawn.lock"):
+                with runner.lock_file(path, blocking=False) as held:
+                    self.assertTrue(held)
+            with gate.sampling_slot(self.root) as held:
+                self.assertFalse(held)
+            runner.atomic_json(pending, {**runner.load_json(pending), "request_id": "replacement"})
+            return resources.Sample(.4, 16, 1, 100)
+        probe = mock.Mock()
+        probe.pressure.return_value, probe.processors.return_value = 1, 16
+        def process(root, request, config):
+            seen.append(request["request_id"])
+            return "succeeded"
+        with mock.patch.object(resources, "is_darwin", return_value=True), \
+             mock.patch.object(resources, "DarwinProbe", return_value=probe), \
+             mock.patch.object(resources.time, "monotonic", return_value=100), \
+             mock.patch.object(resources, "sample", side_effect=sample) as sampling, \
+             mock.patch.object(gate, "lease", side_effect=lambda **kwargs: self.production_lease(
+                 directory=self.base / "admission", now=10_000, load=lambda: 95, cooldown=0, **kwargs)), \
+             mock.patch.object(runner, "process_request", side_effect=process), \
+             mock.patch.object(runner, "spawn_worker") as spawn:
+            self.assertEqual(runner.worker(self.root), 0)
+            self.assertEqual(sampling.call_count, 1)
+            spawn.assert_not_called()
+        self.assertEqual(seen, ["replacement"])
+        self.assertFalse(pending.exists())
 
     def test_worker_pauses_failed_backoff_and_blocked_requests_without_respawn(self):
         for outcome in ("failed", "backoff", "blocked"):

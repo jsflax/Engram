@@ -1,5 +1,6 @@
 """Paths shared by the Codex plugin regressions, independent of the caller cwd."""
 import atexit
+import contextlib
 import os
 from pathlib import Path
 import sys
@@ -37,6 +38,7 @@ os.environ["HOME"] = str(TEST_HOME)
 os.environ["CODEX_HOME"] = str(TEST_CODEX_HOME)
 
 
+@contextlib.contextmanager
 def fixture_spawn_gate(module, directory):
     """Real kernel admission for unrelated synthetic worker regressions.
 
@@ -48,5 +50,7 @@ def fixture_spawn_gate(module, directory):
     """
     from unittest import mock
     production = module.lease
-    return mock.patch.object(module, "lease", side_effect=lambda: production(
-        directory=directory, now=10_000, load=lambda: 0, cooldown=0))
+    with mock.patch.object(module.resources, "is_darwin", return_value=False), \
+         mock.patch.object(module, "lease", side_effect=lambda **kwargs: production(
+             directory=directory, now=10_000, load=lambda: 0, cooldown=0, **kwargs)):
+        yield
