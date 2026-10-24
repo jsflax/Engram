@@ -4,6 +4,18 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.15.23] - 2026-10-24
+
+### Fixed
+
+- Complete access-only memory updates without rebuilding derived graph data or
+  restarting a settled graph layout. Full scans and structural updates still
+  publish their complete results.
+- Preserve the latest memory access times when live updates finish, including
+  batches that also contain structural graph changes.
+- Avoid whole-graph lookup rebuilding in the render loop and resolve the
+  reticle node directly, while preserving duplicate precedence.
+
 ## [0.15.22] - 2026-10-24
 
 ### Fixed
