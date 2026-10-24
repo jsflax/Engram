@@ -30,7 +30,7 @@ struct RenderUpdate: Sendable {
     var bulkEdgeCounts: [UUID: Int]?
     var bulkNodeBatches: [[(pk: Int64, node: NodeData)]] = []
     var clusterGroups: [[UUID]]?
-    var finalize: Bool = false  // recomputeDerivedData + wake sim + mark loaded
+    var finalize: Bool = false  // Complete the legacy bulk snapshot; live loader completion tracks actual changes.
 
     var isEmpty: Bool {
         insertedNodes.isEmpty && updatedNodes.isEmpty && removedNodePks.isEmpty &&
@@ -267,6 +267,7 @@ actor Galaxy: Identifiable {
     /// before the next query; neither hydrated models nor an unbounded batch
     /// queue survive the await. A full scan is nodes-first, then edges.
     private func runLoader(generation: UInt64) async {
+        var needsDerivedData = false
         do {
             while true {
                 try checkLoad(generation)
@@ -274,11 +275,16 @@ actor Galaxy: Identifiable {
                 case .scan:
                     await setLoadStatus(.loading, generation: generation)
                     try await scan(generation: generation)
+                    needsDerivedData = true
                 case .rows(let nodes, let edges):
-                    try await reconcile(nodes: nodes, edges: edges, generation: generation)
+                    let graphChanged = try await reconcile(nodes: nodes, edges: edges, generation: generation)
+                    needsDerivedData = needsDerivedData || graphChanged
                 case .idle:
                     let revision = loadChanges.withLock { $0.revision }
-                    await finishLoad(generation: generation, revision: revision)
+                    if await finishLoad(generation: generation, revision: revision,
+                                        rebuildDerivedData: needsDerivedData) {
+                        needsDerivedData = false
+                    }
                     if loadChanges.withLock({ $0.finishIfIdle(generation: generation) }) {
                         scheduleClusters(generation: generation, revision: revision)
                         return
@@ -352,7 +358,7 @@ actor Galaxy: Identifiable {
         }
     }
 
-    private func reconcile(nodes: [Int64], edges: [Int64], generation: UInt64) async throws {
+    private func reconcile(nodes: [Int64], edges: [Int64], generation: UInt64) async throws -> Bool {
         try checkLoad(generation)
         guard let lattice = latticeRef.resolve() else { throw LoadFailure.storageUnavailable }
         var nodeRows: [(pk: Int64, node: NodeData)] = []
@@ -372,7 +378,7 @@ actor Galaxy: Identifiable {
             if let row, let data = Self.snapshotEdge(row) { edgeRows.append(data) }
             else { removedEdges.append(pk) }
         }
-        await applyLoadChunk(nodes: nodeRows, edges: edgeRows, removedNodes: removedNodes,
+        return await applyLoadChunk(nodes: nodeRows, edges: edgeRows, removedNodes: removedNodes,
                              removedEdges: removedEdges, generation: generation,
                              diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
     }
@@ -384,11 +390,14 @@ actor Galaxy: Identifiable {
                 renderStore.edgePkToGlobalId.keys.filter { !edges.contains($0) })
     }
 
+    /// Returns whether completion needs graph-derived work. Access timestamps
+    /// update lookup metadata but do not invalidate topology or edge aggregates.
+    @discardableResult
     @MainActor func applyLoadChunk(
         nodes: [(pk: Int64, node: NodeData)] = [], edges: [(pk: Int64, edge: EdgeData)] = [],
         removedNodes: [Int64] = [], removedEdges: [Int64] = [], generation: UInt64,
         diagnosticEnqueuedAt: UInt64? = nil
-    ) {
+    ) -> Bool {
         let diagnosticStart = FrameGapDiagnostics.timestamp()
         var accepted = false
         defer {
@@ -399,8 +408,10 @@ actor Galaxy: Identifiable {
                     endedAt: DispatchTime.now().uptimeNanoseconds)
             }
         }
-        guard !Task.isCancelled, loadChanges.withLock({ $0.accepts(generation) }) else { return }
+        guard !Task.isCancelled, loadChanges.withLock({ $0.accepts(generation) }) else { return false }
         accepted = true
+        let topologyBefore = renderStore.topologyVersion
+        let edgesBefore = renderStore.allEdgesVersion
         let config = registry?.currentDrainConfig ?? DrainConfig(
             hiddenProjects: [], hiddenRelations: [], timeFilter: nil, is3D: false,
             soundEnabled: false, notificationsEnabled: false)
@@ -421,6 +432,11 @@ actor Galaxy: Identifiable {
                     store.pendingNodeInserts.append((pk, node))
                 } else if visible {
                     self.handleNodeUpdate(pk: pk, node: node, config: config)
+                } else if let old = store.allNodes[node.id], !Self.nodeStructureChanged(from: old, to: node) {
+                    // Hidden rows also receive recall updates. Their metadata
+                    // must not republish an otherwise unchanged graph.
+                    store.allNodes[node.id]?.lastAccessedAt = node.lastAccessedAt
+                    if store.nodeById[node.id] != nil { store.nodeById.removeValue(forKey: node.id) }
                 } else {
                     store.allNodes[node.id] = node
                     store.nodeById.removeValue(forKey: node.id)
@@ -438,6 +454,7 @@ actor Galaxy: Identifiable {
         }
         if let registry { registry.withReleasedSingleGalaxySnapshot(for: self, apply) }
         else { apply() }
+        return renderStore.topologyVersion != topologyBefore || renderStore.allEdgesVersion != edgesBefore
     }
 
     @MainActor private func setLoadStatus(_ status: GalaxyLoadStatus, generation: UInt64) {
@@ -448,12 +465,19 @@ actor Galaxy: Identifiable {
         if let registry { registry.panelSnapshot.refresh(from: registry) }
     }
 
-    @MainActor private func finishLoad(generation: UInt64, revision: UInt64) {
-        guard !Task.isCancelled, loadChanges.withLock({ $0.accepts(generation) && $0.revision == revision && !$0.needsScan && $0.nodes.isEmpty && $0.edges.isEmpty }) else { return }
-        recomputeDerivedData()
+    /// A full scan or graph change still finalizes all derived data. A live
+    /// access-only reconciliation is already complete after its lookup writes;
+    /// rebuilding here would repeat whole-graph work and wake a settled graph.
+    @discardableResult
+    @MainActor func finishLoad(generation: UInt64, revision: UInt64, rebuildDerivedData: Bool) -> Bool {
+        guard !Task.isCancelled, loadChanges.withLock({ $0.accepts(generation) && $0.revision == revision && !$0.needsScan && $0.nodes.isEmpty && $0.edges.isEmpty }) else { return false }
+        if rebuildDerivedData { recomputeDerivedData() }
         isInitialLoad = false
-        setLoadStatus(.complete, generation: generation)
-        simulation3D?.wake()
+        if rebuildDerivedData || loadStatus != .complete || !isLoaded {
+            setLoadStatus(.complete, generation: generation)
+        }
+        if rebuildDerivedData { simulation3D?.wake() }
+        return true
     }
 
     /// Clustering is optional derived work. It never delays subscriptions or
@@ -798,14 +822,11 @@ actor Galaxy: Identifiable {
             }
             #endif
         }
-        let structuralChange = old.project != node.project ||
-            old.topic != node.topic ||
-            old.importance != node.importance ||
-            old.label != node.label || old.content != node.content
-        if !structuralChange {
-            // Access-only change: update dicts (O(1)), skip O(n) array scan.
-            // nodes[] array gets stale lastAccessedAt but that field doesn't affect
-            // rendering — it's only used by activity log which reads from nodeById.
+        if !Self.nodeStructureChanged(from: old, to: node) {
+            // Access-only changes update lookup metadata without scanning nodes[].
+            // Rendering does not use lastAccessedAt; activity reads nodeById.
+            // Live completion skips derived work, and a later structural/full-scan
+            // rebuild overlays the authoritative access time from allNodes.
             store.allNodes[gid]?.lastAccessedAt = node.lastAccessedAt
             store.nodeById[gid]?.lastAccessedAt = node.lastAccessedAt
             return
@@ -822,6 +843,11 @@ actor Galaxy: Identifiable {
         store.bumpTopology()
     }
     
+    nonisolated private static func nodeStructureChanged(from old: NodeData, to node: NodeData) -> Bool {
+        old.project != node.project || old.topic != node.topic || old.importance != node.importance ||
+            old.label != node.label || old.content != node.content || old.createdAt != node.createdAt
+    }
+
     @MainActor func handleNodeDelete(_ pk: Int64, config: DrainConfig) {
         handleNodeDeletes([pk], config: config)
     }
@@ -1130,7 +1156,14 @@ actor Galaxy: Identifiable {
         // Filtering/migration callers still request the full reconciliation.
         if rebuildVisibleIndex {
             store.visibleNodeIds = Set(store.nodes.map(\.id))
-            store.nodeById = Dictionary(store.nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
+            // nodes[] deliberately omits access-only edits. Preserve its display
+            // fields/order while retaining the latest authoritative access metadata,
+            // including when structural edits and recalls share one loader run.
+            store.nodeById = Dictionary(store.nodes.map { node in
+                var current = node
+                current.lastAccessedAt = store.allNodes[node.id]?.lastAccessedAt ?? node.lastAccessedAt
+                return (node.id, current)
+            }, uniquingKeysWith: { _, b in b })
         }
 
         // Relation counts

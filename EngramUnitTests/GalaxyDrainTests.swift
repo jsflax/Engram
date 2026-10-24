@@ -54,6 +54,163 @@ final class GalaxyDrainTests: XCTestCase {
         XCTAssertEqual(Set(galaxy.renderStore.nodes.map(\.id)).count, 100)
     }
 
+    func testAccessOnlyLoaderCompletionPreservesFreshLookupsWithoutWakingSimulation() async throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        let registry = GalaxyRegistry()
+        let settings = VisualizerConfig()
+        settings.hiddenProjects = ["Hidden"]
+        registry.updateDrainConfig(from: settings, timeFilter: nil)
+        let galaxy = Galaxy(id: "stream", displayName: "Stream", lattice: lattice.sendableReference)
+        registry.register(galaxy)
+        let changes = await galaxy.loadChanges
+        let generation = changes.withLock { $0.begin() }
+        guard case .scan = changes.withLock({ $0.next(generation: generation) }) else {
+            return XCTFail("Expected baseline scan")
+        }
+        let nodes = makeNodes(3)
+        let hidden = NodeData(id: nodes[2].id, project: "Hidden", topic: nodes[2].topic,
+                              label: nodes[2].label, content: nodes[2].content, createdAt: nodes[2].createdAt,
+                              lastAccessedAt: nodes[2].lastAccessedAt, importance: nodes[2].importance)
+        galaxy.applyLoadChunk(nodes: [(1, nodes[0]), (2, nodes[1]), (3, hidden)], generation: generation)
+        XCTAssertTrue(galaxy.finishLoad(generation: generation, revision: changes.withLock { $0.revision },
+                                       rebuildDerivedData: true))
+        XCTAssertTrue(changes.withLock { $0.finishIfIdle(generation: generation) })
+        // Real simulation convergence, with no GPU dispatch or timing assertion.
+        for _ in 0..<1_000 { registry.unifiedSimulation.tick() }
+        XCTAssertTrue(registry.unifiedSimulation.isSettled)
+        // Preserve hidden-row exclusion even if an older lookup still retained it.
+        galaxy.renderStore.nodeById[hidden.id] = hidden
+        let alpha = registry.unifiedSimulation.alpha
+        let framesSinceWake = registry.unifiedSimulation.framesSinceWake
+        let topology = galaxy.renderStore.topologyVersion
+        let nodesVersion = galaxy.renderStore.nodesVersion
+        let colorsVersion = galaxy.renderStore.colorMapVersion
+        let groups = galaxy.renderStore.topicGroups
+        let accessedAt = nodes[0].lastAccessedAt.addingTimeInterval(60)
+        var accessed = nodes[0]
+        accessed.lastAccessedAt = accessedAt
+        var hiddenAccessed = hidden
+        hiddenAccessed.lastAccessedAt = accessedAt
+        XCTAssertTrue(changes.withLock { $0.record(1, edge: false, generation: generation) })
+        XCTAssertFalse(changes.withLock { $0.record(3, edge: false, generation: generation) })
+        guard case .rows = changes.withLock({ $0.next(generation: generation) }) else {
+            return XCTFail("Expected live reconciliation")
+        }
+        let graphChanged = galaxy.applyLoadChunk(nodes: [(1, accessed), (3, hiddenAccessed)], generation: generation)
+        XCTAssertFalse(graphChanged)
+        let lookupVersion = galaxy.renderStore.nodeLookupVersion
+        XCTAssertTrue(galaxy.finishLoad(generation: generation, revision: changes.withLock { $0.revision },
+                                       rebuildDerivedData: graphChanged))
+        XCTAssertTrue(changes.withLock { $0.finishIfIdle(generation: generation) })
+        XCTAssertEqual(galaxy.renderStore.nodeById[accessed.id]?.lastAccessedAt, accessedAt)
+        XCTAssertEqual(galaxy.renderStore.allNodes[accessed.id]?.lastAccessedAt, accessedAt)
+        XCTAssertEqual(galaxy.renderStore.allNodes[hidden.id]?.lastAccessedAt, accessedAt)
+        XCTAssertNil(galaxy.renderStore.nodeById[hidden.id])
+        XCTAssertNotNil(galaxy.renderStore.glowingNodes[accessed.id], "Recall still starts its activity glow")
+        XCTAssertEqual(galaxy.renderStore.topologyVersion, topology)
+        XCTAssertEqual(galaxy.renderStore.nodesVersion, nodesVersion)
+        XCTAssertEqual(galaxy.renderStore.nodeLookupVersion, lookupVersion, "Completion must not replace the fresh lookup")
+        XCTAssertEqual(galaxy.renderStore.colorMapVersion, colorsVersion)
+        XCTAssertEqual(galaxy.renderStore.topicGroups, groups)
+        XCTAssertTrue(registry.unifiedSimulation.isSettled)
+        XCTAssertEqual(registry.unifiedSimulation.alpha, alpha)
+        XCTAssertEqual(registry.unifiedSimulation.framesSinceWake, framesSinceWake)
+        XCTAssertTrue(galaxy.isLoaded)
+        XCTAssertEqual(galaxy.loadStatus, .complete)
+    }
+
+    func testStructuralLoaderCompletionPreservesAccessMetadataAndRefreshesDerivedData() async throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        let registry = GalaxyRegistry()
+        let galaxy = Galaxy(id: "stream", displayName: "Stream", lattice: lattice.sendableReference)
+        registry.register(galaxy)
+        let changes = await galaxy.loadChanges
+        let generation = changes.withLock { $0.begin() }
+        _ = changes.withLock { $0.next(generation: generation) }
+        let nodes = makeNodes(4)
+        let oldEdge = EdgeData(id: UUID(), sourceId: nodes[2].id, targetId: nodes[3].id, relation: "part_of")
+        galaxy.applyLoadChunk(nodes: nodes.enumerated().map { (Int64($0.offset + 1), $0.element) },
+                              edges: [(1, oldEdge)], generation: generation)
+        XCTAssertTrue(galaxy.finishLoad(generation: generation, revision: changes.withLock { $0.revision },
+                                       rebuildDerivedData: true))
+        XCTAssertTrue(changes.withLock { $0.finishIfIdle(generation: generation) })
+        registry.unifiedSimulation.setPositions([:])
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 0.5)
+        var accessed = nodes[0]
+        accessed.lastAccessedAt = accessed.lastAccessedAt.addingTimeInterval(60)
+        let edited = NodeData(id: nodes[1].id, project: "Changed", topic: "Other", label: "Edited",
+                              content: "Changed", createdAt: nodes[1].createdAt,
+                              lastAccessedAt: nodes[1].lastAccessedAt, importance: 5)
+        let newEdge = EdgeData(id: UUID(), sourceId: nodes[0].id, targetId: nodes[1].id, relation: "relates_to")
+        XCTAssertTrue(changes.withLock { $0.record(1, edge: false, generation: generation) })
+        _ = changes.withLock { $0.next(generation: generation) }
+        let graphChanged = galaxy.applyLoadChunk(nodes: [(1, accessed), (2, edited)], edges: [(2, newEdge)],
+                                                 removedNodes: [4], removedEdges: [1], generation: generation)
+        XCTAssertTrue(graphChanged)
+        let topologyBeforeCompletion = galaxy.renderStore.topologyVersion
+        XCTAssertTrue(galaxy.finishLoad(generation: generation, revision: changes.withLock { $0.revision },
+                                       rebuildDerivedData: graphChanged))
+        XCTAssertTrue(changes.withLock { $0.finishIfIdle(generation: generation) })
+        XCTAssertGreaterThan(galaxy.renderStore.topologyVersion, topologyBeforeCompletion)
+        XCTAssertEqual(galaxy.renderStore.nodeById[accessed.id]?.lastAccessedAt, accessed.lastAccessedAt)
+        XCTAssertEqual(galaxy.renderStore.nodes.first?.lastAccessedAt, nodes[0].lastAccessedAt,
+                       "Rebuilding lookup metadata must not rewrite unchanged rendering rows")
+        XCTAssertEqual(galaxy.renderStore.nodeById[edited.id]?.content, edited.content)
+        XCTAssertEqual(galaxy.renderStore.visibleNodeIds, Set(nodes.prefix(3).map(\.id)))
+        XCTAssertNil(galaxy.renderStore.allNodes[nodes[3].id])
+        XCTAssertEqual(Set(galaxy.renderStore.allEdges.keys), [newEdge.id])
+        XCTAssertEqual(Dictionary(uniqueKeysWithValues: galaxy.renderStore.relationCounts), ["relates_to": 1])
+        XCTAssertEqual(galaxy.renderStore.edgeCountByNode, [nodes[0].id: 1, nodes[1].id: 1])
+        XCTAssertEqual(galaxy.renderStore.topicGroups.count, 1)
+        let remainingTopic = try XCTUnwrap(galaxy.renderStore.topicGroups.first)
+        XCTAssertEqual(Set(remainingTopic.ids), [nodes[0].id, nodes[2].id])
+        XCTAssertNotNil(galaxy.renderStore.colorMap["Changed"])
+        registry.mergeRenderData()
+        let panelDeadline = Date().addingTimeInterval(3)
+        while registry.panelSnapshot.totalCount != 3 && Date() < panelDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(registry.panelSnapshot.totalCount, 3)
+        XCTAssertEqual(registry.panelSnapshot.projectCounts["Changed"], 1)
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 1, "Structural completion still wakes the simulation")
+    }
+
+    func testLoaderCompletionRejectsPendingRescanRevisionAndRetiredGeneration() async throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        let registry = GalaxyRegistry()
+        let galaxy = Galaxy(id: "stream", displayName: "Stream", lattice: lattice.sendableReference)
+        registry.register(galaxy)
+        let changes = await galaxy.loadChanges
+        let generation = changes.withLock { $0.begin() }
+        galaxy.applyLoadChunk(nodes: [(1, makeNodes(1)[0])], generation: generation)
+        let originalRevision = changes.withLock { $0.revision }
+        let initialTopology = galaxy.renderStore.topologyVersion
+        XCTAssertFalse(galaxy.finishLoad(generation: generation, revision: originalRevision, rebuildDerivedData: true),
+                       "A preview cannot complete the pending full scan")
+        XCTAssertTrue(galaxy.isInitialLoad)
+        XCTAssertFalse(galaxy.isLoaded)
+        XCTAssertEqual(galaxy.renderStore.topologyVersion, initialTopology)
+        _ = changes.withLock { $0.next(generation: generation) }
+        _ = changes.withLock { $0.record(1, edge: false, generation: generation) }
+        XCTAssertFalse(galaxy.finishLoad(generation: generation, revision: originalRevision, rebuildDerivedData: true))
+        _ = changes.withLock { $0.next(generation: generation) }
+        XCTAssertFalse(galaxy.finishLoad(generation: generation, revision: originalRevision, rebuildDerivedData: true),
+                       "Draining the queue does not make an old revision current")
+        XCTAssertNil(changes.withLock { $0.requestScan() })
+        let scanRevision = changes.withLock { $0.revision }
+        XCTAssertFalse(galaxy.finishLoad(generation: generation, revision: scanRevision, rebuildDerivedData: true))
+        guard case .scan = changes.withLock({ $0.next(generation: generation) }) else {
+            return XCTFail("Requested rescan must be retained")
+        }
+        XCTAssertTrue(galaxy.finishLoad(generation: generation, revision: scanRevision, rebuildDerivedData: true))
+        XCTAssertFalse(galaxy.isInitialLoad)
+        XCTAssertTrue(galaxy.isLoaded)
+        let completedTopology = galaxy.renderStore.topologyVersion
+        galaxy.cancelLoading()
+        XCTAssertFalse(galaxy.finishLoad(generation: generation, revision: scanRevision, rebuildDerivedData: true))
+        XCTAssertEqual(galaxy.renderStore.topologyVersion, completedTopology)
+    }
+
     func testRemovedGalaxyRejectsQueuedStreamChunksAndOldGeneration() async throws {
         let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
         let registry = GalaxyRegistry()
@@ -131,6 +288,22 @@ final class GalaxyDrainTests: XCTestCase {
             XCTAssertEqual(galaxy.loadStatus, .complete)
             XCTAssertEqual(galaxy.renderStore.allNodes.count, 151)
             XCTAssertEqual(galaxy.renderStore.allEdges.count, 1)
+            // Exercise the observer -> reconcile -> finishLoad path, not only
+            // handleNodeUpdate: completion used to overwrite this fresh value.
+            let changes = await galaxy.loadChanges
+            let topologyBeforeRecall = galaxy.renderStore.topologyVersion
+            let accessedAt = rows[0].lastAccessedAt.addingTimeInterval(60)
+            rows[0].lastAccessedAt = accessedAt
+            let recallDeadline = Date().addingTimeInterval(3)
+            phase = "wait-recall-completion"
+            while Date() < recallDeadline {
+                if galaxy.renderStore.nodeById[firstID]?.lastAccessedAt == accessedAt,
+                   !changes.withLock({ $0.workerRunning }) { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertEqual(galaxy.renderStore.nodeById[firstID]?.lastAccessedAt, accessedAt)
+            XCTAssertFalse(changes.withLock { $0.workerRunning }, "Recall must finish its loader run")
+            XCTAssertEqual(galaxy.renderStore.topologyVersion, topologyBeforeRecall)
             rows[0].content = "Changed after baseline"
             lattice.delete(rows[150])
             lattice.delete(edge)

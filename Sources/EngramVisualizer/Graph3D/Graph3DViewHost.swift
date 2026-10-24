@@ -360,7 +360,7 @@ struct Graph3DView: View {
     private var reticleOverlay: some View {
         let reticleTarget = self.reticleTarget
         let hasTarget = reticleTarget != nil
-        let nodeById = galaxyRegistry.mergedNodeById
+        let targetNode = reticleTarget.flatMap { galaxyRegistry.node(for: $0) }
 
         ZStack {
             // Crosshair lines
@@ -390,7 +390,7 @@ struct Graph3DView: View {
             }
 
             // Target label below reticle
-            if let targetId = reticleTarget, let node = nodeById[targetId] {
+            if let node = targetNode {
                 Text(node.label)
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.9))

@@ -7,9 +7,8 @@ import SwiftUI
 import simd
 
 /// Manages N galaxies and produces merged data for the single Metal renderer.
-/// @Observable so SidebarView can react to topology changes. renderTick reads
-/// outside SwiftUI observation tracking, so no spurious view updates.
-/// Per-frame properties (positions) are @ObservationIgnored.
+/// Render state is not observable. Sidebar updates use the explicitly refreshed
+/// panel snapshot, so per-frame work does not invalidate SwiftUI views.
 @MainActor
 final class GalaxyRegistry {
     private(set) var galaxies: [String: Galaxy] = [:]  // id -> Galaxy
@@ -28,14 +27,12 @@ final class GalaxyRegistry {
     let siblingSpacing: Float = 4000  // X between same-level galaxies
 
     // Merged data for renderer (recomputed when any galaxy's topology changes).
-    // @ObservationIgnored — these change on topology updates and are read by the
-    // RealityKit scene via GalaxyRegistryAdapter, not SwiftUI views. Without this,
-    // every topology change triggers GraphView.body re-evaluation (~400% CPU).
+    // These aggregates are read by RealityKit through GalaxyRegistryAdapter.
+    // Keep them separate from the observable panel snapshot.
     @ObservationIgnored private(set) var mergedNodes: [NodeData] = []
     @ObservationIgnored private(set) var mergedEdges: [EdgeData] = []
     @ObservationIgnored private(set) var mergedHubs: Set<UUID> = []
     @ObservationIgnored private(set) var mergedColorMap: [String: Color] = [:]
-    @ObservationIgnored private(set) var mergedNodeById: [UUID: NodeData] = [:]
     @ObservationIgnored let panelSnapshot = GalaxyPanelSnapshot()
 
     // Node -> galaxy routing (for selection, detail panel, search)
@@ -70,12 +67,10 @@ final class GalaxyRegistry {
         let nodes: UInt64
         let edges: UInt64
         let hubs: UInt64
-        let lookup: UInt64
         let allEdges: UInt64
         let edgeInsertionGeneration: UInt64
         let insertedEdgeCount: Int
         let nodeAppendGeneration: UInt64
-        let lookupAppendGeneration: UInt64
         let nodeCount: Int
         let colors: UInt64
         let worldCenter: SIMD3<Float>
@@ -89,7 +84,6 @@ final class GalaxyRegistry {
     // Includes hidden/dangling winners: precedence is resolved BEFORE filters.
     @ObservationIgnored private var winningEdgeIDs: Set<UUID> = []
     @ObservationIgnored private var mergedNodeEnds: [String: Int] = [:]
-    @ObservationIgnored private var lookupOwners: [UUID: Int] = [:]
     @ObservationIgnored private var lastMergedNodeCount = 0
     @ObservationIgnored private var previousNodeVersion: UInt64 = 0
     @ObservationIgnored private var previousNodeCount = 0
@@ -325,12 +319,11 @@ final class GalaxyRegistry {
             return RenderRevision(identity: ObjectIdentifier($0),
                                   topology: store.topologyVersion,
                                   nodes: store.nodesVersion, edges: store.edgesVersion,
-                                  hubs: store.hubsVersion, lookup: store.nodeLookupVersion,
+                                  hubs: store.hubsVersion,
                                   allEdges: store.allEdgesVersion,
                                   edgeInsertionGeneration: store.edgeInsertionGeneration,
                                   insertedEdgeCount: store.insertedEdgeIDs.count,
                                   nodeAppendGeneration: store.nodeAppendGeneration,
-                                  lookupAppendGeneration: store.nodeLookupAppendGeneration,
                                   nodeCount: store.nodes.count,
                                   colors: store.colorMapVersion, worldCenter: $0.worldCenter)
         }
@@ -348,9 +341,6 @@ final class GalaxyRegistry {
         }
         let colorsChanged = identitiesChanged || ordered.contains {
             previous[$0.id]?.colors != $0.renderStore.colorMapVersion
-        }
-        let lookupChanged = identitiesChanged || ordered.contains {
-            previous[$0.id]?.lookup != $0.renderStore.nodeLookupVersion
         }
         let appendOnly = !identitiesChanged && ordered.allSatisfy {
             guard let old = previous[$0.id] else { return false }
@@ -471,37 +461,6 @@ final class GalaxyRegistry {
             mergedNodesVersion &+= 1
         }
 
-        if lookupChanged {
-            if let only = ordered.first, ordered.count == 1 {
-                mergedNodeById = only.renderStore.nodeById
-                lookupOwners.removeAll(keepingCapacity: true)
-            } else {
-                // Dictionary lookup has its own mutation guard: access metadata
-                // and hidden-row changes need not alter the visible node array.
-                let appendLookup = appendOnly && ordered.allSatisfy {
-                    previous[$0.id]?.lookupAppendGeneration == $0.renderStore.nodeLookupAppendGeneration
-                }
-                if !appendLookup {
-                    mergedNodeById.removeAll(keepingCapacity: true)
-                    lookupOwners.removeAll(keepingCapacity: true)
-                }
-                for (rank, galaxy) in ordered.enumerated() {
-                    let store = galaxy.renderStore
-                    if appendLookup {
-                        for node in store.nodes.dropFirst(previous[galaxy.id]!.nodeCount) {
-                            guard lookupOwners[node.id].map({ rank <= $0 }) ?? true else { continue }
-                            mergedNodeById[node.id] = store.nodeById[node.id]
-                            lookupOwners[node.id] = rank
-                        }
-                    } else {
-                        for (id, node) in store.nodeById where lookupOwners[id] == nil {
-                            mergedNodeById[id] = node
-                            lookupOwners[id] = rank
-                        }
-                    }
-                }
-            }
-        }
         if hubsChanged {
             if let only = ordered.first, ordered.count == 1 { mergedHubs = only.renderStore.hubs }
             else {
@@ -655,14 +614,12 @@ final class GalaxyRegistry {
         }
         mergedNodes = []
         mergedEdges = []
-        mergedNodeById = [:]
         mergedHubs = []
         mergedColorMap = [:]
         defer {
             let store = galaxy.renderStore
             mergedNodes = store.nodes
             mergedEdges = store.edges
-            mergedNodeById = store.nodeById
             mergedHubs = store.hubs
             mergedColorMap = store.colorMap
         }
@@ -672,6 +629,30 @@ final class GalaxyRegistry {
     @ObservationIgnored private var lastSingleGalaxyId: String?
 
     // MARK: - Merged Accessors (convenience for renderer)
+
+    /// Resolve current metadata only for the requested row. Access timestamps
+    /// do not affect geometry and must not rebuild a whole-graph lookup during
+    /// a render tick. Consult the same first-wins precedence as render merging,
+    /// including lookup-only rows that are absent from the visible node array.
+    func node(for id: UUID) -> NodeData? {
+        for galaxy in galaxiesInPrecedenceOrder() {
+            if let node = galaxy.renderStore.nodeById[id] { return node }
+        }
+        return nil
+    }
+
+    /// Explicit current metadata snapshot for consumers that need every row.
+    /// Rendering and reticle targeting use dense arrays or `node(for:)` instead.
+    /// The returned Dictionary keeps ordinary value semantics across updates.
+    var mergedNodeById: [UUID: NodeData] {
+        let ordered = galaxiesInPrecedenceOrder()
+        if ordered.count == 1, let only = ordered.first { return only.renderStore.nodeById }
+        var result: [UUID: NodeData] = [:]
+        for galaxy in ordered {
+            result.merge(galaxy.renderStore.nodeById) { first, _ in first }
+        }
+        return result
+    }
 
     /// Positions from the unified simulation — already in world space.
     var mergedPositions: [UUID: SIMD3<Float>] {
