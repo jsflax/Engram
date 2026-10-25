@@ -42,7 +42,7 @@ let package = Package(
         .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.0"),
         // Consumer receipt qualification: retain the 2.2.5 stack with the
         // atomic local metadata extension and its matching pinned Core.
-        .package(url: "https://github.com/jsflax/lattice.git", revision: "dabbb10455ddaaf2d998f4c4b1c513ee0899f38d"),
+        .package(url: "https://github.com/jsflax/lattice.git", revision: "94bb5fd7b42785cce83e269baa5b1afcceee0772"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
