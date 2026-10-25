@@ -40,9 +40,9 @@ let package = Package(
     dependencies: [
         // Preserve the Codex client-capability decoding fix in the owned SDK.
         .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.0"),
-        // Consumer receipt qualification: retain the 2.2.5 stack with the
-        // atomic local metadata extension and its matching pinned Core.
-        .package(url: "https://github.com/jsflax/lattice.git", revision: "94bb5fd7b42785cce83e269baa5b1afcceee0772"),
+        // Consumer receipt qualification: retain the audited-write stack and
+        // encode local update field names for existing native sync receivers.
+        .package(url: "https://github.com/jsflax/lattice.git", revision: "5781dee39c90873613c457dba553a701e6bac6a4"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
