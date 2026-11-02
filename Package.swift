@@ -42,7 +42,7 @@ let package = Package(
         .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.0"),
         // Consumer receipt qualification: retain the audited-write stack and
         // encode local update field names for existing native sync receivers.
-        .package(url: "https://github.com/jsflax/lattice.git", revision: "a174ace3f5946291310bc39e02657f28d7d2eb53"),
+        .package(url: "https://github.com/jsflax/lattice.git", revision: "09f119c88922bcce360d61e18946f4a86a9527dc"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
