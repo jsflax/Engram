@@ -70,7 +70,6 @@ struct GraphAccessibilityTests {
     private func requireElement(_ identifier: String, in host: NSView) async throws -> any NSAccessibilityProtocol {
         // Swift Testing is not NSApplication.run(). Service AppKit's display/run-loop
         // boundary instead of spinning only the Swift concurrency executor.
-        #expect(Thread.isMainThread)
         #expect(host.window?.isVisible == true)
         let deadline = ContinuousClock.now + .seconds(2)
         repeat {
@@ -83,6 +82,7 @@ struct GraphAccessibilityTests {
     }
 
     private func settleHost(_ host: NSView) {
+        #expect(Thread.isMainThread)
         host.window?.contentView?.layoutSubtreeIfNeeded()
         host.layoutSubtreeIfNeeded()
         host.displayIfNeeded()
