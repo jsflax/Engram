@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage the exact portable core and tests without Engram's Apple-only graph."""
+"""Stage the exact portable core and tests without Engram's Apple-only runtime."""
 
 import argparse
 import hashlib
@@ -16,7 +16,10 @@ def prepare(repository: Path, destination: Path, source_sha: str | None = None) 
     # A fresh destination prevents stale source or test files from participating.
     destination.mkdir(parents=True, exist_ok=False)
     hashes = {}
-    for relative in ("Sources/EngramMemoryCore", "Tests/EngramMemoryCoreTests", "Tests/Fixtures/ProcessGuard"):
+    for relative in (
+        "Sources/EngramMemoryCore", "Tests/EngramMemoryCoreTests", "Tests/Fixtures/ProcessGuard",
+        "Packages/EngramGraphContracts/Sources/EngramGraphContract",
+    ):
         checked = repository
         for part in Path(relative).parts:
             checked /= part
@@ -44,10 +47,12 @@ let package = Package(
     name: "EngramPortableQualification",
     products: [.library(name: "EngramMemoryCore", targets: ["EngramMemoryCore"])],
     targets: [
-        .target(name: "EngramMemoryCore"),
+        .target(name: "EngramGraphContract",
+                path: "Packages/EngramGraphContracts/Sources/EngramGraphContract"),
+        .target(name: "EngramMemoryCore", dependencies: ["EngramGraphContract"]),
         .executableTarget(name: "EngramProcessGuardFixture", dependencies: ["EngramMemoryCore"],
                           path: "Tests/Fixtures/ProcessGuard"),
-        .testTarget(name: "EngramMemoryCoreTests", dependencies: ["EngramMemoryCore", "EngramProcessGuardFixture"]),
+        .testTarget(name: "EngramMemoryCoreTests", dependencies: ["EngramMemoryCore", "EngramProcessGuardFixture", "EngramGraphContract"]),
     ]
 )
 '''
