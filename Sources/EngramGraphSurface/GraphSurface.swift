@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import EngramRealityKit
+import EngramGraphContract
 
 /// Native host tokens for graph controls and detail cards. The intrinsic dark canvas
 /// and its geometry/material palette remain Engram's, even inside a light host panel.
@@ -112,6 +113,8 @@ private struct GraphContent: View {
                             status.font(appearance.caption).foregroundStyle(appearance.secondaryText)
                         }
                         Spacer()
+                        GraphMemoryPicker(session: session)
+                            .frame(maxWidth: 200)
                         Button("Fit", systemImage: "arrow.up.left.and.arrow.down.right") { session.fitGraph() }
                             .disabled(!session.isRenderingActive || session.snapshot?.nodes.isEmpty != false)
                     }
@@ -122,17 +125,12 @@ private struct GraphContent: View {
                     }
                     Spacer()
                     if let memory = session.selectedMemory {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(memory.label).font(appearance.headline)
-                            Text(memory.content).font(appearance.caption).lineLimit(4)
-                            if memory.contentIsExcerpt { Text("Excerpt").font(.caption2).foregroundStyle(appearance.secondaryText) }
-                        }
+                        GraphMemoryDetail(memory: memory, appearance: appearance)
                         .padding(12).frame(maxWidth: min(360, max(0, geometry.size.width - 32)), alignment: .leading)
                         .background(appearance.background, in: RoundedRectangle(cornerRadius: appearance.cardRadius))
                         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
                             session.updateDetailHeight(height, for: memory.id)
                         }
-                        .accessibilityElement(children: .combine)
                         .id(memory.id) // A same-height replacement card still gets its own measurement.
                     }
                 }
@@ -160,5 +158,47 @@ private struct GraphContent: View {
         guard let snapshot = session.snapshot else { return Text("Waiting for project data") }
         let suffix = snapshot.completeness == .limitReached ? " · result limit reached" : ""
         return Text("\(snapshot.nodes.count) memories · \(snapshot.edges.count) connections\(suffix)")
+    }
+}
+
+/// A native keyboard/VoiceOver path to the same selection as spatial taps. The binding does not
+/// capture a snapshot or keep a second selection; the session checks current lifetime/membership.
+@MainActor
+struct GraphMemoryPicker: View {
+    @Bindable var session: EngramGraphSession
+    var selection: Binding<UUID?> {
+        Binding(get: { session.selectedNode }, set: { session.select($0) })
+    }
+    var body: some View {
+        Picker("Memory", selection: selection) {
+            Text("No selection").tag(nil as UUID?)
+            ForEach(session.snapshot?.nodes ?? []) { memory in
+                Text(memory.label).tag(Optional(memory.id))
+            }
+        }
+        .pickerStyle(.menu)
+        .disabled(!session.isRenderingActive || session.snapshot?.nodes.isEmpty != false)
+        .accessibilityHint("Choose a memory to read its details.")
+        .accessibilityIdentifier("engram.graph.memory-selection")
+    }
+}
+
+@MainActor
+struct GraphMemoryDetail: View {
+    let memory: EngramGraphNode
+    let appearance: EngramGraphAppearance
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(memory.label).font(appearance.headline)
+            Text(memory.content).font(appearance.caption).lineLimit(4)
+            if memory.contentIsExcerpt { Text("Excerpt").font(.caption2).foregroundStyle(appearance.secondaryText) }
+        }
+        // Keep the compact visual card, but expose every authorized character to assistive
+        // technology. An exported excerpt must never be described as a complete memory.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(memory.label))
+        .accessibilityValue(Text(memory.contentIsExcerpt ? "Excerpt. \(memory.content)" : memory.content))
+        .accessibilityAddTraits(.isStaticText)
+        .accessibilityIdentifier("engram.graph.selected-memory")
     }
 }
