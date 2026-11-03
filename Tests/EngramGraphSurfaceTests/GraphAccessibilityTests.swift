@@ -67,7 +67,7 @@ struct GraphAccessibilityTests {
         #expect(fixture.session.scene == nil)
     }
 
-    private func requireElement(_ identifier: String, in host: NSView) async throws -> any NSAccessibilityProtocol {
+    private func requireElement(_ identifier: String, in host: NSView) async throws -> AXElementReader {
         // Swift Testing is not NSApplication.run(). Service AppKit's display/run-loop
         // boundary instead of spinning only the Swift concurrency executor.
         #expect(host.window?.isVisible == true)
@@ -78,7 +78,7 @@ struct GraphAccessibilityTests {
             await Task.yield()
         } while ContinuousClock.now < deadline
         return try #require(find(identifier, in: host),
-            "Hosted AX element missing; window visible: \(host.window?.isVisible == true), root AX children: \(host.accessibilityChildren()?.count ?? 0)")
+            "Hosted AX element missing; window visible: \(host.window?.isVisible == true), tree: \(accessibilityDiagnostic(host))")
     }
 
     private func settleHost(_ host: NSView) {
@@ -90,15 +90,77 @@ struct GraphAccessibilityTests {
         _ = RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
     }
 
-    private func find(_ identifier: String, in object: any NSAccessibilityProtocol, depth: Int = 0)
-        -> (any NSAccessibilityProtocol)? {
+    private func find(_ identifier: String, in object: NSObject, depth: Int = 0) -> AXElementReader? {
         guard depth < 32 else { return nil }
-        if object.accessibilityIdentifier() == identifier { return object }
-        for child in object.accessibilityChildren() ?? [] {
-            if let accessible = child as? any NSAccessibilityProtocol,
+        let reader = AXElementReader(object: object)
+        if reader.accessibilityIdentifier() == identifier { return reader }
+        for child in reader.children {
+            if let accessible = child as? NSObject,
                let result = find(identifier, in: accessible, depth: depth + 1) { return result }
         }
         return nil
+    }
+
+    private func accessibilityDiagnostic(_ root: NSObject) -> String {
+        var rows: [String] = []
+        func visit(_ object: NSObject, depth: Int) {
+            guard depth < 4, rows.count < 24 else { return }
+            let reader = AXElementReader(object: object)
+            rows.append("\(depth):\(type(of: object)) full=\(object is any NSAccessibilityProtocol) element=\(object is any NSAccessibilityElementProtocol) id=\(reader.accessibilityIdentifier() ?? "<nil>")")
+            for child in reader.children.prefix(16) {
+                if let object = child as? NSObject { visit(object, depth: depth + 1) }
+            }
+        }
+        visit(root, depth: 0)
+        return rows.joined(separator: "; ")
+    }
+}
+
+/// NSHostingView returns [Any] children. A native child need not adopt the full
+/// NSAccessibilityProtocol; read its public legacy attributes when it does not.
+@MainActor
+private struct AXElementReader {
+    let object: NSObject
+
+    private var modern: (any NSAccessibilityProtocol)? { object as? any NSAccessibilityProtocol }
+
+    private func legacyValue(_ attribute: NSAccessibility.Attribute) -> Any? {
+        guard object.accessibilityAttributeNames().contains(attribute) else { return nil }
+        return object.accessibilityAttributeValue(attribute)
+    }
+
+    var children: [Any] {
+        if let children = modern?.accessibilityChildren() { return children }
+        return legacyValue(.children) as? [Any] ?? []
+    }
+
+    func accessibilityIdentifier() -> String? {
+        if let identifier = modern?.accessibilityIdentifier() { return identifier }
+        if let element = object as? any NSAccessibilityElementProtocol,
+           let identifier = element.accessibilityIdentifier?() { return identifier }
+        return legacyValue(.identifier) as? String
+    }
+
+    func accessibilityRole() -> NSAccessibility.Role? {
+        if let role = modern?.accessibilityRole() { return role }
+        guard let role = legacyValue(.role) as? String else { return nil }
+        return NSAccessibility.Role(rawValue: role)
+    }
+
+    func accessibilityLabel() -> String? {
+        if let label = modern?.accessibilityLabel() { return label }
+        return legacyValue(.description) as? String
+    }
+
+    func accessibilityValue() -> Any? {
+        if let value = modern?.accessibilityValue() { return value }
+        return legacyValue(.value)
+    }
+
+    func isAccessibilityEnabled() -> Bool? {
+        if let modern { return modern.isAccessibilityEnabled() }
+        // Missing/wrongly typed AXEnabled must fail even the disabled-control case.
+        return legacyValue(.enabled) as? Bool
     }
 }
 

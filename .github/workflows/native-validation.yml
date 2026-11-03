@@ -287,6 +287,7 @@ jobs:
             ENGRAM_DAEMON_CONTENTION_LOG="$VALIDATION_ROOT/evidence/daemon-contention-core.log" \
             python3 -B scripts/run_native_tests.py --diagnostics-dir "$VALIDATION_ROOT/evidence/daemon-contention" \
             --timeout-seconds 210 --silence-seconds 180 \
+            --require-swift-test readbackRequiresCurrentCohortAndNoExactPendingDelivery \
             --require-swift-test realHubBeginContentionPreservesUnacknowledgedWorkAndRecovers -- \
             "$VALIDATION_ROOT/bin/swift-validation" test --force-resolved-versions --disable-index-store --skip-build --no-parallel \
             --filter 'EngramTests.DaemonHubContentionTests'

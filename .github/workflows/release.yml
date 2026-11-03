@@ -250,6 +250,7 @@ jobs:
             ENGRAM_DAEMON_CONTENTION_LOG="$fixture_root/diagnostics/core.log" \
             python3 -B scripts/run_native_tests.py --diagnostics-dir "$fixture_root/diagnostics/runner" \
             --timeout-seconds 210 --silence-seconds 180 \
+            --require-swift-test readbackRequiresCurrentCohortAndNoExactPendingDelivery \
             --require-swift-test realHubBeginContentionPreservesUnacknowledgedWorkAndRecovers -- \
             swift test --force-resolved-versions --skip-build --no-parallel \
             --filter 'EngramTests.DaemonHubContentionTests'
