@@ -728,6 +728,7 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
         for name, step_id in ids.items():
             self.assertEqual(re.findall(r'^        id: (.*)$', step_section(workflow, name), re.M), [step_id])
         prerequisites = {
+            'Test pure Engram graph contracts': 'checkout_source',
             'Validate legacy Codex learner and installers': 'checkout_source',
             'Validate packaged process guard command': 'native_build',
             'Run full native release filter': 'native_build',
