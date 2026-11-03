@@ -7,9 +7,12 @@ import RealityKit
 /// All rendering logic lives in EngramRealityScene — this view just hosts it.
 public struct EngramRealityView: View {
     let scene: EngramRealityScene
+    let isActive: Bool
+    @State private var isMounted = true
 
-    public init(scene: EngramRealityScene) {
+    public init(scene: EngramRealityScene, isActive: Bool = true) {
         self.scene = scene
+        self.isActive = isActive
     }
 
     public var body: some View {
@@ -17,13 +20,27 @@ public struct EngramRealityView: View {
             let root = scene.setup()
             content.add(root)
 
-            // RealityKit supplies this delta. Opt-in scene diagnostics measure
-            // callback spacing separately; neither value proves presentation time.
-            content.subscribe(to: SceneEvents.Update.self) { event in
-                let dt = Float(event.deltaTime)
-                scene.update(dt: dt)
+            scene.setRenderingActive(isActive && isMounted)
+            scene.installFrameSubscription {
+                content.subscribe(to: SceneEvents.Update.self) { [weak scene] event in
+                    scene?.update(dt: Float(event.deltaTime))
+                }
+            }
+        } update: { content in
+            scene.setRenderingActive(isActive && isMounted)
+            scene.installFrameSubscription {
+                content.subscribe(to: SceneEvents.Update.self) { [weak scene] event in
+                    scene?.update(dt: Float(event.deltaTime))
+                }
             }
         }
+        // The graph's white atlas labels and emissive materials belong to Engram's
+        // dark canvas, independently of the embedding app's control appearance.
+        // RealityView's default environment consumes backgroundStyle; a colored
+        // sibling behind the view does not configure its rendered background.
+        .backgroundStyle(Color(red: 0.051, green: 0.067, blue: 0.09))
+        .onAppear { isMounted = true }
+        .onDisappear { isMounted = false; scene.setRenderingActive(false) }
         .transaction { $0.animation = nil }  // Prevent overlay animations from resizing
     }
 }

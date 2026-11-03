@@ -218,11 +218,16 @@ public actor MemoryTools {
     struct OperationReadContext {
         fileprivate let signature: String
         fileprivate let database: Lattice
+        /// nil is the local-only route (no `_source` column). A union explicitly names the
+        /// personal stores whose unattributed legacy content belongs to this principal.
+        /// These are Core's exact source labels, not paths or evidence of authorization.
+        let ownLegacySourceLabels: [String]?
     }
 
     private struct ReadRoute {
         let signature: String
         let attachments: [Lattice]
+        let ownLegacySourceLabels: [String]?
     }
 
     func prepareOperationReadLattice(for project: String) throws -> OperationReadContext {
@@ -234,7 +239,8 @@ public actor MemoryTools {
             guard try resolveReadRoute(for: project, strict: true).signature == route.signature else {
                 throw MemoryOperationError.storageUnavailable
             }
-            return OperationReadContext(signature: route.signature, database: database)
+            return OperationReadContext(signature: route.signature, database: database,
+                                        ownLegacySourceLabels: route.ownLegacySourceLabels)
         } catch let error as MemoryOperationError { throw error }
         catch { throw MemoryOperationError.storageUnavailable }
     }
@@ -325,7 +331,21 @@ public actor MemoryTools {
             signature = (includeSynced ? "synced|" : "|")
                 + spokes.map(\.path).sorted().joined(separator: "|")
         }
-        return ReadRoute(signature: signature, attachments: attachments)
+        let ownLegacySourceLabels: [String]?
+        if attachments.isEmpty {
+            ownLegacySourceLabels = nil
+        } else {
+            var labels = ["main"]
+            if includeSynced, case .file(let url) = syncedLattice!.configuration.storage {
+                // Core attach_alias_for/quoted_attach_alias use the file stem, then retain
+                // its SQL-identifier quotes in the `_source` string value.
+                labels.append("\"" + url.deletingPathExtension().lastPathComponent
+                    .replacingOccurrences(of: "\"", with: "\"\"") + "\"")
+            }
+            ownLegacySourceLabels = labels
+        }
+        return ReadRoute(signature: signature, attachments: attachments,
+                         ownLegacySourceLabels: ownLegacySourceLabels)
     }
 
     private func operationStorageBinding(_ database: Lattice) throws -> String {

@@ -176,6 +176,9 @@ struct LabelProjectTopicCache {
 /// Atlas regeneration is debounced (60-frame minimum between rebuilds).
 @MainActor
 public final class LabelBatchSystem {
+    /// The scoped graph uses smaller cluster titles in graph units. Desktop dimensions remain unchanged.
+    public var compactGraphLabels = false
+
     private static let vertsPerLabel = 4
     private static let indicesPerLabel = 6
 
@@ -201,6 +204,7 @@ public final class LabelBatchSystem {
         let cameraRight: SIMD3<Float>
         let cameraUp: SIMD3<Float>
         let scaleFactor: Float
+        let compactGraphLabels: Bool
         let selectedNode: UUID?
         let searchIsActive: Bool
         let searchMatches: Set<UUID>
@@ -322,7 +326,7 @@ public final class LabelBatchSystem {
             atlasVersion: scene.labelAtlasGenerator.atlasVersion,
             visibleLabels: visibleSet.visibleLabelIndices,
             cameraPosition: camPos, cameraRight: camRight, cameraUp: camUp,
-            scaleFactor: scaleFactor, selectedNode: selectedNode,
+            scaleFactor: scaleFactor, compactGraphLabels: compactGraphLabels, selectedNode: selectedNode,
             searchIsActive: isSearchActive, searchMatches: searchMatchIds,
             colors: colorMap, projectCentroids: dataProvider.projectCentroids,
             capacity: scene.labelBatchCapacity)
@@ -355,11 +359,12 @@ public final class LabelBatchSystem {
             guard let rect = atlasRects[node.id] else { continue }
             let pos = nodeIdx < positionArray.count ? positionArray[nodeIdx] : (positions[node.id] ?? .zero)
 
-            let anchor = pos * scaleFactor + SIMD3<Float>(0, 12.0, 0)
+            let anchor = pos * scaleFactor + SIMD3<Float>(0, 12.0 * (compactGraphLabels ? scaleFactor : 1), 0)
 
-            let baseHalfH: Float = node.isHub ? 2.5 : 2.0
-            let halfH = baseHalfH
-            let halfW = halfH * (rect.u1 - rect.u0) / max(rect.v1 - rect.v0, 0.001) * aspectCorrection
+            let aspect = (rect.u1 - rect.u0) / max(rect.v1 - rect.v0, 0.001) * aspectCorrection
+            let extent = RKLabelGeometry.halfExtents(for: node.isHub ? .hub : .node,
+                aspect: aspect, compact: compactGraphLabels, scaleFactor: scaleFactor)
+            let halfW = extent.x, halfH = extent.y
 
             let color = colorMap[node.project] ?? SIMD3<Float>(0.8, 0.8, 0.8)
 
@@ -418,8 +423,10 @@ public final class LabelBatchSystem {
             let color = colorMap[project] ?? SIMD3<Float>(0.9, 0.9, 0.9)
             let topY = projectTopicCache.maxY(forProject: project) ?? centroid.y
             let anchor = SIMD3<Float>(centroid.x, topY + 40.0, centroid.z) * scaleFactor
-            let halfH: Float = 14.0
-            let halfW = halfH * (rect.u1 - rect.u0) / max(rect.v1 - rect.v0, 0.001) * aspectCorrection
+            let aspect = (rect.u1 - rect.u0) / max(rect.v1 - rect.v0, 0.001) * aspectCorrection
+            let extent = RKLabelGeometry.halfExtents(for: .project, aspect: aspect,
+                compact: compactGraphLabels, scaleFactor: scaleFactor)
+            let halfW = extent.x, halfH = extent.y
             let dist = simd_length(anchor - camPos)
             let opacity: Float = max(0.5, 1.0 - min(1.0, dist / 8000.0))
             let r = camRight * halfW
@@ -456,8 +463,10 @@ public final class LabelBatchSystem {
                 let centroid = data.sum / Float(data.count)
                 let color = colorMap[data.project] ?? SIMD3<Float>(0.7, 0.7, 0.7)
                 let anchor = SIMD3<Float>(centroid.x, data.maxY + 25.0, centroid.z) * scaleFactor
-                let halfH: Float = 8.0
-                let halfW = halfH * (rect.u1 - rect.u0) / max(rect.v1 - rect.v0, 0.001) * aspectCorrection
+                let aspect = (rect.u1 - rect.u0) / max(rect.v1 - rect.v0, 0.001) * aspectCorrection
+                let extent = RKLabelGeometry.halfExtents(for: .topic, aspect: aspect,
+                    compact: compactGraphLabels, scaleFactor: scaleFactor)
+                let halfW = extent.x, halfH = extent.y
                 let dist = simd_length(anchor - camPos)
                 let opacity: Float = max(0.3, 1.0 - min(1.0, dist / 5000.0))
                 let r = camRight * halfW
