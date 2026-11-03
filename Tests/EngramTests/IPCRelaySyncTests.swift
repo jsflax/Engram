@@ -831,7 +831,7 @@ struct IPCRelaySyncTests {
     // Verifies:
     //   1. Fresh synced DB receives only filtered projects (correctness)
     //   2. Non-filtered projects don't leak through (filter respect)
-    //   3. Upload volume is proportional to filtered data, not entire audit log
+    //   3. Every received delivery names an allowed memory; exact live UUIDs match
 
     @Test(.timeLimit(.minutes(2)))
     func ipcRelay_freshSyncDbRespectsFilter() async throws {
@@ -939,14 +939,10 @@ struct IPCRelaySyncTests {
 
         try await Task.sleep(for: .milliseconds(100))
 
-        // Track sync progress from the hub
-        // Lattice 1.x: progress is an AsyncStream, not a callback.
-        nonisolated(unsafe) var lastProgress: Lattice.SyncProgress?
-        let progressStream = local2.syncProgressStream
-        let progressTask = Task.detached {
-            for await p in progressStream { lastProgress = p }
-        }
-        defer { progressTask.cancel() }
+        let expectedIDs = Set(local2.objects(Memory.self).snapshot()
+            .filter { $0.project == "Lattice" || $0.project == "engram-server" }
+            .compactMap(\.globalId))
+        #expect(expectedIDs.count == 3)
 
         // Create fresh synced DB — triggers IPC connection
         var syncedConfig2 = Lattice.Configuration(fileURL: syncedURL)
@@ -990,14 +986,20 @@ struct IPCRelaySyncTests {
         #expect(localOnlyCount == 0,
             "FILTER LEAK: \(localOnlyCount) LocalOnly memories leaked through to fresh synced DB")
 
-        // 4. Upload volume: should be ≤ 3 (only filtered memories), not 6+ (entire audit log)
-        // After compaction, the AuditLog has entries for ALL 6 memories (compacted state).
-        // upload_pending_changes should only process/send the 3 filtered ones.
-        // If totalUpload > 3, the entire audit log is being replayed regardless of filter.
-        if let progress = lastProgress {
-            #expect(progress.totalUpload <= 3,
-                "AUDIT LOG REPLAY: upload_pending_changes processed \(progress.totalUpload) entries — expected ≤ 3 (only filtered). Entire audit log is being sent on fresh sync DB.")
-        }
+        // 4. Every actual received Memory delivery must name an allowed row.
+        // totalUpload counts transmissions, including a fresh-peer snapshot or
+        // retransmission of the same allowed row. It is not a distinct-row count.
+        // The destination is unfiltered, so retained incoming audit entries expose
+        // any forbidden delivery even if a later operation removed its live row.
+        let received = synced2.objects(AuditLog.self).snapshot()
+            .filter { $0.tableName == "Memory" && $0.isFromRemote }
+        #expect(synced2.lastQueryError() == nil)
+        #expect(!received.isEmpty)
+        #expect(received.allSatisfy { entry in
+            entry.globalRowId.map { expectedIDs.contains($0) } == true
+        }, "FILTER LEAK: a received audit delivery names a non-filtered memory")
+        #expect(Set(received.compactMap(\.globalRowId)) == expectedIDs)
+        #expect(Set(syncedMemories.compactMap(\.globalId)) == expectedIDs)
 
         // 5. Local must retain all data
         #expect(local2.objects(Memory.self).count == 6,

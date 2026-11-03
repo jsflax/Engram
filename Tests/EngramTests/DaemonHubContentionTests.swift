@@ -19,6 +19,8 @@ struct DaemonHubContentionTests {
         let receipts: Int
         let receiveCursor: String?
         let acknowledged: Bool
+        let resetCutoff: Int64
+        let pendingDeliveries: Int
     }
 
     /// Raw reads are restricted to this test's newly-created SQLite fixtures.
@@ -68,6 +70,10 @@ struct DaemonHubContentionTests {
             // in the same SQLite read snapshot. ACKs are channel-specific;
             // the global isSynchronized field alone is insufficient for IPC.
             let values = try row("""
+                WITH cutoff AS (
+                  SELECT COALESCE((SELECT value FROM _lattice_meta
+                    WHERE key = 'sync_reset_through_v1:' || ?2), '0') AS value
+                )
                 SELECT
                   (SELECT COUNT(*) FROM Memory WHERE globalId = ?1 COLLATE NOCASE),
                   (SELECT COUNT(*) FROM AuditLog
@@ -76,18 +82,33 @@ struct DaemonHubContentionTests {
                   \(readsApplyReceipts ? "(SELECT COUNT(*) FROM _lattice_applied_receipts)" : "0"),
                   (SELECT last_received_event_id FROM _lattice_replication_slots WHERE sync_id = ?2),
                   EXISTS (SELECT 1 FROM AuditLog
-                          WHERE tableName = 'Memory' AND globalRowId = ?1 COLLATE NOCASE)
+                          WHERE tableName = 'Memory' AND globalRowId = ?1 COLLATE NOCASE
+                            AND id > CAST((SELECT value FROM cutoff) AS INTEGER))
                     AND EXISTS (SELECT 1 FROM _lattice_replication_slots WHERE sync_id = ?2)
                     AND NOT EXISTS (
                       SELECT 1 FROM AuditLog a
                       WHERE a.tableName = 'Memory' AND a.globalRowId = ?1 COLLATE NOCASE
+                        AND a.id > CAST((SELECT value FROM cutoff) AS INTEGER)
                         AND COALESCE((SELECT s.is_synchronized FROM _lattice_sync_state s
                                      WHERE s.audit_entry_id = a.id AND s.sync_id = ?2),
                                      a.isSynchronized) != 1)
+                    AND NOT EXISTS (SELECT 1 FROM _lattice_sync_outbox
+                      WHERE sync_id = ?2 AND table_name = 'Memory'
+                        AND global_row_id = ?1 COLLATE NOCASE),
+                  (SELECT value FROM cutoff),
+                  (SELECT COUNT(*) FROM _lattice_sync_outbox
+                    WHERE sync_id = ?2 AND table_name = 'Memory'
+                      AND global_row_id = ?1 COLLATE NOCASE)
                 """, bindings: [id.uuidString, "ipc:\(channel)"])
+            // Fresh-peer replay retires its old channel cohort without rewriting all
+            // historical AuditLog flags. Only a positively observed current cohort can
+            // establish ACK, and an exact pending delivery always prevents it.
+            guard let text = values[6], let cutoff = Int64(text), cutoff >= 0,
+                  String(cutoff) == text else { throw FixtureError.invalidReadback }
             return Readback(memoryRows: try integer(values[0]), auditRows: try integer(values[1]),
                             totalAuditRows: try integer(values[2]), receipts: try integer(values[3]),
-                            receiveCursor: values[4], acknowledged: try integer(values[5]) == 1)
+                            receiveCursor: values[4], acknowledged: try integer(values[5]) == 1,
+                            resetCutoff: cutoff, pendingDeliveries: try integer(values[7]))
         }
 
         func auditEventIDs(_ id: UUID) throws -> Set<String> {
@@ -170,6 +191,58 @@ struct DaemonHubContentionTests {
             }
         }
         return nil
+    }
+
+    @Test
+    func readbackRequiresCurrentCohortAndNoExactPendingDelivery() throws {
+        // A new synthetic SQLite fixture tests the readback predicate itself; no
+        // Lattice writer, real store, native log sink or IPC endpoint is involved.
+        let directory = try testFixtureDirectory().appending(path: "ack-\(UUID().uuidString.prefix(8))")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appending(path: "fixture.sqlite")
+        var pointer: OpaquePointer?
+        guard sqlite3_open(url.path, &pointer) == SQLITE_OK, let database = pointer else {
+            if let pointer { sqlite3_close(pointer) }
+            throw FixtureError.invalidReadback
+        }
+        defer { sqlite3_close(database) }
+        func write(_ sql: String) throws {
+            let code = sqlite3_exec(database, sql, nil, nil, nil)
+            guard code == SQLITE_OK else { throw FixtureError.sqlite("synthetic ACK fixture", code) }
+        }
+        let id = UUID(), channel = "fixture"
+        try write("""
+            CREATE TABLE Memory(globalId TEXT);
+            CREATE TABLE AuditLog(id INTEGER PRIMARY KEY, tableName TEXT, globalRowId TEXT, isSynchronized INTEGER);
+            CREATE TABLE _lattice_applied_receipts(id INTEGER);
+            CREATE TABLE _lattice_replication_slots(sync_id TEXT, last_received_event_id TEXT);
+            CREATE TABLE _lattice_sync_state(audit_entry_id INTEGER, sync_id TEXT, is_synchronized INTEGER);
+            CREATE TABLE _lattice_meta(key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE _lattice_sync_outbox(sync_id TEXT, table_name TEXT, global_row_id TEXT);
+            INSERT INTO Memory VALUES('\(id.uuidString)');
+            INSERT INTO _lattice_replication_slots VALUES('ipc:fixture', 'event');
+            INSERT INTO AuditLog VALUES(1, 'Memory', '\(id.uuidString)', 0);
+            """)
+        let reader = try Reader(url)
+        #expect(try !reader.snapshot(id, channel: channel).acknowledged)
+        try write("INSERT INTO _lattice_meta VALUES('sync_reset_through_v1:ipc:fixture', '1')")
+        #expect(try !reader.snapshot(id, channel: channel).acknowledged,
+                "Retiring old history is not itself delivery evidence")
+        try write("INSERT INTO AuditLog VALUES(2, 'Memory', '\(id.uuidString)', 0)")
+        #expect(try !reader.snapshot(id, channel: channel).acknowledged)
+        try write("INSERT INTO _lattice_sync_state VALUES(2, 'ipc:fixture', 1)")
+        #expect(try reader.snapshot(id, channel: channel).acknowledged)
+        try write("INSERT INTO _lattice_sync_outbox VALUES('ipc:fixture', 'Memory', '\(id.uuidString)')")
+        #expect(try !reader.snapshot(id, channel: channel).acknowledged,
+                "Uncertain durable delivery cannot be hidden by an audit ACK")
+        try write("UPDATE _lattice_sync_outbox SET sync_id='ipc:other'")
+        #expect(try reader.snapshot(id, channel: channel).acknowledged)
+        try write("UPDATE _lattice_meta SET value='0'")
+        #expect(try !reader.snapshot(id, channel: channel).acknowledged,
+                "Unretired old work remains pending")
+        try write("UPDATE _lattice_meta SET value='01'")
+        #expect(throws: (any Error).self) { try reader.snapshot(id, channel: channel) }
     }
 
     @Test(.timeLimit(.minutes(3)))

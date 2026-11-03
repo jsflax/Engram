@@ -68,13 +68,26 @@ struct GraphAccessibilityTests {
     }
 
     private func requireElement(_ identifier: String, in host: NSView) async throws -> any NSAccessibilityProtocol {
+        // Swift Testing is not NSApplication.run(). Service AppKit's display/run-loop
+        // boundary instead of spinning only the Swift concurrency executor.
+        #expect(Thread.isMainThread)
+        #expect(host.window?.isVisible == true)
         let deadline = ContinuousClock.now + .seconds(2)
         repeat {
-            host.layoutSubtreeIfNeeded()
+            settleHost(host)
             if let element = find(identifier, in: host) { return element }
             await Task.yield()
         } while ContinuousClock.now < deadline
-        return try #require(find(identifier, in: host))
+        return try #require(find(identifier, in: host),
+            "Hosted AX element missing; window visible: \(host.window?.isVisible == true), root AX children: \(host.accessibilityChildren()?.count ?? 0)")
+    }
+
+    private func settleHost(_ host: NSView) {
+        host.window?.contentView?.layoutSubtreeIfNeeded()
+        host.layoutSubtreeIfNeeded()
+        host.displayIfNeeded()
+        // Synchronous helper is intentionally bounded; no second timer or task owner.
+        _ = RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
     }
 
     private func find(_ identifier: String, in object: any NSAccessibilityProtocol, depth: Int = 0)
@@ -89,7 +102,7 @@ struct GraphAccessibilityTests {
     }
 }
 
-/// Unshown native controls only: no graph scene, Metal, store, credentials or network.
+/// Visible hosted controls for in-process AX inspection only: no graph scene, Metal, store, credentials or network.
 @MainActor
 private final class Fixture {
     let session: EngramGraphSession
@@ -122,15 +135,20 @@ private final class Fixture {
         try session.apply(snapshot, from: session.identity, for: session.beginLoading())
     }
 
-    func host<Content: View>(_ content: Content) -> NSHostingView<Content> {
-        let view = NSHostingView(rootView: content)
+    func host<Content: View>(_ content: Content) -> NSView {
+        // CI need not have VoiceOver running. Enable the public SwiftUI accessibility
+        // environment for this test root, without changing system or user AX settings.
+        let view = NSHostingView(rootView: content.environment(\.accessibilityEnabled, true))
         view.frame = root.bounds; root.addSubview(view)
+        window.orderFront(nil)
         view.layoutSubtreeIfNeeded()
+        view.displayIfNeeded()
         return view
     }
 
     func close() {
         session.invalidate(); session.detachSurface(token)
+        window.orderOut(nil)
         window.contentView = nil; window.close()
     }
 }
