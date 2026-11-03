@@ -196,9 +196,19 @@ enum AtlasRasterizer {
             return curY + rowH
         }
 
-        let requiredWidth = max(
-            (projLabels + topicLabels).map { Int(ceil($0.width + padding * 2)) }.max() ?? 0,
-            labelInfos.map { Int(ceil($0.width + padding * 2)) }.max() ?? 0)
+        var requiredWidth: Int = 0
+        for label in projLabels {
+            let width = Int(ceil(label.width + padding * 2))
+            requiredWidth = max(requiredWidth, width)
+        }
+        for label in topicLabels {
+            let width = Int(ceil(label.width + padding * 2))
+            requiredWidth = max(requiredWidth, width)
+        }
+        for info in labelInfos {
+            let width = Int(ceil(info.width + padding * 2))
+            requiredWidth = max(requiredWidth, width)
+        }
         var atlasW: Int = 512
         while atlasW < requiredWidth && atlasW < maxDim { atlasW *= 2 }
         var atlasH: Int = 512

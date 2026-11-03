@@ -290,6 +290,13 @@ def initialized_store_snapshot(db):
             "operation_receipts": receipts}
 
 
+def register_fixture_storage_writer(setup):
+    # Only synthetic setup writes to disposable, native-created fixtures use
+    # this capability. Match the qualified Core writer epoch explicitly; never
+    # derive it from the database or remove its generated writer guards.
+    setup.create_function("lattice_storage_writer_epoch", 0, lambda: 9, deterministic=True)
+
+
 def remove_fixture_store_identity(db):
     # Only the disposable, native-created startup fixture calls this helper,
     # after its native child has exited. Keep the generated audit triggers:
@@ -317,6 +324,7 @@ def remove_fixture_store_identity(db):
                     setup.execute("SELECT name, seq FROM sqlite_sequence ORDER BY name").fetchall())
         before = preserved()
         assert before[1] and before[2] == [(1, 0)] and len(before[4]) == 1, "Unexpected startup fixture state"
+        register_fixture_storage_writer(setup)
         setup.create_function("sync_disabled", 0, lambda: 1)
         deleted = setup.execute("DELETE FROM EngramOperationStoreV1 WHERE singletonKey = 'local-operation-store'")
         assert deleted.rowcount == 1, "Fixture identity removal was not exact"
@@ -477,6 +485,7 @@ def run_warm_startup(binary, migration_binary=None):
                 with closing(sqlite3.connect(db, timeout=1)) as setup:
                     assert setup.execute("SELECT COUNT(*) FROM _lattice_replication_slots").fetchone()[0] == 0
                     if slot_count:
+                        register_fixture_storage_writer(setup)
                         setup.execute("INSERT INTO _lattice_replication_slots(sync_id) VALUES (?)",
                                       ("warm-startup-regression-" + token,))
                         setup.commit()
@@ -616,6 +625,7 @@ def run_warm_multistore_startup(binary, migration_binary=None):
                 with closing(sqlite3.connect(path, timeout=1)) as setup:
                     assert setup.execute("SELECT COUNT(*) FROM _lattice_replication_slots").fetchone()[0] == 0
                     slot = f"warm-multistore-regression-{token}-{index}"
+                    register_fixture_storage_writer(setup)
                     setup.execute("INSERT INTO _lattice_replication_slots(sync_id) VALUES (?)", (slot,))
                     setup.commit()
                     expected_slots[path] = setup.execute(
