@@ -70,6 +70,7 @@ jobs:
           repo = root / 'repo'
           files = subprocess.check_output(['git', 'ls-files', '-z', 'Sources', 'Tests', 'scripts',
               'Package.swift', 'Package.resolved', '.swiftpm/configuration/mirrors.json', 'codex/plugins/engram',
+              'Packages/EngramGraphContracts',
               '.github/workflows/native-validation.yml'], cwd=repo).decode().split('\0')
           hashes = {name: hashlib.sha256((repo / name).read_bytes()).hexdigest() for name in files if name}
           (root / 'evidence/source-identity.json').write_text(json.dumps({
@@ -77,6 +78,17 @@ jobs:
               'workflow': 'native-validation', 'run_id': os.environ['GITHUB_RUN_ID'],
               'run_attempt': os.environ['GITHUB_RUN_ATTEMPT']}, indent=2) + '\n')
           PY
+
+      - name: Test pure Engram graph contracts
+        if: ${{ !cancelled() && steps.checkout_source.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift test --package-path "$VALIDATION_ROOT/repo/Packages/EngramGraphContracts" \
+            --scratch-path "$VALIDATION_ROOT/graph-contracts" --cache-path "$VALIDATION_ROOT/cache" \
+            --config-path "$VALIDATION_ROOT/config" --security-path "$VALIDATION_ROOT/security" \
+            --jobs 2 --disable-index-store 2>&1 | tee "$VALIDATION_ROOT/evidence/graph-contracts.log"
 
       - name: Validate legacy Codex learner and installers
         if: ${{ !cancelled() && steps.checkout_source.outcome == 'success' }}
