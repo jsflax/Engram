@@ -62,8 +62,9 @@ struct GraphAccessibilityTests {
         let selected = try #require(fixture.session.selectedMemory)
         let host = fixture.host(GraphMemoryDetail(memory: selected, appearance: .init()))
         let element = try await requireElement("engram.graph.selected-memory", in: host)
-        #expect(element.accessibilityLabel() == node.label)
-        #expect(element.accessibilityValue() as? String == (excerpt ? "Excerpt. " : "") + content)
+        #expect(element.accessibilityLabel() == node.label, "Hosted detail AX: \(element.diagnostic())")
+        #expect(element.accessibilityValue() as? String == (excerpt ? "Excerpt. " : "") + content,
+                "Hosted detail AX: \(element.diagnostic())")
         #expect(fixture.session.scene == nil)
     }
 
@@ -106,7 +107,7 @@ struct GraphAccessibilityTests {
         func visit(_ object: NSObject, depth: Int) {
             guard depth < 4, rows.count < 24 else { return }
             let reader = AXElementReader(object: object)
-            rows.append("\(depth):\(type(of: object)) full=\(object is any NSAccessibilityProtocol) element=\(object is any NSAccessibilityElementProtocol) id=\(reader.accessibilityIdentifier() ?? "<nil>")")
+            rows.append("\(depth):\(type(of: object)) full=\(object is any NSAccessibilityProtocol) element=\(object is any NSAccessibilityElementProtocol) \(reader.diagnostic())")
             for child in reader.children.prefix(16) {
                 if let object = child as? NSObject { visit(object, depth: depth + 1) }
             }
@@ -117,7 +118,7 @@ struct GraphAccessibilityTests {
 }
 
 /// NSHostingView returns [Any] children. A native child need not adopt the full
-/// NSAccessibilityProtocol; read its public legacy attributes when it does not.
+/// NSAccessibilityProtocol; its public object getters can still be implemented.
 @MainActor
 private struct AXElementReader {
     let object: NSObject
@@ -129,32 +130,73 @@ private struct AXElementReader {
         return object.accessibilityAttributeValue(attribute)
     }
 
+    // Only known zero-argument Objective-C object getters are dispatched this way.
+    // Never use perform for scalar AXEnabled, frames, actions, or private selectors.
+    private func objectValue(_ selector: Selector) -> Any? {
+        guard object.responds(to: selector) else { return nil }
+        return object.perform(selector)?.takeUnretainedValue()
+    }
+
     var children: [Any] {
         if let children = modern?.accessibilityChildren() { return children }
+        if let children = objectValue(#selector(NSAccessibilityProtocol.accessibilityChildren)) as? [Any] {
+            return children
+        }
         return legacyValue(.children) as? [Any] ?? []
     }
 
     func accessibilityIdentifier() -> String? {
-        if let identifier = modern?.accessibilityIdentifier() { return identifier }
+        if let identifier = modern?.accessibilityIdentifier(), !identifier.isEmpty { return identifier }
         if let element = object as? any NSAccessibilityElementProtocol,
-           let identifier = element.accessibilityIdentifier?() { return identifier }
-        return legacyValue(.identifier) as? String
+           let identifier = element.accessibilityIdentifier?(), !identifier.isEmpty { return identifier }
+        if let identifier = objectValue(#selector(NSAccessibilityProtocol.accessibilityIdentifier)) as? String,
+           !identifier.isEmpty { return identifier }
+        guard let identifier = legacyValue(.identifier) as? String, !identifier.isEmpty else { return nil }
+        return identifier
     }
 
     func accessibilityRole() -> NSAccessibility.Role? {
         if let role = modern?.accessibilityRole() { return role }
+        if let role = objectValue(#selector(NSAccessibilityProtocol.accessibilityRole)) as? String {
+            return NSAccessibility.Role(rawValue: role)
+        }
         guard let role = legacyValue(.role) as? String else { return nil }
         return NSAccessibility.Role(rawValue: role)
     }
 
     func accessibilityLabel() -> String? {
         if let label = modern?.accessibilityLabel() { return label }
+        if let label = objectValue(#selector(NSAccessibilityProtocol.accessibilityLabel)) as? String { return label }
         return legacyValue(.description) as? String
     }
 
     func accessibilityValue() -> Any? {
         if let value = modern?.accessibilityValue() { return value }
+        if let value = objectValue(#selector(NSAccessibilityProtocol.accessibilityValue)) { return value }
         return legacyValue(.value)
+    }
+
+    func diagnostic() -> String {
+        let fields: [(String, Selector, NSAccessibility.Attribute)] = [
+            ("id", #selector(NSAccessibilityProtocol.accessibilityIdentifier), .identifier),
+            ("role", #selector(NSAccessibilityProtocol.accessibilityRole), .role),
+            ("label", #selector(NSAccessibilityProtocol.accessibilityLabel), .description),
+            ("value", #selector(NSAccessibilityProtocol.accessibilityValue), .value),
+        ]
+        func summary(_ value: Any?) -> String {
+            guard let value else { return "<nil>" }
+            // Fixture text only; cap every value independently inside the existing tree bound.
+            return String(String(describing: value).prefix(160))
+        }
+        let advertised = object.accessibilityAttributeNames()
+        let values = fields.map { name, selector, attribute in
+            "\(name)[responds=\(object.responds(to: selector)), direct=\(summary(objectValue(selector))), "
+                + "advertised=\(advertised.contains(attribute)), legacy=\(summary(legacyValue(attribute)))]"
+        }
+        let childrenSelector = #selector(NSAccessibilityProtocol.accessibilityChildren)
+        let directChildren = objectValue(childrenSelector) as? [Any]
+        return values.joined(separator: " ")
+            + " children[responds=\(object.responds(to: childrenSelector)), directCount=\(directChildren?.count.description ?? "<nil>")]"
     }
 
     func isAccessibilityEnabled() -> Bool? {
