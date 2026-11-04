@@ -2297,6 +2297,67 @@ final class AdapterSnapshotTests: XCTestCase {
         XCTAssertEqual(registry.edgeTailMergeCount, 2)
     }
 
+    func testIdenticalEdgeReplayPreservesRevisionsAndMixedAppendReuse() async throws {
+        let (lattice, registry, group, groupGeneration, personal, personalGeneration, adapter) =
+            try await crossGalaxyStreamingFixture()
+        defer { lattice.close() }
+        let a = node(), b = node()
+        group.applyLoadChunk(nodes: [(1, a)], generation: groupGeneration)
+        personal.applyLoadChunk(nodes: [(1, b)], generation: personalGeneration)
+        let high = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "high")
+        let replay = (0..<50).map { _ in
+            EdgeData(id: UUID(), sourceId: b.id, targetId: a.id, relation: "replayed")
+        }
+        let rows = replay.enumerated().map { (Int64($0.offset + 1), $0.element) }
+        group.applyLoadChunk(edges: [(1, high)], generation: groupGeneration)
+        personal.applyLoadChunk(edges: rows, generation: personalGeneration)
+        adapter.tick(dt: 1 / 60)
+        let initialIDs = adapter.edges.map(\.id)
+        let store = personal.renderStore
+        let allEdgesVersion = store.allEdgesVersion
+        let insertionGeneration = store.edgeInsertionGeneration
+        let insertedIDs = store.insertedEdgeIDs
+        let topology = store.topologyVersion
+        let edgeVersion = adapter.edgeVersion, generation = adapter.edgeAppendGeneration
+        let visits = registry.edgeMergeVisitCount, builds = adapter.edgeSnapshotBuildCount
+        let comparisons = adapter.edgePrefixComparisonCount, copies = adapter.retainedEdgeSnapshotCopyCount
+
+        // A baseline rescan or observer replay can repeat complete 50-row pages.
+        // Neither graph-change classification nor downstream work should change.
+        for _ in 0..<3 {
+            XCTAssertFalse(personal.applyLoadChunk(edges: rows, generation: personalGeneration))
+            adapter.tick(dt: 1 / 60)
+            XCTAssertEqual(store.allEdgesVersion, allEdgesVersion)
+            XCTAssertEqual(store.edgeInsertionGeneration, insertionGeneration)
+            XCTAssertEqual(store.insertedEdgeIDs, insertedIDs)
+            XCTAssertEqual(store.topologyVersion, topology)
+            XCTAssertEqual(adapter.edgeVersion, edgeVersion)
+            XCTAssertEqual(adapter.edgeAppendGeneration, generation)
+            XCTAssertEqual(adapter.edges.map(\.id), initialIDs)
+            XCTAssertEqual(registry.edgeMergeVisitCount, visits)
+            XCTAssertEqual(adapter.edgeSnapshotBuildCount, builds)
+            XCTAssertEqual(adapter.edgePrefixComparisonCount, comparisons)
+            XCTAssertEqual(adapter.retainedEdgeSnapshotCopyCount, copies)
+        }
+
+        // Replays mixed with a new row must not erase the append certificate.
+        let added = EdgeData(id: UUID(), sourceId: a.id, targetId: b.id, relation: "new")
+        XCTAssertTrue(personal.applyLoadChunk(edges: [(51, added)] + rows, generation: personalGeneration))
+        adapter.tick(dt: 1 / 60)
+        XCTAssertEqual(store.allEdgesVersion, allEdgesVersion + 1)
+        XCTAssertEqual(store.edgeInsertionGeneration, insertionGeneration)
+        XCTAssertEqual(store.insertedEdgeIDs, insertedIDs + [added.id])
+        XCTAssertEqual(adapter.edges.map(\.id), initialIDs + [added.id])
+        XCTAssertEqual(registry.edgeMergeVisitCount - visits, 1)
+        XCTAssertEqual(adapter.edgeSnapshotBuildCount - builds, 1)
+        XCTAssertEqual(adapter.edgePrefixComparisonCount, comparisons)
+        XCTAssertEqual(adapter.retainedEdgeSnapshotCopyCount, copies)
+        XCTAssertEqual(adapter.edgeAppendGeneration, generation)
+        let reuse = try XCTUnwrap(adapter.edgeInsertionReuse(since: edgeVersion, count: initialIDs.count))
+        XCTAssertTrue(reuse.preservesExistingIndices)
+        XCTAssertEqual(reuse.insertedRanges, [initialIDs.count..<(initialIDs.count + 1)])
+    }
+
     func testEdgeTailPreservesHiddenAndDanglingWinnersAndRevealsLateEndpoints() async throws {
         let (lattice, registry, group, groupGeneration, personal, personalGeneration, adapter) =
             try await crossGalaxyStreamingFixture()

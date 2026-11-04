@@ -34,6 +34,11 @@ public final class FrameGapDiagnostics {
         public fileprivate(set) var rejectedCount: UInt64 = 0
         public fileprivate(set) var fallbackCount: UInt64 = 0
         public fileprivate(set) var rows: UInt64 = 0
+        // Incoming edge rows, not distinct IDs. New counts rows absent from
+        // committed state, including repeated IDs already pending insertion.
+        public fileprivate(set) var newEdgeRows: UInt64 = 0
+        public fileprivate(set) var unchangedEdgeRows: UInt64 = 0
+        public fileprivate(set) var changedEdgeRows: UInt64 = 0
         public fileprivate(set) var durationNanoseconds: UInt64 = 0
         public fileprivate(set) var maximumDurationNanoseconds: UInt64 = 0
         public fileprivate(set) var queueSamples: UInt64 = 0
@@ -82,11 +87,12 @@ public final class FrameGapDiagnostics {
         "load_count", "load_accepted", "load_rejected", "load_rows",
         "load_apply_ms", "load_apply_max_ms", "load_queue_samples", "load_queue_ms", "load_queue_max_ms",
         "force_apply_count", "force_applied", "force_rejected", "force_raw_fallback",
-        "force_apply_ms", "force_apply_max_ms", "force_queue_samples", "force_queue_ms", "force_queue_max_ms"
+        "force_apply_ms", "force_apply_max_ms", "force_queue_samples", "force_queue_ms", "force_queue_max_ms",
+        "load_new_edges", "load_unchanged_edges", "load_changed_edges"
     ].joined(separator: ",")
 
     public static func csvValues(_ sample: Sample?) -> String {
-        guard let sample else { return Array(repeating: "0", count: 24).joined(separator: ",") }
+        guard let sample else { return Array(repeating: "0", count: 27).joined(separator: ",") }
         func ms(_ nanoseconds: UInt64) -> String { String(format: "%.3f", Double(nanoseconds) / 1_000_000) }
         let load = sample.load, force = sample.force
         return [
@@ -98,7 +104,8 @@ public final class FrameGapDiagnostics {
             ms(load.queueNanoseconds), ms(load.maximumQueueNanoseconds),
             String(force.count), String(force.acceptedCount), String(force.rejectedCount), String(force.fallbackCount),
             ms(force.durationNanoseconds), ms(force.maximumDurationNanoseconds), String(force.queueSamples),
-            ms(force.queueNanoseconds), ms(force.maximumQueueNanoseconds)
+            ms(force.queueNanoseconds), ms(force.maximumQueueNanoseconds),
+            String(load.newEdgeRows), String(load.unchangedEdgeRows), String(load.changedEdgeRows)
         ].joined(separator: ",")
     }
 
@@ -112,10 +119,14 @@ public final class FrameGapDiagnostics {
 
     public init(enabled: Bool) { self.enabled = enabled }
 
-    public func recordLoad(rows: Int, accepted: Bool, queuedAt: UInt64?, startedAt: UInt64, endedAt: UInt64) {
+    public func recordLoad(rows: Int, accepted: Bool, queuedAt: UInt64?, startedAt: UInt64, endedAt: UInt64,
+                           newEdgeRows: Int = 0, unchangedEdgeRows: Int = 0, changedEdgeRows: Int = 0) {
         guard enabled else { return }
         load.record(queuedAt: queuedAt, startedAt: startedAt, endedAt: endedAt)
         load.rows = Work.add(load.rows, UInt64(max(0, rows)))
+        load.newEdgeRows = Work.add(load.newEdgeRows, UInt64(max(0, newEdgeRows)))
+        load.unchangedEdgeRows = Work.add(load.unchangedEdgeRows, UInt64(max(0, unchangedEdgeRows)))
+        load.changedEdgeRows = Work.add(load.changedEdgeRows, UInt64(max(0, changedEdgeRows)))
         if accepted { load.acceptedCount = Work.add(load.acceptedCount, 1) }
         else { load.rejectedCount = Work.add(load.rejectedCount, 1) }
     }

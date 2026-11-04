@@ -400,12 +400,15 @@ actor Galaxy: Identifiable {
     ) -> Bool {
         let diagnosticStart = FrameGapDiagnostics.timestamp()
         var accepted = false
+        var newEdgeRows = 0, unchangedEdgeRows = 0, changedEdgeRows = 0
         defer {
             if let diagnosticStart {
                 FrameGapDiagnostics.shared.recordLoad(
                     rows: nodes.count + edges.count + removedNodes.count + removedEdges.count,
                     accepted: accepted, queuedAt: diagnosticEnqueuedAt, startedAt: diagnosticStart,
-                    endedAt: DispatchTime.now().uptimeNanoseconds)
+                    endedAt: DispatchTime.now().uptimeNanoseconds,
+                    newEdgeRows: newEdgeRows, unchangedEdgeRows: unchangedEdgeRows,
+                    changedEdgeRows: changedEdgeRows)
             }
         }
         guard !Task.isCancelled, loadChanges.withLock({ $0.accepts(generation) }) else { return false }
@@ -447,8 +450,19 @@ actor Galaxy: Identifiable {
             self.flushPendingNodeInserts(config: config)
             for (pk, edge) in edges {
                 store.edgePkToGlobalId[pk] = edge.id
-                if store.allEdges[edge.id] == nil { store.pendingEdgeInserts.append((edge.id, edge)) }
-                else { self.handleEdgeUpdate(edge, config: config) }
+                if store.allEdges[edge.id] == nil {
+                    store.pendingEdgeInserts.append((edge.id, edge))
+                    if diagnosticStart != nil { newEdgeRows += 1 }
+                } else {
+                    let revision = diagnosticStart != nil ? store.allEdgesVersion : nil
+                    self.handleEdgeUpdate(edge, config: config)
+                    // Measure the mutation decision itself, without logging
+                    // identifiers or repeating endpoint comparisons per row.
+                    if let revision {
+                        if store.allEdgesVersion == revision { unchangedEdgeRows += 1 }
+                        else { changedEdgeRows += 1 }
+                    }
+                }
             }
             self.flushPendingEdgeInserts(config: config)
         }
@@ -541,8 +555,14 @@ actor Galaxy: Identifiable {
     nonisolated static func snapshotEdge(_ edge: MemoryEdge) -> (pk: Int64, edge: EdgeData)? {
         edge.withMaterializedReads {
             guard let pk = edge.primaryKey, let gid = edge.globalId else { return nil }
-            return (pk, EdgeData(id: gid, sourceId: edge.sourceGlobalId,
-                                 targetId: edge.targetGlobalId, relation: edge.relation.rawValue))
+            // Lattice's nonoptional UUID getter substitutes a new UUID for
+            // malformed stored text. Reject those endpoints before conversion
+            // so rescans cannot turn one invalid row into changing topology.
+            let fields = edge.asRefType
+            guard let source = UUID(uuidString: fields.getString(named: "sourceGlobalId")),
+                  let target = UUID(uuidString: fields.getString(named: "targetGlobalId")) else { return nil }
+            return (pk, EdgeData(id: gid, sourceId: source,
+                                 targetId: target, relation: edge.relation.rawValue))
         }
     }
     
@@ -1023,14 +1043,15 @@ actor Galaxy: Identifiable {
         // Updating an edge whose insert has not flushed supersedes that old row.
         store.pendingEdgeInserts.removeAll { $0.edge.id == data.id }
         let old = store.allEdges[data.id]
-        store.allEdges[data.id] = data
-        // Only scan the edges array when structural fields changed (relation, endpoints).
-        // Edge updates that don't change routing (rare) skip the O(edges) linear scan.
+        // Replayed rows and non-rendering database edits can produce identical
+        // EdgeData. Do not even reassign them: allEdges' mutation observer would
+        // invalidate the insertion journal and force a full multi-galaxy merge.
         let structuralChange = old == nil ||
             old!.relation != data.relation ||
             old!.sourceId != data.sourceId ||
             old!.targetId != data.targetId
         if structuralChange {
+            store.allEdges[data.id] = data
             store.edges.removeAll { $0.id == data.id }
             store.filteredEdgeIds.remove(data.id)
             if let old {

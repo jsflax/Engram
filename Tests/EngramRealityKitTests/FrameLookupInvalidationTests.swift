@@ -149,9 +149,11 @@ struct FrameLookupInvalidationTests {
     @Test("Gap work keeps exact outcomes, unknown queue stamps and saturating totals")
     func frameGapWorkAggregatesAndSaturates() {
         let diagnostics = FrameGapDiagnostics(enabled: true), owner = NSObject()
-        diagnostics.recordLoad(rows: 2, accepted: true, queuedAt: 10, startedAt: 20, endedAt: 50)
+        diagnostics.recordLoad(rows: 2, accepted: true, queuedAt: 10, startedAt: 20, endedAt: 50,
+                               newEdgeRows: 1, unchangedEdgeRows: 1)
         diagnostics.recordLoad(rows: 3, accepted: false, queuedAt: nil, startedAt: 40, endedAt: 45)
-        diagnostics.recordLoad(rows: 4, accepted: true, queuedAt: 100, startedAt: 60, endedAt: 70)
+        diagnostics.recordLoad(rows: 4, accepted: true, queuedAt: 100, startedAt: 60, endedAt: 70,
+                               unchangedEdgeRows: 1, changedEdgeRows: 3)
         diagnostics.recordForce(outcome: .positionsApplied, queuedAt: 15, startedAt: 20, endedAt: 30)
         diagnostics.recordForce(outcome: .rejected, queuedAt: nil, startedAt: 40, endedAt: 60)
         diagnostics.recordForce(outcome: .rawFallback, queuedAt: 30, startedAt: 30, endedAt: 34)
@@ -160,6 +162,9 @@ struct FrameLookupInvalidationTests {
         #expect(sample?.load.acceptedCount == 2)
         #expect(sample?.load.rejectedCount == 1)
         #expect(sample?.load.rows == 9)
+        #expect(sample?.load.newEdgeRows == 1)
+        #expect(sample?.load.unchangedEdgeRows == 2)
+        #expect(sample?.load.changedEdgeRows == 3)
         #expect(sample?.load.durationNanoseconds == 45)
         #expect(sample?.load.maximumDurationNanoseconds == 30)
         #expect(sample?.load.queueSamples == 1)
@@ -179,13 +184,14 @@ struct FrameLookupInvalidationTests {
         // including queue availability and previous-callback attribution.
         let csv = FrameGapDiagnostics(enabled: true)
         csv.recordLoad(rows: 2, accepted: true, queuedAt: 1_000_000,
-                       startedAt: 3_000_000, endedAt: 8_000_000)
+                       startedAt: 3_000_000, endedAt: 8_000_000,
+                       newEdgeRows: 1, unchangedEdgeRows: 1)
         csv.recordForce(outcome: .rawFallback, queuedAt: nil,
                         startedAt: 9_000_000, endedAt: 12_000_000)
         let csvFirst = csv.beginCallback(owner: owner, at: 20_000_000)
         let columns = FrameGapDiagnostics.csvHeader.components(separatedBy: ",")
         let firstValues = FrameGapDiagnostics.csvValues(csvFirst).components(separatedBy: ",")
-        #expect(columns.count == 24)
+        #expect(columns.count == 27)
         #expect(Set(columns).count == columns.count)
         #expect(firstValues.count == columns.count)
         let firstFields = Dictionary(uniqueKeysWithValues: zip(columns, firstValues))
@@ -193,6 +199,9 @@ struct FrameLookupInvalidationTests {
         #expect(firstFields["load_count"] == "1")
         #expect(firstFields["load_accepted"] == "1")
         #expect(firstFields["load_rows"] == "2")
+        #expect(firstFields["load_new_edges"] == "1")
+        #expect(firstFields["load_unchanged_edges"] == "1")
+        #expect(firstFields["load_changed_edges"] == "0")
         #expect(firstFields["load_apply_ms"] == "5.000")
         #expect(firstFields["load_apply_max_ms"] == "5.000")
         #expect(firstFields["load_queue_samples"] == "1")
@@ -213,18 +222,26 @@ struct FrameLookupInvalidationTests {
         #expect(nextFields["callback_outside_ms"] == "18.000")
         #expect(nextFields["previous_logger_tail_ms"] == "2.000")
         #expect(nextFields["load_count"] == "0")
+        #expect(nextFields["load_new_edges"] == "0")
+        #expect(nextFields["load_unchanged_edges"] == "0")
+        #expect(nextFields["load_changed_edges"] == "0")
         #expect(nextFields["force_apply_count"] == "0")
 
-        diagnostics.recordLoad(rows: Int.max, accepted: true, queuedAt: nil, startedAt: 0, endedAt: .max)
-        diagnostics.recordLoad(rows: Int.max, accepted: true, queuedAt: nil, startedAt: 0, endedAt: .max)
-        diagnostics.recordLoad(rows: Int.max, accepted: false, queuedAt: 0, startedAt: .max, endedAt: .max)
-        diagnostics.recordLoad(rows: -1, accepted: false, queuedAt: 0, startedAt: .max, endedAt: .max)
+        for _ in 0..<3 {
+            diagnostics.recordLoad(rows: Int.max, accepted: true, queuedAt: nil, startedAt: 0, endedAt: .max,
+                                   newEdgeRows: Int.max, unchangedEdgeRows: Int.max, changedEdgeRows: Int.max)
+        }
+        diagnostics.recordLoad(rows: -1, accepted: false, queuedAt: 0, startedAt: .max, endedAt: .max,
+                               newEdgeRows: -1, unchangedEdgeRows: -1, changedEdgeRows: -1)
         let saturated = diagnostics.beginCallback(owner: owner, at: .max)
         #expect(saturated?.load.count == 4)
         #expect(saturated?.load.rows == UInt64.max)
+        #expect(saturated?.load.newEdgeRows == UInt64.max)
+        #expect(saturated?.load.unchangedEdgeRows == UInt64.max)
+        #expect(saturated?.load.changedEdgeRows == UInt64.max)
         #expect(saturated?.load.durationNanoseconds == UInt64.max)
         #expect(saturated?.load.maximumDurationNanoseconds == UInt64.max)
-        #expect(saturated?.load.queueSamples == 2)
+        #expect(saturated?.load.queueSamples == 1)
         #expect(saturated?.load.queueNanoseconds == UInt64.max)
         #expect(saturated?.load.maximumQueueNanoseconds == UInt64.max)
         #expect(saturated?.force.count == 0)
@@ -243,7 +260,8 @@ struct FrameLookupInvalidationTests {
         #expect(enabledStamp == 42)
         #expect(clockReads == 1)
         let diagnostics = FrameGapDiagnostics(enabled: false), owner = NSObject()
-        diagnostics.recordLoad(rows: 50, accepted: true, queuedAt: 1, startedAt: 2, endedAt: 3)
+        diagnostics.recordLoad(rows: 50, accepted: true, queuedAt: 1, startedAt: 2, endedAt: 3,
+                               newEdgeRows: 10, unchangedEdgeRows: 30, changedEdgeRows: 10)
         diagnostics.recordForce(outcome: .positionsApplied, queuedAt: 1, startedAt: 2, endedAt: 3)
         #expect(diagnostics.beginCallback(owner: owner, at: 4) == nil)
         diagnostics.finishCallback(owner: owner, bodyEndedAt: 5, exitedAt: 6)

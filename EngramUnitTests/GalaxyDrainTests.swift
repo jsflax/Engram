@@ -504,6 +504,64 @@ final class GalaxyDrainTests: XCTestCase {
         XCTAssertEqual(snapshot.edge.relation, expected.3)
     }
 
+    func testEdgeSnapshotRejectsMalformedEndpointsWithoutChangingStoredRows() throws {
+        // Only Edge is registered: valid endpoint UUIDs are deliberately
+        // dangling and must survive validation without a Memory lookup.
+        let lattice = try Lattice(MemoryEdge.self, configuration: .init(storage: .memory()))
+        defer { lattice.close() }
+        let source = try XCTUnwrap(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"))
+        let target = try XCTUnwrap(UUID(uuidString: "FFFFFFFF-2222-3333-4444-555555555555"))
+        let zero = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000000"))
+        let fixtures = [
+            ("", target.uuidString, false),
+            ("not-a-uuid", target.uuidString, false),
+            (source.uuidString, "", false),
+            (source.uuidString, "not-a-uuid", false),
+            ("", "", false),
+            (source.uuidString.uppercased(), target.uuidString.lowercased(), true),
+            (zero.uuidString, target.uuidString, true),
+        ]
+        var stored: [Int64: (id: UUID, source: String, target: String)] = [:]
+        var validRows: [UUID: (source: UUID, target: UUID)] = [:]
+        for fixture in fixtures {
+            let edge = MemoryEdge(sourceGlobalId: source, targetGlobalId: target, relation: .partOf)
+            try lattice.add(edge)
+            let pk = try XCTUnwrap(edge.primaryKey)
+            let id = try XCTUnwrap(edge.globalId)
+            // Exercise the persisted scalar representation without the UUID
+            // accessor that would hide malformed text behind random UUIDs.
+            edge.asRefType.setString(named: "sourceGlobalId", fixture.0)
+            edge.asRefType.setString(named: "targetGlobalId", fixture.1)
+            stored[pk] = (id, fixture.0, fixture.1)
+            if fixture.2 {
+                validRows[id] = (try XCTUnwrap(UUID(uuidString: fixture.0)),
+                                 try XCTUnwrap(UUID(uuidString: fixture.1)))
+            }
+        }
+
+        for _ in 0..<3 {
+            // Fresh handles mirror repeated loader scans of the same rows.
+            let rows = lattice.objects(MemoryEdge.self).snapshot()
+            XCTAssertEqual(rows.count, fixtures.count)
+            let snapshots = rows.compactMap(Galaxy.snapshotEdge)
+            XCTAssertEqual(snapshots.count, 2, "Each malformed endpoint must be rejected independently")
+            XCTAssertEqual(Set(snapshots.map(\.edge.id)), Set(validRows.keys))
+            for snapshot in snapshots {
+                let expected = try XCTUnwrap(validRows[snapshot.edge.id])
+                XCTAssertEqual(snapshot.edge.sourceId, expected.source)
+                XCTAssertEqual(snapshot.edge.targetId, expected.target)
+                XCTAssertEqual(snapshot.edge.relation, "part_of")
+            }
+            for row in rows {
+                let expected = try XCTUnwrap(stored[try XCTUnwrap(row.primaryKey)])
+                XCTAssertFalse(row.isMaterialized, "Validation must restore the caller's read mode")
+                XCTAssertEqual(row.globalId, expected.id)
+                XCTAssertEqual(row.asRefType.getString(named: "sourceGlobalId"), expected.source)
+                XCTAssertEqual(row.asRefType.getString(named: "targetGlobalId"), expected.target)
+            }
+        }
+    }
+
     func testInitialFinalizeMatchesFullDerivationWithFiltersAndDanglingEdges() async throws {
         let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
         let registry = GalaxyRegistry()
@@ -1159,6 +1217,54 @@ final class GalaxyDrainTests: XCTestCase {
         galaxy.renderStore.glowingNodes.removeValue(forKey: node.id)
         adapter.tick(dt: 1 / 60)
         XCTAssertTrue(adapter.glowingNodes.isEmpty)
+    }
+
+    func testIdenticalEdgeUpdateCancelsStalePendingInsertAndStillAppliesRealEdit() throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        defer { lattice.close() }
+        let registry = GalaxyRegistry()
+        let galaxy = Galaxy(id: "personal", displayName: "Personal", lattice: lattice.sendableReference)
+        registry.register(galaxy)
+        let nodes = makeNodes(3)
+        galaxy.insertNodeBatch(nodes, config: config)
+        let current = EdgeData(id: UUID(), sourceId: nodes[0].id, targetId: nodes[1].id, relation: "part_of")
+        galaxy.handleEdgeUpdate(current, config: config)
+        registry.mergeRenderData()
+        let store = galaxy.renderStore
+        let allEdgesVersion = store.allEdgesVersion, topology = store.topologyVersion
+        let insertionGeneration = store.edgeInsertionGeneration, edgesVersion = store.edgesVersion
+        let edited = EdgeData(id: current.id, sourceId: nodes[0].id, targetId: nodes[2].id, relation: "relates_to")
+
+        // The newest observation matches committed state but supersedes an
+        // older deferred insert. Equality must not skip cancelling that insert.
+        galaxy.handleEdgeInsert(edited, config: config)
+        galaxy.handleEdgeUpdate(current, config: config)
+        galaxy.flushPendingEdgeInserts(config: config)
+        XCTAssertTrue(store.pendingEdgeInserts.isEmpty)
+        XCTAssertEqual(store.allEdgesVersion, allEdgesVersion)
+        XCTAssertEqual(store.edgeInsertionGeneration, insertionGeneration)
+        XCTAssertEqual(store.edgesVersion, edgesVersion)
+        XCTAssertEqual(store.topologyVersion, topology)
+        XCTAssertEqual(store.allEdges[current.id]?.targetId, nodes[1].id)
+        XCTAssertEqual(store.edges.map(\.id), [current.id])
+        XCTAssertEqual(store.edgeCountByNode[nodes[0].id], 1)
+        XCTAssertEqual(store.edgeCountByNode[nodes[1].id], 1)
+        XCTAssertEqual(store.edgeCountByNode[nodes[2].id] ?? 0, 0)
+        XCTAssertTrue(store.hubs.contains(nodes[1].id))
+        XCTAssertEqual(registry.unifiedSimulation.edgeIndicesPublic.count, 1)
+
+        // A genuine endpoint/relation change still takes the structural path.
+        galaxy.handleEdgeUpdate(edited, config: config)
+        registry.mergeRenderData()
+        XCTAssertGreaterThan(store.allEdgesVersion, allEdgesVersion)
+        XCTAssertGreaterThan(store.edgeInsertionGeneration, insertionGeneration)
+        XCTAssertGreaterThan(store.topologyVersion, topology)
+        XCTAssertEqual(registry.mergedEdges.first?.targetId, nodes[2].id)
+        XCTAssertEqual(registry.mergedEdges.first?.relation, "relates_to")
+        XCTAssertEqual(store.edgesByNode[nodes[1].id]?.count ?? 0, 0)
+        XCTAssertEqual(store.edgesByNode[nodes[2].id]?.map(\.id), [current.id])
+        XCTAssertFalse(store.hubs.contains(nodes[1].id))
+        XCTAssertEqual(registry.unifiedSimulation.edgeIndicesPublic.count, 1)
     }
 
     func testEdgeEditsInvalidateHubStyleAndKeepSimulationConsistent() throws {
