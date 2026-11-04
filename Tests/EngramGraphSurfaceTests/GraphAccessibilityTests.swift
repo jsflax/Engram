@@ -68,6 +68,63 @@ struct GraphAccessibilityTests {
         #expect(fixture.session.scene == nil)
     }
 
+    @Test(arguments: ["removed", "hidden", "detached", "revoked"])
+    func nativePopupActionsKeepDuplicateLabelsDistinctAndFenceRetainedActions(change: String) async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        let nodes = fixture.nodes.map {
+            EngramGraphNode(id: $0.id, project: "project", topic: "architecture", label: "Same label",
+                            content: $0.content, importance: 1, isHub: false)
+        }
+        try fixture.publish(nodes, revision: 2)
+        let host = fixture.host(GraphMemoryPicker(session: fixture.session))
+        // Keep the original semantic AX assertions above. This lookup exercises the actual
+        // AppKit action route as well, including two separate items with identical labels.
+        _ = try await requireElement("engram.graph.memory-selection", in: host)
+        let popup = try #require(nativePopup(in: host))
+        #expect(popup.numberOfItems == 3)
+        #expect(popup.item(at: 1)?.title == popup.item(at: 2)?.title)
+        var saved: [UUID?] = []
+        fixture.session.onStateChange = { _, state in saved.append(state.selectedNode) }
+        popup.selectItem(at: 2)
+        let sent = popup.sendAction(popup.action, to: popup.target)
+        #expect(sent)
+        #expect(fixture.session.selectedNode == nodes[1].id)
+        #expect(saved == [nodes[1].id])
+        fixture.session.select(nodes[0].id)
+        let deadline = ContinuousClock.now + .seconds(2)
+        repeat {
+            settleHost(host)
+            await Task.yield()
+        } while (popup.selectedItem?.representedObject as? UUID) != nodes[0].id && ContinuousClock.now < deadline
+        #expect((popup.selectedItem?.representedObject as? UUID) == nodes[0].id)
+        switch change {
+        case "removed": try fixture.publish([nodes[1]], revision: 3)
+        case "hidden": fixture.session.setVisibility(.hidden)
+        case "detached": fixture.session.detachSurface(fixture.token)
+        default: fixture.session.invalidate()
+        }
+        let accepted = fixture.session.selectedNode
+        let savedCount = saved.count
+        // Do not settle SwiftUI first: the old native menu can still be retained by AppKit.
+        popup.selectItem(at: 1)
+        _ = popup.sendAction(popup.action, to: popup.target)
+        #expect(fixture.session.selectedNode == accepted)
+        #expect(fixture.session.data.selectedNode == accepted)
+        #expect(saved.count == savedCount)
+        #expect(fixture.session.scene == nil)
+    }
+
+    private func nativePopup(in view: NSView, depth: Int = 0) -> NSPopUpButton? {
+        guard depth < 32 else { return nil }
+        if let popup = view as? NSPopUpButton,
+           popup.accessibilityIdentifier() == "engram.graph.memory-selection" { return popup }
+        for child in view.subviews {
+            if let popup = nativePopup(in: child, depth: depth + 1) { return popup }
+        }
+        return nil
+    }
+
     private func requireElement(_ identifier: String, in host: NSView) async throws -> AXElementReader {
         // Swift Testing is not NSApplication.run(). Service AppKit's display/run-loop
         // boundary instead of spinning only the Swift concurrency executor.

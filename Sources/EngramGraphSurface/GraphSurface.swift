@@ -170,19 +170,88 @@ struct GraphMemoryPicker: View {
         Binding(get: { session.selectedNode }, set: { session.select($0) })
     }
     var body: some View {
-        Picker("Memory", selection: selection) {
-            Text("No selection").tag(nil as UUID?)
-            ForEach(session.snapshot?.nodes ?? []) { memory in
-                Text(memory.label).tag(Optional(memory.id))
+        GraphMemoryPopUp(items: (session.snapshot?.nodes ?? []).map { .init(id: $0.id, label: $0.label) },
+                         selectedID: session.selectedNode,
+                         enabled: session.isRenderingActive && session.snapshot?.nodes.isEmpty == false,
+                         selection: selection)
+    }
+}
+
+/// Apply metadata to the real popup rather than a combined SwiftUI accessibility element.
+/// AppKit supplies its role, selected value, enabled state and keyboard/menu behavior.
+@MainActor
+private struct GraphMemoryPopUp: NSViewRepresentable {
+    struct Item: Equatable {
+        let id: UUID
+        let label: String
+    }
+    let items: [Item]
+    let selectedID: UUID?
+    let enabled: Bool
+    let selection: Binding<UUID?>
+    @Environment(\.colorScheme) private var colorScheme
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var selection: Binding<UUID?>?
+        var items: [Item]?
+
+        @objc func choose(_ sender: NSPopUpButton) {
+            guard sender.isEnabled, let selection, let item = sender.selectedItem else { return }
+            if let id = item.representedObject as? UUID {
+                selection.wrappedValue = id
+            } else if item === sender.item(at: 0) {
+                selection.wrappedValue = nil
             }
+            // A retained menu action may be refused by the current session guard.
+            select(selection.wrappedValue, in: sender)
         }
-        .pickerStyle(.menu)
-        .labelsHidden()
-        .disabled(!session.isRenderingActive || session.snapshot?.nodes.isEmpty != false)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Memory")
-        .accessibilityHint("Choose a memory to read its details.")
-        .accessibilityIdentifier("engram.graph.memory-selection")
+
+        func select(_ id: UUID?, in view: NSPopUpButton) {
+            let index = id.flatMap { selected in
+                view.itemArray.firstIndex { ($0.representedObject as? UUID) == selected }
+            } ?? 0
+            view.selectItem(at: index)
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> NSPopUpButton {
+        let view = NSPopUpButton(frame: .zero, pullsDown: false)
+        view.target = context.coordinator
+        view.action = #selector(Coordinator.choose(_:))
+        view.setAccessibilityIdentifier("engram.graph.memory-selection")
+        view.setAccessibilityLabel("Memory")
+        view.setAccessibilityHelp("Choose a memory to read its details.")
+        view.setContentHuggingPriority(.defaultHigh, for: .vertical)
+        return view
+    }
+    func updateNSView(_ view: NSPopUpButton, context: Context) {
+        context.coordinator.selection = selection
+        if context.coordinator.items != items {
+            let menu = NSMenu()
+            menu.autoenablesItems = false
+            menu.addItem(NSMenuItem(title: "No selection", action: nil, keyEquivalent: ""))
+            for item in items {
+                // Add individual menu items: duplicate memory labels must retain distinct IDs.
+                let entry = NSMenuItem(title: item.label, action: nil, keyEquivalent: "")
+                entry.representedObject = item.id as NSUUID
+                menu.addItem(entry)
+            }
+            view.menu = menu
+            context.coordinator.items = items
+        }
+        context.coordinator.select(selectedID, in: view)
+        view.isEnabled = enabled
+        view.appearance = NSAppearance(named: colorScheme == .dark ? .darkAqua : .aqua)
+    }
+    static func dismantleNSView(_ view: NSPopUpButton, coordinator: Coordinator) {
+        coordinator.selection = nil
+        coordinator.items = nil
+        view.target = nil
+        view.action = nil
+        view.isEnabled = false
+        view.removeAllItems()
     }
 }
 
