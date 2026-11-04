@@ -43,7 +43,7 @@ let package = Package(
         // Match Lattice PR44’s qualified MCP transport and request-dispatch revision.
         .package(url: "https://github.com/jsflax/swift-sdk.git", revision: "82951cc9cd05de216e8dd6425f951ce31d76fa0a"),
         // Preserve the throwing persisted-schema guard with the reviewed SDK/Core pair.
-        .package(url: "https://github.com/jsflax/lattice.git", revision: "9fce5a3cbefc9241fba114ec9f75af0784574b29"),
+        .package(url: "https://github.com/jsflax/lattice.git", revision: "c93f32f0b1d2735ed1b0a19d0762234e436caacd"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),

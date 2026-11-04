@@ -177,7 +177,10 @@ struct GraphMemoryPicker: View {
             }
         }
         .pickerStyle(.menu)
+        .labelsHidden()
         .disabled(!session.isRenderingActive || session.snapshot?.nodes.isEmpty != false)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Memory")
         .accessibilityHint("Choose a memory to read its details.")
         .accessibilityIdentifier("engram.graph.memory-selection")
     }
