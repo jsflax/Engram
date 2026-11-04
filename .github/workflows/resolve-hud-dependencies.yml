@@ -1,0 +1,190 @@
+name: Resolve HUD dependencies
+run-name: Resolve HUD dependencies at ${{ github.sha }}
+
+on:
+  push:
+    branches: [codex/hud-engram-resolution-20261104]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hud-engram-resolution-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: macos-26
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out exact source under localdev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          task_root="$HOME/localdev/engram-hud-resolve-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$HOME/localdev"
+          mkdir -m 700 "$task_root"
+          mkdir -m 700 -p "$task_root"/{scratch,cache,config,security,swift-sdks,module-cache,tmp,evidence,private,mirror}
+          {
+            echo "VALIDATION_ROOT=$task_root"
+            echo "TMPDIR=$task_root/tmp"
+            echo "CLANG_MODULE_CACHE_PATH=$task_root/module-cache"
+            echo "SWIFTPM_MODULECACHE_OVERRIDE=$task_root/module-cache"
+          } >> "$GITHUB_ENV"
+          gh auth setup-git
+          git init "$task_root/repo"
+          git -C "$task_root/repo" remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git -C "$task_root/repo" fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git -C "$task_root/repo" checkout --detach "$SOURCE_SHA"
+          test "$(git -C "$task_root/repo" rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C "$task_root/repo" diff --exit-code
+          cp "$task_root/repo/Package.resolved" "$task_root/evidence/Package.resolved.before"
+          cp "$task_root/repo/.swiftpm/configuration/mirrors.json" "$task_root/private/mirrors.json"
+          SOURCE_ROOT="$task_root" python3 -B - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['SOURCE_ROOT']); repo = root / 'repo'
+          sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+          assert sha(repo / 'Package.swift') == '5927329ef257f93438dc13fdb6a4700211000215beaf5077e5851906a8ed0783'
+          seed = '75a0194319d7433da0647a752b04732574b72d99135a0c6b13b39f9617ecbe27'
+          assert sha(repo / 'Package.resolved') == seed
+          assert sha(repo / 'Engram.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') == seed
+          files = subprocess.check_output(['git', 'ls-files', '-z'], cwd=repo).decode().split('\0')
+          hashes = {name: sha(repo / name) for name in files if name}
+          (root / 'evidence/source-identity.json').write_text(json.dumps({
+              'source_sha': os.environ['SOURCE_SHA'], 'files_sha256': hashes,
+              'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT']}, indent=2) + '\n')
+          PY
+          swift --version > "$task_root/evidence/swift.txt"
+          xcodebuild -version > "$task_root/evidence/xcode.txt"
+
+      - name: Mirror identical Sparkle artifact from localhost
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VALIDATION_ROOT/repo"
+          artifact_url=https://github.com/sparkle-project/Sparkle/releases/download/2.8.1/Sparkle-for-Swift-Package-Manager.zip
+          curl -sSfL --connect-timeout 20 --max-time 180 \
+            -o "$VALIDATION_ROOT/mirror/Sparkle-for-Swift-Package-Manager.zip" "$artifact_url"
+          nohup python3 -B "$VALIDATION_ROOT/repo/scripts/artifact_mirror_server.py" --directory "$VALIDATION_ROOT/mirror" \
+            > "$VALIDATION_ROOT/private/mirror.log" 2>&1 &
+          echo "$!" > "$VALIDATION_ROOT/private/mirror.pid"
+          for attempt in 1 2 3 4 5; do
+            if curl -sSf --max-time 2 -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip; then break; fi
+            sleep 1
+          done
+          mirror_status=0
+          curl -sSf --max-time 5 -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip || mirror_status=$?
+          if (( mirror_status != 0 )); then
+            python3 -B scripts/artifact_mirror_diagnostics.py failure --root "$VALIDATION_ROOT" --curl-status "$mirror_status" || true
+            exit "$mirror_status"
+          fi
+          swift package --package-path "$VALIDATION_ROOT/repo" --config-path "$VALIDATION_ROOT/config" \
+            config set-mirror --original "$artifact_url" \
+            --mirror http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip
+          shasum -a 256 "$VALIDATION_ROOT/mirror/Sparkle-for-Swift-Package-Manager.zip" > "$VALIDATION_ROOT/evidence/sparkle.sha256"
+
+      - name: Resolve once through ordinary SwiftPM
+        id: dependencies
+        timeout-minutes: 30
+        env:
+          SWIFTLM_CLONE_TOKEN: ${{ secrets.SWIFTLM_CLONE_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SWIFTLM_CLONE_TOKEN" || { echo '::error::Read-only SwiftLM clone credential is unavailable'; exit 1; }
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${SWIFTLM_CLONE_TOKEN}@github.com/jsflax/SwiftLM.insteadOf"
+          export GIT_CONFIG_VALUE_0=https://github.com/jsflax/SwiftLM
+          # This log can contain a rewritten private URL. Never print or upload it.
+          status=0
+          perl -e 'alarm(8*60); exec @ARGV' -- swift package \
+            --package-path "$VALIDATION_ROOT/repo" --scratch-path "$VALIDATION_ROOT/scratch" \
+            --cache-path "$VALIDATION_ROOT/cache" --config-path "$VALIDATION_ROOT/config" \
+            --security-path "$VALIDATION_ROOT/security" --swift-sdks-path "$VALIDATION_ROOT/swift-sdks" \
+            --manifest-cache local --jobs 1 resolve > "$VALIDATION_ROOT/private/resolve.log" 2>&1 || status=$?
+          RESOLVE_STATUS="$status" python3 -B - <<'PY'
+          import hashlib, json, os, pathlib, re
+          root = pathlib.Path(os.environ['VALIDATION_ROOT'])
+          result = {'exit_code': int(os.environ['RESOLVE_STATUS']), 'attempts': 1,
+                    'raw_log_uploaded': False, 'outputs': {}}
+          for source, name in [(root / 'repo/Package.resolved', 'Package.resolved.generated'),
+                               (root / 'scratch/workspace-state.json', 'workspace-state.json')]:
+              if not source.is_file(): continue
+              raw = source.read_bytes(); value = json.loads(raw)
+              assert os.environ['SWIFTLM_CLONE_TOKEN'].encode() not in raw
+              assert b'x-access-token' not in raw and not re.search(rb'https?://[^/\s"<>]*@', raw), 'Unsafe output URL'
+              (root / 'evidence' / name).write_bytes(raw)
+              result['outputs'][name] = {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
+          (root / 'evidence/resolve-result.json').write_text(json.dumps(result, indent=2) + '\n')
+          PY
+          if (( status != 0 )); then echo '::error::Original resolve failed; credential-bearing log remains private'; fi
+          exit "$status"
+
+      - name: Record source and genuine dependency outcomes
+        if: ${{ always() && env.VALIDATION_ROOT != '' }}
+        env:
+          RESOLVE_OUTCOME: ${{ steps.dependencies.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['VALIDATION_ROOT']); repo = root / 'repo'
+          def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
+          receipt = json.loads((root / 'evidence/source-identity.json').read_text())
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo).decode().strip()
+          changed = [name for name, digest in receipt['files_sha256'].items() if sha(repo / name) != digest]
+          assert head == os.environ['SOURCE_SHA']
+          assert set(changed) <= {'Package.resolved', '.swiftpm/configuration/mirrors.json'}, changed
+          old_mirrors = json.loads((root / 'private/mirrors.json').read_text())['object']
+          mirrors = json.loads((repo / '.swiftpm/configuration/mirrors.json').read_text())['object']
+          expected_mirror = {'original': 'https://github.com/sparkle-project/Sparkle/releases/download/2.8.1/Sparkle-for-Swift-Package-Manager.zip',
+                             'mirror': 'http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip'}
+          assert all(item in mirrors for item in old_mirrors)
+          assert all(item in old_mirrors or item == expected_mirror for item in mirrors)
+          old = json.loads((root / 'evidence/Package.resolved.before').read_text())
+          output = root / 'evidence/Package.resolved.generated'
+          current = json.loads(output.read_text()) if output.is_file() else None
+          delta = None
+          if current:
+              a = {pin['identity']: pin for pin in old['pins']}; b = {pin['identity']: pin for pin in current['pins']}
+              assert len(a) == len(old['pins']) and len(b) == len(current['pins'])
+              delta = {'added': sorted(b.keys() - a.keys()), 'removed': sorted(a.keys() - b.keys()),
+                       'changed': {key: {'before': a[key], 'after': b[key]} for key in a.keys() & b.keys() if a[key] != b[key]}}
+          summary = {'source_sha': head, 'resolve_outcome': os.environ['RESOLVE_OUTCOME'],
+                     'source_changes': changed, 'checked_in_mirrors_preserved': True, 'pin_delta': delta,
+                     'seed_pin_count': len(old['pins']), 'generated_pin_count': len(current['pins']) if current else None,
+                     'originHash': current.get('originHash') if current else None,
+                     'qualification': 'Resolution evidence only; no tests, builds or lock acceptance.'}
+          (root / 'evidence/resolution-integrity.json').write_text(json.dumps(summary, indent=2) + '\n')
+          if os.environ['RESOLVE_OUTCOME'] == 'success':
+              assert current and current.get('originHash')
+              expected = {'lattice': '9fce5a3cbefc9241fba114ec9f75af0784574b29',
+                          'latticecore': 'e678b10e9cdb8eabad65b0a16dcd05a2166f771e',
+                          'swift-sdk': '82951cc9cd05de216e8dd6425f951ce31d76fa0a'}
+              assert all(b[key]['state']['revision'] == revision for key, revision in expected.items())
+              assert output.read_bytes() == (repo / 'Package.resolved').read_bytes()
+          PY
+
+      - name: Stop owned artifact mirror
+        if: ${{ always() && env.VALIDATION_ROOT != '' }}
+        timeout-minutes: 1
+        shell: bash
+        run: 'python3 -B "$VALIDATION_ROOT/repo/scripts/artifact_mirror_diagnostics.py" stop --root "$VALIDATION_ROOT"'
+
+      - name: Upload explicit resolution evidence
+        if: ${{ always() && env.VALIDATION_ROOT != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: engram-hud-resolution-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.VALIDATION_ROOT }}/evidence/
+          if-no-files-found: error
+          retention-days: 7
