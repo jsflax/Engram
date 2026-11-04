@@ -276,7 +276,7 @@ struct GraphMemoryDetail: View {
         VStack(alignment: .leading, spacing: 6) {
             if expanded {
                 ScrollView(.vertical) {
-                    detail(lineLimit: nil)
+                    expandedDetail
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .accessibilityIdentifier("engram.graph.memory-reader")
@@ -297,6 +297,24 @@ struct GraphMemoryDetail: View {
         .onChange(of: memory.id) { _, _ in expanded = false }
     }
 
+    private var expandedDetail: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(memory.label).font(appearance.headline)
+                .accessibilityHidden(true)
+                .background(GraphMemoryMetadataAccessibility(text: memory.label, heading: true))
+            if memory.contentIsExcerpt {
+                Text("Excerpt").font(.caption2).foregroundStyle(appearance.secondaryText)
+                    .accessibilityHidden(true)
+                    .background(GraphMemoryMetadataAccessibility(text: "Excerpt", heading: false))
+            }
+            Text(memory.content).font(appearance.caption).lineLimit(nil)
+                .textSelection(.enabled)
+        }
+        // Text selection has a native TextKit accessibility child inside the scroll view.
+        // Keep the heading, excerpt qualifier and complete body as ordered children.
+        .accessibilityElement(children: .contain)
+    }
+
     private func detail(lineLimit: Int?) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(memory.label).font(appearance.headline)
@@ -311,5 +329,37 @@ struct GraphMemoryDetail: View {
         .accessibilityValue(Text(memory.contentIsExcerpt ? "Excerpt. \(memory.content)" : memory.content))
         .accessibilityAddTraits(.isStaticText)
         .accessibilityIdentifier("engram.graph.selected-memory")
+    }
+}
+
+/// Keep the visible SwiftUI typography and its exact bounds, while exposing metadata as native
+/// scroll-area children beside TextKit's selectable body. The synthetic Text AX node is hidden
+/// only for these labels, so there is one semantic element for each visible title/qualifier.
+@MainActor
+private struct GraphMemoryMetadataAccessibility: NSViewRepresentable {
+    let text: String
+    let heading: Bool
+
+    final class MetadataView: NSView {
+        var text = ""
+        var heading = false
+        override func isAccessibilityElement() -> Bool { true }
+        override func accessibilityRole() -> NSAccessibility.Role? {
+            if heading, #available(macOS 26.0, *) { return NSAccessibility.Role(rawValue: "AXHeading") }
+            return .staticText
+        }
+        override func accessibilityValue() -> Any? { text }
+        override func accessibilityChildren() -> [Any]? { [] }
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+
+    func makeNSView(context: Context) -> MetadataView {
+        let view = MetadataView(frame: .zero)
+        updateNSView(view, context: context)
+        return view
+    }
+    func updateNSView(_ view: MetadataView, context: Context) {
+        view.text = text
+        view.heading = heading
     }
 }

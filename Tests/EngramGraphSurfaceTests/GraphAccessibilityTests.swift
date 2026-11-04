@@ -132,12 +132,17 @@ struct GraphAccessibilityTests {
             .frame(width: 320, height: maximumHeight, alignment: .topLeading))
         let toggle = try await requireElement("engram.graph.memory-reading-toggle", in: host)
         #expect(toggle.accessibilityLabel() == "Read memory")
-        #expect(find("engram.graph.memory-reader", in: host) == nil)
-        #expect(toggle.performPress())
-        _ = try await requireElement("engram.graph.memory-reader", in: host)
-        let detail = try await requireElement("engram.graph.selected-memory", in: host)
-        #expect(detail.accessibilityValue() as? String == content)
-        let scroll = try #require(nativeScrollView(in: host))
+        #expect(nativeScrollView(in: host) == nil)
+        #expect(toggle.performPress(), "Read action: \(toggle.diagnostic())")
+        let scroll = try await requireScrollView(in: host)
+        #expect(scroll.accessibilityRole() == .scrollArea)
+        let text = try await requireAccessibleTextNodes([first.label, content], in: scroll, host: host)
+        let titleIndex = try #require(text.firstIndex { $0.hasText(first.label) })
+        let bodyIndex = try #require(text.firstIndex { $0.accessibilityValue() as? String == content })
+        #expect(titleIndex < bodyIndex)
+        if #available(macOS 26.0, *) { #expect(text[titleIndex].accessibilityRole()?.rawValue == "AXHeading") }
+        #expect(!text.contains { $0.hasText("Excerpt") })
+        #expect(text[bodyIndex].accessibilityValue() as? String == content)
         let document = try #require(scroll.documentView)
         #expect(scroll.bounds.height > 0 && scroll.bounds.height <= maximumHeight)
         #expect(document.bounds.height > scroll.contentView.bounds.height)
@@ -146,14 +151,14 @@ struct GraphAccessibilityTests {
         #expect(scroll.documentVisibleRect.maxY >= document.bounds.maxY - 1)
         let collapse = try await requireElement("engram.graph.memory-reading-toggle", in: host)
         #expect(collapse.accessibilityLabel() == "Show less")
-        #expect(collapse.performPress())
+        #expect(collapse.performPress(), "Collapse action: \(collapse.diagnostic())")
         let deadline = ContinuousClock.now + .seconds(2)
         repeat { settleHost(host); await Task.yield() }
-        while find("engram.graph.memory-reader", in: host) != nil && ContinuousClock.now < deadline
-        #expect(find("engram.graph.memory-reader", in: host) == nil)
+        while nativeScrollView(in: host) != nil && ContinuousClock.now < deadline
+        #expect(nativeScrollView(in: host) == nil)
         let reopen = try await requireElement("engram.graph.memory-reading-toggle", in: host)
-        #expect(reopen.performPress())
-        _ = try await requireElement("engram.graph.memory-reader", in: host)
+        #expect(reopen.performPress(), "Reopen action: \(reopen.diagnostic())")
+        _ = try await requireScrollView(in: host)
         fixture.session.select(fixture.nodes[1].id)
         let selectionDeadline = ContinuousClock.now + .seconds(2)
         repeat { settleHost(host); await Task.yield() }
@@ -161,10 +166,91 @@ struct GraphAccessibilityTests {
             && ContinuousClock.now < selectionDeadline
         let next = try await requireElement("engram.graph.selected-memory", in: host)
         #expect(next.accessibilityValue() as? String == fixture.nodes[1].content)
-        #expect(find("engram.graph.memory-reader", in: host) == nil)
+        #expect(nativeScrollView(in: host) == nil)
         #expect(find("engram.graph.memory-reading-toggle", in: host)?.accessibilityLabel() == "Read memory")
         #expect(saved == [fixture.nodes[1].id]) // Expanding/collapsing never changes graph selection/camera.
         #expect(fixture.session.scene == nil)
+    }
+
+    @Test
+    func expandedExcerptRetainsHeadingQualifierAndAllAuthorizedText() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        let content = (1...40).map { "Authorized excerpt line \($0)." }.joined(separator: "\n")
+        let memory = EngramGraphNode(id: UUID(), project: "project", topic: "architecture", label: "Excerpt memory",
+                                     content: content, contentIsExcerpt: true, importance: 1, isHub: false)
+        try fixture.publish([memory], revision: 2)
+        fixture.session.select(memory.id)
+        let host = fixture.host(SelectedDetailFixture(session: fixture.session, maximumHeight: 220)
+            .frame(width: 320, height: 220, alignment: .topLeading))
+        let toggle = try await requireElement("engram.graph.memory-reading-toggle", in: host)
+        #expect(toggle.accessibilityLabel() == "Read excerpt")
+        #expect(toggle.performPress(), "Excerpt action: \(toggle.diagnostic())")
+        let scroll = try await requireScrollView(in: host)
+        #expect(scroll.accessibilityRole() == .scrollArea)
+        let text = try await requireAccessibleTextNodes([memory.label, "Excerpt", content], in: scroll, host: host)
+        let titleIndex = try #require(text.firstIndex { $0.hasText(memory.label) })
+        let qualifierIndex = try #require(text.firstIndex { $0.hasText("Excerpt") })
+        let bodyIndex = try #require(text.firstIndex { $0.accessibilityValue() as? String == content })
+        #expect(titleIndex < qualifierIndex && qualifierIndex < bodyIndex)
+        if #available(macOS 26.0, *) { #expect(text[titleIndex].accessibilityRole()?.rawValue == "AXHeading") }
+        #expect(text[bodyIndex].accessibilityValue() as? String == content)
+        #expect(fixture.session.scene == nil)
+    }
+
+    private func requireScrollView(in host: NSView) async throws -> NSScrollView {
+        let deadline = ContinuousClock.now + .seconds(2)
+        repeat {
+            settleHost(host)
+            if let scroll = nativeScrollView(in: host) { return scroll }
+            await Task.yield()
+        } while ContinuousClock.now < deadline
+        return try #require(nativeScrollView(in: host), "Expanded native scroll area missing: \(accessibilityDiagnostic(host))")
+    }
+
+    private func requireAccessibleTextNodes(_ expected: [String], in scroll: NSScrollView,
+                                            host: NSView) async throws -> [AXElementReader] {
+        // Native view creation can precede SwiftUI's AX child publication. Use the same bounded
+        // AppKit settling boundary as requireElement, then require every exact semantic value.
+        let deadline = ContinuousClock.now + .seconds(2)
+        repeat {
+            settleHost(host)
+            let nodes = accessibleTextNodes(in: scroll)
+            if expected.allSatisfy({ value in nodes.contains { $0.hasText(value) } }) { return nodes }
+            await Task.yield()
+        } while ContinuousClock.now < deadline
+        let nodes = accessibleTextNodes(in: scroll)
+        let complete = expected.allSatisfy { value in nodes.contains { $0.hasText(value) } }
+        let primaryContents = scroll.accessibilityContents() ?? []
+        let primaryTrees = primaryContents.prefix(4).compactMap { child -> String? in
+            guard let object = child as? NSObject else { return nil }
+            return accessibilityDiagnostic(object)
+        }.joined(separator: " | ")
+        let navigation = scroll.accessibilityChildrenInNavigationOrder() ?? []
+        let navigationNodes = navigation.prefix(4).compactMap { child -> String? in
+            guard let object = child as? NSObject else { return nil }
+            return AXElementReader(object: object).diagnostic()
+        }.joined(separator: " | ")
+        let documentTree = scroll.documentView.map { accessibilityDiagnostic($0) } ?? "<nil>"
+        try #require(complete, "Expanded scoped AX content missing; primaryContents count=\(primaryContents.count): \(primaryTrees); navigation count=\(navigation.count): \(navigationNodes); document: \(documentTree); scroll: \(accessibilityDiagnostic(scroll)); host: \(accessibilityDiagnostic(host))")
+        return nodes
+    }
+
+    private func accessibleTextNodes(in root: NSObject) -> [AXElementReader] {
+        var result: [AXElementReader] = []
+        var visited: Set<ObjectIdentifier> = []
+        func visit(_ object: NSObject, depth: Int) {
+            guard depth < 32, visited.count < 128, visited.insert(ObjectIdentifier(object)).inserted else { return }
+            let node = AXElementReader(object: object)
+            if node.accessibilityRole() == .staticText || node.accessibilityRole()?.rawValue == "AXHeading" {
+                result.append(node)
+            }
+            for child in node.children {
+                if let object = child as? NSObject { visit(object, depth: depth + 1) }
+            }
+        }
+        visit(root, depth: 0)
+        return result
     }
 
     private func nativeScrollView(in view: NSView, depth: Int = 0) -> NSScrollView? {
@@ -294,8 +380,18 @@ private struct AXElementReader {
         return legacyValue(.value)
     }
 
+    func hasText(_ text: String) -> Bool {
+        accessibilityLabel() == text || accessibilityValue() as? String == text
+    }
+
     func performPress() -> Bool {
         if let modern { return modern.accessibilityPerformPress() }
+        // SwiftUI's AXLink node exposes the public method without adopting the full protocol.
+        // AnyObject lookup uses AppKit's imported BOOL signature; never dispatch scalar actions
+        // through the object-returning getter helper, or attempt another route after a result.
+        if object.responds(to: #selector(NSAccessibilityProtocol.accessibilityPerformPress)) {
+            return (object as AnyObject).accessibilityPerformPress?() ?? false
+        }
         guard object.accessibilityActionNames().contains(.press) else { return false }
         object.accessibilityPerformAction(.press)
         return true
@@ -320,8 +416,11 @@ private struct AXElementReader {
         }
         let childrenSelector = #selector(NSAccessibilityProtocol.accessibilityChildren)
         let directChildren = objectValue(childrenSelector) as? [Any]
+        let pressSelector = #selector(NSAccessibilityProtocol.accessibilityPerformPress)
+        let actions = object.accessibilityActionNames().prefix(8).map(\.rawValue)
         return values.joined(separator: " ")
             + " children[responds=\(object.responds(to: childrenSelector)), directCount=\(directChildren?.count.description ?? "<nil>")]"
+            + " press[full=\(modern != nil), responds=\(object.responds(to: pressSelector)), legacyActions=\(actions)]"
     }
 
     func isAccessibilityEnabled() -> Bool? {
