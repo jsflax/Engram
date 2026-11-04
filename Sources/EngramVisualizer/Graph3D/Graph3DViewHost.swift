@@ -2,7 +2,6 @@ import SwiftUI
 import EngramSceneKit
 import EngramRealityKit
 import RealityKit
-import GameController
 import simd
 import os
 import Lattice
@@ -31,6 +30,8 @@ struct Graph3DView: View {
     @State private var rkSceneManager: RKSceneManager?
     @State private var scrollMonitor: Any?
     @State private var reticleTarget: UUID?
+    @State private var hasGamepad = false
+    @Environment(\.appearsActive) private var appearsActive
     @State private var teleportLabelText: String?
     @State private var teleportCounterValue: Int = 0
 
@@ -80,7 +81,7 @@ struct Graph3DView: View {
                 }
 
                 // Center reticle (only when gamepad connected)
-                if GCController.current != nil {
+                if hasGamepad {
                     reticleOverlay
                 }
 
@@ -151,7 +152,7 @@ struct Graph3DView: View {
                             Label("T/R teleport", systemImage: "keyboard")
                             Label("[/] galaxy", systemImage: "keyboard")
                         }
-                        if GCController.current != nil {
+                        if hasGamepad {
                             HStack(spacing: 16) {
                                 Label("L-Stick move", systemImage: "l.joystick")
                                 Label("R-Stick look", systemImage: "r.joystick")
@@ -174,7 +175,13 @@ struct Graph3DView: View {
             }
         }
         .accessibilityIdentifier("graph-3d-view")
-        .onDisappear { removeInputMonitor() }
+        .onAppear { updateControllerFocus() }
+        .onDisappear {
+            rkSceneManager?.isGraphInputActive = false
+            removeInputMonitor()
+        }
+        .onChange(of: appearsActive) { _, _ in updateControllerFocus() }
+        .onChange(of: isMascotChatOpen) { _, _ in updateControllerFocus() }
         .onChange(of: soundEnabled) { _, enabled in
             rkSceneManager?.soundEnabled = enabled
         }
@@ -214,6 +221,10 @@ struct Graph3DView: View {
         mgr.galaxyRegistry = galaxyRegistry
         mgr.soundEnabled = soundEnabled
         mgr.camera3DState = camera3DState
+        mgr.controllerConnectionCallback = { connected in
+            hasGamepad = connected
+        }
+        updateControllerFocus()
         mgr.selectionCallback = { newSelection in
             selectedNode = newSelection
         }
@@ -255,6 +266,10 @@ struct Graph3DView: View {
                 }
             }
         }
+    }
+
+    private func updateControllerFocus() {
+        rkSceneManager?.isGraphInputActive = appearsActive && !isMascotChatOpen
     }
 
     private func pushDataToRKScene() {

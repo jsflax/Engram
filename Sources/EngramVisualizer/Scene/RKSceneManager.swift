@@ -63,10 +63,35 @@ final class RKSceneManager {
     var layoutMode: LayoutMode = .forceDirected
     var semanticClusters3D: [SemanticCluster3D] = []
 
+    // Controller polling belongs to the active scene, alongside keyboard input.
+    var isGraphInputActive = false {
+        didSet {
+            if !isGraphInputActive {
+                inputHandler.reset()
+                reticleElapsed = .infinity
+                setReticleTarget(nil)
+            }
+        }
+    }
+    var controllerConnectionCallback: ((Bool) -> Void)?
+    private(set) var hasGamepad = false
+    private(set) var reticleTarget: UUID?
+    private let inputHandler = InputHandler()
+    private let readGamepad: @MainActor () -> GamepadInputState?
+    private let acceptsGamepadInput: @MainActor () -> Bool
+    private var reticleElapsed: Float = .infinity
+
     // Force engine
     private var forceEngine: ForceEngine?
 
-    init?(registry: GalaxyRegistry) {
+    init?(registry: GalaxyRegistry,
+          readGamepad: @escaping @MainActor () -> GamepadInputState? = InputHandler.readGamepad,
+          acceptsGamepadInput: @escaping @MainActor () -> Bool = {
+              NSApp?.isActive == true && NSApp?.keyWindow?.attachedSheet == nil
+                  && !(NSApp?.keyWindow?.firstResponder is NSTextView)
+          }) {
+        self.readGamepad = readGamepad
+        self.acceptsGamepadInput = acceptsGamepadInput
         self.camera = CameraController()
         self.dataAdapter = GalaxyRegistryAdapter(registry: registry)
         // Hosted isolation supplies an explicit owned directory; Foundation's
@@ -143,6 +168,7 @@ final class RKSceneManager {
     private func updateCameraForFrame(dt: Float) {
         // Camera update
         camera.pollKeyboard(dt: dt)
+        pollGamepad(dt: dt)
         if let orbitRate = Self.harnessOrbitRate {
             camera.targetAzimuth += orbitRate * dt * .pi / 180
         }
@@ -154,6 +180,55 @@ final class RKSceneManager {
                 exit(0)
             }
         }
+    }
+
+    private func pollGamepad(dt: Float) {
+        let state = readGamepad()
+        let connected = state != nil
+        if hasGamepad != connected {
+            hasGamepad = connected
+            controllerConnectionCallback?(connected)
+        }
+        let active = isGraphInputActive && acceptsGamepadInput()
+        let actions = inputHandler.update(state: state, camera: camera, dt: dt, active: active)
+        guard connected, active else {
+            reticleElapsed = .infinity
+            setReticleTarget(nil)
+            return
+        }
+        // Movement needs no graph data. Resolve reticle at most eight times
+        // per second; A requests a fresh hit test so selection is never stale.
+        if dt.isFinite { reticleElapsed += max(0, dt) }
+        if (reticleElapsed >= 0.125 || actions.contains(.select)), renderViewSize.width > 0,
+           renderViewSize.height > 0, let registry = galaxyRegistry {
+            reticleElapsed = 0
+            setReticleTarget(camera.hitTest(
+                at: CGPoint(x: renderViewSize.width / 2, y: renderViewSize.height / 2),
+                viewSize: renderViewSize, positions: registry.mergedPositions,
+                currentTarget: reticleTarget))
+        }
+        for action in actions {
+            switch action {
+            case .select:
+                if let reticleTarget {
+                    selectedNode = reticleTarget
+                    selectionCallback?(reticleTarget)
+                }
+            case .cancel:
+                selectedNode = nil
+                selectionCallback?(nil)
+            case .previousProject: teleportToNextProject(direction: -1)
+            case .nextProject: teleportToNextProject(direction: 1)
+            case .previousGalaxy: teleportToNextGalaxy(direction: -1)
+            case .nextGalaxy: teleportToNextGalaxy(direction: 1)
+            }
+        }
+    }
+
+    private func setReticleTarget(_ target: UUID?) {
+        guard reticleTarget != target else { return }
+        reticleTarget = target
+        reticleCallback?(target)
     }
 
     @inline(__always)

@@ -229,9 +229,14 @@ jobs:
             --require-swift-test testOctreeUploadReplacesEqualCountTree \
             --require-swift-test testOctreeUploadGrowsThenShrinks \
             --require-swift-test testBruteForceGuard8K \
-            --require-swift-test testBruteForceAllowed1K -- \
+            --require-swift-test testBruteForceAllowed1K \
+            --require-swift-test exactOrdering \
+            --require-swift-test changingTopologies \
+            --require-swift-test largeTopology \
+            --require-swift-test rejectsInvalidInput \
+            --require-swift-test unusedCapacity -- \
             "$VALIDATION_ROOT/bin/swift-validation" test --force-resolved-versions --disable-index-store --skip-build --no-parallel \
-            --filter 'testPreparationCentroidsUseFirstEncodePositionsAndCadence|testPreparationRegroupAndCapacityGrowth|testPreparationAsyncDirtyDispatch|testPreparationEdgeOnlyReusesGroupsAndUpdatesSprings|testPreparationEdgeOnlyKeepsCurrentCentroids|testOctreeUploadReusesAcceptedTree|testOctreeUploadReplacesEqualCountTree|testOctreeUploadGrowsThenShrinks|testBruteForceGuard8K|testBruteForceAllowed1K'
+            --filter 'testPreparationCentroidsUseFirstEncodePositionsAndCadence|testPreparationRegroupAndCapacityGrowth|testPreparationAsyncDirtyDispatch|testPreparationEdgeOnlyReusesGroupsAndUpdatesSprings|testPreparationEdgeOnlyKeepsCurrentCentroids|testOctreeUploadReusesAcceptedTree|testOctreeUploadReplacesEqualCountTree|testOctreeUploadGrowsThenShrinks|testBruteForceGuard8K|testBruteForceAllowed1K|ForceEdgeCSRTests'
 
       # Keep the existing <2s held-writer assertion, but isolate its scheduling
       # window from the parallel suite. The matching skip above is not a waiver.

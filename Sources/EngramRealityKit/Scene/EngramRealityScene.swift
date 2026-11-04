@@ -241,6 +241,13 @@ public final class EngramRealityScene {
         guard let v = ProcessInfo.processInfo.environment["ENGRAM_FRAME_STATS"], !v.isEmpty else { return nil }
         return v == "1" ? "/tmp/engram-frame-stats.csv" : v
     }()
+    /// Process-lifetime diagnostic isolation, never an ordinary display setting.
+    /// Skip creation entirely so a capture contains no nebula VFX simulation.
+    private static let diagnosticFogDisabled: Bool = {
+        let environment = ProcessInfo.processInfo.environment
+        guard let path = environment["ENGRAM_FRAME_STATS"], !path.isEmpty else { return false }
+        return environment["ENGRAM_DIAGNOSTIC_NO_FOG"] == "1"
+    }()
     public var isFrameTimingEnabled: Bool { frameStatsPath != nil }
     private var frameStatsBuffer: [String] = []
     private var frameStatsHeaderWritten = false
@@ -257,7 +264,7 @@ public final class EngramRealityScene {
         guard let path = frameStatsPath, !frameStatsBuffer.isEmpty else { return }
         if !frameStatsHeaderWritten {
             let refresh = NSScreen.main?.maximumFramesPerSecond ?? 0
-            let header = "# refresh_hz=\(refresh) date=\(Date())\n"
+            let header = "# refresh_hz=\(refresh) fog_mode=\(Self.diagnosticFogDisabled ? "disabled" : "enabled") date=\(Date())\n"
                 + "frame,dt_ms,tick_ms,lod_ms,node_ms,edge_ms,label_ms,commit_ms,nebula_ms,galaxy_titles_ms,mascot_ms,flow_ms,lights_ms,audio_ms,total_ms,nodes,edges,vis_edges,near,mid,far,tick_callback_ms,tick_force_prepare_ms,tick_drain_ms,tick_sim_ms,tick_merge_ms,tick_snapshot_ms,tick_cache_ms,tick_detail_flags,"
                 + FrameGapDiagnostics.csvHeader + "\n"
             FileManager.default.createFile(atPath: path, contents: header.data(using: .utf8))
@@ -450,13 +457,15 @@ public final class EngramRealityScene {
 
         // 8. Nebula update — cameraPos drives the far-LOD crossfade
         // (per-project gas near, one galaxy-colored mass far).
-        nebulaBatchSystem.update(
-            container: nebulaContainer,
-            dataProvider: dataProvider,
-            topologyChanged: topologyChanged,
-            scaleFactor: scaleFactor,
-            cameraPosition: cameraPos
-        )
+        if !Self.diagnosticFogDisabled {
+            nebulaBatchSystem.update(
+                container: nebulaContainer,
+                dataProvider: dataProvider,
+                topologyChanged: topologyChanged,
+                scaleFactor: scaleFactor,
+                cameraPosition: cameraPos
+            )
+        }
         phaseMark()
 
         // 8b. Galaxy titles — glowing displayName above each galaxy.

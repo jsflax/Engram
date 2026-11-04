@@ -15,6 +15,8 @@ on:
       - '.swiftpm/configuration/mirrors.json'
       - 'scripts/prepare_visualizer_tests.py'
       - 'scripts/test_prepare_visualizer_tests.py'
+      - 'scripts/package_visualizer_diagnostic.py'
+      - 'scripts/test_package_visualizer_diagnostic.py'
       - '.github/workflows/visualizer-validation.yml'
 
 permissions:
@@ -28,7 +30,7 @@ jobs:
   app-tests:
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: macos-26
-    timeout-minutes: 110
+    timeout-minutes: 150
     env:
       SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
       PYTHONDONTWRITEBYTECODE: '1'
@@ -75,7 +77,9 @@ jobs:
           xcrun swift --version > "$task_root/evidence/swift-version.txt"
 
       - name: Check isolated launch preparation controls
-        run: 'python3 -I -B "$VALIDATION_ROOT/repo/scripts/test_prepare_visualizer_tests.py" -v'
+        run: |
+          python3 -I -B "$VALIDATION_ROOT/repo/scripts/test_prepare_visualizer_tests.py" -v
+          python3 -I -B "$VALIDATION_ROOT/repo/scripts/test_package_visualizer_diagnostic.py" -v
 
       - name: Mirror identical Sparkle artifact and resolve exact dependencies
         timeout-minutes: 20
@@ -150,6 +154,40 @@ jobs:
             -resultBundlePath "$VALIDATION_ROOT/evidence/tests.xcresult"
           python3 -B scripts/prepare_visualizer_tests.py verify-inputs --root "$VALIDATION_ROOT"
           python3 -B scripts/prepare_visualizer_tests.py audit --root "$VALIDATION_ROOT"
+
+      - name: Archive optimized diagnostic visualizer
+        timeout-minutes: 45
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VALIDATION_ROOT/repo"
+          # Keep the existing Debug test host intact. This separate Release
+          # archive is for live profiling, not publication or installation.
+          IBToolNeverDeque=1 python3 -B scripts/run_native_tests.py \
+            --diagnostics-dir "$VALIDATION_ROOT/evidence/diagnostic-build" \
+            --timeout-seconds 2400 --silence-seconds 600 -- \
+            xcodebuild archive -project Engram.xcodeproj -scheme Engram -configuration Release \
+            -destination 'generic/platform=macOS' -derivedDataPath "$VALIDATION_ROOT/derived-release" \
+            -archivePath "$VALIDATION_ROOT/diagnostic/Engram.xcarchive" \
+            -clonedSourcePackagesDirPath "$VALIDATION_ROOT/scratch" -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile -skipMacroValidation -skipPackagePluginValidation -jobs 2 \
+            -resultBundlePath "$VALIDATION_ROOT/evidence/diagnostic-build.xcresult" \
+            ARCHS=arm64 DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
+            COMPILER_INDEX_STORE_ENABLE=NO
+          python3 -B scripts/prepare_visualizer_tests.py verify-diagnostic-inputs --root "$VALIDATION_ROOT"
+
+      - name: Package source-bound app and matching symbols
+        timeout-minutes: 8
+        run: 'python3 -I -B "$VALIDATION_ROOT/repo/scripts/package_visualizer_diagnostic.py" --root "$VALIDATION_ROOT" --source-sha "$SOURCE_SHA"'
+
+      - name: Upload optimized diagnostic visualizer
+        uses: actions/upload-artifact@v4
+        with:
+          name: visualizer-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.VALIDATION_ROOT }}/diagnostic-artifact
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Stop owned artifact mirror
         if: ${{ always() && env.VALIDATION_ROOT != '' }}
