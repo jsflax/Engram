@@ -223,6 +223,10 @@ private struct GraphMemoryPopUp: NSViewRepresentable {
         view.setAccessibilityIdentifier("engram.graph.memory-selection")
         view.setAccessibilityLabel("Memory")
         view.setAccessibilityHelp("Choose a memory to read its details.")
+        // AppKit exposes the popup cell as the accessibility element.
+        view.cell?.setAccessibilityIdentifier("engram.graph.memory-selection")
+        view.cell?.setAccessibilityLabel("Memory")
+        view.cell?.setAccessibilityHelp("Choose a memory to read its details.")
         view.setContentHuggingPriority(.defaultHigh, for: .vertical)
         return view
     }
