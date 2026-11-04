@@ -51,8 +51,8 @@ jobs:
           import hashlib, json, os, pathlib, subprocess
           root = pathlib.Path(os.environ['SOURCE_ROOT']); repo = root / 'repo'
           sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-          assert sha(repo / 'Package.swift') == '5927329ef257f93438dc13fdb6a4700211000215beaf5077e5851906a8ed0783'
-          seed = '75a0194319d7433da0647a752b04732574b72d99135a0c6b13b39f9617ecbe27'
+          assert sha(repo / 'Package.swift') == '1b03632aa4d2e0a9dc856026c61b197513a0a6670157754daaa84c37ec1486e4'
+          seed = '8e1b4f6c311e1118ca00bd53c55d595568dbf0e33a42e45fa03a3ba7d791441c'
           assert sha(repo / 'Package.resolved') == seed
           assert sha(repo / 'Engram.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') == seed
           files = subprocess.check_output(['git', 'ls-files', '-z'], cwd=repo).decode().split('\0')
@@ -167,7 +167,9 @@ jobs:
           (root / 'evidence/resolution-integrity.json').write_text(json.dumps(summary, indent=2) + '\n')
           if os.environ['RESOLVE_OUTCOME'] == 'success':
               assert current and current.get('originHash')
-              expected = {'lattice': '9fce5a3cbefc9241fba114ec9f75af0784574b29',
+              assert len(a) == len(b) == 46 and set(a) == set(b)
+              assert {key for key in a if a[key] != b[key]} == {'lattice'}, 'Unexpected dependency pin delta'
+              expected = {'lattice': 'c93f32f0b1d2735ed1b0a19d0762234e436caacd',
                           'latticecore': 'e678b10e9cdb8eabad65b0a16dcd05a2166f771e',
                           'swift-sdk': '82951cc9cd05de216e8dd6425f951ce31d76fa0a'}
               assert all(b[key]['state']['revision'] == revision for key, revision in expected.items())
