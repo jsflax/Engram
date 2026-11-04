@@ -95,18 +95,25 @@ public final class FrameGapDiagnostics {
         guard let sample else { return Array(repeating: "0", count: 27).joined(separator: ",") }
         func ms(_ nanoseconds: UInt64) -> String { String(format: "%.3f", Double(nanoseconds) / 1_000_000) }
         let load = sample.load, force = sample.force
-        return [
+        let callbackFields: [String] = [
             sample.hasPreviousCallback ? "3" : "1", String(sample.sequence), String(sample.previousSequence),
             ms(sample.entryIntervalNanoseconds), ms(sample.outsideCallbackNanoseconds),
-            ms(sample.previousLoggerTailNanoseconds),
+            ms(sample.previousLoggerTailNanoseconds)
+        ]
+        let loadFields: [String] = [
             String(load.count), String(load.acceptedCount), String(load.rejectedCount), String(load.rows),
             ms(load.durationNanoseconds), ms(load.maximumDurationNanoseconds), String(load.queueSamples),
-            ms(load.queueNanoseconds), ms(load.maximumQueueNanoseconds),
+            ms(load.queueNanoseconds), ms(load.maximumQueueNanoseconds)
+        ]
+        let forceFields: [String] = [
             String(force.count), String(force.acceptedCount), String(force.rejectedCount), String(force.fallbackCount),
             ms(force.durationNanoseconds), ms(force.maximumDurationNanoseconds), String(force.queueSamples),
-            ms(force.queueNanoseconds), ms(force.maximumQueueNanoseconds),
+            ms(force.queueNanoseconds), ms(force.maximumQueueNanoseconds)
+        ]
+        let edgeFields: [String] = [
             String(load.newEdgeRows), String(load.unchangedEdgeRows), String(load.changedEdgeRows)
-        ].joined(separator: ",")
+        ]
+        return (callbackFields + loadFields + forceFields + edgeFields).joined(separator: ",")
     }
 
     private weak var owner: AnyObject?
