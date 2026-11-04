@@ -175,8 +175,12 @@ struct Graph3DView: View {
             }
         }
         .accessibilityIdentifier("graph-3d-view")
-        .onAppear { updateControllerFocus() }
+        .onAppear {
+            rkSceneManager?.graphHostIsVisible = true
+            updateControllerFocus()
+        }
         .onDisappear {
+            rkSceneManager?.graphHostIsVisible = false
             rkSceneManager?.isGraphInputActive = false
             removeInputMonitor()
         }
@@ -224,6 +228,7 @@ struct Graph3DView: View {
         mgr.controllerConnectionCallback = { connected in
             hasGamepad = connected
         }
+        mgr.graphHostIsVisible = true
         updateControllerFocus()
         mgr.selectionCallback = { newSelection in
             selectedNode = newSelection
@@ -269,7 +274,7 @@ struct Graph3DView: View {
     }
 
     private func updateControllerFocus() {
-        rkSceneManager?.isGraphInputActive = appearsActive && !isMascotChatOpen
+        rkSceneManager?.updateGraphInputFocus(appearsActive: appearsActive, mascotChatVisible: isMascotChatOpen)
     }
 
     private func pushDataToRKScene() {

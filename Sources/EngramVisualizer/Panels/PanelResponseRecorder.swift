@@ -56,17 +56,24 @@ enum PanelResponseRecorder {
             // measurement, but mark it so the strict UI gate cannot count it.
             pending[name] = Start(timestamp: now, clockOrigin: "callback", beginTimestamp: now)
         }
+        if let start = pending[name] {
+            recordTimeline(name, phase: "begin", start: start, timestamp: now)
+        }
     }
 
     static func mutationReturned(_ name: String) {
         guard isEnabled, var start = pending[name] else { return }
-        start.mutationReturnTimestamp = ProcessInfo.processInfo.systemUptime
+        let now = ProcessInfo.processInfo.systemUptime
+        start.mutationReturnTimestamp = now
         pending[name] = start
+        recordTimeline(name, phase: "mutation_returned", start: start,
+                       timestamp: now)
     }
 
     static func didDraw(_ name: String) {
         guard let path = outputPath, let start = pending.removeValue(forKey: name) else { return }
         let drawTimestamp = ProcessInfo.processInfo.systemUptime
+        recordTimeline(name, phase: "draw", start: start, timestamp: drawTimestamp)
         let elapsed = (drawTimestamp - start.timestamp) * 1000
         let line = "\(name),\(String(format: "%.3f", elapsed)),\(start.clockOrigin)\n"
         let phases = PanelResponsePhases(eventTimestamp: start.timestamp,
@@ -101,8 +108,34 @@ enum PanelResponseRecorder {
         }
     }
 
+    /// Keep absolute clocks in a separate diagnostic file so action-aligned
+    /// samples can be matched without changing the existing acceptance CSV.
+    /// Logging at begin also preserves actions whose first draw never arrives.
+    private static func recordTimeline(_ name: String, phase: String,
+                                       start: Start, timestamp: TimeInterval) {
+        guard let path = outputPath else { return }
+        let wallTime = Date().timeIntervalSince1970
+        let line = "\(name),\(phase),\(start.clockOrigin),\(start.timestamp),\(timestamp),\(wallTime)\n"
+        writer.async {
+            let timelinePath = path + ".timeline.csv"
+            if !FileManager.default.fileExists(atPath: timelinePath) {
+                let header = "action,phase,clock_origin,event_uptime,phase_uptime,phase_unix_time\n"
+                FileManager.default.createFile(atPath: timelinePath, contents: Data(header.utf8))
+            }
+            guard let handle = FileHandle(forWritingAtPath: timelinePath) else { return }
+            defer { try? handle.close() }
+            do {
+                try handle.seekToEnd()
+                try handle.write(contentsOf: Data(line.utf8))
+            } catch { }
+        }
+    }
+
     static func cancel(_ name: String) {
-        pending.removeValue(forKey: name)
+        if let start = pending.removeValue(forKey: name) {
+            recordTimeline(name, phase: "cancel", start: start,
+                           timestamp: ProcessInfo.processInfo.systemUptime)
+        }
     }
 }
 

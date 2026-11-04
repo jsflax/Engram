@@ -1,3 +1,4 @@
+import Foundation
 import GameController
 import EngramRealityKit
 
@@ -38,10 +39,20 @@ final class InputHandler {
     private var awaitingButtonRelease = true
 
     static func readGamepad() -> GamepadInputState? {
-        readGamepad(current: GCController.current, controllers: GCController.controllers())
+        readGamepad(captureDiagnostics: false).state
+    }
+
+    static func readGamepad(captureDiagnostics: Bool) -> GamepadInputReading {
+        readGamepad(current: GCController.current, controllers: GCController.controllers(),
+                    captureDiagnostics: captureDiagnostics)
     }
 
     static func readGamepad(current: GCController?, controllers: [GCController]) -> GamepadInputState? {
+        readGamepad(current: current, controllers: controllers, captureDiagnostics: false).state
+    }
+
+    static func readGamepad(current: GCController?, controllers: [GCController],
+                            captureDiagnostics: Bool) -> GamepadInputReading {
         // `current` is the most recently used controller, not the list of
         // connected devices. Include one already connected before app launch.
         let controller: GCController?
@@ -50,7 +61,22 @@ final class InputHandler {
         } else {
             controller = controllers.first { $0.extendedGamepad != nil }
         }
-        guard let controller, let gamepad = controller.extendedGamepad else { return nil }
+        let enumeration: GamepadEnumerationDiagnostics?
+        if captureDiagnostics {
+            enumeration = GamepadEnumerationDiagnostics(
+                connectedCount: controllers.count,
+                supportedCount: controllers.filter { $0.extendedGamepad != nil }.count,
+                connected: controllers.prefix(8).map(describeController),
+                current: current.map(describeController), selected: controller.map(describeController),
+                selection: controller == nil ? "none" : (controller === current ? "current" : "connected-fallback"),
+                currentConnectedIndex: current.flatMap { selected in controllers.firstIndex { $0 === selected } },
+                selectedConnectedIndex: controller.flatMap { selected in controllers.firstIndex { $0 === selected } })
+        } else {
+            enumeration = nil
+        }
+        guard let controller, let gamepad = controller.extendedGamepad else {
+            return GamepadInputReading(state: nil, enumeration: enumeration)
+        }
         var state = GamepadInputState(identity: ObjectIdentifier(controller))
         state.leftX = gamepad.leftThumbstick.xAxis.value
         state.leftY = gamepad.leftThumbstick.yAxis.value
@@ -66,7 +92,14 @@ final class InputHandler {
         if gamepad.buttonY.isPressed { state.buttons.insert(.y) }
         if gamepad.leftShoulder.isPressed { state.buttons.insert(.leftShoulder) }
         if gamepad.rightShoulder.isPressed { state.buttons.insert(.rightShoulder) }
-        return state
+        return GamepadInputReading(state: state, enumeration: enumeration)
+    }
+
+    private static func describeController(_ controller: GCController) -> GamepadControllerDescription {
+        GamepadControllerDescription(productCategory: String(controller.productCategory.prefix(128)),
+            vendorName: controller.vendorName.map { String($0.prefix(128)) },
+            controllerClass: NSStringFromClass(type(of: controller)),
+            extendedProfileClass: controller.extendedGamepad.map { NSStringFromClass(type(of: $0)) })
     }
 
     func reset() {

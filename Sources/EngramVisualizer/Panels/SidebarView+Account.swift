@@ -8,9 +8,9 @@ import SwiftUI
 
 extension SidebarView {
     @ViewBuilder
-    var accountContent: some View {
+    func accountContent(snapshot: SidebarSyncSnapshot) -> some View {
         if accountService.isSignedIn {
-            signedInContent
+            signedInContent(snapshot: snapshot)
                 .onAppear {
                     syncManager.refreshDaemonHealth()
                 }
@@ -20,7 +20,7 @@ extension SidebarView {
     }
 
     @ViewBuilder
-    var signedInContent: some View {
+    func signedInContent(snapshot: SidebarSyncSnapshot) -> some View {
         VStack(alignment: .leading, spacing: 24) {
             section("Account") {
                 VStack(alignment: .leading, spacing: 12) {
@@ -103,16 +103,17 @@ extension SidebarView {
             // sub) still needs the exposure controls — exposure requires the
             // daemon, not personal sync.
             section("Projects") {
-                VStack(alignment: .leading, spacing: 4) {
+                LazyVStack(alignment: .leading, spacing: 4) {
                     if projects.isEmpty {
                         Text("No projects yet")
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(.white.opacity(0.35))
                     } else {
                         ForEach(projects, id: \.self) { project in
-                            syncProjectRow(project)
+                            let settings = snapshot[project]
+                            syncProjectRow(project, settings: settings)
                             if expandedExposureProject == project {
-                                exposureExpansion(for: project)
+                                exposureExpansion(for: project, exposed: settings.exposedGroups)
                             }
                         }
                     }
@@ -195,10 +196,10 @@ extension SidebarView {
         }
     }
 
-    func syncProjectRow(_ project: String) -> some View {
-        let isOn = syncConfigs.first(where: { $0.project == project })?.policy == .sync
+    func syncProjectRow(_ project: String, settings: SidebarSyncSnapshot.Project) -> some View {
+        let isOn = settings.isSyncing
         let count = projectCounts[project] ?? 0
-        let exposedCount = exposedGroupIds(for: project).count
+        let exposedCount = settings.exposedGroups.count
         let expanded = expandedExposureProject == project
         return Button {
             syncManager.toggleProject(project)

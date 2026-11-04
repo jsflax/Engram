@@ -244,8 +244,7 @@ extension SidebarView {
     /// and, on expose, registers the local name in the group's project
     /// registry (create-or-match, decision 13's default mapping).
     @ViewBuilder
-    func exposureExpansion(for project: String) -> some View {
-        let exposed = exposedGroupIds(for: project)
+    func exposureExpansion(for project: String, exposed: Set<String>) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text("Share with groups — un-sharing stops future sharing; already-shared memories remain (retract one via is_private)")
                 .font(.system(size: 9, design: .monospaced))
@@ -281,7 +280,4 @@ extension SidebarView {
         .padding(.vertical, 4)
     }
 
-    func exposedGroupIds(for project: String) -> Set<String> {
-        syncConfigs.first(where: { $0.project == project })?.exposedGroups ?? []
-    }
 }

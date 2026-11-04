@@ -30,6 +30,11 @@ public final class RKMascotSystem {
     private var preparedHoloImages: [String: (key: MascotHoloKey, image: CGImage)] = [:]
     private var appliedHoloOpacities: [String: Float] = [:]
 
+    /// Constant-time counts; no entity traversal or state changes.
+    var diagnosticCounts: (tracked: Int, loading: Int) {
+        (activeMascots.count, mascotLoadingProjects.count)
+    }
+
     /// Priority-comparable task type for mascot behavior.
     public enum MascotTask: Comparable {
         case create(nodeId: UUID, position: SIMD3<Float>)

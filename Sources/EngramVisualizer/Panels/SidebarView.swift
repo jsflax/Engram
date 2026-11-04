@@ -44,7 +44,7 @@ struct SidebarView: View {
     @Environment(\.lattice) var lattice
     @Environment(SyncManager.self) var syncManager
     @Environment(GroupService.self) var groupService
-    @State private var isCompacting = false
+    @State private var databaseMaintenance = SidebarDatabaseMaintenance.shared
     /// Project whose group-exposure expansion is open (Account tab).
     @State var expandedExposureProject: String?
 
@@ -78,6 +78,10 @@ struct SidebarView: View {
 
     var body: some View {
         let renderConfig = SidebarRenderConfiguration(config: config, selectedTab: selection.selectedTab)
+        // Read each sync setting here so observation belongs to this render,
+        // never to a deferred per-row scan of database-backed model getters.
+        let accountSnapshot = renderConfig.selectedTab == .account && accountService.isSignedIn
+            ? SidebarSyncSnapshot(syncConfigs) : .empty
         return VStack(spacing: 0) {
             Spacer().frame(height: 28) // clear traffic light buttons
             tabBar(selectedTab: renderConfig.selectedTab)
@@ -110,7 +114,7 @@ struct SidebarView: View {
                     Group {
                         switch renderConfig.selectedTab {
                         case .settings: settingsContent
-                        case .account: accountContent
+                        case .account: accountContent(snapshot: accountSnapshot)
                         case .visualizer, .logs: EmptyView()
                         }
                     }
@@ -577,17 +581,10 @@ struct SidebarView: View {
                     statRow("Database", value: dbFileSize)
 
                     Button {
-                        guard !isCompacting else { return }
-                        isCompacting = true
-                        Task {
-                            lattice.compactHistory()
-                            lattice.vacuum()
-                            lattice.checkpoint()
-                            isCompacting = false
-                        }
+                        databaseMaintenance.start(lattice.sendableReference)
                     } label: {
                         HStack(spacing: 6) {
-                            if isCompacting {
+                            if databaseMaintenance.isRunning {
                                 ProgressView()
                                     .controlSize(.small)
                                     .scaleEffect(0.7)
@@ -595,10 +592,10 @@ struct SidebarView: View {
                                 Image(systemName: "arrow.triangle.2.circlepath")
                                     .font(.system(size: 11))
                             }
-                            Text(isCompacting ? "Compacting…" : "Compact Database")
+                            Text(databaseMaintenance.isRunning ? "Compacting…" : "Compact Database")
                                 .font(.system(size: 12, design: .monospaced))
                         }
-                        .foregroundStyle(.white.opacity(isCompacting ? 0.4 : 0.7))
+                        .foregroundStyle(.white.opacity(databaseMaintenance.isRunning ? 0.4 : 0.7))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 8)
                         .background(
@@ -607,7 +604,13 @@ struct SidebarView: View {
                         )
                     }
                     .buttonStyle(.plain)
-                    .disabled(isCompacting)
+                    .disabled(databaseMaintenance.isRunning)
+                    if let result = databaseMaintenance.result {
+                        Text(result.message)
+                            .font(.caption)
+                            .foregroundStyle(result.isIncomplete ? Color.orange : Color.white.opacity(0.6))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
 

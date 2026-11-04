@@ -1,3 +1,4 @@
+import Foundation
 @testable import Engram
 import EngramRealityKit
 import GameController
@@ -147,6 +148,16 @@ final class GamepadInputTests: XCTestCase {
         XCTAssertEqual(current.identity, ObjectIdentifier(second))
         XCTAssertTrue(current.buttons.contains(.x))
         XCTAssertNil(InputHandler.readGamepad(current: nil, controllers: []))
+        let diagnostic = InputHandler.readGamepad(current: second, controllers: [first, second],
+                                                   captureDiagnostics: true)
+        XCTAssertEqual(diagnostic.state?.identity, current.identity)
+        XCTAssertEqual(diagnostic.enumeration?.connectedCount, 2)
+        XCTAssertEqual(diagnostic.enumeration?.supportedCount, 2)
+        XCTAssertEqual(diagnostic.enumeration?.selection, "current")
+        XCTAssertEqual(diagnostic.enumeration?.selectedConnectedIndex, 1)
+        XCTAssertNotNil(diagnostic.enumeration?.selected?.extendedProfileClass)
+        XCTAssertNil(InputHandler.readGamepad(current: first, controllers: [first],
+                                               captureDiagnostics: false).enumeration)
     }
 
     func testCancelButtonReachesSelectionCallbackThroughSceneFrame() throws {
@@ -168,4 +179,78 @@ final class GamepadInputTests: XCTestCase {
         callback(1 / 60)
         XCTAssertEqual(selections.count, 1, "Holding B must not spam selection/UI changes")
     }
+
+    func testControllerDiagnosticCadenceWaitsForActiveWindowAndThenStops() {
+        var cadence = GamepadDiagnosticCadence(duration: 120)
+        XCTAssertEqual(cadence.next(now: 10, armReady: false), .waiting)
+        XCTAssertNil(cadence.next(now: 1000, armReady: false))
+        XCTAssertNil(cadence.armedAt, "An unattended launch must not consume the capture window")
+        XCTAssertEqual(cadence.next(now: 1001, armReady: true), .capturing)
+        XCTAssertEqual(cadence.armedAt, 1001)
+        XCTAssertNil(cadence.next(now: 1001.9, armReady: true))
+        XCTAssertEqual(cadence.next(now: 1002, armReady: true), .capturing)
+        XCTAssertEqual(cadence.next(now: 1121, armReady: false), .finished)
+        XCTAssertTrue(cadence.finished)
+        XCTAssertNil(cadence.next(now: 1122, armReady: true))
+    }
+
+    func testControllerDiagnosticCadenceBoundsDenseFrameCallsAndInvalidClock() {
+        var cadence = GamepadDiagnosticCadence(duration: 600)
+        XCTAssertNil(cadence.next(now: .nan, armReady: true))
+        var rows = 0
+        for index in 0...72_000 {
+            if cadence.next(now: Double(index) / 60, armReady: true) != nil { rows += 1 }
+        }
+        XCTAssertLessThanOrEqual(rows, 602)
+        XCTAssertGreaterThan(rows, 500)
+        XCTAssertTrue(cadence.finished)
+    }
+
+    func testControllerDiagnosticsAccumulateInputBetweenRowsWithoutUIContent() throws {
+        let configuration = try XCTUnwrap(GamepadDiagnosticConfiguration(
+            environment: ["ENGRAM_CONTROLLER_STATS": "/diagnostics/controller.jsonl"]))
+        var rows: [GamepadDiagnosticRecord] = []
+        let recorder = GamepadDiagnosticRecorder(configuration: configuration) { rows.append($0) }
+        let gate = GamepadGateDiagnostics(graphHostVisible: true, hostAppearsActive: true,
+            mascotChatVisible: false, graphInputActive: true, appActive: true, keyWindowNumber: 7,
+            attachedSheet: false, firstResponderClass: "NSView", firstResponderIsTextView: false,
+            applicationGateAccepted: true, inputAccepted: true)
+        func frame(_ time: Double, input: GamepadInputState, cameraChanged: Bool) {
+            let phase = recorder.nextPhase(now: time, armReady: true)
+            recorder.observe(now: time, phase: phase,
+                reading: GamepadInputReading(state: input, enumeration: nil), gate: phase == nil ? nil : gate,
+                inputAccepted: true, cameraTargetChanged: cameraChanged, cameraLookChanged: false)
+        }
+        frame(0, input: state(), cameraChanged: false)
+        var moving = state(); moving.leftY = 1
+        frame(0.2, input: moving, cameraChanged: true)
+        frame(0.4, input: state(), cameraChanged: false)
+        frame(1, input: state(), cameraChanged: false)
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertFalse(rows[1].input.nonNeutral)
+        XCTAssertEqual(rows[1].sincePreviousRecord.frames, 3)
+        XCTAssertEqual(rows[1].sincePreviousRecord.framesWithNonNeutralInput, 1)
+        XCTAssertEqual(rows[1].sincePreviousRecord.framesWithMovementPastDeadzone, 1)
+        XCTAssertEqual(rows[1].sincePreviousRecord.framesWithAcceptedMovementInput, 1)
+        XCTAssertEqual(rows[1].sincePreviousRecord.framesWithCameraTargetChange, 1)
+        let encoded = String(decoding: try JSONEncoder().encode(rows[1]), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("identity"), "ObjectIdentifier must not enter the diagnostic")
+        XCTAssertFalse(encoded.contains("serial"))
+        XCTAssertTrue(encoded.contains("firstResponderClass"))
+    }
+
+    func testControllerDiagnosticConfigurationRequiresAbsolutePathAndBoundsDuration() throws {
+        XCTAssertNil(GamepadDiagnosticConfiguration(environment: [:]))
+        XCTAssertNil(GamepadDiagnosticConfiguration(environment: ["ENGRAM_CONTROLLER_STATS": "relative.jsonl"]))
+        XCTAssertNil(GamepadDiagnosticConfiguration(environment: ["ENGRAM_CONTROLLER_STATS": "/diagnostics/"]))
+        for (requested, expected) in [("120", 120.0), ("10000", 600.0), ("0.1", 1.0),
+                                      ("nan", 120.0), ("-1", 120.0), ("invalid", 120.0)] {
+            let configuration = try XCTUnwrap(GamepadDiagnosticConfiguration(environment: [
+                "ENGRAM_CONTROLLER_STATS": "/diagnostics/controller.jsonl",
+                "ENGRAM_CONTROLLER_STATS_SECONDS": requested,
+            ]))
+            XCTAssertEqual(configuration.duration, expected)
+        }
+    }
+
 }

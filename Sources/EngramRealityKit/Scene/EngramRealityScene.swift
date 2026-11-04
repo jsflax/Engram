@@ -43,7 +43,7 @@ public final class EngramRealityScene {
     /// Hide the complete subtree and skip mascot frame updates while disabled.
     /// Retain existing entities so showing them resumes their state.
     public var showMascots: Bool = true {
-        didSet { mascotContainer.isEnabled = showMascots }
+        didSet { mascotContainer.isEnabled = showMascots && !Self.diagnosticMascotsDisabled }
     }
     public var flowParticleEntity: ModelEntity?
     public let lightContainer: Entity
@@ -207,6 +207,7 @@ public final class EngramRealityScene {
         rootEntity.addChild(galaxyTitleContainer)
         rootEntity.addChild(mascotContainer)
         rootEntity.addChild(lightContainer)
+        if Self.diagnosticMascotsDisabled { mascotContainer.isEnabled = false }
 
         // Create point light pool
         for i in 0..<maxPointLights {
@@ -248,9 +249,17 @@ public final class EngramRealityScene {
         guard let path = environment["ENGRAM_FRAME_STATS"], !path.isEmpty else { return false }
         return environment["ENGRAM_DIAGNOSTIC_NO_FOG"] == "1"
     }()
+    /// Never start mascot loading/animation in this diagnostic process. The
+    /// persisted display preference stays untouched, including when it changes.
+    private static let diagnosticMascotsDisabled: Bool = {
+        let environment = ProcessInfo.processInfo.environment
+        guard let path = environment["ENGRAM_FRAME_STATS"], !path.isEmpty else { return false }
+        return environment["ENGRAM_DIAGNOSTIC_NO_MASCOTS"] == "1"
+    }()
     public var isFrameTimingEnabled: Bool { frameStatsPath != nil }
     private var frameStatsBuffer: [String] = []
     private var frameStatsHeaderWritten = false
+    private var rendererStatsHeaderWritten = false
 
     @inline(__always)
     private func nowNs() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
@@ -264,7 +273,7 @@ public final class EngramRealityScene {
         guard let path = frameStatsPath, !frameStatsBuffer.isEmpty else { return }
         if !frameStatsHeaderWritten {
             let refresh = NSScreen.main?.maximumFramesPerSecond ?? 0
-            let header = "# refresh_hz=\(refresh) fog_mode=\(Self.diagnosticFogDisabled ? "disabled" : "enabled") date=\(Date())\n"
+            let header = "# refresh_hz=\(refresh) fog_mode=\(Self.diagnosticFogDisabled ? "disabled" : "enabled") mascot_mode=\(Self.diagnosticMascotsDisabled ? "diagnostic-disabled" : "normal") date=\(Date())\n"
                 + "frame,dt_ms,tick_ms,lod_ms,node_ms,edge_ms,label_ms,commit_ms,nebula_ms,galaxy_titles_ms,mascot_ms,flow_ms,lights_ms,audio_ms,total_ms,nodes,edges,vis_edges,near,mid,far,tick_callback_ms,tick_force_prepare_ms,tick_drain_ms,tick_sim_ms,tick_merge_ms,tick_snapshot_ms,tick_cache_ms,tick_detail_flags,"
                 + FrameGapDiagnostics.csvHeader + "\n"
             FileManager.default.createFile(atPath: path, contents: header.data(using: .utf8))
@@ -275,7 +284,45 @@ public final class EngramRealityScene {
             h.write(frameStatsBuffer.joined().data(using: .utf8)!)
             try? h.close()
         }
+        appendRendererStats(path: path + ".renderer.csv")
         frameStatsBuffer.removeAll(keepingCapacity: true)
+    }
+
+    /// One shallow count per frame-log flush (normally 120 frames). Enabled
+    /// flags are local entity flags, not camera visibility or particle counts.
+    /// This diagnostic work belongs to the measured logger tail, not scene work.
+    private func appendRendererStats(path: String) {
+        let uptime = nowNs()
+        let wallTime = Date().timeIntervalSince1970
+        func children(of container: Entity) -> (attached: Int, enabled: Int) {
+            var attached = 0
+            var enabled = 0
+            for child in container.children {
+                attached += 1
+                if child.isEnabled { enabled += 1 }
+            }
+            return (attached, enabled)
+        }
+        let nebula = children(of: nebulaContainer)
+        let mascots = children(of: mascotContainer)
+        let nebulaTracked = nebulaBatchSystem.diagnosticTrackedCounts
+        let mascotTracked = mascotSystem.diagnosticCounts
+        let line = "\(frameCount),\(uptime),\(wallTime),"
+            + "\(Self.diagnosticFogDisabled ? "disabled" : "enabled"),\(Self.diagnosticMascotsDisabled ? "diagnostic-disabled" : "normal"),"
+            + "\(showMascots),\(rootEntity.isEnabled),\(nebulaContainer.isEnabled),\(nebula.attached),\(nebula.enabled),"
+            + "\(nebulaTracked.clusters),\(nebulaTracked.galaxies),\(nebulaTracked.bridges),"
+            + "\(mascotContainer.isEnabled),\(mascots.attached),\(mascots.enabled),\(mascotTracked.tracked),\(mascotTracked.loading)\n"
+        if !rendererStatsHeaderWritten {
+            let header = "frame,uptime_ns,unix_time,fog_mode,mascot_mode,show_mascots,root_enabled,nebula_container_enabled,nebula_children,nebula_children_enabled,nebula_clusters_tracked,nebula_galaxies_tracked,nebula_bridges_tracked,mascot_container_enabled,mascot_children,mascot_children_enabled,mascots_tracked,mascots_loading\n"
+            FileManager.default.createFile(atPath: path, contents: Data(header.utf8))
+            rendererStatsHeaderWritten = true
+        }
+        guard let handle = FileHandle(forWritingAtPath: path) else { return }
+        defer { try? handle.close() }
+        do {
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data(line.utf8))
+        } catch { }
     }
 
     // MARK: - Per-Frame Update
@@ -478,7 +525,7 @@ public final class EngramRealityScene {
 
         // 9. Mascot update
 
-        if showMascots {
+        if showMascots && !Self.diagnosticMascotsDisabled {
             mascotSystem.update(
                 container: mascotContainer,
                 dataProvider: dataProvider,

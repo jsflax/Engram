@@ -26,6 +26,11 @@ public final class NebulaBatchSystem {
     /// Last applied LOD opacity per entity key — write-on-change only.
     private var lastOpacity: [String: Float] = [:]
 
+    /// Retained emitter entities, not particle counts; read only by diagnostics.
+    var diagnosticTrackedCounts: (clusters: Int, galaxies: Int, bridges: Int) {
+        (activeNebulae.count, activeGalaxyGas.count, activeBridges.count)
+    }
+
     /// Camera distances (to a galaxy's worldCenter) over which per-project
     /// nebulae crossfade into the galaxy's single-color mass. Scaled by the
     /// galaxy's own extent so a huge personal cloud doesn't flip to a blob

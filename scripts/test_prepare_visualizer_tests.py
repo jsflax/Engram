@@ -128,7 +128,7 @@ class HostPreparationTests(unittest.TestCase):
             original = products / 'Engram.xctestrun'
             original.write_bytes(plistlib.dumps(self.original))
             result = M.prepare(root)
-            self.assertEqual(result['expected_tests'], 16)
+            self.assertEqual(result['expected_tests'], 18)
             output = plistlib.loads(Path(result['prepared']).read_bytes())
             environment = output['TestConfigurations'][0]['TestTargets'][0]['EnvironmentVariables']
             self.assertEqual(environment['CLAUDE_MEMORY_DB'], str(root / 'fixtures/app-memory.sqlite'))
@@ -183,9 +183,13 @@ class HostPreparationTests(unittest.TestCase):
             'testMascotInsertionRangesMatchFullRebuild',
             'testInsertionMembershipFallbacksMatchFullRebuild')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 160)
+        self.assertEqual(len(inventory), 175)
+        self.assertIn('SidebarSyncSnapshotTests/testDatabaseReadsScaleWithConfigsAndLazyRowsDoNotReadSQL', inventory)
+        self.assertIn('SidebarSyncSnapshotTests/testParentObservationRefreshesPolicyExposureAndQueryMembership', inventory)
+        self.assertIn('SidebarDatabaseMaintenanceTests/testBlockedMaintenanceLeavesMainActorResponsiveAndRejectsDuplicateStarts', inventory)
         self.assertIn('GamepadInputTests/testRealSceneFrameCallbackConsumesControllerExactlyOnce', inventory)
         self.assertIn('GamepadInputTests/testCancelButtonReachesSelectionCallbackThroughSceneFrame', inventory)
+        self.assertIn('GamepadInputTests/testControllerDiagnosticCadenceWaitsForActiveWindowAndThenStops', inventory)
         self.assertIn('AdapterSnapshotTests/testCurrentNodeLookupPreservesPrecedenceAndIndependentSnapshots', inventory)
         for name in (
             'testAccessOnlyLoaderCompletionPreservesFreshLookupsWithoutWakingSimulation',

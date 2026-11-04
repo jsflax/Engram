@@ -12,7 +12,7 @@ import subprocess
 
 CLASSES = ('GalaxyLoadChangesTests', 'GalaxyDrainTests', 'VisualizerHostIsolationTests', 'AdapterSnapshotTests',
            'FrameLookupInvalidationTests', 'SceneMetadataDomainTests', 'LogsViewTests', 'NebulaLODVisibilityTests',
-           'SidebarSelectionTests', 'GamepadInputTests')
+           'SidebarSelectionTests', 'GamepadInputTests', 'SidebarDatabaseMaintenanceTests', 'SidebarSyncSnapshotTests')
 # These functional regressions share a class with device-dependent performance
 # budgets. Select their methods explicitly rather than widening that class.
 METHODS = {'PanelPerformanceTests': (

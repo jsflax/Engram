@@ -77,7 +77,11 @@ final class RKSceneManager {
     private(set) var hasGamepad = false
     private(set) var reticleTarget: UUID?
     private let inputHandler = InputHandler()
-    private let readGamepad: @MainActor () -> GamepadInputState?
+    private let readGamepad: @MainActor (Bool) -> GamepadInputReading
+    private let controllerDiagnostics: GamepadDiagnosticRecorder?
+    var graphHostIsVisible = false
+    private var graphHostAppearsActive: Bool?
+    private var graphHostChatVisible: Bool?
     private let acceptsGamepadInput: @MainActor () -> Bool
     private var reticleElapsed: Float = .infinity
 
@@ -85,12 +89,18 @@ final class RKSceneManager {
     private var forceEngine: ForceEngine?
 
     init?(registry: GalaxyRegistry,
-          readGamepad: @escaping @MainActor () -> GamepadInputState? = InputHandler.readGamepad,
+          readGamepad: (@MainActor () -> GamepadInputState?)? = nil,
+          controllerDiagnostics: GamepadDiagnosticRecorder? = GamepadDiagnosticRecorder.fromEnvironment(),
           acceptsGamepadInput: @escaping @MainActor () -> Bool = {
               NSApp?.isActive == true && NSApp?.keyWindow?.attachedSheet == nil
                   && !(NSApp?.keyWindow?.firstResponder is NSTextView)
           }) {
-        self.readGamepad = readGamepad
+        if let readGamepad {
+            self.readGamepad = { _ in GamepadInputReading(state: readGamepad(), enumeration: nil) }
+        } else {
+            self.readGamepad = { InputHandler.readGamepad(captureDiagnostics: $0) }
+        }
+        self.controllerDiagnostics = controllerDiagnostics
         self.acceptsGamepadInput = acceptsGamepadInput
         self.camera = CameraController()
         self.dataAdapter = GalaxyRegistryAdapter(registry: registry)
@@ -182,14 +192,50 @@ final class RKSceneManager {
         }
     }
 
+    /// Keep the original input gate unchanged while retaining its host context
+    /// for an explicitly enabled controller diagnostic.
+    func updateGraphInputFocus(appearsActive: Bool, mascotChatVisible: Bool) {
+        graphHostAppearsActive = appearsActive
+        graphHostChatVisible = mascotChatVisible
+        isGraphInputActive = appearsActive && !mascotChatVisible
+    }
+
     private func pollGamepad(dt: Float) {
-        let state = readGamepad()
+        let recorder = controllerDiagnostics?.isFinished == false ? controllerDiagnostics : nil
+        let now = recorder == nil ? 0 : ProcessInfo.processInfo.systemUptime
+        let phase = recorder?.nextPhase(now: now, armReady: graphHostIsVisible
+            && NSApp?.isActive == true && NSApp?.keyWindow != nil)
+        let reading = readGamepad(phase != nil)
+        let state = reading.state
         let connected = state != nil
         if hasGamepad != connected {
             hasGamepad = connected
             controllerConnectionCallback?(connected)
         }
-        let active = isGraphInputActive && acceptsGamepadInput()
+        let applicationGate = isGraphInputActive ? acceptsGamepadInput() : nil
+        let active = isGraphInputActive && applicationGate == true
+        let cameraBefore = recorder.map { _ in (camera.targetCameraPos, camera.targetAzimuth, camera.targetElevation) }
+        defer {
+            if let recorder, let cameraBefore {
+                let gate: GamepadGateDiagnostics?
+                if phase != nil {
+                    let window = NSApp?.keyWindow
+                    let responder = window?.firstResponder
+                    gate = GamepadGateDiagnostics(graphHostVisible: graphHostIsVisible,
+                        hostAppearsActive: graphHostAppearsActive, mascotChatVisible: graphHostChatVisible,
+                        graphInputActive: isGraphInputActive, appActive: NSApp?.isActive == true,
+                        keyWindowNumber: window?.windowNumber, attachedSheet: window?.attachedSheet != nil,
+                        firstResponderClass: responder.map { NSStringFromClass(type(of: $0)) },
+                        firstResponderIsTextView: responder is NSTextView,
+                        applicationGateAccepted: applicationGate, inputAccepted: active)
+                } else {
+                    gate = nil
+                }
+                recorder.observe(now: now, phase: phase, reading: reading, gate: gate,
+                    inputAccepted: active, cameraTargetChanged: cameraBefore.0 != camera.targetCameraPos,
+                    cameraLookChanged: cameraBefore.1 != camera.targetAzimuth || cameraBefore.2 != camera.targetElevation)
+            }
+        }
         let actions = inputHandler.update(state: state, camera: camera, dt: dt, active: active)
         guard connected, active else {
             reticleElapsed = .infinity

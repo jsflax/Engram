@@ -489,7 +489,8 @@ final class SidebarPresentation {
     @ObservationIgnored nonisolated(unsafe) private var hideTask: Task<Void, Never>?
 
     func togglePinned() {
-        if !isVisible { PanelResponseRecorder.begin("sidebar.open") }
+        let startsOpening = !isVisible
+        if startsOpening { PanelResponseRecorder.begin("sidebar.open") }
         withAnimation(.easeInOut(duration: 0.2)) {
             isPinned.toggle()
             if isPinned {
@@ -497,6 +498,7 @@ final class SidebarPresentation {
                 isPeeking = false
             }
         }
+        if startsOpening { PanelResponseRecorder.mutationReturned("sidebar.open") }
     }
 
     func hoverChanged(_ hovering: Bool) {
@@ -505,6 +507,7 @@ final class SidebarPresentation {
             if !isPinned && !isPeeking {
                 PanelResponseRecorder.begin("sidebar.open")
                 withAnimation(.easeInOut(duration: 0.2)) { isPeeking = true }
+                PanelResponseRecorder.mutationReturned("sidebar.open")
             }
         } else if !isPinned {
             hideTask?.cancel()
