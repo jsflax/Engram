@@ -88,6 +88,7 @@ private final class GraphContainer: NSView {
 private struct GraphContent: View {
     @Bindable var session: EngramGraphSession
     let appearance: EngramGraphAppearance
+    @State private var headerHeight: CGFloat = 0
     var body: some View {
         GeometryReader { geometry in
             ZStack {
@@ -121,11 +122,13 @@ private struct GraphContent: View {
                     .padding(12)
                     .background(appearance.background, in: RoundedRectangle(cornerRadius: appearance.cardRadius))
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                        headerHeight = height
                         session.updateHeaderHeight(height)
                     }
-                    Spacer()
+                    Spacer(minLength: 0)
                     if let memory = session.selectedMemory {
-                        GraphMemoryDetail(memory: memory, appearance: appearance)
+                        GraphMemoryDetail(memory: memory, appearance: appearance,
+                            maximumHeight: max(0, geometry.size.height - headerHeight - 80))
                         .padding(12).frame(maxWidth: min(360, max(0, geometry.size.width - 32)), alignment: .leading)
                         .background(appearance.background, in: RoundedRectangle(cornerRadius: appearance.cardRadius))
                         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
@@ -263,14 +266,46 @@ private struct GraphMemoryPopUp: NSViewRepresentable {
 struct GraphMemoryDetail: View {
     let memory: EngramGraphNode
     let appearance: EngramGraphAppearance
+    var maximumHeight: CGFloat = 240
+    @State private var expanded = false
+
+    private var boundedHeight: CGFloat {
+        maximumHeight.isFinite ? max(0, min(320, maximumHeight)) : 0
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if expanded {
+                ScrollView(.vertical) {
+                    detail(lineLimit: nil)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .accessibilityIdentifier("engram.graph.memory-reader")
+            } else {
+                detail(lineLimit: 4)
+            }
+            Button(expanded ? "Show less" : memory.contentIsExcerpt ? "Read excerpt" : "Read memory") {
+                expanded.toggle()
+            }
+            .buttonStyle(.link)
+            .accessibilityIdentifier("engram.graph.memory-reading-toggle")
+        }
+        // Reserve the measured header, outer/card padding and both stack gaps. The expanded
+        // reader scrolls inside the existing graph instead of growing beyond its host panel.
+        .frame(height: expanded ? boundedHeight : nil, alignment: .topLeading)
+        .frame(maxHeight: boundedHeight, alignment: .topLeading)
+        .clipped()
+        .onChange(of: memory.id) { _, _ in expanded = false }
+    }
+
+    private func detail(lineLimit: Int?) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
             Text(memory.label).font(appearance.headline)
-            Text(memory.content).font(appearance.caption).lineLimit(4)
+            Text(memory.content).font(appearance.caption).lineLimit(lineLimit)
+                .textSelection(.enabled)
             if memory.contentIsExcerpt { Text("Excerpt").font(.caption2).foregroundStyle(appearance.secondaryText) }
         }
-        // Keep the compact visual card, but expose every authorized character to assistive
-        // technology. An exported excerpt must never be described as a complete memory.
+        // Expose every authorized character in either presentation. An exported excerpt must
+        // never be described as a complete memory; expansion does not fetch or widen its scope.
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text(memory.label))
         .accessibilityValue(Text(memory.contentIsExcerpt ? "Excerpt. \(memory.content)" : memory.content))

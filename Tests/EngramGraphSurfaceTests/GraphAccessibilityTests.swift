@@ -115,6 +115,67 @@ struct GraphAccessibilityTests {
         #expect(fixture.session.scene == nil)
     }
 
+    @Test(arguments: [120.0, 220.0])
+    func memoryReaderScrollsLongContentWithinHostAndResetsSelection(height: Double) async throws {
+        let maximumHeight = CGFloat(height)
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        let content = (1...80).map { "Line \($0): authorized memory detail with enough text to scroll." }
+            .joined(separator: "\n") + "\nFinal authorized sentence."
+        let first = EngramGraphNode(id: UUID(), project: "project", topic: "architecture", label: "Long memory",
+                                   content: content, importance: 1, isHub: false)
+        try fixture.publish([first, fixture.nodes[1]], revision: 2)
+        fixture.session.select(first.id)
+        var saved: [UUID?] = []
+        fixture.session.onStateChange = { _, state in saved.append(state.selectedNode) }
+        let host = fixture.host(SelectedDetailFixture(session: fixture.session, maximumHeight: maximumHeight)
+            .frame(width: 320, height: maximumHeight, alignment: .topLeading))
+        let toggle = try await requireElement("engram.graph.memory-reading-toggle", in: host)
+        #expect(toggle.accessibilityLabel() == "Read memory")
+        #expect(find("engram.graph.memory-reader", in: host) == nil)
+        #expect(toggle.performPress())
+        _ = try await requireElement("engram.graph.memory-reader", in: host)
+        let detail = try await requireElement("engram.graph.selected-memory", in: host)
+        #expect(detail.accessibilityValue() as? String == content)
+        let scroll = try #require(nativeScrollView(in: host))
+        let document = try #require(scroll.documentView)
+        #expect(scroll.bounds.height > 0 && scroll.bounds.height <= maximumHeight)
+        #expect(document.bounds.height > scroll.contentView.bounds.height)
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: document.bounds.maxY))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        #expect(scroll.documentVisibleRect.maxY >= document.bounds.maxY - 1)
+        let collapse = try await requireElement("engram.graph.memory-reading-toggle", in: host)
+        #expect(collapse.accessibilityLabel() == "Show less")
+        #expect(collapse.performPress())
+        let deadline = ContinuousClock.now + .seconds(2)
+        repeat { settleHost(host); await Task.yield() }
+        while find("engram.graph.memory-reader", in: host) != nil && ContinuousClock.now < deadline
+        #expect(find("engram.graph.memory-reader", in: host) == nil)
+        let reopen = try await requireElement("engram.graph.memory-reading-toggle", in: host)
+        #expect(reopen.performPress())
+        _ = try await requireElement("engram.graph.memory-reader", in: host)
+        fixture.session.select(fixture.nodes[1].id)
+        let selectionDeadline = ContinuousClock.now + .seconds(2)
+        repeat { settleHost(host); await Task.yield() }
+        while find("engram.graph.selected-memory", in: host)?.accessibilityLabel() != fixture.nodes[1].label
+            && ContinuousClock.now < selectionDeadline
+        let next = try await requireElement("engram.graph.selected-memory", in: host)
+        #expect(next.accessibilityValue() as? String == fixture.nodes[1].content)
+        #expect(find("engram.graph.memory-reader", in: host) == nil)
+        #expect(find("engram.graph.memory-reading-toggle", in: host)?.accessibilityLabel() == "Read memory")
+        #expect(saved == [fixture.nodes[1].id]) // Expanding/collapsing never changes graph selection/camera.
+        #expect(fixture.session.scene == nil)
+    }
+
+    private func nativeScrollView(in view: NSView, depth: Int = 0) -> NSScrollView? {
+        guard depth < 32 else { return nil }
+        if let scroll = view as? NSScrollView { return scroll }
+        for child in view.subviews {
+            if let scroll = nativeScrollView(in: child, depth: depth + 1) { return scroll }
+        }
+        return nil
+    }
+
     private func nativePopup(in view: NSView, depth: Int = 0) -> NSPopUpButton? {
         guard depth < 32 else { return nil }
         if let popup = view as? NSPopUpButton,
@@ -233,6 +294,13 @@ private struct AXElementReader {
         return legacyValue(.value)
     }
 
+    func performPress() -> Bool {
+        if let modern { return modern.accessibilityPerformPress() }
+        guard object.accessibilityActionNames().contains(.press) else { return false }
+        object.accessibilityPerformAction(.press)
+        return true
+    }
+
     func diagnostic() -> String {
         let fields: [(String, Selector, NSAccessibility.Attribute)] = [
             ("id", #selector(NSAccessibilityProtocol.accessibilityIdentifier), .identifier),
@@ -260,6 +328,18 @@ private struct AXElementReader {
         if let modern { return modern.isAccessibilityEnabled() }
         // Missing/wrongly typed AXEnabled must fail even the disabled-control case.
         return legacyValue(.enabled) as? Bool
+    }
+}
+
+/// The production selected-memory identity resets local reader expansion on selection changes.
+@MainActor
+private struct SelectedDetailFixture: View {
+    @Bindable var session: EngramGraphSession
+    let maximumHeight: CGFloat
+    var body: some View {
+        if let memory = session.selectedMemory {
+            GraphMemoryDetail(memory: memory, appearance: .init(), maximumHeight: maximumHeight).id(memory.id)
+        }
     }
 }
 
