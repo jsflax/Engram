@@ -1,0 +1,68 @@
+name: EngramHUDProvider
+options:
+  deploymentTarget:
+    macOS: "15.0"
+  defaultConfig: Release
+packages:
+  Engram:
+    path: ../..
+  EngramGraphContracts:
+    path: ../../Packages/EngramGraphContracts
+  HUDNativeViewABI:
+    path: ../../../hud/Packages/HUDNativeViewABI
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_OBJC_INTEROP_MODE: objcxx
+    CLANG_ENABLE_OBJC_ARC: YES
+    CLANG_ENABLE_MODULES: YES
+    ENABLE_HARDENED_RUNTIME: YES
+    ENABLE_APP_SANDBOX: NO
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "$(HUD_PROVIDER_SIGNING_IDENTITY)"
+    DEVELOPMENT_TEAM: "$(HUD_PROVIDER_TEAM_ID)"
+    CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+targets:
+  EngramHUDProvider:
+    type: bundle
+    platform: macOS
+    sources:
+      - Bundle
+      - Sources/EngramHUDAdapter
+    dependencies:
+      - package: Engram
+        product: EngramGraphSurface
+      - package: Engram
+        product: EngramMemoryCore
+      - package: EngramGraphContracts
+        product: EngramHUDContract
+      - package: HUDNativeViewABI
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.jsflax.engram.hud-provider
+        PRODUCT_MODULE_NAME: EngramHUDProvider
+        PRODUCT_NAME: EngramHUDProvider
+        MACH_O_TYPE: mh_bundle
+        SKIP_INSTALL: YES
+        SWIFT_INSTALL_OBJC_HEADER: YES
+        # Match the current host's strict system-only dependency policy.
+        # Inspect actual linkage after build; do not rewrite install names or loosen admission.
+        LD_RUNPATH_SEARCH_PATHS: ""
+        DISABLE_SWIFT_SPAN_COMPATIBILITY_RPATH: YES
+    info:
+      path: Generated/Provider-Info.plist
+      properties:
+        CFBundleIdentifier: io.jsflax.engram.hud-provider
+        CFBundleExecutable: EngramHUDProvider
+        CFBundlePackageType: BNDL
+        CFBundleVersion: "3"
+        CFBundleShortVersionString: "0.1.2"
+        CFBundleSupportedPlatforms: [MacOSX]
+        LSMinimumSystemVersion: "15.0"
+        NSPrincipalClass: EngramHUDProvider
+schemes:
+  EngramHUDProvider:
+    build:
+      targets:
+        EngramHUDProvider: all

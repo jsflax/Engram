@@ -36,12 +36,14 @@ let package = Package(
         .library(name: "EngramMetalShaders", targets: ["EngramMetalShaders"]),
         .library(name: "CEngramSceneTypes", targets: ["CEngramSceneTypes"]),
         .library(name: "EngramRealityKit", targets: ["EngramRealityKit"]),
+        .library(name: "EngramGraphSurface", targets: ["EngramGraphSurface"]),
     ],
     dependencies: [
-        // Preserve the Codex client-capability decoding fix in the owned SDK.
-        .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.0"),
-        // Published checked transactions and matching Core/MCP requirements.
-        .package(url: "https://github.com/jsflax/lattice.git", exact: "2.2.5"),
+        .package(path: "Packages/EngramGraphContracts"),
+        // Match Lattice PR44’s qualified MCP transport and request-dispatch revision.
+        .package(url: "https://github.com/jsflax/swift-sdk.git", revision: "82951cc9cd05de216e8dd6425f951ce31d76fa0a"),
+        // Preserve the throwing persisted-schema guard with the reviewed SDK/Core pair.
+        .package(url: "https://github.com/jsflax/lattice.git", revision: "c93f32f0b1d2735ed1b0a19d0762234e436caacd"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
@@ -74,11 +76,13 @@ let package = Package(
         // consumes for the agents deployment). Apple conformances (CoreML
         // embedder, NLTagger extractor, Lattice storage) live in EngramKit.
         .target(
-            name: "EngramMemoryCore"
+            name: "EngramMemoryCore",
+            dependencies: [.product(name: "EngramGraphContract", package: "EngramGraphContracts")]
         ),
         .testTarget(
             name: "EngramMemoryCoreTests",
-            dependencies: ["EngramMemoryCore", "EngramProcessGuardFixture"]
+            dependencies: ["EngramMemoryCore", "EngramProcessGuardFixture",
+                .product(name: "EngramGraphContract", package: "EngramGraphContracts")]
         ),
         .executableTarget(
             name: "EngramProcessGuardFixture",
@@ -236,6 +240,18 @@ let package = Package(
         .testTarget(
             name: "EngramRealityKitTests",
             dependencies: ["EngramRealityKit"],
+            swiftSettings: [.interoperabilityMode(.Cxx)]
+        ),
+        .target(
+            name: "EngramGraphSurface",
+            dependencies: ["EngramMemoryCore", "EngramRealityKit", "EngramSceneKit", "EngramMetalShaders",
+                .product(name: "EngramGraphContract", package: "EngramGraphContracts")],
+            swiftSettings: [.interoperabilityMode(.Cxx)]
+        ),
+        .testTarget(
+            name: "EngramGraphSurfaceTests",
+            dependencies: ["EngramGraphSurface", "EngramMemoryCore", "EngramRealityKit", "EngramSceneKit",
+                .product(name: "EngramGraphContract", package: "EngramGraphContracts")],
             swiftSettings: [.interoperabilityMode(.Cxx)]
         ),
         .testTarget(

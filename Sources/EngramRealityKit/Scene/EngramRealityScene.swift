@@ -30,6 +30,27 @@ public final class EngramRealityScene {
     public let rootEntity: Entity
     public weak var dataProvider: SceneDataProvider?
     public weak var cameraProvider: CameraProvider?
+    public private(set) var isRenderingActive = true
+    private var frameSubscription: EventSubscription?
+    private var didSetup = false
+    private let diagnosticsEnabled: Bool
+
+    /// Suspension cancels frame delivery and disables the entity subtree immediately. A host
+    /// resumes through EngramRealityView, which supplies a fresh subscription from its content.
+    public func setRenderingActive(_ active: Bool) {
+        isRenderingActive = active
+        rootEntity.isEnabled = active
+        if !active {
+            frameSubscription?.cancel()
+            frameSubscription = nil
+            spatialAudioSystem.stopAll()
+        }
+    }
+
+    func installFrameSubscription(_ create: () -> EventSubscription) {
+        guard isRenderingActive, frameSubscription == nil else { return }
+        frameSubscription = create()
+    }
 
     // MARK: - Entity References
 
@@ -155,13 +176,15 @@ public final class EngramRealityScene {
 
     // MARK: - Init
 
-    public init(audioTemporaryDirectory: URL = FileManager.default.temporaryDirectory) {
+    public init(audioTemporaryDirectory: URL = FileManager.default.temporaryDirectory,
+                audioEnabled: Bool = true, diagnosticsEnabled: Bool = true) {
         guard let device = MTLCreateSystemDefaultDevice(),
               let commandQueue = device.makeCommandQueue() else {
             fatalError("Metal is required for EngramRealityKit")
         }
 
         self.device = device
+        self.diagnosticsEnabled = diagnosticsEnabled
         self.commandQueue = commandQueue
         self.library = try? device.makeDefaultLibrary(bundle: .module)
 
@@ -195,7 +218,7 @@ public final class EngramRealityScene {
         self.galaxyTitleSystem = GalaxyTitleSystem()
         self.mascotSystem = RKMascotSystem()
         self.flowParticleSystem = RKFlowParticleSystem()
-        self.spatialAudioSystem = RKSpatialAudioSystem(temporaryDirectory: audioTemporaryDirectory)
+        self.spatialAudioSystem = RKSpatialAudioSystem(temporaryDirectory: audioTemporaryDirectory, enabled: audioEnabled)
         self.labelAtlasGenerator = RKLabelAtlasGenerator(device: device)
 
         // Generate sphere template (after all stored properties initialized)
@@ -223,6 +246,8 @@ public final class EngramRealityScene {
 
     /// Creates and returns the root entity ready for RealityView. Call once.
     public func setup() -> Entity {
+        guard !didSetup else { return rootEntity }
+        didSetup = true
         // Create batch entities with initial materials
         setupNodeBatch()
         setupEdgeBatch()
@@ -238,6 +263,7 @@ public final class EngramRealityScene {
     /// are buffered and flushed every 120 frames so the harness itself
     /// doesn't add a per-frame write syscall to the measurement.
     private lazy var frameStatsPath: String? = {
+        guard diagnosticsEnabled else { return nil }
         guard let v = ProcessInfo.processInfo.environment["ENGRAM_FRAME_STATS"], !v.isEmpty else { return nil }
         return v == "1" ? "/tmp/engram-frame-stats.csv" : v
     }()
@@ -276,7 +302,7 @@ public final class EngramRealityScene {
     /// Called from SceneEvents.Update — dt is RealityKit's supplied delta, not
     /// an independently measured callback interval or presentation latency.
     public func update(dt: Float) {
-        guard let dataProvider else { return }
+        guard isRenderingActive, let dataProvider else { return }
         if frameStatsPath != nil { return updateInstrumented(dt: dt, dataProvider: dataProvider) }
         updateBody(dt: dt, dataProvider: dataProvider)
     }

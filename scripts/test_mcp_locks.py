@@ -501,6 +501,37 @@ class PersistenceHarnessTests(unittest.TestCase):
                     HARNESS.initialized_store_snapshot(path)
                 self.assertEqual(db.execute("SELECT value FROM _lattice_meta").fetchone()[0], str(original_cookie))
 
+    def add_fixture_writer_guard(self, db, table, operation):
+        # Match the current Core guard independently of the setup helper.
+        db.execute(f'''CREATE TRIGGER "_lattice_writer_v9_{table}_{operation}"
+            BEFORE {operation} ON "{table}"
+            BEGIN SELECT CASE WHEN lattice_storage_writer_epoch() != 9
+            THEN RAISE(ABORT,'Lattice writer storage epoch mismatch') END; END''')
+
+    def test_fixture_slot_write_keeps_epoch_guard_and_connection_scope(self):
+        with self.temporary_directory() as directory:
+            path = Path(directory) / "slots.sqlite"
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                db.execute("CREATE TABLE _lattice_replication_slots(sync_id TEXT)")
+                self.add_fixture_writer_guard(db, "_lattice_replication_slots", "INSERT")
+                schema = db.execute("SELECT sql FROM sqlite_master ORDER BY name").fetchall()
+                for epoch in (None, 8, 10):
+                    with self.subTest(epoch=epoch):
+                        if epoch is not None:
+                            db.create_function("lattice_storage_writer_epoch", 0, lambda: epoch)
+                        with self.assertRaises(sqlite3.DatabaseError):
+                            db.execute("INSERT INTO _lattice_replication_slots VALUES ('rejected')")
+                        self.assertEqual(db.execute("SELECT * FROM _lattice_replication_slots").fetchall(), [])
+                HARNESS.register_fixture_storage_writer(db)
+                db.execute("INSERT INTO _lattice_replication_slots VALUES ('fixture-slot')")
+                db.commit()
+                self.assertEqual(db.execute("SELECT * FROM _lattice_replication_slots").fetchall(), [("fixture-slot",)])
+                self.assertEqual(db.execute("SELECT sql FROM sqlite_master ORDER BY name").fetchall(), schema)
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "no such function: lattice_storage_writer_epoch"):
+                    db.execute("INSERT INTO _lattice_replication_slots VALUES ('unqualified')")
+                self.assertEqual(db.execute("SELECT * FROM _lattice_replication_slots").fetchall(), [("fixture-slot",)])
+
     def guarded_startup_fixture(self, directory):
         path = (Path(directory) / "startup.sqlite").resolve()
         with contextlib.closing(sqlite3.connect(path)) as db:
@@ -526,6 +557,7 @@ class PersistenceHarnessTests(unittest.TestCase):
                                         'formatVersion', OLD.formatVersion),
                             json_array('singletonKey', 'storeID', 'formatVersion'), unixepoch('subsec'));
                 END""")
+            self.add_fixture_writer_guard(db, "EngramOperationStoreV1", "DELETE")
             cookie = db.execute("PRAGMA schema_version").fetchone()[0]
             db.execute("INSERT INTO _lattice_meta VALUES ('schema_fingerprint:fixture', ?)", (str(cookie),))
             db.commit()
@@ -536,6 +568,12 @@ class PersistenceHarnessTests(unittest.TestCase):
             path = self.guarded_startup_fixture(directory)
             with contextlib.closing(sqlite3.connect(path)) as db:
                 before = list(db.iterdump())
+                # SQLite may resolve either trigger's missing function first.
+                with self.assertRaisesRegex(sqlite3.OperationalError, "no such function:"):
+                    db.execute("DELETE FROM EngramOperationStoreV1")
+                db.rollback()
+                self.assertEqual(list(db.iterdump()), before)
+                HARNESS.register_fixture_storage_writer(db)
                 with self.assertRaisesRegex(sqlite3.OperationalError, "no such function: sync_disabled"):
                     db.execute("DELETE FROM EngramOperationStoreV1")
                 db.rollback()
@@ -554,6 +592,8 @@ class PersistenceHarnessTests(unittest.TestCase):
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM EngramOperationStoreV1").fetchone()[0], 0)
                 with self.assertRaisesRegex(sqlite3.OperationalError, "no such function: sync_disabled"):
                     db.execute("SELECT sync_disabled()")
+                with self.assertRaisesRegex(sqlite3.OperationalError, "no such function: lattice_storage_writer_epoch"):
+                    db.execute("SELECT lattice_storage_writer_epoch()")
 
     def test_startup_identity_removal_refuses_unsafe_fixture_preconditions(self):
         for mutation in ("INSERT INTO EngramOperationReceiptV1 VALUES (1)",

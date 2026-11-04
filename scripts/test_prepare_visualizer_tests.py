@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Pure launch-description checks; never invokes Xcode, a host, or a store."""
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -280,12 +281,14 @@ class DependencyPreparationTests(unittest.TestCase):
                       'basedOn': None, 'subpath': 'repo'}
 
     def test_exact_local_self_preserves_all_remote_checkouts(self):
-        before, local = M.dependency_checkouts(self.repo, self.pins, self.remote)
+        before, local, contracts = M.dependency_checkouts(self.repo, self.pins, self.remote)
         self.assertIsNone(local)
-        after, local = M.dependency_checkouts(self.repo, self.pins, self.remote + [self.local])
+        self.assertIsNone(contracts)
+        after, local, contracts = M.dependency_checkouts(self.repo, self.pins, self.remote + [self.local])
         self.assertEqual(before, after)
         self.assertEqual(len(after), 46)
         self.assertEqual(local, self.local['packageRef'])
+        self.assertIsNone(contracts)
 
     def test_unknown_or_wrong_path_local_package_refuses(self):
         for part, key, value in [('packageRef', 'identity', 'unexpected'),
@@ -306,5 +309,80 @@ class DependencyPreparationTests(unittest.TestCase):
         state = copy.deepcopy(self.remote); state[0]['packageRef']['kind'] = 'fileSystem'
         with self.assertRaisesRegex(ValueError, 'pinned dependency is not remote'):
             M.dependency_checkouts(self.repo, self.pins, state + [self.local])
+
+    def graph_contract_fixture(self, directory):
+        repo = Path(directory).resolve() / 'repo'
+        package = repo / 'Packages/EngramGraphContracts'
+        inventory = {}
+        for relative in ('Package.swift', 'Sources/EngramGraphContract/GraphSnapshot.swift',
+                         'Sources/EngramGraphContract/GraphViewState.swift',
+                         'Sources/EngramHUDContract/GraphWire.swift'):
+            path = package / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('// synthetic source identity: ' + relative + '\n')
+            inventory[str(path.relative_to(repo))] = hashlib.sha256(path.read_bytes()).hexdigest()
+        entry = {'packageRef': {'identity': 'engramgraphcontracts', 'kind': 'fileSystem',
+                                'name': 'EngramGraphContracts', 'location': str(package)},
+                 'state': {'name': 'fileSystem', 'path': str(package)},
+                 'subpath': 'engramgraphcontracts', 'basedOn': None}
+        return repo, inventory, entry
+
+    def test_exact_graph_contracts_preserves_remote_set_with_or_without_local_root(self):
+        with tempfile.TemporaryDirectory(prefix='engram graph contract identity ') as directory:
+            repo, inventory, graph = self.graph_contract_fixture(directory)
+            root = copy.deepcopy(self.local)
+            root['packageRef']['location'] = root['state']['path'] = str(repo)
+            for locals in ([graph], [root, graph]):
+                with self.subTest(root_present=len(locals) == 2):
+                    checkouts, local, contracts = M.dependency_checkouts(repo, self.pins,
+                        self.remote + locals, inventory)
+                    self.assertEqual(checkouts, {pin['identity']: pin['identity'] for pin in self.pins})
+                    self.assertEqual(local, root['packageRef'] if len(locals) == 2 else None)
+                    self.assertEqual(contracts, graph['packageRef'])
+
+    def test_graph_contracts_refuses_wrong_metadata_and_remote_set_changes(self):
+        with tempfile.TemporaryDirectory(prefix='engram graph contract identity ') as directory:
+            repo, inventory, graph = self.graph_contract_fixture(directory)
+            for part, key, value in [('packageRef', 'identity', 'unexpected'),
+                                     ('packageRef', 'kind', 'root'),
+                                     ('packageRef', 'name', 'AnotherPackage'),
+                                     ('packageRef', 'location', str(repo / 'other')),
+                                     ('state', 'path', str(repo / 'other')),
+                                     ('state', 'name', 'edited')]:
+                altered = copy.deepcopy(graph); altered[part][key] = value
+                with self.subTest(part=part, key=key), self.assertRaises(ValueError):
+                    M.dependency_checkouts(repo, self.pins, self.remote + [altered], inventory)
+            for field, value in [('subpath', 'other'), ('basedOn', {'name': 'checkout'})]:
+                altered = copy.deepcopy(graph); altered[field] = value
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    M.dependency_checkouts(repo, self.pins, self.remote + [altered], inventory)
+            replaced = copy.deepcopy(self.remote); replaced[0]['packageRef']['kind'] = 'fileSystem'
+            for state in (self.remote[:-1] + [graph], self.remote + [self.remote[0], graph],
+                          self.remote + [graph, graph], replaced + [graph]):
+                with self.subTest(dependencies=len(state)), self.assertRaises(ValueError):
+                    M.dependency_checkouts(repo, self.pins, state, inventory)
+
+    def test_graph_contracts_requires_current_inventory_and_unaliased_owned_sources(self):
+        with tempfile.TemporaryDirectory(prefix='engram graph contract identity ') as directory:
+            repo, inventory, graph = self.graph_contract_fixture(directory)
+            for missing in (None, {}, {k: v for k, v in inventory.items()
+                                      if not k.endswith('GraphSnapshot.swift')}):
+                with self.subTest(inventory=missing), self.assertRaisesRegex(ValueError, 'inventory missing'):
+                    M.dependency_checkouts(repo, self.pins, self.remote + [graph], missing)
+            source = repo / 'Packages/EngramGraphContracts/Sources/EngramGraphContract/GraphSnapshot.swift'
+            original = source.read_bytes()
+            source.write_bytes(original + b'// changed\n')
+            with self.assertRaisesRegex(ValueError, 'source changed'):
+                M.dependency_checkouts(repo, self.pins, self.remote + [graph], inventory)
+            source.write_bytes(original)
+            target = repo / 'same-bytes.swift'; target.write_bytes(original)
+            source.unlink(); source.symlink_to(target)
+            with self.assertRaises(ValueError):
+                M.dependency_checkouts(repo, self.pins, self.remote + [graph], inventory)
+            source.unlink(); source.write_bytes(original)
+            package = repo / 'Packages/EngramGraphContracts'
+            moved = repo / 'elsewhere'; package.rename(moved); package.symlink_to(moved)
+            with self.assertRaisesRegex(ValueError, 'not canonical'):
+                M.dependency_checkouts(repo, self.pins, self.remote + [graph], inventory)
 
 if __name__ == '__main__': unittest.main()

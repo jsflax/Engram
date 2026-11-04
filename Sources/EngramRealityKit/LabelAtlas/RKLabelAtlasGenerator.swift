@@ -32,6 +32,9 @@ public final class RKLabelAtlasGenerator {
         let aspectCorrection: Float
     }
 
+    /// Delivered only after the existing generation-fenced worker publishes matching pixels/UVs.
+    public var onLayoutPublished: ((RKLabelLayout) -> Void)?
+
     private var published: PublishedAtlas?
     private lazy var builds = LabelAtlasBuildQueue(
         rasterize: { request in AtlasRasterizer.render(request) },
@@ -74,6 +77,7 @@ public final class RKLabelAtlasGenerator {
                                    projectRects: raster.projectRects, topicRects: raster.topicRects,
                                    aspectCorrection: raster.aspectCorrection)
         atlasVersion &+= 1
+        if let layout = raster.layout { onLayoutPublished?(layout) }
         return true
     }
 }
@@ -103,6 +107,15 @@ struct AtlasRaster: @unchecked Sendable {
     let projectRects: [String: AtlasRect]
     let topicRects: [String: AtlasRect]
     let aspectCorrection: Float
+    let layout: RKLabelLayout?
+
+    init(image: CGImage, nodeRects: [UUID: AtlasRect], projectRects: [String: AtlasRect],
+         topicRects: [String: AtlasRect], aspectCorrection: Float, input: AtlasRequest? = nil) {
+        self.image = image; self.nodeRects = nodeRects; self.projectRects = projectRects
+        self.topicRects = topicRects; self.aspectCorrection = aspectCorrection
+        layout = input.map { RKLabelLayout(input: $0, nodeRects: nodeRects, projectRects: projectRects,
+                                           topicRects: topicRects, aspectCorrection: aspectCorrection) }
+    }
 }
 
 enum AtlasRasterizer {
@@ -116,6 +129,15 @@ enum AtlasRasterizer {
         let topicFont = CTFontCreateWithName("SF Mono" as CFString, 24, nil)
 
         let padding: CGFloat = 4
+        let maxDim = 4096
+        // Keep full text in the source/detail model. Only the atlas line is ellipsized.
+        func boundedLine(_ text: String, attributes: [NSAttributedString.Key: Any]) -> CTLine {
+            let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attributes))
+            let maximum = Double(maxDim - 16) // Both existing inner and packing padding.
+            guard CTLineGetTypographicBounds(line, nil, nil, nil) > maximum else { return line }
+            let token = CTLineCreateWithAttributedString(NSAttributedString(string: "…", attributes: attributes))
+            return CTLineCreateTruncatedLine(line, maximum, .end, token) ?? token
+        }
 
         // --- Measure project labels ---
         struct ClusterLabel {
@@ -129,11 +151,10 @@ enum AtlasRasterizer {
         for name in request.projects {
             guard !Task.isCancelled else { return nil }
             let attrs: [NSAttributedString.Key: Any] = [.font: projFont, .foregroundColor: CGColor.white]
-            let attrStr = NSAttributedString(string: name.uppercased(), attributes: attrs)
-            let line = CTLineCreateWithAttributedString(attrStr)
+            let line = boundedLine(name.uppercased(), attributes: attrs)
             var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
             let w = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
-            projLabels.append(ClusterLabel(key: name, line: line, width: w + 8, height: ascent + descent + leading, ascent: ascent))
+            projLabels.append(ClusterLabel(key: name, line: line, width: min(w, CGFloat(maxDim - 16)) + 8, height: ascent + descent + leading, ascent: ascent))
         }
 
         // --- Measure topic labels ---
@@ -141,11 +162,10 @@ enum AtlasRasterizer {
         for name in request.topics {
             guard !Task.isCancelled else { return nil }
             let attrs: [NSAttributedString.Key: Any] = [.font: topicFont, .foregroundColor: CGColor.white]
-            let attrStr = NSAttributedString(string: name, attributes: attrs)
-            let line = CTLineCreateWithAttributedString(attrStr)
+            let line = boundedLine(name, attributes: attrs)
             var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
             let w = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
-            topicLabels.append(ClusterLabel(key: name, line: line, width: w + 8, height: ascent + descent + leading, ascent: ascent))
+            topicLabels.append(ClusterLabel(key: name, line: line, width: min(w, CGFloat(maxDim - 16)) + 8, height: ascent + descent + leading, ascent: ascent))
         }
 
         // --- Measure node labels ---
@@ -154,12 +174,11 @@ enum AtlasRasterizer {
             guard !Task.isCancelled else { return nil }
             let font = entry.isHub ? monoBold : monoMedium
             let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: CGColor.white]
-            let attrStr = NSAttributedString(string: entry.label, attributes: attributes)
-            let line = CTLineCreateWithAttributedString(attrStr)
+            let line = boundedLine(entry.label, attributes: attributes)
             var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
             let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
             let height = ascent + descent + leading
-            labelInfos.append((entry, line, width + 8, height + 4, ascent))
+            labelInfos.append((entry, line, min(width, CGFloat(maxDim - 16)) + 8, height + 4, ascent))
         }
         labelInfos.sort { $0.height > $1.height }
 
@@ -177,8 +196,21 @@ enum AtlasRasterizer {
             return curY + rowH
         }
 
-        let maxDim = 4096
+        var requiredWidth: Int = 0
+        for label in projLabels {
+            let width = Int(ceil(label.width + padding * 2))
+            requiredWidth = max(requiredWidth, width)
+        }
+        for label in topicLabels {
+            let width = Int(ceil(label.width + padding * 2))
+            requiredWidth = max(requiredWidth, width)
+        }
+        for info in labelInfos {
+            let width = Int(ceil(info.width + padding * 2))
+            requiredWidth = max(requiredWidth, width)
+        }
         var atlasW: Int = 512
+        while atlasW < requiredWidth && atlasW < maxDim { atlasW *= 2 }
         var atlasH: Int = 512
 
         // Expand atlas to fit cluster labels + as many node labels as possible
@@ -194,7 +226,7 @@ enum AtlasRasterizer {
                 let w = Int(ceil(info.width + padding * 2))
                 let h = Int(ceil(info.height + padding * 2))
                 if curX + w > atlasW { curX = 0; curY += rowH; rowH = 0 }
-                if curY + h > remainH { fits = false; break }
+                if w > atlasW || curY + h > remainH { fits = false; break }
                 curX += w
                 rowH = max(rowH, h)
             }
@@ -209,7 +241,7 @@ enum AtlasRasterizer {
             } else if atlasH < maxDim {
                 atlasH *= 2
             } else {
-                break  // Max size — node labels will be truncated, cluster labels still fit
+                break  // Max size — omit labels that cannot fit; never publish out-of-range UVs.
             }
         }
 
@@ -240,12 +272,15 @@ enum AtlasRasterizer {
                 let w = Int(ceil(label.width + padding * 2))
                 let h = Int(ceil(label.height + padding * 2))
                 if curX + w > atlasW { curX = 0; curY += rowH; rowH = 0 }
-                guard curY + h <= atlasH else { break }
+                guard w <= atlasW, curY + h <= atlasH else { break }
 
                 let drawX = CGFloat(curX) + padding
                 let drawY = CGFloat(atlasH - curY) - label.ascent - padding
+                context.saveGState()
+                context.clip(to: CGRect(x: CGFloat(curX), y: CGFloat(atlasH - curY - h), width: CGFloat(w), height: CGFloat(h)))
                 context.textPosition = CGPoint(x: drawX, y: drawY)
                 CTLineDraw(label.line, context)
+                context.restoreGState()
 
                 let u0 = Float(curX) / uvW
                 let v0 = Float(atlasH - curY - h) / uvH
@@ -277,12 +312,15 @@ enum AtlasRasterizer {
             let h = Int(ceil(info.height + padding * 2))
 
             if curX + w > atlasW { curX = 0; curY += rowH; rowH = 0 }
-            guard curY + h <= atlasH else { continue }
+            guard w <= atlasW, curY + h <= atlasH else { continue }
 
             let drawX = CGFloat(curX) + padding
             let drawY = CGFloat(atlasH - curY) - info.ascent - padding
+            context.saveGState()
+            context.clip(to: CGRect(x: CGFloat(curX), y: CGFloat(atlasH - curY - h), width: CGFloat(w), height: CGFloat(h)))
             context.textPosition = CGPoint(x: drawX, y: drawY)
             CTLineDraw(info.line, context)
+            context.restoreGState()
 
             let u0 = Float(curX) / uvW
             let v0 = Float(atlasH - curY - h) / uvH
@@ -296,7 +334,7 @@ enum AtlasRasterizer {
         guard !Task.isCancelled, let image = context.makeImage() else { return nil }
         return AtlasRaster(image: image, nodeRects: nodeRectMap,
                            projectRects: projRectMap, topicRects: topicRectMap,
-                           aspectCorrection: Float(atlasW) / Float(atlasH))
+                           aspectCorrection: Float(atlasW) / Float(atlasH), input: request)
     }
 }
 

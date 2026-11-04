@@ -136,13 +136,14 @@ def prepare(root):
     }, indent=2) + '\n')
     return {'prepared': str(target), 'expected_tests': len(expected)}
 
-def dependency_checkouts(repo, pins, dependencies):
-    """Xcode adds the local package itself to SwiftPM's managed dependencies."""
+def dependency_checkouts(repo, pins, dependencies, source_files=None):
+    """Admit only the owned root and its source-bound pure contract package."""
     expected = {pin['identity'] for pin in pins}
     require(len(pins) == len(expected) == 46, 'dependency pins changed')
     checkouts = {}
     seen = set()
     local = None
+    graph_contracts = None
     for entry in dependencies:
         reference = entry['packageRef']
         identity = reference['identity']
@@ -151,8 +152,29 @@ def dependency_checkouts(repo, pins, dependencies):
         if identity in expected:
             require(reference['kind'] == 'remoteSourceControl', 'pinned dependency is not remote')
             checkouts[identity] = entry['subpath']
+        elif identity == 'engramgraphcontracts':
+            package = repo / 'Packages/EngramGraphContracts'
+            require(reference == {'identity': 'engramgraphcontracts', 'kind': 'fileSystem',
+                                  'name': 'EngramGraphContracts', 'location': str(package)}
+                    and entry['state'] == {'name': 'fileSystem', 'path': str(package)}
+                    and entry['subpath'] == 'engramgraphcontracts'
+                    and entry.get('basedOn') is None, 'unexpected graph contract dependency')
+            prefix = 'Packages/EngramGraphContracts/'
+            required = ('Package.swift', 'Sources/EngramGraphContract/GraphSnapshot.swift',
+                        'Sources/EngramGraphContract/GraphViewState.swift',
+                        'Sources/EngramHUDContract/GraphWire.swift')
+            require(source_files is not None and all(prefix + path in source_files for path in required),
+                    'graph contract source inventory missing')
+            require(repo.resolve(strict=True) == repo and package.resolve(strict=True) == package,
+                    'graph contract package is not canonical')
+            for name, expected_hash in source_files.items():
+                if name.startswith(prefix):
+                    path = repo / name
+                    require(owned(package, path) == path and path.is_file()
+                            and digest(path) == expected_hash, 'graph contract source changed: ' + name)
+            graph_contracts = reference
         else:
-            # The only additional package is this exact, already hash-checked repo.
+            # Preserve the existing exact, already hash-checked root allowance.
             require(local is None and reference['kind'] in ('root', 'fileSystem')
                     and reference['name'] in ('Engram', repo.name)
                     and identity in ('engram', repo.name.lower())
@@ -161,7 +183,7 @@ def dependency_checkouts(repo, pins, dependencies):
                     and entry.get('basedOn') is None, 'unexpected local dependency')
             local = reference
     require(set(checkouts) == expected, 'dependency set changed')
-    return checkouts, local
+    return checkouts, local, graph_contracts
 
 def verify_inputs(root):
     repo = root / 'repo'
@@ -187,7 +209,7 @@ def verify_inputs(root):
     with (root / 'evidence' / ('workspace-state-' + suffix + '.json')).open('xb') as output:
         output.write(state_bytes)
     state = json.loads(state_bytes)['object']['dependencies']
-    checkouts, local = dependency_checkouts(repo, pins, state)
+    checkouts, local, graph_contracts = dependency_checkouts(repo, pins, state, identity['files_sha256'])
     heads = {}
     for pin in pins:
         checkout = owned(root, root / 'scratch/checkouts' / checkouts[pin['identity']])
@@ -197,7 +219,8 @@ def verify_inputs(root):
     result = {'source_sha': identity['source_sha'], 'source_files': len(identity['files_sha256']),
               'lock_sha256': hashlib.sha256(original_lock).hexdigest(), 'pins': pins,
               'actual_checkout_heads': heads, 'sdk_mirrors_preserved': True,
-              'local_package_reference': local, 'workspace_state_sha256': hashlib.sha256(state_bytes).hexdigest()}
+              'local_package_reference': local, 'graph_contracts_package_reference': graph_contracts,
+              'workspace_state_sha256': hashlib.sha256(state_bytes).hexdigest()}
     destination = root / 'evidence' / ('inputs-' + suffix + '.json')
     require(not destination.exists(), 'input verification receipt already exists')
     destination.write_text(json.dumps(result, indent=2) + '\n')

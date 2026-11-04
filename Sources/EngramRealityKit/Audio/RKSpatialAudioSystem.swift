@@ -74,8 +74,11 @@ public final class RKSpatialAudioSystem {
 
     // MARK: - Init
 
-    public init(temporaryDirectory: URL = FileManager.default.temporaryDirectory) {
+    public init(temporaryDirectory: URL = FileManager.default.temporaryDirectory, enabled: Bool = true) {
         self.temporaryDirectory = temporaryDirectory
+        self.isEnabled = enabled
+        // Embedded graph surfaces opt out before any audio resource/temp file is created.
+        guard enabled else { return }
         generateAudioResources()
         let proxCount = proximityToneResources.count
         let hasEdge = edgeHumResource != nil

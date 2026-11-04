@@ -73,4 +73,33 @@ struct LabelLayoutTests {
         let packed = result.compactMap { $0 }
         #expect(packed.count == 100)
     }
+    @Test(arguments: [false, true])
+    func compactGeometryMatchesRasterizedLabelBoundsWithoutChangingDesktop(isHub: Bool) async throws {
+        let id = UUID(), project = "hud", topic = "native-connectors"
+        let text = "Memory label with a long title"
+        let node = RKNodeSnapshot(id: id, project: project, topic: topic,
+            label: text, importance: 1, isHub: isHub)
+        let input = AtlasRequest(nodes: [node], hubs: [], projects: [project], topics: [topic])
+        let value = await Task.detached { AtlasRasterizer.render(input) }.value
+        let raster = try #require(value)
+        let layout = try #require(raster.layout)
+        let samples: [(AtlasRect?, Float?, RKLabelGeometry.Kind, Float, Float)] = [
+            (raster.nodeRects[id], layout.nodeAspects[id], isHub ? .hub : .node, isHub ? 2.5 : 2, isHub ? 2.5 : 2),
+            (raster.projectRects[project], layout.projectAspects[project], .project, 4, 14),
+            (raster.topicRects[topic], layout.topicAspects[topic], .topic, 3, 8)
+        ]
+        for (optionalRect, optionalAspect, kind, compactHeight, desktopHeight) in samples {
+            let rect = try #require(optionalRect)
+            let actualAspect = (rect.u1 - rect.u0) / (rect.v1 - rect.v0) * raster.aspectCorrection
+            let cachedAspect = try #require(optionalAspect)
+            #expect(abs(cachedAspect - actualAspect) < 0.0001)
+            let compact = RKLabelGeometry.halfExtents(for: kind, aspect: actualAspect, compact: true)
+            #expect(abs(compact.x - compactHeight * actualAspect) < 0.0001 && compact.y == compactHeight)
+            let desktop = RKLabelGeometry.halfExtents(for: kind, aspect: actualAspect, compact: false)
+            #expect(abs(desktop.x - desktopHeight * actualAspect) < 0.0001 && desktop.y == desktopHeight)
+            let scaled = RKLabelGeometry.halfExtents(for: kind, aspect: actualAspect, compact: true, scaleFactor: 0.005)
+            #expect(abs(scaled.y - compactHeight * 0.005) < 0.0001)
+        }
+    }
+
 }

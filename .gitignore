@@ -26,5 +26,10 @@ gpu-forces.log
 gpu_crash.txt
 vec0_logs.txt
 Packages/
+# Publish only the pure contracts, retaining other package checkouts as ignored.
+!/Packages/
+/Packages/*
+!/Packages/EngramGraphContracts/
+/Packages/EngramGraphContracts/.swiftpm/
 __pycache__/
 *.py[cod]

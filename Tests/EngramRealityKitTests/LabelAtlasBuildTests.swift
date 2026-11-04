@@ -151,6 +151,75 @@ struct LabelAtlasBuildTests {
         await publication.waitForValue(count: 2)
         #expect(!queue.needsRetry)
     }
+    @Test(arguments: [false, true])
+    func wideContractLabelsStayInsideCappedAtlasAndRetainFullSource(longNode: Bool) async throws {
+        let project = String(repeating: "W", count: 256), topic = String(repeating: "M", count: 256)
+        let label = longNode ? String(repeating: "W", count: 512) : String(repeating: "W", count: 100)
+        let node = RKNodeSnapshot(id: nodeID, project: project, topic: topic, label: label, importance: 1, isHub: false)
+        let input = AtlasRequest(nodes: [node], hubs: [], projects: [project], topics: [topic])
+        let value = await Task.detached { AtlasRasterizer.render(input) }.value
+        let raster = try #require(value)
+        let layout = try #require(raster.layout)
+        #expect(raster.image.width > 512 && raster.image.width <= 4096 && raster.image.height <= 4096)
+        #expect(input.entries[0].label == label && input.projects == [project] && input.topics == [topic])
+        #expect(layout.matches(nodes: [node], hubs: [], projects: [project], topics: [topic]))
+        let nodeRect = try #require(raster.nodeRects[nodeID])
+        let projectRect = try #require(raster.projectRects[project])
+        let topicRect = try #require(raster.topicRects[topic])
+        for rect in [nodeRect, projectRect, topicRect] {
+            #expect(rect.u0 >= 0 && rect.u1 <= 1 && rect.v0 >= 0 && rect.v1 <= 1)
+            #expect(rect.u1 > rect.u0 && rect.v1 > rect.v0)
+        }
+        // A maximum-byte ASCII project is wider than4096 before ellipsizing.
+        #expect((projectRect.u1 - projectRect.u0) * Float(raster.image.width) <= 4096)
+        let aspect = try #require(layout.projectAspects[project])
+        #expect(abs(aspect - (projectRect.u1 - projectRect.u0) / (projectRect.v1 - projectRect.v0) * raster.aspectCorrection) < 0.0001)
+    }
+
+    @Test func maximumGraphLabelMetadataUsesExistingDetachedWorkerAndBoundedAtlas() async throws {
+        let nodes = (0..<2000).map { index in
+            RKNodeSnapshot(id: UUID(), project: "project", topic: "topic", label: "Memory \(index)", importance: 1, isHub: false)
+        }
+        let input = AtlasRequest(nodes: nodes, hubs: [], projects: ["project"], topics: ["topic"])
+        let output = await Task.detached {
+            (pthread_main_np() != 0, AtlasRasterizer.render(input))
+        }.value
+        #expect(!output.0)
+        let raster = try #require(output.1)
+        let layout = try #require(raster.layout)
+        #expect(layout.matches(nodes: nodes, hubs: [], projects: ["project"], topics: ["topic"]))
+        #expect(raster.image.width <= 4096 && raster.image.height <= 4096)
+        #expect(layout.nodeAspects.count == raster.nodeRects.count && raster.nodeRects.count == 2000)
+        #expect(raster.nodeRects.values.allSatisfy { $0.u0 >= 0 && $0.u1 <= 1 && $0.v0 >= 0 && $0.v1 <= 1 })
+    }
+
+    @Test @MainActor
+    func publishedLayoutKeepsWorkerInputIdentityAcrossObsoleteCompletion() async throws {
+        let worker = ControlledAtlasRasterizer(), publication = AtlasPublicationRecorder()
+        let queue = LabelAtlasBuildQueue(
+            rasterize: { input in await worker.run(input, onMainThread: pthread_main_np() != 0) },
+            publish: { raster in publication.record(raster); return true })
+        let old = request(label: "old"), current = request(label: "current")
+        let oldValue = await Task.detached { AtlasRasterizer.render(old) }.value
+        let currentValue = await Task.detached { AtlasRasterizer.render(current) }.value
+        let oldRaster = try #require(oldValue), currentRaster = try #require(currentValue)
+        queue.request(old)
+        let first = await worker.nextStarted()
+        #expect(!first.onMainThread)
+        queue.request(current)
+        await worker.finish(first.id, with: oldRaster)
+        let second = await worker.nextStarted()
+        #expect(!second.onMainThread && publication.values.isEmpty)
+        await worker.finish(second.id, with: currentRaster)
+        await publication.waitForValue()
+        #expect(publication.values.count == 1)
+        let layout = try #require(publication.values[0].layout)
+        let node = RKNodeSnapshot(id: nodeID, project: "project", topic: "topic", label: "current", importance: 1, isHub: false)
+        #expect(layout.matches(nodes: [node], hubs: [], projects: ["project"], topics: ["topic"]))
+        let staleNode = RKNodeSnapshot(id: nodeID, project: "project", topic: "topic", label: "old", importance: 1, isHub: false)
+        #expect(!layout.matches(nodes: [staleNode], hubs: [], projects: ["project"], topics: ["topic"]))
+    }
+
 }
 
 /// Continuations keep these tests deterministic: the test controls completion
@@ -185,8 +254,9 @@ private actor ControlledAtlasRasterizer {
         return await withCheckedContinuation { startedWaiters.append($0) }
     }
 
-    func finish(_ id: Int) {
+    func finish(_ id: Int, with raster: AtlasRaster? = nil) {
         guard let (_, continuation) = finishing.removeValue(forKey: id) else { return }
+        if let raster { continuation.resume(returning: raster); return }
         let context = CGContext(data: nil, width: 2, height: 2, bitsPerComponent: 8,
                                 bytesPerRow: 8, space: CGColorSpaceCreateDeviceRGB(),
                                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!

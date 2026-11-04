@@ -103,6 +103,21 @@ public final class CameraController: CameraProvider {
         isDragging = false
     }
 
+    /// Restore one bounded presentation state without a visible interpolation from old values.
+    /// Scale/FOV remain owned by this controller, rather than supplied by a saved payload.
+    @discardableResult
+    public func restore(azimuth: Float, elevation: Float, target: SIMD3<Float>, radius: Float) -> Bool {
+        guard azimuth.isFinite, abs(azimuth) <= 1_000_000,
+              elevation.isFinite, abs(elevation) <= .pi / 2 - 0.1,
+              radius.isFinite, (1...10_000_000).contains(radius),
+              [target.x, target.y, target.z].allSatisfy({ $0.isFinite && abs($0) <= 2_000_000 }) else { return false }
+        targetAzimuth = azimuth; self.azimuth = azimuth
+        targetElevation = elevation; self.elevation = elevation
+        targetCameraPos = target; cameraTarget = target; orbitRadius = radius
+        heldKeys.removeAll(); isDragging = false
+        return true
+    }
+
     public func applyLookDrag(start: (azimuth: Float, elevation: Float, camPos: SIMD3<Float>),
                               dx: Float, dy: Float) {
         let newAz = start.azimuth + dx
