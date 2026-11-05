@@ -154,6 +154,15 @@ struct DerivationPrivacyTests {
         let ids = try [seed(spoke, project: "teammate-name", author: UUID()),
                        seed(spoke, project: "teammate-name", author: UUID())]
         let result = try await derive(operation, tools: ctx.tools, ids: ids, project: "destination")
+        if operation == "organize" {
+            #expect(result.isError == true)
+            #expect(text(from: result).contains("cross-store"))
+            #expect(ctx.local.objects(Memory.self).count == 0)
+            #expect(ctx.local.objects(Edge.self).count == 0)
+            #expect(spoke.objects(Memory.self).count == 2)
+            #expect(spoke.objects(Memory.self).allSatisfy { $0.topic == "original" && $0.deletedAt == nil && $0.derivationPolicy == MemoryDerivationPolicy.direct.rawValue })
+            return
+        }
         #expect(result.isError != true)
         let id = try #require(extractId(from: text(from: result)).flatMap(UUID.init(uuidString:)))
         let summary = try #require(ctx.local.objects(Memory.self).where { $0.globalId == id }.first)

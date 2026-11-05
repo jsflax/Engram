@@ -1,5 +1,6 @@
 import EngramModels
 import Foundation
+import Combine
 import Lattice
 
 /// Data-layer sync logic extracted from the Visualizer's SyncManager.
@@ -11,52 +12,83 @@ public enum SyncService {
     /// normally opened with just these models: unregistered tables can survive
     /// a schema-subset reopen, and `nil` would upload those tables as well.
     /// Local operation identities and receipts must never become sync data.
-    public static func buildPersonalRelaySyncFilter() -> Lattice.SyncFilter {
+    public static func buildPersonalRelaySyncFilter(from lattice: Lattice? = nil) -> Lattice.SyncFilter {
+        guard let values = policyValues(from: lattice, group: nil) else { return denyPolicyFilter() }
         var filter = Lattice.SyncFilter()
-        filter.include(Memory.self)
-        filter.include(Edge.self)
+        let eligible: @Sendable (Query<Memory>) -> Query<Bool> = { !$0.isPrivate && $0.derivationPolicy.in(values) }
+        filter.include(Memory.self, where: eligible)
+        filter.include(Edge.self) { edge in
+            edge.sourceGlobalId.in(\Memory.globalId, where: eligible) && edge.targetGlobalId.in(\Memory.globalId, where: eligible)
+        }
         filter.include(SyncConfig.self)
         return filter
     }
 
-    /// Tables permitted on the group's cloud channel. Its IPC upload filter
-    /// remains the narrower authored-by-me filter below; project maps belong
-    /// to this group and must never pass through the personal hub.
-    public static func buildGroupRelaySyncFilter() -> Lattice.SyncFilter {
+    /// Cold-open bootstrap admits only the explicit new-direct policy. The
+    /// retained policy observer expands this to validated derived values.
+    public static func buildGroupRelaySyncFilter(from lattice: Lattice? = nil, groupId: UUID? = nil) -> Lattice.SyncFilter {
+        guard let values = policyValues(from: lattice, group: groupId, groupRequired: true) else { return denyPolicyFilter() }
         var filter = Lattice.SyncFilter()
-        filter.include(Memory.self)
-        filter.include(Edge.self)
+        let eligible: @Sendable (Query<Memory>) -> Query<Bool> = { !$0.isPrivate && $0.derivationPolicy.in(values) }
+        filter.include(Memory.self, where: eligible)
+        filter.include(Edge.self) { edge in
+            edge.sourceGlobalId.in(\Memory.globalId, where: eligible) && edge.targetGlobalId.in(\Memory.globalId, where: eligible)
+        }
         filter.include(GroupProjectMap.self)
         return filter
     }
 
-    /// Build a SyncFilter from SyncConfig rows in the given database.
-    /// Includes non-private memories for projects with `.sync` policy,
-    /// edges where both endpoints match, and all SyncConfig rows.
-    public static func buildSyncFilter(from lattice: Lattice) -> Lattice.SyncFilter {
-        var projects: [String] = []
-        for config in lattice.objects(SyncConfig.self).where({ $0.policy == .sync }) {
-            projects.append(config.project)
+    /// Exact full-policy equality, never row IDs or substring membership. A
+    /// tightened current row immediately unmatches any older allowlist unless
+    /// its new policy independently permits this same destination. Unseen
+    /// valid values are denied until the owned observer refreshes the filter.
+    static let maximumPolicyValues = 4096
+    private static func policyValues(from lattice: Lattice?, group: UUID?, groupRequired: Bool = false) -> [String?]? {
+        guard let lattice else { return [MemoryDerivationPolicy.direct.rawValue] }
+        let rows = lattice.objects(Memory.self).distinct(by: \.derivationPolicy).snapshot(limit: Int64(maximumPolicyValues + 1))
+        guard lattice.lastQueryError() == nil, rows.count <= maximumPolicyValues else { return nil }
+        var values = Set<String>()
+        for row in rows.map({ $0.materialize() }) {
+            guard let policy = MemoryDerivationPolicy(rawValue: row.derivationPolicy), !policy.privateFloor else { continue }
+            if let group {
+                guard policy.permits(group: group) else { continue }
+            } else if groupRequired && policy.groupCeiling != nil { continue }
+            values.insert(policy.rawValue)
         }
-        let syncedProjects = projects
+        // This is a known complete policy, not an inference from a legacy row.
+        values.insert(MemoryDerivationPolicy.direct.rawValue)
+        return values.sorted().map(Optional.some)
+    }
 
+    private static func policyConfigs(from lattice: Lattice) -> [SyncConfig]? {
+        let rows = lattice.objects(SyncConfig.self).snapshot(limit: Int64(maximumPolicyValues + 1)).map { $0.materialize() }
+        guard lattice.lastQueryError() == nil, rows.count <= maximumPolicyValues,
+              Set(rows.map(\.project)).count == rows.count else { return nil }
+        return rows
+    }
+
+    /// An EMPTY SyncFilter uploads everything in pinned Lattice. Explicit
+    /// false predicate keeps it nonempty. Entries are a table whitelist, so
+    /// omitting all other tables denies them without querying models absent
+    /// from a hub/spoke's schema. Memory exists on every owned relay.
+    public static func denyPolicyFilter() -> Lattice.SyncFilter {
         var filter = Lattice.SyncFilter()
+        filter.include(Memory.self) { $0.globalId.in([UUID?]()) }
+        return filter
+    }
 
-        if !syncedProjects.isEmpty {
-            let memoryPredicate: @Sendable (Query<Memory>) -> Query<Bool> = { mem in
-                return !mem.isPrivate && mem.project.in(syncedProjects)
-            }
-            filter.include(Memory.self, where: memoryPredicate)
-
-            // Edges: only sync edges where both endpoints are synced memories
-            filter.include(Edge.self) { edge in
-                edge.sourceGlobalId.in(\Memory.globalId, where: memoryPredicate)
-                    && edge.targetGlobalId.in(\Memory.globalId, where: memoryPredicate)
-            }
+    public static func buildSyncFilter(from lattice: Lattice) -> Lattice.SyncFilter {
+        guard let configs = policyConfigs(from: lattice), let values = policyValues(from: lattice, group: nil) else { return denyPolicyFilter() }
+        let projects = configs.filter { $0.policy == .sync }.map(\.project)
+        var filter = Lattice.SyncFilter()
+        let eligible: @Sendable (Query<Memory>) -> Query<Bool> = {
+            !$0.isPrivate && $0.project.in(projects) && $0.derivationPolicy.in(values)
         }
-        // SyncConfig: replicate sync preferences across devices
+        filter.include(Memory.self, where: eligible)
+        filter.include(Edge.self) { edge in
+            edge.sourceGlobalId.in(\Memory.globalId, where: eligible) && edge.targetGlobalId.in(\Memory.globalId, where: eligible)
+        }
         filter.include(SyncConfig.self)
-
         return filter
     }
 
@@ -222,22 +254,15 @@ public enum SyncService {
     /// than everything — the difference between "this group gets nothing
     /// yet" and "this group gets your entire database".
     public static func buildGroupSyncFilter(from lattice: Lattice, groupId: UUID) -> Lattice.SyncFilter {
-        let gid = groupId.uuidString
-        var exposed: [String] = []
-        for config in lattice.objects(SyncConfig.self) where config.exposedGroups.contains(gid) {
-            exposed.append(config.project)
-        }
-        let exposedProjects = exposed
-
+        guard let configs = policyConfigs(from: lattice), let values = policyValues(from: lattice, group: groupId) else { return denyPolicyFilter() }
+        let projects = configs.filter { $0.exposedGroups.contains(groupId.uuidString) }.map(\.project)
         var filter = Lattice.SyncFilter()
-        let memoryPredicate: @Sendable (Query<Memory>) -> Query<Bool> = { mem in
-            // `.in([])` is false for every row — the fail-closed empty case.
-            !mem.isPrivate && mem.project.in(exposedProjects)
+        let eligible: @Sendable (Query<Memory>) -> Query<Bool> = {
+            !$0.isPrivate && $0.project.in(projects) && $0.derivationPolicy.in(values)
         }
-        filter.include(Memory.self, where: memoryPredicate)
+        filter.include(Memory.self, where: eligible)
         filter.include(Edge.self) { edge in
-            edge.sourceGlobalId.in(\Memory.globalId, where: memoryPredicate)
-                && edge.targetGlobalId.in(\Memory.globalId, where: memoryPredicate)
+            edge.sourceGlobalId.in(\Memory.globalId, where: eligible) && edge.targetGlobalId.in(\Memory.globalId, where: eligible)
         }
         return filter
     }
@@ -255,10 +280,10 @@ public enum SyncService {
     /// memories that never transit the hub, so relaying it up would create
     /// a dangling edge. Edges flow hub→spoke only. GroupProjectMap likewise
     /// never leaves the spoke.
-    public static func buildSpokeToHubFilter(me: UUID) -> Lattice.SyncFilter {
+    public static func buildSpokeToHubFilter(me: UUID, from lattice: Lattice? = nil, groupId: UUID? = nil) -> Lattice.SyncFilter {
+        guard let values = policyValues(from: lattice, group: groupId, groupRequired: true) else { return denyPolicyFilter() }
         var filter = Lattice.SyncFilter()
-        filter.include(Memory.self) { mem in mem.authorUserId == me }
-        // Edge/GroupProjectMap intentionally absent → never uploaded.
+        filter.include(Memory.self) { !$0.isPrivate && $0.authorUserId == me && $0.derivationPolicy.in(values) }
         return filter
     }
 
@@ -286,7 +311,7 @@ public enum SyncService {
             authorizationToken: authToken,
             wssEndpoint: endpoint,
             migration: engramMigrations,
-            syncFilter: buildGroupRelaySyncFilter()
+            syncFilter: buildGroupRelaySyncFilter(groupId: groupId)
         )
         // Filter at CONFIGURATION time, not after open: a spoke that
         // connects before its filter lands would run unfiltered, which on a
@@ -294,7 +319,7 @@ public enum SyncService {
         config.ipcTargets = [.init(
             channel: groupChannel(groupId),
             syncFilter: buildSpokeToHubFilter(
-                me: selfUserId ?? UUID(uuidString: "00000000-0000-0000-0000-000000000000")!),
+                me: selfUserId ?? UUID(uuidString: "00000000-0000-0000-0000-000000000000")!, groupId: groupId),
             // Stage A4: un-exposing a project must NOT delete rows the
             // group already has — narrowing here is bookkeeping-only and
             // the spoke stays a full mirror (reads are membership-scoped).
@@ -347,5 +372,206 @@ public enum SyncService {
             Memory.self, Edge.self, SyncConfig.self,
             configuration: syncedConfig
         )
+    }
+
+    public enum PolicyRelay: Sendable {
+        case hub(personalChannel: String, groupIds: [UUID])
+        case personal(channel: String)
+        case group(id: UUID, author: UUID?)
+    }
+
+    private static func policyTargets(_ lattice: Lattice, relay: PolicyRelay) -> [(String, Lattice.SyncFilter)] {
+        switch relay {
+        case .hub(let personal, let groups):
+            return [(personal, buildSyncFilter(from: lattice))] + groups.map { (groupChannel($0), buildGroupSyncFilter(from: lattice, groupId: $0)) }
+        case .personal(let channel):
+            let filter = buildPersonalRelaySyncFilter(from: lattice)
+            return [("", filter), (channel, filter)]
+        case .group(let id, let author):
+            return [("", buildGroupRelaySyncFilter(from: lattice, groupId: id)),
+                    (groupChannel(id), buildSpokeToHubFilter(me: author ?? UUID(uuidString: "00000000-0000-0000-0000-000000000000")!, from: lattice, groupId: id))]
+        }
+    }
+
+    /// The daemon retains this token, then cancels it before relay retirement.
+    /// No observer registry, detached lifetime, credentials or source text.
+    public final class PolicyObservation: @unchecked Sendable {
+        private var lattice: Lattice?
+        private let relay: PolicyRelay
+        private let storageIdentity: String?
+        private let queue = DispatchQueue(label: "engram.policy-refresh")
+        private let lock = NSRecursiveLock()
+        private var generation: UInt64 = 0
+        private var scheduled = false
+        private var cancelled = false
+        private var observers: [AnyCancellable] = []
+        // The native API only enqueues reconciliation; it provides no ACK.
+        private var enqueued: [(String, Lattice.SyncFilter)] = []
+        private var reconciliationRequested = false
+        private var reconciliationTimer: DispatchWorkItem?
+        private var reconciliationTicket: UInt64 = 0
+        private var reconciliationStep = 0
+        private var stableSignature: [(String, Lattice.SyncFilter)] = []
+        private static let reconciliationDelays = [2, 4, 8, 16, 30, 60]
+        var reconciliationBackoffStep: Int { lock.withLock { reconciliationStep } }
+        // Internal deterministic race seam. Production construction never sets it.
+        private var installHook: (@Sendable () -> Void)?
+        var beforeInstall: (@Sendable () -> Void)? {
+            get { lock.withLock { installHook } }
+            set { lock.withLock { installHook = newValue } }
+        }
+        var hasPendingRefresh: Bool { lock.withLock { scheduled } }
+
+        public init(lattice: Lattice, relay: PolicyRelay) {
+            self.lattice = lattice; self.relay = relay
+            storageIdentity = Self.currentStorageIdentity(lattice)
+            observers = [lattice.observe(Memory.self) { [weak self] _ in self?.refresh() },
+                         lattice.observe(SyncConfig.self) { [weak self] _ in self?.refresh() }]
+            refresh()
+        }
+
+        public func refresh() { requestRefresh(reconcile: false) }
+
+        private func requestRefresh(reconcile: Bool) {
+            lock.lock()
+            guard !cancelled else { lock.unlock(); return }
+            generation &+= 1
+            reconciliationRequested = reconciliationRequested || reconcile
+            let start = !scheduled
+            scheduled = true
+            lock.unlock()
+            if start { queue.async { [weak self] in self?.drain() } }
+        }
+
+        private func drain() {
+            lock.lock()
+            guard !cancelled, let lattice else { scheduled = false; lock.unlock(); return }
+            let captured = generation
+            let reconcile = reconciliationRequested
+            let hook = installHook
+            lock.unlock()
+            guard storageIdentity != nil, Self.currentStorageIdentity(lattice) == storageIdentity else {
+                cancel(); return
+            }
+            let first = SyncService.policyTargets(lattice, relay: relay)
+            // A failed/overflowing read is sufficient to retire permission.
+            // Never wait for notification quiescence before enqueueing denial.
+            // Native installation is asynchronous, not acknowledged here.
+            lock.lock()
+            guard !cancelled else { scheduled = false; lock.unlock(); return }
+            if first.contains(where: { $0.1 == SyncService.denyPolicyFilter() }) {
+                enqueueDenial(on: lattice, targets: first)
+            }
+            lock.unlock()
+            hook?()
+            let latest = SyncService.policyTargets(lattice, relay: relay)
+            guard Self.currentStorageIdentity(lattice) == storageIdentity else { cancel(); return }
+            lock.lock()
+            guard !cancelled else { scheduled = false; lock.unlock(); return }
+            if latest.contains(where: { $0.1 == SyncService.denyPolicyFilter() }) {
+                enqueueDenial(on: lattice, targets: latest)
+            }
+            // A callback generation and a second authoritative read both
+            // fence delayed work. Retire while retrying a changing snapshot:
+            // an old permissive filter must not survive a notification storm.
+            if captured != generation || !Self.same(first, latest) {
+                enqueueDenial(on: lattice, targets: latest)
+                lock.unlock()
+                queue.asyncAfter(deadline: .now() + .milliseconds(25)) { [weak self] in self?.drain() }
+                return
+            }
+            if reconcile || !Self.same(enqueued, latest) {
+                for (channel, filter) in latest { lattice.updateSyncFilter(filter, forChannel: channel) }
+                enqueued = latest
+            }
+            if captured != generation {
+                // An installation can synchronously cause an observation.
+                // Do not lose that refresh just because this drain owned it.
+                lock.unlock()
+                queue.asyncAfter(deadline: .now() + .milliseconds(25)) { [weak self] in self?.drain() }
+                return
+            }
+            let changed = !Self.same(stableSignature, latest)
+            stableSignature = latest
+            scheduleReconciliation(reset: changed)
+            reconciliationRequested = false
+            scheduled = false
+            lock.unlock()
+        }
+
+        private static func currentStorageIdentity(_ lattice: Lattice) -> String? {
+            switch lattice.configuration.storage {
+            case .memory(let name): return "memory:" + name
+            case .file(let url):
+                guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                      attributes[.type] as? FileAttributeType == .typeRegular,
+                      let device = attributes[.systemNumber] as? NSNumber,
+                      let inode = attributes[.systemFileNumber] as? NSNumber else { return nil }
+                return "file:" + device.stringValue + ":" + inode.stringValue
+            }
+        }
+
+        /// Caller holds lock. Only a changed complete policy/exposure signature
+        /// restarts backoff. Ordinary row notifications and our own queued
+        /// reconciliation effects do not turn idle retry into continuous work.
+        private func scheduleReconciliation(reset: Bool) {
+            if reset {
+                reconciliationTimer?.cancel(); reconciliationTimer = nil
+                reconciliationTicket &+= 1
+                reconciliationStep = 0
+            }
+            guard reconciliationTimer == nil else { return }
+            let delay = Self.reconciliationDelays[min(reconciliationStep, Self.reconciliationDelays.count - 1)]
+            reconciliationStep = min(reconciliationStep + 1, Self.reconciliationDelays.count)
+            let ticket = reconciliationTicket
+            let item = DispatchWorkItem { [weak self] in self?.reconcileAfterTimer(ticket: ticket) }
+            reconciliationTimer = item
+            queue.asyncAfter(deadline: .now() + .seconds(delay), execute: item)
+        }
+
+        private func reconcileAfterTimer(ticket: UInt64) {
+            lock.lock()
+            guard !cancelled, ticket == reconciliationTicket else { lock.unlock(); return }
+            reconciliationTimer = nil
+            lock.unlock()
+            requestRefresh(reconcile: true)
+        }
+
+        /// Caller holds lock. Revocation is safe even when the read's
+        /// generation is stale; only a stable current read may restore it.
+        private func enqueueDenial(on lattice: Lattice, targets: [(String, Lattice.SyncFilter)]) {
+            let denied = targets.map { ($0.0, SyncService.denyPolicyFilter()) }
+            if !Self.same(enqueued, denied) {
+                for (channel, filter) in denied { lattice.updateSyncFilter(filter, forChannel: channel) }
+                enqueued = denied
+            }
+        }
+
+        private static func same(_ a: [(String, Lattice.SyncFilter)], _ b: [(String, Lattice.SyncFilter)]) -> Bool {
+            a.count == b.count && zip(a, b).allSatisfy { pair in pair.0.0 == pair.1.0 && pair.0.1 == pair.1.1 }
+        }
+
+        public func cancel() {
+            lock.lock()
+            guard !cancelled else { lock.unlock(); return }
+            cancelled = true; generation &+= 1; scheduled = false
+            reconciliationTimer?.cancel(); reconciliationTimer = nil
+            reconciliationTicket &+= 1
+            reconciliationRequested = false
+            let old = observers; observers = []
+            if let lattice {
+                let channels: [String]
+                switch relay {
+                case .hub(let personal, let groups): channels = [personal] + groups.map(SyncService.groupChannel)
+                case .personal(let channel): channels = ["", channel]
+                case .group(let id, _): channels = ["", SyncService.groupChannel(id)]
+                }
+                for channel in channels { lattice.updateSyncFilter(SyncService.denyPolicyFilter(), forChannel: channel) }
+            }
+            lattice = nil; installHook = nil
+            lock.unlock()
+            old.forEach { $0.cancel() }
+        }
+        deinit { cancel() }
     }
 }

@@ -115,6 +115,9 @@ extension MemoryTools {
             return refusal.result
         }
         let sources = inputs.targets
+        guard sources.allSatisfy({ $0.lattice.configuration.fileURL.standardizedFileURL == localLattice.configuration.fileURL.standardizedFileURL }) else {
+            return DerivationScopeError(message: "Organize cross-store relabeling is unavailable until label and policy writes can share one supported transaction. No rows were changed.").result
+        }
 
         let project = a.project ?? sources[0].memory.project
         let initialScope: DerivationSnapshot
@@ -132,17 +135,20 @@ extension MemoryTools {
             hubEmbedding = Vector<Float>(floats)
         }
         // The hub, edges and local topic updates share a checked transaction
-        // with bounded BEGIN retry. Other stores are rechecked, not locked
-        // atomically with the local destination.
+        // with bounded BEGIN retry. Other policy copies are rechecked, but
+        // every selected row being relabeled must belong to this local store.
         let hubGlobalId: UUID
         do {
             hubGlobalId = try LatticeBeginRetry.run(on: localLattice, log: { log("[organize] \($0)") }) {
                 let inputs = try derivationSources(ids)
                 let sources = inputs.targets
-                let isPrivate = try derivationPrivacy(sources: inputs, project: project, updatesSourceLabels: true, unchangedFrom: initialScope)
+                let policy = try derivationRestriction(sources: inputs, project: project, updatesSourceLabels: true, unchangedFrom: initialScope)
+                guard sources.allSatisfy({ $0.lattice.configuration.fileURL.standardizedFileURL == localLattice.configuration.fileURL.standardizedFileURL }) else {
+                    throw DerivationScopeError(message: "A selected source moved to an unsupported cross-store destination.")
+                }
                 let hub = Memory(
                     content: hubContent, topic: label, project: project, source: "organize",
-                    embedding: hubEmbedding, isPrivate: isPrivate, authorUserId: currentUserId
+                    embedding: hubEmbedding, isPrivate: policy.privateFloor, authorUserId: currentUserId, derivationPolicy: policy.rawValue
                 )
                 try localLattice.add(hub)
                 guard let hubGid = hub.globalId else {
@@ -152,6 +158,9 @@ extension MemoryTools {
                     if let gid = source.memory.globalId {
                         let edge = Edge(sourceGlobalId: gid, targetGlobalId: hubGid, relation: .partOf, authorUserId: currentUserId)
                         try localLattice.add(edge)
+                        // The selected sources and hub share this checked
+                        // transaction. Remote replicas remain policy inputs.
+                        source.memory.derivationPolicy = policy.rawValue
                         source.memory.topic = label
                     }
                 }

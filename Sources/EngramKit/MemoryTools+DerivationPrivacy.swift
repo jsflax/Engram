@@ -29,6 +29,7 @@ extension MemoryTools {
             let project: String
             let source: String
             let isPrivate: Bool
+            let policy: String
             let author: UUID?
             let modifiedAt: Date?
             let audience: Set<String>
@@ -151,42 +152,46 @@ extension MemoryTools {
         }
         return try DerivationSnapshot(stores: sources.stores, sources: sources.copies.map { source in
             let store = source.lattice.configuration.fileURL.standardizedFileURL
-            let audience: Set<String>
-            if source.memory.isPrivate {
-                audience = []
+            guard let policy = MemoryDerivationPolicy(rawValue: source.memory.derivationPolicy) else {
+                throw DerivationScopeError(message: "A source has unclassified or unsupported derivation policy. Keep it local pending reviewed classification.")
+            }
+            let currentAudience: Set<String>
+            if source.memory.effectiveIsPrivate {
+                currentAudience = []
             } else if let spoke = spokes.first(where: { $0.url == store }) {
                 // A teammate's project name need not match ours. The actual
                 // spoke defines its audience, not a local project's name.
-                audience = [spoke.group!]
+                currentAudience = [spoke.group!]
             } else {
-                audience = try derivationProjectAudience(source.memory.project)
+                currentAudience = try derivationProjectAudience(source.memory.project)
             }
+            let audience = policy.groupCeiling.map { currentAudience.intersection($0) } ?? currentAudience
             return DerivationSnapshot.Source(
                 id: source.memory.globalId, store: store,
                 content: source.memory.content, topic: source.memory.topic, project: source.memory.project,
-                source: source.memory.source, isPrivate: source.memory.isPrivate, author: source.memory.authorUserId,
+                source: source.memory.source, isPrivate: source.memory.effectiveIsPrivate, policy: policy.rawValue,
+                author: source.memory.authorUserId,
                 modifiedAt: source.memory.modifiedAt, audience: audience
             )
         }, destination: destination)
     }
 
-    /// Returns the privacy inherited by a derived row. This checks the audience
-    /// represented by today's store/exposure configuration; it does not invent a
-    /// per-memory ACL or authorize later project re-exposure.
-    func derivationPrivacy(
+    /// Persist this restriction with every derived field. The current store
+    /// audience is intersected with any earlier restriction before admission.
+    func derivationRestriction(
         sources: DerivationInputs,
         project: String,
         destinationLattice: Lattice? = nil,
         updatesSourceLabels: Bool = false,
         unchangedFrom initial: DerivationSnapshot? = nil
-    ) throws -> Bool {
+    ) throws -> MemoryDerivationPolicy {
         let snapshot = try derivationSnapshot(sources: sources, project: project, destinationLattice: destinationLattice)
         if let initial, snapshot != initial {
             throw DerivationScopeError(message: "Source content or sharing scope changed while deriving. Re-read the sources and retry.")
         }
         let hasPrivate = snapshot.sources.contains { $0.isPrivate }
         let hasPublic = snapshot.sources.contains { !$0.isPrivate }
-        if !hasPublic { return hasPrivate }
+        if !hasPublic { return try makeDerivationRestriction(privateFloor: hasPrivate, groups: []) }
 
         let destination = snapshot.destination
         let audiences = snapshot.sources.map(\.audience)
@@ -198,7 +203,7 @@ extension MemoryTools {
             guard !updatesSourceLabels, !hasSharedSource, destination.isEmpty else {
                 throw DerivationScopeError(message: "Private and non-private sources cannot be combined in shared work or used to relabel non-private originals. Derive them separately.")
             }
-            return true
+            return try makeDerivationRestriction(privateFloor: true, groups: [])
         }
 
         if hasSharedSource, let first = audiences.first,
@@ -208,7 +213,71 @@ extension MemoryTools {
         guard audiences.allSatisfy({ destination.isSubset(of: $0) }) else {
             throw DerivationScopeError(message: "The destination project would share source material with another group. Choose a destination within the source audience.")
         }
-        return false
+        let ceiling = audiences.dropFirst().reduce(audiences.first ?? []) { $0.intersection($1) }
+        return try makeDerivationRestriction(privateFloor: false, groups: ceiling)
+    }
+
+    func derivationPrivacy(sources: DerivationInputs, project: String, destinationLattice: Lattice? = nil,
+                           updatesSourceLabels: Bool = false, unchangedFrom initial: DerivationSnapshot? = nil) throws -> Bool {
+        try derivationRestriction(sources: sources, project: project, destinationLattice: destinationLattice,
+                                  updatesSourceLabels: updatesSourceLabels, unchangedFrom: initial).privateFloor
+    }
+
+    private func makeDerivationRestriction(privateFloor: Bool, groups: Set<String>) throws -> MemoryDerivationPolicy {
+        guard let policy = MemoryDerivationPolicy.derived(privateFloor: privateFloor, groupCeiling: groups) else {
+            throw DerivationScopeError(message: "The source audience cannot be represented safely. Keep it local pending reviewed classification.")
+        }
+        return policy
+    }
+
+    struct MutationRestrictionSnapshot: Equatable {
+        struct Copy: Equatable {
+            let store: URL
+            let policy: String
+            let isPrivate: Bool
+            let author: UUID?
+        }
+        let stores: [DerivationStoreBinding]
+        let copies: [Copy]
+        let policy: MemoryDerivationPolicy
+    }
+
+    /// Updates cannot discard a tighter restriction on another configured copy.
+    /// Tombstones are allowed here solely to preserve ordinary undelete behavior;
+    /// derivation admission still rejects them.
+    func mutationRestriction(_ id: UUID) throws -> MutationRestrictionSnapshot {
+        let stores = try derivationStores()
+        var copies: [MutationRestrictionSnapshot.Copy] = []
+        var floor = false
+        var ceiling: Set<String>?
+        for (binding, lattice) in stores {
+            let rows = lattice.objects(Memory.self).where { $0.globalId == id }.snapshot(limit: 2)
+            guard lattice.lastQueryError() == nil, rows.count <= 1 else {
+                throw DerivationScopeError(message: "Could not read every policy copy before updating.")
+            }
+            guard let row = rows.first?.materialize() else { continue }
+            guard let policy = MemoryDerivationPolicy(rawValue: row.derivationPolicy) else {
+                throw DerivationScopeError(message: "A copy has unclassified or unsupported derivation policy. Keep it local pending reviewed classification.")
+            }
+            copies.append(.init(store: binding.url, policy: policy.rawValue, isPrivate: row.isPrivate, author: row.authorUserId))
+            floor = floor || policy.privateFloor
+            if let groups = policy.groupCeiling { ceiling = ceiling.map { $0.intersection(groups) } ?? groups }
+        }
+        guard !copies.isEmpty, try derivationStores().map(\.binding) == stores.map(\.binding) else {
+            throw DerivationScopeError(message: "The memory or its configured stores changed before updating.")
+        }
+        let policy = try ceiling.map { try makeDerivationRestriction(privateFloor: floor, groups: $0) } ?? .direct
+        return .init(stores: stores.map(\.binding), copies: copies, policy: policy)
+    }
+
+    func validateMutationRestriction(_ policy: MemoryDerivationPolicy, project: String, isPrivate: Bool) throws {
+        guard !policy.privateFloor || isPrivate else {
+            throw DerivationScopeError(message: "Inherited device privacy cannot be cleared by an ordinary update.")
+        }
+        if !isPrivate, let ceiling = policy.groupCeiling,
+           !(try derivationProjectAudience(project)).isSubset(of: ceiling) {
+            throw DerivationScopeError(message: "The destination would exceed the inherited group audience.")
+        }
     }
 
     private func derivationProjectAudience(_ project: String) throws -> Set<String> {

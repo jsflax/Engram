@@ -92,9 +92,12 @@ extension MemoryTools {
                     let sources = try episodeSummarySources(epGid)
                     let isPrivate = try episodeSummaryPrivacy(episode: current, owner: episodeLattice,
                                                              sources: sources, unchangedFrom: initial)
+                    let policy = try derivationRestriction(sources: sources, project: current.project,
+                                                          destinationLattice: episodeLattice, unchangedFrom: initial)
                     // These setters share the owning store's checked transaction:
                     // no summary text can commit before its privacy flag does.
                     if current.isPrivate != isPrivate { current.isPrivate = isPrivate }
+                    current.derivationPolicy = policy.rawValue
                     current.content += "\n\nSummary: \(summary)"
                     current.modifiedAt = Date()
                     return Set(sources.targets.compactMap { $0.memory.globalId }).count - 1
