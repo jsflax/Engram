@@ -509,17 +509,19 @@ actor Galaxy: Identifiable {
     }
 
     /// A full scan or graph change still finalizes all derived data. A live
-    /// access-only reconciliation is already complete after its lookup writes;
-    /// rebuilding here would repeat whole-graph work and wake a settled graph.
+    /// access-only reconciliation is already complete after its lookup writes.
+    /// Only initial completion explicitly wakes the shared simulation; live
+    /// changes use its coalesced topology-delta policy, even after a full rescan.
     @discardableResult
     @MainActor func finishLoad(generation: UInt64, revision: UInt64, rebuildDerivedData: Bool) -> Bool {
         guard !Task.isCancelled, loadChanges.withLock({ $0.accepts(generation) && $0.revision == revision && !$0.needsScan && $0.nodes.isEmpty && $0.edges.isEmpty }) else { return false }
+        let completedInitialLoad = isInitialLoad
         if rebuildDerivedData { recomputeDerivedData() }
         isInitialLoad = false
         if rebuildDerivedData || loadStatus != .complete || !isLoaded {
             setLoadStatus(.complete, generation: generation)
         }
-        if rebuildDerivedData { simulation3D?.wake() }
+        if completedInitialLoad { simulation3D?.wake() }
         return true
     }
 

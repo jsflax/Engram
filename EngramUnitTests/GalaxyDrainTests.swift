@@ -307,7 +307,11 @@ final class GalaxyDrainTests: XCTestCase {
         }
         XCTAssertEqual(registry.panelSnapshot.totalCount, 3)
         XCTAssertEqual(registry.panelSnapshot.projectCounts["Changed"], 1)
-        XCTAssertEqual(registry.unifiedSimulation.alpha, 1, "Structural completion still wakes the simulation")
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 0.5,
+                       "Live completion refreshes derived data without restarting active cooling")
+        registry.unifiedSimulation.tick()
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 0.4975, accuracy: 0.000_001,
+                       "The small pending topology delta preserves cooling on the next tick")
     }
 
     func testLoaderCompletionRejectsPendingRescanRevisionAndRetiredGeneration() async throws {
@@ -318,6 +322,7 @@ final class GalaxyDrainTests: XCTestCase {
         let changes = await galaxy.loadChanges
         let generation = changes.withLock { $0.begin() }
         galaxy.applyLoadChunk(nodes: [(1, makeNodes(1)[0])], generation: generation)
+        registry.unifiedSimulation.setPositions([:])
         let originalRevision = changes.withLock { $0.revision }
         let initialTopology = galaxy.renderStore.topologyVersion
         XCTAssertFalse(galaxy.finishLoad(generation: generation, revision: originalRevision, rebuildDerivedData: true),
@@ -325,25 +330,35 @@ final class GalaxyDrainTests: XCTestCase {
         XCTAssertTrue(galaxy.isInitialLoad)
         XCTAssertFalse(galaxy.isLoaded)
         XCTAssertEqual(galaxy.renderStore.topologyVersion, initialTopology)
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 0.5)
         _ = changes.withLock { $0.next(generation: generation) }
         _ = changes.withLock { $0.record(1, edge: false, generation: generation) }
         XCTAssertFalse(galaxy.finishLoad(generation: generation, revision: originalRevision, rebuildDerivedData: true))
+        XCTAssertTrue(galaxy.isInitialLoad)
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 0.5)
         _ = changes.withLock { $0.next(generation: generation) }
         XCTAssertFalse(galaxy.finishLoad(generation: generation, revision: originalRevision, rebuildDerivedData: true),
                        "Draining the queue does not make an old revision current")
+        XCTAssertTrue(galaxy.isInitialLoad)
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 0.5)
         XCTAssertNil(changes.withLock { $0.requestScan() })
         let scanRevision = changes.withLock { $0.revision }
         XCTAssertFalse(galaxy.finishLoad(generation: generation, revision: scanRevision, rebuildDerivedData: true))
+        XCTAssertTrue(galaxy.isInitialLoad)
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 0.5)
         guard case .scan = changes.withLock({ $0.next(generation: generation) }) else {
             return XCTFail("Requested rescan must be retained")
         }
         XCTAssertTrue(galaxy.finishLoad(generation: generation, revision: scanRevision, rebuildDerivedData: true))
         XCTAssertFalse(galaxy.isInitialLoad)
         XCTAssertTrue(galaxy.isLoaded)
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 1, "The first accepted completion still wakes the graph")
         let completedTopology = galaxy.renderStore.topologyVersion
         galaxy.cancelLoading()
+        registry.unifiedSimulation.setPositions([:])
         XCTAssertFalse(galaxy.finishLoad(generation: generation, revision: scanRevision, rebuildDerivedData: true))
         XCTAssertEqual(galaxy.renderStore.topologyVersion, completedTopology)
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 0.5, "Retired completions cannot reheat the graph")
     }
 
     func testRemovedGalaxyRejectsQueuedStreamChunksAndOldGeneration() async throws {
@@ -418,11 +433,19 @@ final class GalaxyDrainTests: XCTestCase {
             try lattice.add(edge)
             let galaxy = Galaxy(id: "stream", displayName: "Stream", lattice: lattice.sendableReference)
             observedGalaxy = galaxy
+            let registry = GalaxyRegistry()
+            registry.register(galaxy)
+            registry.unifiedSimulation.setPositions([:])
             await galaxy.loadData()
             XCTAssertTrue(galaxy.isLoaded)
             XCTAssertEqual(galaxy.loadStatus, .complete)
             XCTAssertEqual(galaxy.renderStore.allNodes.count, 151)
             XCTAssertEqual(galaxy.renderStore.allEdges.count, 1)
+            XCTAssertEqual(registry.unifiedSimulation.alpha, 1, "The real initial load must wake the unified simulation")
+            for _ in 0..<1_000 { registry.unifiedSimulation.tick() }
+            XCTAssertTrue(registry.unifiedSimulation.isSettled)
+            let settledAlpha = registry.unifiedSimulation.alpha
+            let settledFrames = registry.unifiedSimulation.framesSinceWake
             // Exercise the observer -> reconcile -> finishLoad path, not only
             // handleNodeUpdate: completion used to overwrite this fresh value.
             let changes = await galaxy.loadChanges
@@ -439,6 +462,8 @@ final class GalaxyDrainTests: XCTestCase {
             XCTAssertEqual(galaxy.renderStore.nodeById[firstID]?.lastAccessedAt, accessedAt)
             XCTAssertFalse(changes.withLock { $0.workerRunning }, "Recall must finish its loader run")
             XCTAssertEqual(galaxy.renderStore.topologyVersion, topologyBeforeRecall)
+            XCTAssertTrue(registry.unifiedSimulation.isSettled)
+            XCTAssertEqual(registry.unifiedSimulation.alpha, settledAlpha)
             rows[0].content = "Changed after baseline"
             lattice.delete(rows[150])
             lattice.delete(edge)
@@ -453,15 +478,42 @@ final class GalaxyDrainTests: XCTestCase {
                 if galaxy.renderStore.allNodes[firstID]?.content == "Changed after baseline",
                    galaxy.renderStore.allNodes[lastID] == nil,
                    galaxy.renderStore.allNodes[addedID] != nil,
-                   galaxy.renderStore.allEdges.isEmpty { break }
+                   galaxy.renderStore.allEdges.isEmpty,
+                   !changes.withLock({ $0.workerRunning }) { break }
                 try await Task.sleep(for: .milliseconds(10))
             }
-            await galaxy.stopObservers()
+            XCTAssertFalse(changes.withLock { $0.workerRunning }, "Structural observer reconciliation must finish")
             XCTAssertEqual(galaxy.renderStore.allNodes[firstID]?.content, "Changed after baseline")
             XCTAssertNil(galaxy.renderStore.allNodes[lastID])
             XCTAssertNotNil(galaxy.renderStore.allNodes[addedID])
             XCTAssertEqual(galaxy.renderStore.allNodes.count, 151)
             XCTAssertTrue(galaxy.renderStore.allEdges.isEmpty)
+            XCTAssertTrue(registry.unifiedSimulation.isSettled,
+                          "Small live observer changes must not reheat the graph during completion")
+            registry.unifiedSimulation.tick()
+            XCTAssertTrue(registry.unifiedSimulation.isSettled)
+            XCTAssertEqual(registry.unifiedSimulation.alpha, settledAlpha)
+            XCTAssertEqual(registry.unifiedSimulation.framesSinceWake, settledFrames)
+            XCTAssertEqual(Set(registry.unifiedSimulation.nodeIds), Set(galaxy.renderStore.allNodes.keys))
+
+            // An unchanged full scan still rebuilds derived data. It must not
+            // inherit the initial-completion wake after the graph has settled.
+            let topologyBeforeRescan = galaxy.renderStore.topologyVersion
+            galaxy.setNodeFilter(nil)
+            let rescanDeadline = Date().addingTimeInterval(3)
+            while changes.withLock({ $0.workerRunning }) && Date() < rescanDeadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertFalse(changes.withLock { $0.workerRunning })
+            XCTAssertGreaterThan(galaxy.renderStore.topologyVersion, topologyBeforeRescan,
+                                 "The requested full rescan must actually complete its derived-data refresh")
+            XCTAssertTrue(galaxy.isLoaded)
+            XCTAssertFalse(galaxy.isInitialLoad)
+            registry.unifiedSimulation.tick()
+            XCTAssertTrue(registry.unifiedSimulation.isSettled)
+            XCTAssertEqual(registry.unifiedSimulation.alpha, settledAlpha)
+            XCTAssertEqual(registry.unifiedSimulation.framesSinceWake, settledFrames)
+            await galaxy.stopObservers()
         } catch {
             // Stop subscriptions on errors too. This cancels optional cluster
             // work; stopObservers does not promise to join an in-flight pass.

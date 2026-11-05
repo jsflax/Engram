@@ -10,7 +10,7 @@ import plistlib
 import re
 import subprocess
 
-CLASSES = ('GalaxyLoadChangesTests', 'GalaxyDrainTests', 'VisualizerHostIsolationTests', 'AdapterSnapshotTests',
+CLASSES = ('GalaxyLoadChangesTests', 'GalaxyDrainTests', 'ForceWakePolicyTests', 'VisualizerHostIsolationTests', 'AdapterSnapshotTests',
            'FrameLookupInvalidationTests', 'SceneMetadataDomainTests', 'LogsViewTests', 'NebulaLODVisibilityTests',
            'NebulaDetailPlannerTests',
            'SidebarSelectionTests', 'GamepadInputTests', 'HIDGamepadInputTests',

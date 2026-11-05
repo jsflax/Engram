@@ -128,7 +128,7 @@ class HostPreparationTests(unittest.TestCase):
             original = products / 'Engram.xctestrun'
             original.write_bytes(plistlib.dumps(self.original))
             result = M.prepare(root)
-            self.assertEqual(result['expected_tests'], 20)
+            self.assertEqual(result['expected_tests'], 21)
             output = plistlib.loads(Path(result['prepared']).read_bytes())
             environment = output['TestConfigurations'][0]['TestTargets'][0]['EnvironmentVariables']
             self.assertEqual(environment['CLAUDE_MEMORY_DB'], str(root / 'fixtures/app-memory.sqlite'))
@@ -183,7 +183,10 @@ class HostPreparationTests(unittest.TestCase):
             'testMascotInsertionRangesMatchFullRebuild',
             'testInsertionMembershipFallbacksMatchFullRebuild')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 216)
+        self.assertEqual(len(inventory), 223)
+        self.assertIn('ForceWakePolicyTests/testExactly24ActualChangesStaySettledDespiteDuplicateAndAbsentOperations', inventory)
+        self.assertIn('ForceWakePolicyTests/test25ActualChangesReheatFromTheSettledFloor', inventory)
+        self.assertIn('ForceWakePolicyTests/testHubRemovalCountsIncidentEdgesTowardBulkWake', inventory)
         self.assertIn('NebulaDetailPlannerTests/testOutgoingPositiveOpacityRemainsChargedThroughoutReplacement', inventory)
         self.assertIn('NebulaLODVisibilityTests/testOverlapping166ProjectsBoundActualEnabledEntitiesAndPreserveAggregateCoverage', inventory)
         self.assertIn('NebulaLODVisibilityTests/testGlobalBudgetIncludesOutgoingEntitiesDuringCameraTeleportAndRateGrowth', inventory)
