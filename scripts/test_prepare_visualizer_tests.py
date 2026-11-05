@@ -128,7 +128,7 @@ class HostPreparationTests(unittest.TestCase):
             original = products / 'Engram.xctestrun'
             original.write_bytes(plistlib.dumps(self.original))
             result = M.prepare(root)
-            self.assertEqual(result['expected_tests'], 19)
+            self.assertEqual(result['expected_tests'], 20)
             output = plistlib.loads(Path(result['prepared']).read_bytes())
             environment = output['TestConfigurations'][0]['TestTargets'][0]['EnvironmentVariables']
             self.assertEqual(environment['CLAUDE_MEMORY_DB'], str(root / 'fixtures/app-memory.sqlite'))
@@ -183,7 +183,10 @@ class HostPreparationTests(unittest.TestCase):
             'testMascotInsertionRangesMatchFullRebuild',
             'testInsertionMembershipFallbacksMatchFullRebuild')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 206)
+        self.assertEqual(len(inventory), 216)
+        self.assertIn('NebulaDetailPlannerTests/testOutgoingPositiveOpacityRemainsChargedThroughoutReplacement', inventory)
+        self.assertIn('NebulaLODVisibilityTests/testOverlapping166ProjectsBoundActualEnabledEntitiesAndPreserveAggregateCoverage', inventory)
+        self.assertIn('NebulaLODVisibilityTests/testGlobalBudgetIncludesOutgoingEntitiesDuringCameraTeleportAndRateGrowth', inventory)
         self.assertIn('GalaxyDrainTests/testCoalescedEdgeScanKeepsReadBoundsAndReplaysConcurrentEditAndDelete', inventory)
         self.assertIn('GalaxyDrainTests/testCancelledCoalescedEdgeScanDiscardsPartialGroupAndDoesNotPrune', inventory)
         self.assertIn('AdapterSnapshotTests/testIdenticalEdgeReplayPreservesRevisionsAndMixedAppendReuse', inventory)
@@ -285,6 +288,10 @@ class HostPreparationTests(unittest.TestCase):
         mirrored = mirrored.replace('#expect(', 'XCTAssertTrue(').replace('#require(', 'XCTUnwrap(')
         self.assertEqual((repo / 'EngramUnitTests/NebulaLODVisibilityTests.swift').read_text(), mirrored)
         expected = ['NebulaLODVisibilityTests/' + name for name in (
+            'testOverlapping166ProjectsBoundActualEnabledEntitiesAndPreserveAggregateCoverage',
+            'testGlobalBudgetIncludesOutgoingEntitiesDuringCameraTeleportAndRateGrowth',
+            'testWorldSpaceSelectionSurvivesScaleChangesAndRespondsToClusterGeometry',
+            'testMissingGalaxySnapshotGetsBoundedDetailsAndRetainedCoarseFallback',
             'testInitialNearAndFarVisibility',
             'testFadeEndpointsAndTinyReentry',
             'testHiddenMovementResizeAndRecreation')]

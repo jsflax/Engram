@@ -510,7 +510,8 @@ public final class EngramRealityScene {
                 dataProvider: dataProvider,
                 topologyChanged: topologyChanged,
                 scaleFactor: scaleFactor,
-                cameraPosition: cameraPos
+                cameraPosition: cameraPos,
+                deltaTime: dt
             )
         }
         phaseMark()
