@@ -455,8 +455,28 @@ extension MemoryTools {
             if topic == "general",
                let (consensusTopic, count) = topicCounts.max(by: { $0.value < $1.value }),
                count >= 2 {
-                memory.topic = consensusTopic
-                committedLogs.append("Auto-inferred topic '\(consensusTopic)' for [\(memoryGlobalId.uuidString)]")
+                // Topic text is derived content too. Qualify every actual
+                // contributor now; stale/unknown/restricted neighbors are not
+                // permission to label a direct row. The user's explicit content
+                // and default topic survive when inference cannot be admitted.
+                let contributors = autoConnectCandidates.filter { $0.object.topic == consensusTopic }
+                    .compactMap { $0.object.globalId }
+                do {
+                    let inputs = try derivationSources([memoryGlobalId] + contributors)
+                    guard inputs.targets.filter({ $0.memory.globalId != memoryGlobalId })
+                        .allSatisfy({ $0.memory.topic == consensusTopic }) else {
+                        return RememberCommitEffects(memoryID: memoryGlobalId, edgeIDs: edgeIDs,
+                            parentNote: parentNote, autoLinkedGids: autoLinkedGids, logs: committedLogs)
+                    }
+                    let policy = try derivationRestriction(sources: inputs, project: memory.project)
+                    if !policy.privateFloor || memory.isPrivate {
+                        memory.derivationPolicy = policy.rawValue
+                        memory.topic = consensusTopic
+                        committedLogs.append("Auto-inferred a scope-compatible topic for [\(memoryGlobalId.uuidString)]")
+                    }
+                } catch is DerivationScopeError {
+                    // Inference is optional; no unqualified label is copied.
+                }
             }
         }
         return RememberCommitEffects(memoryID: memoryGlobalId, edgeIDs: edgeIDs,
@@ -1176,6 +1196,12 @@ extension MemoryTools {
             )
         }
 
+        let policyBefore: MutationRestrictionSnapshot
+        do {
+            guard let id = mem.globalId else { throw DerivationScopeError(message: "The memory has no stable identity.") }
+            policyBefore = try mutationRestriction(id)
+        } catch let refusal as DerivationScopeError { return refusal.result }
+
         // 6. Apply content edits + metadata in a single transaction
         let oldContent = mem.content
         var contentChanged = false
@@ -1208,6 +1234,15 @@ extension MemoryTools {
 
         do {
             try LatticeBeginRetry.run(on: writeLattice, log: { log("[update] \($0)") }) {
+                guard let id = mem.globalId else { throw DerivationScopeError(message: "The memory has no stable identity.") }
+                let current = try mutationRestriction(id)
+                guard current == policyBefore else {
+                    throw DerivationScopeError(message: "A source policy changed while updating. Re-read and retry.")
+                }
+                let desiredPrivate = a.isPrivate ?? (mem.isPrivate || current.policy.privateFloor)
+                try validateMutationRestriction(current.policy, project: a.setProject ?? mem.project, isPrivate: desiredPrivate)
+                if mem.derivationPolicy != current.policy.rawValue { mem.derivationPolicy = current.policy.rawValue }
+                if current.policy.privateFloor && !mem.isPrivate { mem.isPrivate = true }
                 if let content = a.content {
                     mem.content = content
                     contentChanged = true
@@ -1281,6 +1316,8 @@ extension MemoryTools {
                 // the original author, and the sync firewall keys on it.
                 mem.modifiedAt = Date()
             }
+        } catch let refusal as DerivationScopeError {
+            return refusal.result
         } catch let contention as LatticeBeginRetry.Contention {
             // Only failed BEGINs reach here: this attempt wrote nothing.
             // Setter, COMMIT, rollback and notification failures propagate
@@ -1370,8 +1407,8 @@ extension MemoryTools {
             try LatticeBeginRetry.run(on: localLattice, log: { log("[merge] \($0)") }) {
             let inputs = try derivationSources(gids)
             let sources = inputs.targets
-            let isPrivate = try derivationPrivacy(sources: inputs, project: project, unchangedFrom: initialScope)
-            let merged = Memory(content: content, topic: topic, project: project, source: "merged", embedding: embeddingVec, isPrivate: isPrivate, authorUserId: currentUserId, modifiedAt: Date())
+            let policy = try derivationRestriction(sources: inputs, project: project, unchangedFrom: initialScope)
+            let merged = Memory(content: content, topic: topic, project: project, source: "merged", embedding: embeddingVec, isPrivate: policy.privateFloor, authorUserId: currentUserId, modifiedAt: Date(), derivationPolicy: policy.rawValue)
             try localLattice.add(merged)
 
             guard let gid = merged.globalId else {

@@ -106,7 +106,7 @@ public actor MemoryTools {
             source: m.source,
             importance: m.importance,
             accessCount: m.accessCount,
-            isPrivate: m.isPrivate,
+            isPrivate: m.effectiveIsPrivate,
             authorUserId: m.authorUserId,
             createdAt: m.createdAt,
             modifiedAt: m.modifiedAt,

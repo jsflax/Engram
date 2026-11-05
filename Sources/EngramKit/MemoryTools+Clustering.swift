@@ -395,14 +395,14 @@ extension MemoryTools {
             summaryGlobalId = try LatticeBeginRetry.run(on: localLattice, log: { log("[consolidate] \($0)") }) {
                 let inputs = try derivationSources(ids)
                 let sources = inputs.targets
-                let isPrivate = try derivationPrivacy(sources: inputs, project: project, unchangedFrom: initialScope)
+                let policy = try derivationRestriction(sources: inputs, project: project, unchangedFrom: initialScope)
                 if a.force != true, sources.contains(where: { $0.memory.authorUserId != nil && $0.memory.authorUserId != selfId }) {
                     throw DerivationScopeError(message: "Source authorship changed. Consolidating teammate memories requires force: true.")
                 }
                 let summary = Memory(
                     content: a.content, topic: topic, project: project, source: "consolidation",
-                    embedding: embeddingVec, importance: importance, isPrivate: isPrivate,
-                    authorUserId: currentUserId, modifiedAt: Date()
+                    embedding: embeddingVec, importance: importance, isPrivate: policy.privateFloor,
+                    authorUserId: currentUserId, modifiedAt: Date(), derivationPolicy: policy.rawValue
                 )
                 try localLattice.add(summary)
                 guard let summaryGid = summary.globalId else {

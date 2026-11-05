@@ -61,6 +61,18 @@ public final class Memory {
     /// Author-only — enforced at the MCP handler.
     public var isPrivate: Bool
 
+    /// Versioned derivation restriction (schema v4). NULL is unclassified legacy
+    /// data, not proof of unrestricted sharing. This is not an MCP argument.
+    /// New direct memories carry an explicit direct policy; derived rows carry
+    /// a privacy floor and a finite group ceiling that routine edits preserve.
+    public var derivationPolicy: String?
+
+    /// Unclassified/corrupt rows remain readable locally but are not syncable.
+    public var effectiveIsPrivate: Bool {
+        guard let policy = MemoryDerivationPolicy(rawValue: derivationPolicy) else { return true }
+        return isPrivate || policy.privateFloor
+    }
+
     /// Who authored this memory (schema v3, Groups). Nil for legacy and
     /// never-signed-in rows. Stamped at creation from groups.json's
     /// `selfUserId`; NEVER changed by edits — attribution follows the
@@ -97,7 +109,8 @@ public final class Memory {
         authorUserId: UUID? = nil,
         deletedAt: Date? = nil,
         deletedBy: UUID? = nil,
-        modifiedAt: Date? = nil
+        modifiedAt: Date? = nil,
+        derivationPolicy: String? = MemoryDerivationPolicy.direct.rawValue
     ) {
         self.content = content
         self.topic = topic
@@ -110,9 +123,47 @@ public final class Memory {
         self.accessCount = accessCount
         self.importance = importance
         self.isPrivate = isPrivate
+        self.derivationPolicy = derivationPolicy
         self.authorUserId = authorUserId
         self.deletedAt = deletedAt
         self.deletedBy = deletedBy
         self.modifiedAt = modifiedAt
+    }
+}
+
+/// Canonical, bounded values permit exact SQL equality at native relay boundaries.
+/// Never use a substring/LIKE check to validate this wire field. This policy is
+/// client metadata, not a hosted credential or proof of source authorization.
+public struct MemoryDerivationPolicy: Equatable, Sendable {
+    public let rawValue: String
+    public let privateFloor: Bool
+    /// nil only for an explicitly created direct memory; [] means no groups.
+    public let groupCeiling: Set<String>?
+    public static let maximumGroups = 64
+    public static let direct = MemoryDerivationPolicy(rawValue: "engram-policy:1:direct")!
+
+    public init?(rawValue: String?) {
+        guard let rawValue, rawValue.utf8.count <= 4096 else { return nil }
+        if rawValue == "engram-policy:1:direct" {
+            self.rawValue = rawValue; privateFloor = false; groupCeiling = nil
+            return
+        }
+        let parts = rawValue.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 5, parts[0] == "engram-policy", parts[1] == "1",
+              parts[2] == "derived", parts[3] == "0" || parts[3] == "1" else { return nil }
+        let groups = parts[4].isEmpty ? [] : parts[4].split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+        guard groups.count <= Self.maximumGroups, Set(groups).count == groups.count,
+              groups == groups.sorted(), groups.allSatisfy({ UUID(uuidString: $0)?.uuidString == $0 }),
+              parts[3] != "1" || groups.isEmpty else { return nil }
+        self.rawValue = rawValue; privateFloor = parts[3] == "1"; groupCeiling = Set(groups)
+    }
+
+    public static func derived(privateFloor: Bool, groupCeiling: Set<String>) -> Self? {
+        let groups = privateFloor ? [] : groupCeiling.sorted()
+        return Self(rawValue: "engram-policy:1:derived:\(privateFloor ? "1" : "0"):\(groups.joined(separator: ","))")
+    }
+
+    public func permits(group: UUID) -> Bool {
+        !privateFloor && (groupCeiling?.contains(group.uuidString) ?? true)
     }
 }
