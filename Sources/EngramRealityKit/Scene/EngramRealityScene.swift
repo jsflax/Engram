@@ -30,6 +30,9 @@ public final class EngramRealityScene {
     public let rootEntity: Entity
     public weak var dataProvider: SceneDataProvider?
     public weak var cameraProvider: CameraProvider?
+    /// Logical view dimensions, supplied by the host. Unknown dimensions keep
+    /// mascot rendering conservative instead of guessing a camera frustum.
+    public var viewportSize: SIMD2<Float> = .zero
 
     // MARK: - Entity References
 
@@ -43,7 +46,11 @@ public final class EngramRealityScene {
     /// Hide the complete subtree and skip mascot frame updates while disabled.
     /// Retain existing entities so showing them resumes their state.
     public var showMascots: Bool = true {
-        didSet { mascotContainer.isEnabled = showMascots && !Self.diagnosticMascotsDisabled }
+        didSet {
+            if !showMascots || Self.diagnosticMascotsDisabled { mascotContainer.isEnabled = false }
+            // Re-show after the next frame has synced the camera and reconciled
+            // child eligibility, avoiding a burst of stale visible clones.
+        }
     }
     public var flowParticleEntity: ModelEntity?
     public let lightContainer: Entity
@@ -409,6 +416,28 @@ public final class EngramRealityScene {
         updateAfterTick(dt: dt, dataProvider: dataProvider)
     }
 
+    /// Capture the actual rendered perspective camera after camera sync.
+    /// Head-tracked views need their own reliable view/projection information;
+    /// until available they conservatively retain all mascot renderers.
+    private func mascotVisibilityCamera() -> MascotVisibilityCamera? {
+        guard let cameraProvider, !cameraProvider.isHeadTracked,
+              let projection = cameraEntity.components[PerspectiveCameraComponent.self] else { return nil }
+        let fieldOfViewOrientation: MascotVisibilityCamera.FieldOfViewOrientation
+        switch projection.fieldOfViewOrientation {
+        case .vertical: fieldOfViewOrientation = .vertical
+        case .horizontal: fieldOfViewOrientation = .horizontal
+        @unknown default: return nil
+        }
+        let orientation = cameraEntity.orientation(relativeTo: nil)
+        return MascotVisibilityCamera(
+            position: cameraEntity.position(relativeTo: nil),
+            right: orientation.act(SIMD3(1, 0, 0)), up: orientation.act(SIMD3(0, 1, 0)),
+            forward: orientation.act(SIMD3(0, 0, -1)),
+            fieldOfViewInDegrees: projection.fieldOfViewInDegrees,
+            fieldOfViewOrientation: fieldOfViewOrientation,
+            viewportSize: viewportSize, near: projection.near, far: projection.far)
+    }
+
     @inline(__always)
     private func updateAfterTick(dt: Float, dataProvider: SceneDataProvider) {
         // 2. Update scene root component
@@ -531,8 +560,10 @@ public final class EngramRealityScene {
                 container: mascotContainer,
                 dataProvider: dataProvider,
                 dt: dt,
-                scaleFactor: scaleFactor
+                scaleFactor: scaleFactor,
+                visibilityCamera: mascotVisibilityCamera()
             )
+            if !mascotContainer.isEnabled { mascotContainer.isEnabled = true }
         }
         phaseMark()
 

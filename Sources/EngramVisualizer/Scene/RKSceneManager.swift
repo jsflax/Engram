@@ -49,7 +49,11 @@ final class RKSceneManager {
             dataAdapter.selectedNode = selectedNode
         }
     }
-    var renderViewSize: CGSize = .zero
+    var renderViewSize: CGSize = .zero {
+        didSet {
+            rkScene.viewportSize = SIMD2(Float(renderViewSize.width), Float(renderViewSize.height))
+        }
+    }
 
     // Teleport state
     private(set) var teleportLabel: String?

@@ -12,7 +12,7 @@ import subprocess
 
 CLASSES = ('GalaxyLoadChangesTests', 'GalaxyDrainTests', 'ForceWakePolicyTests', 'VisualizerHostIsolationTests', 'AdapterSnapshotTests',
            'FrameLookupInvalidationTests', 'SceneMetadataDomainTests', 'LogsViewTests', 'NebulaLODVisibilityTests',
-           'NebulaDetailPlannerTests',
+           'NebulaDetailPlannerTests', 'MascotVisibilityTests',
            'SidebarSelectionTests', 'GamepadInputTests', 'HIDGamepadInputTests',
            'SidebarDatabaseMaintenanceTests', 'SidebarSyncSnapshotTests')
 # These functional regressions share a class with device-dependent performance

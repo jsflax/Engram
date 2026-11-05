@@ -128,7 +128,7 @@ class HostPreparationTests(unittest.TestCase):
             original = products / 'Engram.xctestrun'
             original.write_bytes(plistlib.dumps(self.original))
             result = M.prepare(root)
-            self.assertEqual(result['expected_tests'], 21)
+            self.assertEqual(result['expected_tests'], 22)
             output = plistlib.loads(Path(result['prepared']).read_bytes())
             environment = output['TestConfigurations'][0]['TestTargets'][0]['EnvironmentVariables']
             self.assertEqual(environment['CLAUDE_MEMORY_DB'], str(root / 'fixtures/app-memory.sqlite'))
@@ -183,7 +183,10 @@ class HostPreparationTests(unittest.TestCase):
             'testMascotInsertionRangesMatchFullRebuild',
             'testInsertionMembershipFallbacksMatchFullRebuild')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 223)
+        self.assertEqual(len(inventory), 236)
+        self.assertIn('MascotVisibilityTests/testSphereIntersectingViewportEdgeRemainsVisibleWhenItsCenterIsOutside', inventory)
+        self.assertIn('MascotVisibilityTests/testHiddenBehaviorAdvancesNormallyWhileVisualWritesAndQueueRemainRetained', inventory)
+        self.assertIn('MascotVisibilityTests/testLateFactoryCompletionUsesLatestCameraBeforeAttaching', inventory)
         self.assertIn('ForceWakePolicyTests/testExactly24ActualChangesStaySettledDespiteDuplicateAndAbsentOperations', inventory)
         self.assertIn('ForceWakePolicyTests/test25ActualChangesReheatFromTheSettledFloor', inventory)
         self.assertIn('ForceWakePolicyTests/testHubRemovalCountsIncidentEdgesTowardBulkWake', inventory)

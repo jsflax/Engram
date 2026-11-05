@@ -53,6 +53,8 @@ final class AdapterSnapshotTests: XCTestCase {
     func testMascotVisibilityReachesSceneAndPreservesExistingEntities() throws {
         let registry = GalaxyRegistry()
         let manager = try XCTUnwrap(RKSceneManager(registry: registry))
+        manager.renderViewSize = CGSize(width: 800, height: 600)
+        XCTAssertEqual(manager.rkScene.viewportSize, SIMD2<Float>(800, 600))
         let mascot = Entity()
         mascot.position = SIMD3<Float>(1, 2, 3)
         manager.rkScene.mascotContainer.addChild(mascot)
@@ -72,6 +74,11 @@ final class AdapterSnapshotTests: XCTestCase {
 
         manager.showMascots = true
         XCTAssertTrue(manager.rkScene.showMascots)
+        XCTAssertFalse(manager.rkScene.mascotContainer.isEnabled,
+                       "Re-show waits for the next camera-synced visibility reconciliation")
+        XCTAssertFalse(mascot.isEnabledInHierarchy)
+        XCTAssertFalse(lateMascot.isEnabledInHierarchy)
+        manager.rkScene.update(dt: 0)
         XCTAssertTrue(manager.rkScene.mascotContainer.isEnabled)
         XCTAssertTrue(manager.rkScene.mascotContainer.children.first === mascot)
         XCTAssertTrue(lateMascot.parent === manager.rkScene.mascotContainer)

@@ -229,6 +229,7 @@ struct Graph3DView: View {
     private func setupRKRenderer() {
         guard rkSceneManager == nil else { return }
         guard let mgr = RKSceneManager(registry: galaxyRegistry) else { return }
+        mgr.renderViewSize = viewFrame.size
         rkSceneManager = mgr
 
         mgr.galaxyRegistry = galaxyRegistry
