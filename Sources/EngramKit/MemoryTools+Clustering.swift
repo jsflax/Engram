@@ -338,14 +338,13 @@ extension MemoryTools {
         }
         let importance = min(max(a.importance?.value ?? 3, 1), 5)
 
-        // Fetch all memories by globalId
-        var sources: [(memory: Memory, lattice: Lattice)] = []
-        for gid in ids {
-            guard let found = findMemory(id: gid) else {
-                return CallTool.Result(content: [.text("Memory with id \(gid.uuidString) not found.")], isError: true)
-            }
-            sources.append(found)
+        let inputs: DerivationInputs
+        do {
+            inputs = try derivationSources(ids)
+        } catch let refusal as DerivationScopeError {
+            return refusal.result
         }
+        let sources = inputs.targets
 
         // Hard backstop (not just agent-prompt guidance): consolidating a
         // cluster with FOREIGN-authored members demotes teammates' memories
@@ -375,10 +374,10 @@ extension MemoryTools {
             let grouped = Dictionary(grouping: sources, by: { $0.memory.topic })
             return grouped.max(by: { $0.value.count < $1.value.count })?.key ?? sources[0].memory.topic
         }()
-        let initialScope = try derivationSnapshot(sources: sources, project: project)
-
+        let initialScope: DerivationSnapshot
         do {
-            _ = try derivationPrivacy(sources: sources, project: project)
+            initialScope = try derivationSnapshot(sources: inputs, project: project)
+            _ = try derivationPrivacy(sources: inputs, project: project)
         } catch let refusal as DerivationScopeError {
             return refusal.result
         }
@@ -389,13 +388,14 @@ extension MemoryTools {
         }
         let embeddingVec = Vector<Float>(floats)
 
-        // Summary, deprioritized originals (importance → 0) and summarized_by
-        // edges share one checked transaction with a bounded BEGIN retry.
+        // The summary, local originals and local edges share a checked
+        // transaction. Edits to other selected stores are not atomic with it.
         let summaryGlobalId: UUID
         do {
             summaryGlobalId = try LatticeBeginRetry.run(on: localLattice, log: { log("[consolidate] \($0)") }) {
-                let sources = try derivationSources(ids)
-                let isPrivate = try derivationPrivacy(sources: sources, project: project, unchangedFrom: initialScope)
+                let inputs = try derivationSources(ids)
+                let sources = inputs.targets
+                let isPrivate = try derivationPrivacy(sources: inputs, project: project, unchangedFrom: initialScope)
                 if a.force != true, sources.contains(where: { $0.memory.authorUserId != nil && $0.memory.authorUserId != selfId }) {
                     throw DerivationScopeError(message: "Source authorship changed. Consolidating teammate memories requires force: true.")
                 }

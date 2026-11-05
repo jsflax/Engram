@@ -72,15 +72,20 @@ extension MemoryTools {
         if let summary = a.summary, !summary.isEmpty {
             do {
                 let sources = try episodeSummarySources(epGid)
-                let initial = try derivationSnapshot(sources: sources, project: episode.project, destinationLattice: episodeLattice)
-                _ = try episodeSummaryPrivacy(episode: episode, owner: episodeLattice, sources: sources)
+                guard let captured = sources.targets.first(where: { $0.memory.globalId == epGid }),
+                      captured.lattice.configuration.fileURL == episodeLattice.configuration.fileURL,
+                      captured.memory.topic == "episode" else {
+                    throw DerivationScopeError(message: "The episode changed while reading. Re-read it before summarizing.")
+                }
+                let initial = try derivationSnapshot(sources: sources, project: captured.memory.project, destinationLattice: episodeLattice)
+                _ = try episodeSummaryPrivacy(episode: captured.memory, owner: episodeLattice, sources: sources)
 
                 // Only the destination is write-locked. Other stores are
                 // rechecked here, not atomically locked across processes.
                 summarizedMemberCount = try LatticeBeginRetry.run(on: episodeLattice, log: { log("[end_episode] \($0)") }) {
                     let episodes = episodeLattice.objects(Memory.self).where({ $0.globalId == epGid }).snapshot(limit: 2)
                     guard episodeLattice.lastQueryError() == nil, episodes.count == 1,
-                          let current = episodes.first,
+                          let current = episodes.first?.materialize(),
                           current.topic == "episode" else {
                         throw DerivationScopeError(message: "The episode is missing or changed. Re-read it before summarizing.")
                     }
@@ -92,7 +97,7 @@ extension MemoryTools {
                     if current.isPrivate != isPrivate { current.isPrivate = isPrivate }
                     current.content += "\n\nSummary: \(summary)"
                     current.modifiedAt = Date()
-                    return Set(sources.compactMap { $0.memory.globalId }).count - 1
+                    return Set(sources.targets.compactMap { $0.memory.globalId }).count - 1
                 }.value
             } catch let refusal as DerivationScopeError {
                 return refusal.result
@@ -239,48 +244,31 @@ extension MemoryTools {
     /// episode's owning store or findMemory's first copy. A private/tombstoned
     /// replica must not be hidden by a public local copy. Removed links are a
     /// conservative refusal: a supplied summary cannot prove it omitted them.
-    private func episodeSummarySources(_ episodeId: UUID) throws -> [(memory: Memory, lattice: Lattice)] {
-        var stores = [localLattice]
-        if let syncedLattice { stores.append(syncedLattice) }
-        stores.append(contentsOf: liveGroupSpokes().map(\.lattice))
+    private func episodeSummarySources(_ episodeId: UUID) throws -> DerivationInputs {
+        let stores = try derivationStores()
         var ids: Set<UUID> = [episodeId]
-        for store in stores {
-            let edges = store.objects(Edge.self).where({ $0.targetGlobalId == episodeId && $0.relation == .partOf }).snapshot()
-            guard store.lastQueryError() == nil else {
-                throw DerivationScopeError(message: "Could not read every episode member link. Restore access to the graph before summarizing.")
+        for (_, store) in stores {
+            let edges = store.objects(Edge.self).where({ $0.targetGlobalId == episodeId && $0.relation == .partOf }).snapshot(limit: 4097)
+            guard store.lastQueryError() == nil, edges.count <= 4096 else {
+                throw DerivationScopeError(message: "Could not read every episode member link within the derivation limit. Restore access or close without a summary.")
             }
             for edge in edges {
+                edge.materialize()
                 guard edge.deletedAt == nil else {
                     throw DerivationScopeError(message: "The episode contains a removed member link. Close without a summary or prepare a new episode from live sources.")
                 }
                 ids.insert(edge.sourceGlobalId)
             }
         }
-        var sources: [(memory: Memory, lattice: Lattice)] = []
-        for id in ids.sorted(by: { $0.uuidString < $1.uuidString }) {
-            var found = false
-            for store in stores {
-                let memories = store.objects(Memory.self).where({ $0.globalId == id }).snapshot(limit: 2)
-                guard store.lastQueryError() == nil, memories.count <= 1 else {
-                    throw DerivationScopeError(message: "Could not read every episode input. Restore access to the graph before summarizing.")
-                }
-                if let memory = memories.first {
-                    guard memory.deletedAt == nil else {
-                        throw DerivationScopeError(message: "An episode input is tombstoned. Close without a summary or prepare a new episode from live sources.")
-                    }
-                    sources.append((memory, store))
-                    found = true
-                }
-            }
-            guard found else {
-                throw DerivationScopeError(message: "An episode input is missing. Restore the source or close without a summary.")
-            }
+        let inputs = try derivationSources(ids.sorted(by: { $0.uuidString < $1.uuidString }))
+        guard inputs.stores == stores.map(\.binding) else {
+            throw DerivationScopeError(message: "Episode store bindings changed while reading. Re-read it before summarizing.")
         }
-        return sources
+        return inputs
     }
 
     private func episodeSummaryPrivacy(
-        episode: Memory, owner: Lattice, sources: [(memory: Memory, lattice: Lattice)],
+        episode: Memory, owner: Lattice, sources: DerivationInputs,
         unchangedFrom initial: DerivationSnapshot? = nil
     ) throws -> Bool {
         let isPrivate = try derivationPrivacy(sources: sources, project: episode.project,

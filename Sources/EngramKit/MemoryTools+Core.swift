@@ -1328,33 +1328,21 @@ extension MemoryTools {
         }
         let content = a.content
 
-        // Fetch the source memories (may span both DBs)
-        var sources: [(memory: Memory, lattice: Lattice)] = []
-        for gid in gids {
-            guard let found = findMemory(id: gid) else {
-                return CallTool.Result(content: [.text("Memory with id \(gid.uuidString) not found.")], isError: true)
-            }
-            sources.append(found)
+        let inputs: DerivationInputs
+        do {
+            inputs = try derivationSources(gids)
+        } catch let refusal as DerivationScopeError {
+            return refusal.result
         }
-
-        // Tombstoned sources are refused (like consolidate): merging one
-        // would bake removed content into a fresh live row (a tombstone
-        // bypass) and clobber the original tombstone attribution.
-        if let dead = sources.first(where: { $0.memory.deletedAt != nil }) {
-            let gidStr = dead.memory.globalId?.uuidString ?? "?"
-            return CallTool.Result(
-                content: [.text("Memory \(gidStr) is tombstoned (by \(GroupDirectory.badgeName(for: dead.memory.deletedBy))) — undelete it first or drop it from the merge.")],
-                isError: true
-            )
-        }
+        let sources = inputs.targets
 
         // Use first source for defaults
         let topic = a.topic ?? sources[0].memory.topic
         let project = a.project ?? sources[0].memory.project
-        let initialScope = try derivationSnapshot(sources: sources, project: project)
-
+        let initialScope: DerivationSnapshot
         do {
-            _ = try derivationPrivacy(sources: sources, project: project)
+            initialScope = try derivationSnapshot(sources: inputs, project: project)
+            _ = try derivationPrivacy(sources: inputs, project: project)
         } catch let refusal as DerivationScopeError {
             return refusal.result
         }
@@ -1365,8 +1353,9 @@ extension MemoryTools {
         }
         let embeddingVec = Vector<Float>(floats)
 
-        // Create merged memory, clean up edges, remove originals — all in one
-        // transaction. Group-shared and FOREIGN-AUTHORED sources are
+        // The destination and local edits share one checked transaction.
+        // Other selected stores are rechecked, not atomically write-locked.
+        // Group-shared and FOREIGN-AUTHORED sources are
         // TOMBSTONED (never hard-deleted): a hard delete would replicate to
         // every member, and destroying a teammate's original is not merge's
         // call to make. The merged summary is authored by the runner.
@@ -1379,8 +1368,9 @@ extension MemoryTools {
         let selfId = currentUserId
         do {
             try LatticeBeginRetry.run(on: localLattice, log: { log("[merge] \($0)") }) {
-            let sources = try derivationSources(gids)
-            let isPrivate = try derivationPrivacy(sources: sources, project: project, unchangedFrom: initialScope)
+            let inputs = try derivationSources(gids)
+            let sources = inputs.targets
+            let isPrivate = try derivationPrivacy(sources: inputs, project: project, unchangedFrom: initialScope)
             let merged = Memory(content: content, topic: topic, project: project, source: "merged", embedding: embeddingVec, isPrivate: isPrivate, authorUserId: currentUserId, modifiedAt: Date())
             try localLattice.add(merged)
 
