@@ -35,6 +35,11 @@ struct GamepadAccessView: View {
                     .font(.callout)
                     .padding(12)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+            } else if status == .unsupported {
+                Text("This controller isn’t supported by Engram yet.")
+                    .font(.callout)
+                    .padding(12)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
             }
         }
         .alert("Allow controller input?", isPresented: $isPresented) {

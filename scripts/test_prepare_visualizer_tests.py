@@ -183,7 +183,7 @@ class HostPreparationTests(unittest.TestCase):
             'testMascotInsertionRangesMatchFullRebuild',
             'testInsertionMembershipFallbacksMatchFullRebuild')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 197)
+        self.assertEqual(len(inventory), 200)
         self.assertIn('AdapterSnapshotTests/testIdenticalEdgeReplayPreservesRevisionsAndMixedAppendReuse', inventory)
         self.assertIn('GalaxyDrainTests/testIdenticalEdgeUpdateCancelsStalePendingInsertAndStillAppliesRealEdit', inventory)
         self.assertIn('GalaxyDrainTests/testEdgeSnapshotRejectsMalformedEndpointsWithoutChangingStoredRows', inventory)
@@ -197,6 +197,9 @@ class HostPreparationTests(unittest.TestCase):
             'testDescriptorRejectsOtherReportsAndCollectionAncestry',
             'testDescriptorRejectsRelativeAxesAndWrongElementTypes',
             'testSchemaRequiresExactlyOneOfEveryControl',
+            'testRecordedReportOneSelectsMappedControlsAndIgnoresAuxiliary',
+            'testAuxiliaryDescriptorAllowlistRejectsMalformedAndUnrecognizedEntries',
+            'testAuxiliaryDoesNotMaskDuplicateOrMissingMappedControls',
             'testIncompleteStateNeverProducesInput',
             'testHeldControlsMustReturnToNeutralBeforeFirstOutput',
             'testResetRequiresFreshCompleteNeutralState',

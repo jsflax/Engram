@@ -11,11 +11,18 @@ struct HIDGamepadElementDescriptor: Equatable, Sendable {
     let isRelative: Bool
     let hasGamepadAncestor: Bool
     let hasKeyboardOrMouseAncestor: Bool
+    let reportSize: UInt32
+    let reportCount: UInt32
 }
 
 enum HIDGamepadChannel: Hashable, Sendable {
     case leftX, leftY, rightX, rightY, leftTrigger, rightTrigger, hat
     case button(Int)
+}
+
+struct HIDGamepadSelectedInput: Equatable, Sendable {
+    let index: Int
+    let channel: HIDGamepadChannel
 }
 
 /// The reader handles discovery and lifecycle; profiles own device matching,
@@ -50,6 +57,15 @@ enum HIDGamepadProfile: Sendable {
         switch self { case .xboxWirelessBLE: XboxWirelessBLEInputPolicy.validatesSchema(elements) }
     }
 
+    /// Validate the complete report before selecting the controls we may read.
+    /// Recognized auxiliary metadata never becomes a subscribed input channel.
+    func selectedInputs(in elements: [HIDGamepadElementDescriptor]) -> [HIDGamepadSelectedInput]? {
+        guard validatesSchema(elements) else { return nil }
+        return elements.enumerated().compactMap { index, element in
+            channel(for: element).map { HIDGamepadSelectedInput(index: index, channel: $0) }
+        }
+    }
+
     func accepts(rawValue: Int, for channel: HIDGamepadChannel) -> Bool {
         switch self { case .xboxWirelessBLE: XboxWirelessBLEInputPolicy.accepts(rawValue: rawValue, for: channel) }
     }
@@ -78,24 +94,38 @@ enum XboxWirelessBLEInputPolicy {
 
     static func channel(for element: HIDGamepadElementDescriptor) -> HIDGamepadChannel? {
         guard element.reportID == 1, !element.isRelative,
-              element.hasGamepadAncestor, !element.hasKeyboardOrMouseAncestor else { return nil }
-        switch (element.type, element.page, element.usage, element.minimum, element.maximum) {
-        case (1, 1, 48, 0, 65535): return .leftX
-        case (1, 1, 49, 0, 65535): return .leftY
-        case (1, 1, 50, 0, 65535): return .rightX
-        case (1, 1, 53, 0, 65535): return .rightY
-        case (1, 1, 57, 1, 8): return .hat
-        case (1, 2, 197, 0, 1023): return .leftTrigger
-        case (1, 2, 196, 0, 1023): return .rightTrigger
-        case (2, 9, 1...15, 0, 1): return .button(Int(element.usage))
+              element.hasGamepadAncestor, !element.hasKeyboardOrMouseAncestor,
+              element.reportCount == 1 else { return nil }
+        switch (element.type, element.page, element.usage, element.minimum, element.maximum, element.reportSize) {
+        case (1, 1, 48, 0, 65535, 16): return .leftX
+        case (1, 1, 49, 0, 65535, 16): return .leftY
+        case (1, 1, 50, 0, 65535, 16): return .rightX
+        case (1, 1, 53, 0, 65535, 16): return .rightY
+        case (1, 1, 57, 1, 8, 4): return .hat
+        case (1, 2, 197, 0, 1023, 10): return .leftTrigger
+        case (1, 2, 196, 0, 1023, 10): return .rightTrigger
+        case (2, 9, 1...15, 0, 1, 1): return .button(Int(element.usage))
         default: return nil
         }
     }
 
+    /// The observed report has 23 inputs: 22 gamepad controls plus this one-bit
+    /// Consumer Record control. Its descriptor is recognized, but its value is
+    /// never subscribed to, read, or included in the neutral-state requirement.
+    static func isAuxiliary(_ element: HIDGamepadElementDescriptor) -> Bool {
+        element.reportID == 1 && element.type == 2 && element.page == 12
+            && element.usage == 178 && element.minimum == 0 && element.maximum == 1
+            && element.reportSize == 1 && element.reportCount == 1
+            && !element.isRelative && element.hasGamepadAncestor
+            && !element.hasKeyboardOrMouseAncestor
+    }
+
     static func validatesSchema(_ elements: [HIDGamepadElementDescriptor]) -> Bool {
-        guard elements.count == channels.count else { return false }
+        guard (channels.count...channels.count + 1).contains(elements.count) else { return false }
         let mapped = elements.compactMap { channel(for: $0) }
-        return mapped.count == elements.count && Set(mapped) == channels
+        guard mapped.count == channels.count, Set(mapped) == channels else { return false }
+        let auxiliary = elements.filter { channel(for: $0) == nil }
+        return auxiliary.count <= 1 && auxiliary.allSatisfy(isAuxiliary)
     }
 
     static func accepts(rawValue: Int, for channel: HIDGamepadChannel) -> Bool {

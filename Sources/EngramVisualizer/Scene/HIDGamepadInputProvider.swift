@@ -213,17 +213,20 @@ private final class HIDGamepadInputWorker: @unchecked Sendable {
                 && profile.inputReportIDs.contains(IOHIDElementGetReportID($0))
         }
         let descriptors = inputElements.map(Self.describe)
-        guard profile.validatesSchema(descriptors) else {
+        guard let selectedInputs = profile.selectedInputs(in: descriptors) else {
             mailbox.publish(generation: generation, status: .unsupported); return
         }
         var allowed: [IOHIDElementCookie: HIDGamepadElementRecord] = [:]
-        for (element, descriptor) in zip(inputElements, descriptors) {
-            guard let channel = profile.channel(for: descriptor) else { return }
+        // The complete descriptor list may contain recognized auxiliary fields.
+        // Only the profile's selected gamepad controls enter matching or reads.
+        for selected in selectedInputs {
+            let element = inputElements[selected.index]
+            let descriptor = descriptors[selected.index]
             let cookie = IOHIDElementGetCookie(element)
             guard allowed[cookie] == nil else {
                 mailbox.publish(generation: generation, status: .unsupported); return
             }
-            allowed[cookie] = HIDGamepadElementRecord(element: element, descriptor: descriptor, channel: channel)
+            allowed[cookie] = HIDGamepadElementRecord(element: element, descriptor: descriptor, channel: selected.channel)
         }
         guard allowed.count == profile.channels.count, mailbox.activeGeneration() == generation,
               IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else {
@@ -325,7 +328,8 @@ private final class HIDGamepadInputWorker: @unchecked Sendable {
             page: IOHIDElementGetUsagePage(element), usage: IOHIDElementGetUsage(element),
             minimum: IOHIDElementGetLogicalMin(element), maximum: IOHIDElementGetLogicalMax(element),
             isRelative: IOHIDElementIsRelative(element), hasGamepadAncestor: gamepad,
-            hasKeyboardOrMouseAncestor: prohibited)
+            hasKeyboardOrMouseAncestor: prohibited,
+            reportSize: IOHIDElementGetReportSize(element), reportCount: IOHIDElementGetReportCount(element))
     }
 
     private func seed(_ connection: HIDGamepadConnection, onlyMissing: Bool) {

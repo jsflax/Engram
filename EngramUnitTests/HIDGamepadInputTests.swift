@@ -11,11 +11,15 @@ final class HIDGamepadInputTests: XCTestCase {
                             minimum: Int = 0, maximum: Int = 65535,
                             isRelative: Bool = false,
                             hasGamepadAncestor: Bool = true,
-                            hasKeyboardOrMouseAncestor: Bool = false) -> HIDGamepadElementDescriptor {
-        HIDGamepadElementDescriptor(reportID: reportID, type: type, page: page, usage: usage,
+                            hasKeyboardOrMouseAncestor: Bool = false,
+                            reportSize: UInt32? = nil,
+                            reportCount: UInt32 = 1) -> HIDGamepadElementDescriptor {
+        let bits = reportSize ?? (page == 9 ? 1 : page == 2 ? 10 : usage == 57 ? 4 : 16)
+        return HIDGamepadElementDescriptor(reportID: reportID, type: type, page: page, usage: usage,
             minimum: minimum, maximum: maximum, isRelative: isRelative,
             hasGamepadAncestor: hasGamepadAncestor,
-            hasKeyboardOrMouseAncestor: hasKeyboardOrMouseAncestor)
+            hasKeyboardOrMouseAncestor: hasKeyboardOrMouseAncestor,
+            reportSize: bits, reportCount: reportCount)
     }
 
     private var descriptors: [HIDGamepadElementDescriptor] {
@@ -29,6 +33,50 @@ final class HIDGamepadInputTests: XCTestCase {
         [(.leftX, 32768), (.leftY, 32768), (.rightX, 32768), (.rightY, 32768),
          (.leftTrigger, 0), (.rightTrigger, 0), (.hat, 0)]
             + (1...15).map { (.button($0), 0) }
+    }
+
+    /// Sanitized complete report-1 input list from the 2026-11-05 element capture,
+    /// preserving its order and numeric fields. This includes the Consumer Record
+    /// entry omitted by the old handpicked fixture. No device IDs/cookies remain.
+    /// Absolute inputs and gamepad ancestry are corroborated by the static report
+    /// descriptor SHA-256 fb3633e4abcdaf3c52ea0c54388d50b252a2201214c1d0418e09ff62ce6e010f.
+    private func recordedReportOneInputs() throws -> [HIDGamepadElementDescriptor] {
+        struct RecordedInput: Decodable {
+            let type, page, usage, reportID, size, count: UInt32
+            let minimum, maximum: Int
+        }
+        let json = """
+        [
+          {"type":1,"page":1,"usage":48,"reportID":1,"size":16,"count":1,"minimum":0,"maximum":65535},
+          {"type":1,"page":1,"usage":49,"reportID":1,"size":16,"count":1,"minimum":0,"maximum":65535},
+          {"type":1,"page":1,"usage":50,"reportID":1,"size":16,"count":1,"minimum":0,"maximum":65535},
+          {"type":1,"page":1,"usage":53,"reportID":1,"size":16,"count":1,"minimum":0,"maximum":65535},
+          {"type":2,"page":9,"usage":1,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":2,"page":9,"usage":2,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":2,"page":9,"usage":3,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":2,"page":9,"usage":4,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":2,"page":9,"usage":5,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":2,"page":9,"usage":6,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":2,"page":9,"usage":7,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":2,"page":9,"usage":8,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":2,"page":9,"usage":9,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":2,"page":9,"usage":10,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":2,"page":9,"usage":11,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":2,"page":9,"usage":12,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":2,"page":9,"usage":13,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":2,"page":9,"usage":14,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":2,"page":9,"usage":15,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":2,"page":12,"usage":178,"reportID":1,"size":1,"count":1,"minimum":0,"maximum":1},
+          {"type":1,"page":2,"usage":197,"reportID":1,"size":10,"count":1,"minimum":0,"maximum":1023},
+          {"type":1,"page":2,"usage":196,"reportID":1,"size":10,"count":1,"minimum":0,"maximum":1023},
+          {"type":1,"page":1,"usage":57,"reportID":1,"size":4,"count":1,"minimum":1,"maximum":8}
+        ]
+        """
+        return try JSONDecoder().decode([RecordedInput].self, from: Data(json.utf8)).map {
+            descriptor(reportID: $0.reportID, type: $0.type, page: $0.page, usage: $0.usage,
+                       minimum: $0.minimum, maximum: $0.maximum,
+                       reportSize: $0.size, reportCount: $0.count)
+        }
     }
 
     private func readyState() -> HIDGamepadValueState {
@@ -95,9 +143,12 @@ final class HIDGamepadInputTests: XCTestCase {
             descriptor(type: 2, page: 9, usage: 0, maximum: 1),
             descriptor(type: 2, page: 9, usage: 16, maximum: 1),
             descriptor(minimum: -32768, maximum: 32767), descriptor(maximum: 255),
+            descriptor(reportSize: 8), descriptor(reportCount: 2),
             descriptor(page: 2, usage: 196, maximum: 65535),
+            descriptor(page: 2, usage: 196, maximum: 1023, reportSize: 16),
             descriptor(usage: 57, minimum: 0, maximum: 7),
-            descriptor(type: 2, page: 9, usage: 1, maximum: 2)]
+            descriptor(type: 2, page: 9, usage: 1, maximum: 2),
+            descriptor(type: 2, page: 9, usage: 1, maximum: 1, reportCount: 2)]
         for element in rejected { XCTAssertNil(XboxWirelessBLEInputPolicy.channel(for: element)) }
     }
 
@@ -115,6 +166,75 @@ final class HIDGamepadInputTests: XCTestCase {
         var foreignReport = descriptors
         foreignReport[0] = descriptor(reportID: 14)
         XCTAssertFalse(XboxWirelessBLEInputPolicy.validatesSchema(foreignReport))
+    }
+
+    func testRecordedReportOneSelectsMappedControlsAndIgnoresAuxiliary() throws {
+        let profile = HIDGamepadProfile.xboxWirelessBLE
+        let recorded = try recordedReportOneInputs()
+        XCTAssertEqual(recorded.count, 23)
+        XCTAssertTrue(profile.validatesSchema(recorded))
+        let selected = try XCTUnwrap(profile.selectedInputs(in: recorded))
+        XCTAssertEqual(selected.count, 22)
+        XCTAssertEqual(Set(selected.map(\.channel)), profile.channels)
+        XCTAssertEqual(selected.map(\.index), Array(0...18) + Array(20...22),
+                       "The same plan used for device matching and seeding must omit the auxiliary")
+        XCTAssertNil(profile.channel(for: recorded[19]))
+
+        let neutral = Dictionary(uniqueKeysWithValues: neutralInputs)
+        var state = HIDGamepadValueState(profile: profile)
+        for input in selected {
+            XCTAssertEqual(profile.channel(for: recorded[input.index]), input.channel)
+            XCTAssertTrue(state.update(channel: input.channel, rawValue: try XCTUnwrap(neutral[input.channel])))
+        }
+        XCTAssertTrue(state.isComplete, "No auxiliary value is read or required to complete the state")
+        XCTAssertTrue(state.isNeutral)
+        XCTAssertEqual(state.output, readyState().output)
+        XCTAssertTrue(state.update(channel: .leftX, rawValue: 65535))
+        XCTAssertEqual(state.output?.leftX, 1)
+        XCTAssertTrue(state.update(channel: .button(5), rawValue: 1))
+        XCTAssertEqual(state.output?.buttons, 1 << 3)
+        XCTAssertEqual(profile.selectedInputs(in: descriptors)?.count, 22,
+                       "The auxiliary is permitted, not mandatory")
+    }
+
+    func testAuxiliaryDescriptorAllowlistRejectsMalformedAndUnrecognizedEntries() throws {
+        let profile = HIDGamepadProfile.xboxWirelessBLE
+        let invalid = [
+            descriptor(reportID: 5, type: 2, page: 12, usage: 178, maximum: 1, reportSize: 1),
+            descriptor(type: 1, page: 12, usage: 178, maximum: 1, reportSize: 1),
+            descriptor(type: 129, page: 12, usage: 178, maximum: 1, reportSize: 1),
+            descriptor(type: 2, page: 13, usage: 178, maximum: 1, reportSize: 1),
+            descriptor(type: 2, page: 12, usage: 179, maximum: 1, reportSize: 1),
+            descriptor(type: 2, page: 12, usage: 178, minimum: 1, maximum: 1, reportSize: 1),
+            descriptor(type: 2, page: 12, usage: 178, maximum: 2, reportSize: 1),
+            descriptor(type: 2, page: 12, usage: 178, maximum: 1, isRelative: true, reportSize: 1),
+            descriptor(type: 2, page: 12, usage: 178, maximum: 1, hasGamepadAncestor: false, reportSize: 1),
+            descriptor(type: 2, page: 12, usage: 178, maximum: 1, hasKeyboardOrMouseAncestor: true, reportSize: 1),
+            descriptor(type: 2, page: 12, usage: 178, maximum: 1, reportSize: 0),
+            descriptor(type: 2, page: 12, usage: 178, maximum: 1, reportSize: 2),
+            descriptor(type: 2, page: 12, usage: 178, maximum: 1, reportSize: 1, reportCount: 0),
+            descriptor(type: 2, page: 12, usage: 178, maximum: 1, reportSize: 1, reportCount: 2),
+        ]
+        for auxiliary in invalid {
+            var recorded = try recordedReportOneInputs()
+            recorded[19] = auxiliary
+            XCTAssertFalse(profile.validatesSchema(recorded), "Malformed auxiliary: \(auxiliary)")
+            XCTAssertNil(profile.selectedInputs(in: recorded), "No input plan may escape validation")
+        }
+    }
+
+    func testAuxiliaryDoesNotMaskDuplicateOrMissingMappedControls() throws {
+        let profile = HIDGamepadProfile.xboxWirelessBLE
+        let recorded = try recordedReportOneInputs()
+        XCTAssertNil(profile.selectedInputs(in: recorded + [recorded[19]]), "Duplicate auxiliaries are ambiguous")
+        for index in recorded.indices where index != 19 {
+            var missing = recorded
+            missing.remove(at: index)
+            XCTAssertNil(profile.selectedInputs(in: missing), "Missing mapped control \(index)")
+            var duplicate = recorded
+            duplicate[index] = recorded[index == 0 ? 1 : 0]
+            XCTAssertNil(profile.selectedInputs(in: duplicate), "Duplicate mapped control \(index)")
+        }
     }
 
     func testIncompleteStateNeverProducesInput() {
