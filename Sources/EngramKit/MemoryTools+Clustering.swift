@@ -375,6 +375,13 @@ extension MemoryTools {
             let grouped = Dictionary(grouping: sources, by: { $0.memory.topic })
             return grouped.max(by: { $0.value.count < $1.value.count })?.key ?? sources[0].memory.topic
         }()
+        let initialScope = derivationSnapshot(sources: sources, project: project)
+
+        do {
+            _ = try derivationPrivacy(sources: sources, project: project)
+        } catch let refusal as DerivationScopeError {
+            return refusal.result
+        }
 
         // Generate embedding for summary
         guard let floats = try await embedder.embed(text: a.content) else {
@@ -382,37 +389,36 @@ extension MemoryTools {
         }
         let embeddingVec = Vector<Float>(floats)
 
-        // Create summary memory (authored by the runner)
-        let summary = Memory(
-            content: a.content,
-            topic: topic,
-            project: project,
-            source: "consolidation",
-            embedding: embeddingVec,
-            importance: importance,
-            authorUserId: currentUserId,
-            modifiedAt: Date()
-        )
         // Summary, deprioritized originals (importance → 0) and summarized_by
         // edges share one checked transaction with a bounded BEGIN retry.
-        nonisolated(unsafe) let sourceMemories = sources.map(\.memory)
-        let sourceGlobalIds = sourceMemories.compactMap(\.globalId)
         let summaryGlobalId: UUID
         do {
             summaryGlobalId = try LatticeBeginRetry.run(on: localLattice, log: { log("[consolidate] \($0)") }) {
+                let sources = try derivationSources(ids)
+                let isPrivate = try derivationPrivacy(sources: sources, project: project, unchangedFrom: initialScope)
+                if a.force != true, sources.contains(where: { $0.memory.authorUserId != nil && $0.memory.authorUserId != selfId }) {
+                    throw DerivationScopeError(message: "Source authorship changed. Consolidating teammate memories requires force: true.")
+                }
+                let summary = Memory(
+                    content: a.content, topic: topic, project: project, source: "consolidation",
+                    embedding: embeddingVec, importance: importance, isPrivate: isPrivate,
+                    authorUserId: currentUserId, modifiedAt: Date()
+                )
                 try localLattice.add(summary)
                 guard let summaryGid = summary.globalId else {
                     throw MCPError.internalError("Failed to get summary globalId after persist")
                 }
-                for mem in sourceMemories {
-                    mem.importance = 0
+                for source in sources {
+                    source.memory.importance = 0
                 }
-                for sourceGlobalId in sourceGlobalIds {
+                for sourceGlobalId in sources.compactMap({ $0.memory.globalId }) {
                     let edge = Edge(sourceGlobalId: sourceGlobalId, targetGlobalId: summaryGid, relation: .summarizedBy, authorUserId: currentUserId)
                     try localLattice.add(edge)
                 }
                 return summaryGid
             }.value
+        } catch let refusal as DerivationScopeError {
+            return refusal.result
         } catch let contention as LatticeBeginRetry.Contention {
             log("[consolidate] not consolidated: \(contention)")
             return Self.busyReceipt(tool: "consolidate", verb: "consolidated", contention: contention)
