@@ -42,10 +42,21 @@ extension MemoryTools {
     /// Immutable values, not live model references: reclassifying or replacing a
     /// source while embedding must not publish a summary of its older content.
     func derivationSnapshot(
-        sources: [(memory: Memory, lattice: Lattice)], project: String
-    ) -> DerivationSnapshot {
+        sources: [(memory: Memory, lattice: Lattice)], project: String,
+        destinationLattice: Lattice? = nil
+    ) throws -> DerivationSnapshot {
         let spokes = liveGroupSpokes()
-        return DerivationSnapshot(sources: sources.map { source in
+        // Existing rows may be updated directly in a group spoke. Its actual
+        // audience is authoritative even if a local project has the same name.
+        let destination: Set<String>
+        if let destinationLattice, let spoke = spokes.first(where: {
+            $0.lattice.configuration.fileURL.standardizedFileURL == destinationLattice.configuration.fileURL.standardizedFileURL
+        }) {
+            destination = [spoke.groupId.uuidString]
+        } else {
+            destination = try derivationProjectAudience(project)
+        }
+        return try DerivationSnapshot(sources: sources.map { source in
             let store = source.lattice.configuration.fileURL.standardizedFileURL
             let audience: Set<String>
             if source.memory.isPrivate {
@@ -55,7 +66,7 @@ extension MemoryTools {
                 // spoke defines its audience, not a local project's name.
                 audience = [spoke.groupId.uuidString]
             } else {
-                audience = derivationProjectAudience(source.memory.project)
+                audience = try derivationProjectAudience(source.memory.project)
             }
             return DerivationSnapshot.Source(
                 id: source.memory.globalId, store: store,
@@ -63,7 +74,7 @@ extension MemoryTools {
                 isPrivate: source.memory.isPrivate, author: source.memory.authorUserId,
                 modifiedAt: source.memory.modifiedAt, audience: audience
             )
-        }, destination: derivationProjectAudience(project))
+        }, destination: destination)
     }
 
     /// Returns the privacy inherited by a derived row. This checks the audience
@@ -72,10 +83,11 @@ extension MemoryTools {
     func derivationPrivacy(
         sources: [(memory: Memory, lattice: Lattice)],
         project: String,
+        destinationLattice: Lattice? = nil,
         updatesSourceLabels: Bool = false,
         unchangedFrom initial: DerivationSnapshot? = nil
     ) throws -> Bool {
-        let snapshot = derivationSnapshot(sources: sources, project: project)
+        let snapshot = try derivationSnapshot(sources: sources, project: project, destinationLattice: destinationLattice)
         if let initial, snapshot != initial {
             throw DerivationScopeError(message: "Source content or sharing scope changed while deriving. Re-read the sources and retry.")
         }
@@ -106,8 +118,12 @@ extension MemoryTools {
         return false
     }
 
-    private func derivationProjectAudience(_ project: String) -> Set<String> {
-        guard let config = localLattice.objects(SyncConfig.self).where({ $0.project == project }).first else { return [] }
+    private func derivationProjectAudience(_ project: String) throws -> Set<String> {
+        let configs = localLattice.objects(SyncConfig.self).where({ $0.project == project }).snapshot(limit: 2)
+        guard localLattice.lastQueryError() == nil, configs.count <= 1 else {
+            throw DerivationScopeError(message: "Could not determine the project's sharing scope. Restore access to its policy before deriving.")
+        }
+        guard let config = configs.first else { return [] }
         // Group exposure is exact-project only; _default governs personal sync.
         // Preserve legacy non-UUID identifiers while normalizing UUID casing.
         return Set(config.exposedGroups.map { UUID(uuidString: $0)?.uuidString ?? $0 })

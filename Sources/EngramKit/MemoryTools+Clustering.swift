@@ -375,7 +375,7 @@ extension MemoryTools {
             let grouped = Dictionary(grouping: sources, by: { $0.memory.topic })
             return grouped.max(by: { $0.value.count < $1.value.count })?.key ?? sources[0].memory.topic
         }()
-        let initialScope = derivationSnapshot(sources: sources, project: project)
+        let initialScope = try derivationSnapshot(sources: sources, project: project)
 
         do {
             _ = try derivationPrivacy(sources: sources, project: project)

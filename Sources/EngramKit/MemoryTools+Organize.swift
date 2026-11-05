@@ -118,7 +118,7 @@ extension MemoryTools {
         }
 
         let project = a.project ?? sources[0].memory.project
-        let initialScope = derivationSnapshot(sources: sources, project: project)
+        let initialScope = try derivationSnapshot(sources: sources, project: project)
 
         do {
             _ = try derivationPrivacy(sources: try derivationSources(ids), project: project, updatesSourceLabels: true)
