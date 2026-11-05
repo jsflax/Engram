@@ -109,15 +109,22 @@ extension MemoryTools {
         }
 
         // Verify memories exist and determine project
-        var memories: [UUID: Memory] = [:]
+        var sources: [(memory: Memory, lattice: Lattice)] = []
         for gid in ids {
-            guard let (mem, _) = findMemory(id: gid) else {
+            guard let source = findMemory(id: gid) else {
                 return CallTool.Result(content: [.text("Memory [id:\(gid.uuidString)] not found.")], isError: true)
             }
-            memories[gid] = mem
+            sources.append(source)
         }
 
-        let project = a.project ?? memories[ids[0]]?.project ?? "global"
+        let project = a.project ?? sources[0].memory.project
+        let initialScope = try derivationSnapshot(sources: sources, project: project)
+
+        do {
+            _ = try derivationPrivacy(sources: try derivationSources(ids), project: project, updatesSourceLabels: true)
+        } catch let refusal as DerivationScopeError {
+            return refusal.result
+        }
 
         // Create hub memory
         let hubContent = a.summary ?? "Hub: \(label)"
@@ -125,32 +132,33 @@ extension MemoryTools {
         if let floats = try await embedder.embed(text: hubContent) {
             hubEmbedding = Vector<Float>(floats)
         }
-        let hub = Memory(
-            content: hubContent,
-            topic: label,
-            project: project,
-            source: "organize",
-            embedding: hubEmbedding
-        )
         // Hub, edges and topic updates share one checked transaction with a
         // bounded BEGIN retry (previously an autocommit add followed by an
         // unchecked transaction whose failed BEGIN trapped the process).
         let hubGlobalId: UUID
         do {
             hubGlobalId = try LatticeBeginRetry.run(on: localLattice, log: { log("[organize] \($0)") }) {
+                let sources = try derivationSources(ids)
+                let isPrivate = try derivationPrivacy(sources: sources, project: project, updatesSourceLabels: true, unchangedFrom: initialScope)
+                let hub = Memory(
+                    content: hubContent, topic: label, project: project, source: "organize",
+                    embedding: hubEmbedding, isPrivate: isPrivate, authorUserId: currentUserId
+                )
                 try localLattice.add(hub)
                 guard let hubGid = hub.globalId else {
                     throw MCPError.internalError("Failed to get hub globalId.")
                 }
-                for gid in ids {
-                    if let mem = memories[gid] {
+                for source in sources {
+                    if let gid = source.memory.globalId {
                         let edge = Edge(sourceGlobalId: gid, targetGlobalId: hubGid, relation: .partOf, authorUserId: currentUserId)
                         try localLattice.add(edge)
-                        mem.topic = label
+                        source.memory.topic = label
                     }
                 }
                 return hubGid
             }.value
+        } catch let refusal as DerivationScopeError {
+            return refusal.result
         } catch let contention as LatticeBeginRetry.Contention {
             log("[organize] not organized: \(contention)")
             return Self.busyReceipt(tool: "organize", verb: "organized", contention: contention)

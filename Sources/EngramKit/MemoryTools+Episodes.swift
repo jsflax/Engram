@@ -44,28 +44,61 @@ extension MemoryTools {
         let a = try args.decode(EndEpisodeArgs.self)
 
         let episode: Memory
+        let episodeLattice: Lattice
         let epGid: UUID
         if let gid = a.episodeId?.value {
-            guard let (found, _) = findMemory(id: gid) else {
+            guard let (found, owner) = findMemory(id: gid) else {
                 return CallTool.Result(content: [.text("Episode with id \(gid.uuidString) not found.")], isError: true)
             }
             guard found.topic == "episode" else {
                 return CallTool.Result(content: [.text("Memory \(gid.uuidString) is not an episode.")], isError: true)
             }
             episode = found
+            episodeLattice = owner
             epGid = gid
         } else {
             guard let activeId = activeEpisodeId,
-                  let (found, _) = findMemory(id: activeId) else {
+                  let (found, owner) = findMemory(id: activeId) else {
                 throw MCPError.invalidParams("No active episode. Provide 'episode_id' or start one with begin_episode.")
             }
             episode = found
+            episodeLattice = owner
             epGid = activeId
         }
 
-        // Append summary to episode content
+        // Closing without a summary is session bookkeeping only. Keep it
+        // usable even when removed members make a summary unsafe to publish.
+        var summarizedMemberCount: Int?
         if let summary = a.summary, !summary.isEmpty {
-            episode.content += "\n\nSummary: \(summary)"
+            do {
+                let sources = try episodeSummarySources(epGid)
+                let initial = try derivationSnapshot(sources: sources, project: episode.project, destinationLattice: episodeLattice)
+                _ = try episodeSummaryPrivacy(episode: episode, owner: episodeLattice, sources: sources)
+
+                // Only the destination is write-locked. Other stores are
+                // rechecked here, not atomically locked across processes.
+                summarizedMemberCount = try LatticeBeginRetry.run(on: episodeLattice, log: { log("[end_episode] \($0)") }) {
+                    let episodes = episodeLattice.objects(Memory.self).where({ $0.globalId == epGid }).snapshot(limit: 2)
+                    guard episodeLattice.lastQueryError() == nil, episodes.count == 1,
+                          let current = episodes.first,
+                          current.topic == "episode" else {
+                        throw DerivationScopeError(message: "The episode is missing or changed. Re-read it before summarizing.")
+                    }
+                    let sources = try episodeSummarySources(epGid)
+                    let isPrivate = try episodeSummaryPrivacy(episode: current, owner: episodeLattice,
+                                                             sources: sources, unchangedFrom: initial)
+                    // These setters share the owning store's checked transaction:
+                    // no summary text can commit before its privacy flag does.
+                    if current.isPrivate != isPrivate { current.isPrivate = isPrivate }
+                    current.content += "\n\nSummary: \(summary)"
+                    current.modifiedAt = Date()
+                    return Set(sources.compactMap { $0.memory.globalId }).count - 1
+                }.value
+            } catch let refusal as DerivationScopeError {
+                return refusal.result
+            } catch let contention as LatticeBeginRetry.Contention {
+                return Self.busyReceipt(tool: "end_episode", verb: "summarized", contention: contention)
+            }
         }
 
         // Clear activeEpisodeId if it matches
@@ -73,7 +106,7 @@ extension MemoryTools {
             activeEpisodeId = nil
         }
 
-        let memoryCount = countEpisodeMembers(epGid)
+        let memoryCount = summarizedMemberCount ?? countEpisodeMembers(epGid)
         let duration = episodeDuration(epGid, startedAt: episode.createdAt)
 
         log("Ended episode [id:\(epGid.uuidString)]")
@@ -201,6 +234,69 @@ extension MemoryTools {
     }
 
     // MARK: - Episode Helpers
+
+    /// Include every reachable replica and membership edge, not just the
+    /// episode's owning store or findMemory's first copy. A private/tombstoned
+    /// replica must not be hidden by a public local copy. Removed links are a
+    /// conservative refusal: a supplied summary cannot prove it omitted them.
+    private func episodeSummarySources(_ episodeId: UUID) throws -> [(memory: Memory, lattice: Lattice)] {
+        var stores = [localLattice]
+        if let syncedLattice { stores.append(syncedLattice) }
+        stores.append(contentsOf: liveGroupSpokes().map(\.lattice))
+        var ids: Set<UUID> = [episodeId]
+        for store in stores {
+            let edges = store.objects(Edge.self).where({ $0.targetGlobalId == episodeId && $0.relation == .partOf }).snapshot()
+            guard store.lastQueryError() == nil else {
+                throw DerivationScopeError(message: "Could not read every episode member link. Restore access to the graph before summarizing.")
+            }
+            for edge in edges {
+                guard edge.deletedAt == nil else {
+                    throw DerivationScopeError(message: "The episode contains a removed member link. Close without a summary or prepare a new episode from live sources.")
+                }
+                ids.insert(edge.sourceGlobalId)
+            }
+        }
+        var sources: [(memory: Memory, lattice: Lattice)] = []
+        for id in ids.sorted(by: { $0.uuidString < $1.uuidString }) {
+            var found = false
+            for store in stores {
+                let memories = store.objects(Memory.self).where({ $0.globalId == id }).snapshot(limit: 2)
+                guard store.lastQueryError() == nil, memories.count <= 1 else {
+                    throw DerivationScopeError(message: "Could not read every episode input. Restore access to the graph before summarizing.")
+                }
+                if let memory = memories.first {
+                    guard memory.deletedAt == nil else {
+                        throw DerivationScopeError(message: "An episode input is tombstoned. Close without a summary or prepare a new episode from live sources.")
+                    }
+                    sources.append((memory, store))
+                    found = true
+                }
+            }
+            guard found else {
+                throw DerivationScopeError(message: "An episode input is missing. Restore the source or close without a summary.")
+            }
+        }
+        return sources
+    }
+
+    private func episodeSummaryPrivacy(
+        episode: Memory, owner: Lattice, sources: [(memory: Memory, lattice: Lattice)],
+        unchangedFrom initial: DerivationSnapshot? = nil
+    ) throws -> Bool {
+        let isPrivate = try derivationPrivacy(sources: sources, project: episode.project,
+                                             destinationLattice: owner, unchangedFrom: initial)
+        if isPrivate {
+            // Group/personal cloud spokes are already remote destinations.
+            // Marking their row private does not retract a raw spoke write.
+            guard owner.configuration.fileURL.standardizedFileURL == localLattice.configuration.fileURL.standardizedFileURL else {
+                throw DerivationScopeError(message: "Private-derived summaries cannot be written directly to a synced or group episode. Create a private local summary instead.")
+            }
+            if !episode.isPrivate, let author = episode.authorUserId, author != currentUserId {
+                throw DerivationScopeError(message: "Making this episode private is author-only. Its author must make that change before a private summary can be appended.")
+            }
+        }
+        return isPrivate
+    }
 
     /// Clear the active episode state.
     func endActiveEpisode() {
