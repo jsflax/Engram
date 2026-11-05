@@ -63,8 +63,8 @@ enum HIDGamepadProfile: Sendable {
     }
 }
 
-/// The vendor/product pair is shared by Xbox models, so it is never enough to
-/// select a device without validating the complete observed BLE input layout.
+/// Device identity alone does not establish its report layout. Validate the
+/// complete observed BLE input layout before accepting controller values.
 enum XboxWirelessBLEInputPolicy {
     static let channels: Set<HIDGamepadChannel> = Set([
         .leftX, .leftY, .rightX, .rightY, .leftTrigger, .rightTrigger, .hat
