@@ -220,7 +220,13 @@ final class NebulaLODVisibilityTests: XCTestCase {
         }
         let aggregate = try XCTUnwrap(container.children.first { $0.name == "GalaxyGas_main" })
         XCTAssertTrue(aggregate.isEnabled)
-        XCTAssertTrue((aggregate.position) == (center * 0.01))
+        let expectedPosition = center * 0.01
+        // Summing 166 Float-weighted centers introduces tiny rounding error.
+        // This tolerance is 0.01 world unit at the fixture's 0.01 render scale.
+        let positionTolerance: Float = 0.0001
+        let positionError = simd_length(aggregate.position - expectedPosition)
+        XCTAssertTrue(positionError <= positionTolerance,
+                "Fallback center expected \(expectedPosition), actual \(aggregate.position), error \(positionError), tolerance \(positionTolerance)")
         XCTAssertTrue((try XCTUnwrap(aggregate.components[OpacityComponent.self]?.opacity)) > (0.8))
         update(system, container, provider, camera: center + SIMD3<Float>(6000, 0, 0))
         XCTAssertTrue(container.children.first { $0.name == "GalaxyGas_main" } === aggregate)

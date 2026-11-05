@@ -414,7 +414,13 @@ struct NebulaLODVisibilityTests {
         }
         let aggregate = try #require(container.children.first { $0.name == "GalaxyGas_main" })
         #expect(aggregate.isEnabled)
-        #expect((aggregate.position) == (center * 0.01))
+        let expectedPosition = center * 0.01
+        // Summing 166 Float-weighted centers introduces tiny rounding error.
+        // This tolerance is 0.01 world unit at the fixture's 0.01 render scale.
+        let positionTolerance: Float = 0.0001
+        let positionError = simd_length(aggregate.position - expectedPosition)
+        #expect(positionError <= positionTolerance,
+                "Fallback center expected \(expectedPosition), actual \(aggregate.position), error \(positionError), tolerance \(positionTolerance)")
         #expect((try #require(aggregate.components[OpacityComponent.self]?.opacity)) > (0.8))
         update(system, container, provider, camera: center + SIMD3<Float>(6000, 0, 0))
         #expect(container.children.first { $0.name == "GalaxyGas_main" } === aggregate)
