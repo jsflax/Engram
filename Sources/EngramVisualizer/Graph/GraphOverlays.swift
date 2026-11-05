@@ -91,7 +91,7 @@ struct StatsOverlay: View {
             Divider().frame(width: 100).overlay(Color.white.opacity(0.2))
 
             ScrollView(.vertical, showsIndicators: false) {
-                VStack(alignment: .trailing, spacing: 6) {
+                LazyVStack(alignment: .trailing, spacing: 6) {
                     // Project filters
                     ForEach(projects, id: \.self) { project in
                         HStack(spacing: 4) {
@@ -105,6 +105,8 @@ struct StatsOverlay: View {
                                 .buttonStyle(.plain)
                                 .opacity(hiddenProjects.contains(project) ? 0.3 : 0.6)
                                 .help("Fly to \(project)")
+                                .accessibilityLabel("Fly to \(project)")
+                                .accessibilityIdentifier("stats.fly.\(project)")
                             }
                             Button {
                                 toggleProject(project)
@@ -117,9 +119,15 @@ struct StatsOverlay: View {
                                     Text(project)
                                         .font(.system(size: 11, design: .monospaced))
                                         .strikethrough(hiddenProjects.contains(project))
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
                                 }
                             }
                             .buttonStyle(.plain)
+                            .help(project)
+                            .accessibilityLabel(project)
+                            .accessibilityValue(hiddenProjects.contains(project) ? "Hidden" : "Visible")
+                            .accessibilityIdentifier("stats.project.\(project)")
                         }
                     }
 
@@ -136,20 +144,31 @@ struct StatsOverlay: View {
                                         .fill(EdgeColors.relationColors[relation] ?? .white)
                                         .frame(width: 8, height: 8)
                                         .opacity(hiddenRelations.contains(relation) ? 0.3 : 1.0)
-                                    Text("\(relation.replacingOccurrences(of: "_", with: " ")) (\(count))")
+                                    Text(relation.replacingOccurrences(of: "_", with: " "))
                                         .font(.system(size: 11, design: .monospaced))
                                         .strikethrough(hiddenRelations.contains(relation))
+                                        .lineLimit(1)
+                                    Text("(\(count))")
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .strikethrough(hiddenRelations.contains(relation))
+                                        .fixedSize()
                                 }
                             }
                             .buttonStyle(.plain)
+                            .help("\(relation.replacingOccurrences(of: "_", with: " ")) (\(count))")
+                            .accessibilityIdentifier("stats.relation.\(relation)")
                         }
                     }
                 }
             }
             .frame(maxHeight: 300)
+            .accessibilityIdentifier("stats.filters")
         }
         .foregroundStyle(.white.opacity(0.7))
         .padding(12)
+        // Match the sidebar width. A lazy stack cannot measure offscreen
+        // project names to choose a stable intrinsic width while scrolling.
+        .frame(width: 310, alignment: .trailing)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
         .onAppear { setupMaintenanceObserver() }
         .task {

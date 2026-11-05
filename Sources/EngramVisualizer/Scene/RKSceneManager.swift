@@ -49,7 +49,11 @@ final class RKSceneManager {
             dataAdapter.selectedNode = selectedNode
         }
     }
-    var renderViewSize: CGSize = .zero
+    var renderViewSize: CGSize = .zero {
+        didSet {
+            rkScene.viewportSize = SIMD2(Float(renderViewSize.width), Float(renderViewSize.height))
+        }
+    }
 
     // Teleport state
     private(set) var teleportLabel: String?
@@ -63,10 +67,53 @@ final class RKSceneManager {
     var layoutMode: LayoutMode = .forceDirected
     var semanticClusters3D: [SemanticCluster3D] = []
 
+    // Controller polling belongs to the active scene, alongside keyboard input.
+    var isGraphInputActive = false {
+        didSet {
+            if !isGraphInputActive {
+                hidInput?.setActive(false)
+                inputHandler.reset()
+                reticleElapsed = .infinity
+                setReticleTarget(nil)
+            }
+        }
+    }
+    var controllerConnectionCallback: ((Bool) -> Void)?
+    var hidInputStatusCallback: ((HIDGamepadInputStatus) -> Void)?
+    private var reportedHIDStatus: HIDGamepadInputStatus = .inactive
+    private(set) var hasGamepad = false
+    private(set) var reticleTarget: UUID?
+    private let inputHandler = InputHandler()
+    private let readGamepad: @MainActor (Bool) -> GamepadInputReading
+    private let hidInput: HIDGamepadInputProvider?
+    private let controllerDiagnostics: GamepadDiagnosticRecorder?
+    var graphHostIsVisible = false {
+        didSet { if !graphHostIsVisible { hidInput?.setActive(false) } }
+    }
+    private var graphHostAppearsActive: Bool?
+    private var graphHostChatVisible: Bool?
+    private let acceptsGamepadInput: @MainActor () -> Bool
+    private var reticleElapsed: Float = .infinity
+
     // Force engine
     private var forceEngine: ForceEngine?
 
-    init?(registry: GalaxyRegistry) {
+    init?(registry: GalaxyRegistry,
+          readGamepad: (@MainActor () -> GamepadInputState?)? = nil,
+          controllerDiagnostics: GamepadDiagnosticRecorder? = GamepadDiagnosticRecorder.fromEnvironment(),
+          acceptsGamepadInput: @escaping @MainActor () -> Bool = {
+              NSApp?.isActive == true && NSApp?.keyWindow?.attachedSheet == nil
+                  && !(NSApp?.keyWindow?.firstResponder is NSTextView)
+          }) {
+        if let readGamepad {
+            self.readGamepad = { _ in GamepadInputReading(state: readGamepad(), enumeration: nil) }
+            self.hidInput = nil
+        } else {
+            self.readGamepad = { InputHandler.readGamepad(captureDiagnostics: $0) }
+            self.hidInput = HIDGamepadInputProvider()
+        }
+        self.controllerDiagnostics = controllerDiagnostics
+        self.acceptsGamepadInput = acceptsGamepadInput
         self.camera = CameraController()
         self.dataAdapter = GalaxyRegistryAdapter(registry: registry)
         // Hosted isolation supplies an explicit owned directory; Foundation's
@@ -143,6 +190,7 @@ final class RKSceneManager {
     private func updateCameraForFrame(dt: Float) {
         // Camera update
         camera.pollKeyboard(dt: dt)
+        pollGamepad(dt: dt)
         if let orbitRate = Self.harnessOrbitRate {
             camera.targetAzimuth += orbitRate * dt * .pi / 180
         }
@@ -154,6 +202,102 @@ final class RKSceneManager {
                 exit(0)
             }
         }
+    }
+
+    /// Preserve graph/chat focus rules and suspend input during controller setup.
+    /// Retain the host context for explicitly enabled controller diagnostics.
+    func updateGraphInputFocus(appearsActive: Bool, mascotChatVisible: Bool,
+                              controllerSetupVisible: Bool = false) {
+        graphHostAppearsActive = appearsActive
+        graphHostChatVisible = mascotChatVisible
+        isGraphInputActive = appearsActive && !mascotChatVisible && !controllerSetupVisible
+    }
+
+    private func pollGamepad(dt: Float) {
+        let recorder = controllerDiagnostics?.isFinished == false ? controllerDiagnostics : nil
+        let now = recorder == nil ? 0 : ProcessInfo.processInfo.systemUptime
+        let phase = recorder?.nextPhase(now: now, armReady: graphHostIsVisible
+            && NSApp?.isActive == true && NSApp?.keyWindow != nil)
+        let primary = readGamepad(phase != nil)
+        let applicationGate = isGraphInputActive ? acceptsGamepadInput() : nil
+        let active = isGraphInputActive && applicationGate == true
+        // Hardware discovery and IO live on the provider's serial queue. The
+        // frame only changes activation when necessary and reads a value snapshot.
+        hidInput?.setActive(active && primary.state == nil && graphHostIsVisible)
+        let fallback = hidInput?.snapshot()
+        let reading = InputHandler.preferredReading(primary: primary, fallback: fallback, active: active)
+        let hidStatus = primary.state == nil ? (fallback?.status ?? .inactive) : .inactive
+        if (active || primary.state != nil), reportedHIDStatus != hidStatus {
+            reportedHIDStatus = hidStatus
+            hidInputStatusCallback?(hidStatus)
+        }
+        let state = reading.state
+        let connected = state != nil
+        if hasGamepad != connected {
+            hasGamepad = connected
+            controllerConnectionCallback?(connected)
+        }
+        let cameraBefore = recorder.map { _ in (camera.targetCameraPos, camera.targetAzimuth, camera.targetElevation) }
+        defer {
+            if let recorder, let cameraBefore {
+                let gate: GamepadGateDiagnostics?
+                if phase != nil {
+                    let window = NSApp?.keyWindow
+                    let responder = window?.firstResponder
+                    gate = GamepadGateDiagnostics(graphHostVisible: graphHostIsVisible,
+                        hostAppearsActive: graphHostAppearsActive, mascotChatVisible: graphHostChatVisible,
+                        graphInputActive: isGraphInputActive, appActive: NSApp?.isActive == true,
+                        keyWindowNumber: window?.windowNumber, attachedSheet: window?.attachedSheet != nil,
+                        firstResponderClass: responder.map { NSStringFromClass(type(of: $0)) },
+                        firstResponderIsTextView: responder is NSTextView,
+                        applicationGateAccepted: applicationGate, inputAccepted: active)
+                } else {
+                    gate = nil
+                }
+                recorder.observe(now: now, phase: phase, reading: reading, gate: gate,
+                    inputAccepted: active, cameraTargetChanged: cameraBefore.0 != camera.targetCameraPos,
+                    cameraLookChanged: cameraBefore.1 != camera.targetAzimuth || cameraBefore.2 != camera.targetElevation)
+            }
+        }
+        let actions = inputHandler.update(state: state, camera: camera, dt: dt, active: active)
+        guard connected, active else {
+            reticleElapsed = .infinity
+            setReticleTarget(nil)
+            return
+        }
+        // Movement needs no graph data. Resolve reticle at most eight times
+        // per second; A requests a fresh hit test so selection is never stale.
+        if dt.isFinite { reticleElapsed += max(0, dt) }
+        if (reticleElapsed >= 0.125 || actions.contains(.select)), renderViewSize.width > 0,
+           renderViewSize.height > 0, let registry = galaxyRegistry {
+            reticleElapsed = 0
+            setReticleTarget(camera.hitTest(
+                at: CGPoint(x: renderViewSize.width / 2, y: renderViewSize.height / 2),
+                viewSize: renderViewSize, positions: registry.mergedPositions,
+                currentTarget: reticleTarget))
+        }
+        for action in actions {
+            switch action {
+            case .select:
+                if let reticleTarget {
+                    selectedNode = reticleTarget
+                    selectionCallback?(reticleTarget)
+                }
+            case .cancel:
+                selectedNode = nil
+                selectionCallback?(nil)
+            case .previousProject: teleportToNextProject(direction: -1)
+            case .nextProject: teleportToNextProject(direction: 1)
+            case .previousGalaxy: teleportToNextGalaxy(direction: -1)
+            case .nextGalaxy: teleportToNextGalaxy(direction: 1)
+            }
+        }
+    }
+
+    private func setReticleTarget(_ target: UUID?) {
+        guard reticleTarget != target else { return }
+        reticleTarget = target
+        reticleCallback?(target)
     }
 
     @inline(__always)

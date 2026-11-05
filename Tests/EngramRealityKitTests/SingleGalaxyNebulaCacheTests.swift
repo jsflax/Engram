@@ -27,6 +27,12 @@ private final class NebulaTestProvider: SceneDataProvider {
     var topologyVersion: UInt64 = 0
     var positionVersion: UInt64 = 0
     var galaxySnapshots: [RKGalaxySnapshot] = []
+    var explicitClusters: [RKNebulaCluster]?
+    var nebulaClusters: [RKNebulaCluster] {
+        explicitClusters ?? deriveSingleGalaxyNebulaClusters(
+            nodes: nodes, centroids: projectCentroids,
+            positionArray: [], positions: { positions })
+    }
     func tick(dt: Float) {}
 }
 
@@ -64,8 +70,10 @@ struct NebulaTransformUpdateTests {
         }
         update()
         let entities = Dictionary(uniqueKeysWithValues: container.children.map { ($0.name, $0) })
-        try #require(entities.count == 7, "One cluster, two galaxy masses, and four bridge emitters")
+        try #require(entities.count == 8,
+                     "One cluster, two supplied galaxy masses, its missing-main fallback, and four bridge emitters")
         let clusterEntity = try #require(entities["Nebula_main|A"])
+        let fallbackEntity = try #require(entities["GalaxyGas_main"])
         let personalEntity = try #require(entities["GalaxyGas_personal"])
         let groupEntity = try #require(entities["GalaxyGas_group:test"])
         let initialEmitter = try #require(clusterEntity.components[ParticleEmitterComponent.self])
@@ -75,6 +83,8 @@ struct NebulaTransformUpdateTests {
             #expect(container.children.count == entities.count)
             for child in container.children { #expect(entities[child.name] === child) }
             #expect(clusterEntity.position == cluster * scale)
+            #expect(fallbackEntity.position == cluster * scale)
+            #expect(!fallbackEntity.isEnabled, "Fully admitted near detail does not need its coarse fallback")
             #expect(personalEntity.position == personal * scale)
             #expect(groupEntity.position == group * scale)
             for step in 1...4 {
@@ -249,12 +259,176 @@ struct NebulaLODVisibilityTests {
     }
 
     private func update(_ system: NebulaBatchSystem, _ container: Entity,
-                        _ provider: NebulaTestProvider, camera: SIMD3<Float>) {
+                        _ provider: NebulaTestProvider, camera: SIMD3<Float>,
+                        scaleFactor: Float = 0.01, deltaTime: Float = 1 / 60) {
         system.update(container: container, dataProvider: provider, topologyChanged: false,
-                      scaleFactor: 0.01, cameraPosition: camera)
+                      scaleFactor: scaleFactor, cameraPosition: camera, deltaTime: deltaTime)
     }
 
-    @Test("Initial near and far LOD disable only their fully transparent emitters")
+    private func cluster(_ index: Int, galaxy: String = "main", center: SIMD3<Float> = .zero,
+                         radius: Float = 300) -> RKNebulaCluster {
+        .init(galaxyId: galaxy, project: String(format: "P%03d", index), centroid: center,
+              count: 2, radius: radius)
+    }
+
+    private func galaxy(_ id: String, center: SIMD3<Float> = .zero, radius: Float = 1000,
+                        count: Int = 332) -> RKGalaxySnapshot {
+        .init(id: id, displayName: id, worldCenter: center, dominantColor: SIMD3(0.3, 0.5, 0.7),
+              nodeCount: count, radius: radius, parentGalaxyId: nil)
+    }
+
+    @discardableResult
+    private func assertActualDetailBudget(_ container: Entity) throws -> [Entity] {
+        let details = container.children.filter { $0.name.hasPrefix("Nebula_") }
+        let enabled = details.filter(\.isEnabled)
+        #expect((enabled.count) <= (24))
+        var births: Float = 0
+        for entity in details {
+            let opacity = try #require(entity.components[OpacityComponent.self]?.opacity)
+            #expect((entity.isEnabled) == (opacity > 0))
+            if entity.isEnabled {
+                births += try #require(entity.components[ParticleEmitterComponent.self])
+                    .mainEmitter.birthRate
+            }
+        }
+        #expect((births) <= (240.0001) , "Count configured emission, without discounting faded opacity")
+        return enabled
+    }
+
+    @Test("Overlapping166ProjectsBoundActualEnabledEntitiesAndPreserveAggregateCoverage")
+    func overlapping166ProjectsBoundActualEnabledEntitiesAndPreserveAggregateCoverage() throws {
+        let provider = NebulaTestProvider()
+        let inputs = (0..<166).map { index in
+            RKNebulaCluster(galaxyId: "main", project: String(format: "P%03d", index), centroid: .zero,
+                           count: index < 5 ? (index + 1) * 10 : 2, radius: 300)
+        }
+        provider.explicitClusters = inputs
+        let totalWeight = inputs.reduce(0) { $0 + $1.count }
+        provider.galaxySnapshots = [galaxy("main", count: totalWeight)]
+        let system = NebulaBatchSystem(), container = Entity()
+        for _ in 0..<60 {
+            update(system, container, provider, camera: .zero)
+            try assertActualDetailBudget(container)
+        }
+        let details = container.children.filter { $0.name.hasPrefix("Nebula_") }
+        #expect((details.count) == (166))
+        #expect((details.filter(\.isEnabled).count) == (16))
+        let aggregate = try #require(container.children.first { $0.name == "GalaxyGas_main" })
+        let byName = Dictionary(uniqueKeysWithValues: details.map { ($0.name, $0) })
+        let detailCoverage = inputs.reduce(Float(0)) {
+            $0 + Float($1.count) * (byName["Nebula_\($1.key)"]?.components[OpacityComponent.self]?.opacity ?? 0)
+        }
+        #expect(abs((try #require(aggregate.components[OpacityComponent.self]?.opacity)) - (1 - detailCoverage / Float(totalWeight))) <= 0.05 , "Applied coarse coverage retains the existing 0.05 opacity write deadband")
+        #expect(aggregate.isEnabled , "The coarse cloud represents detail withheld by the budget")
+        let retained = Dictionary(uniqueKeysWithValues: container.children.map { ($0.name, $0) })
+        let opacities = Dictionary(uniqueKeysWithValues: container.children.map { ($0.name, $0.components[OpacityComponent.self]?.opacity) })
+        for _ in 0..<5 { update(system, container, provider, camera: .zero) }
+        for entity in container.children {
+            #expect(retained[entity.name] === entity)
+            #expect((entity.components[OpacityComponent.self]?.opacity) == (opacities[entity.name]!))
+        }
+    }
+
+    @Test("GlobalBudgetIncludesOutgoingEntitiesDuringCameraTeleportAndRateGrowth")
+    func globalBudgetIncludesOutgoingEntitiesDuringCameraTeleportAndRateGrowth() throws {
+        let provider = NebulaTestProvider()
+        let secondCenter = SIMD3<Float>(2000, 0, 0)
+        func clusters(radius: Float) -> [RKNebulaCluster] {
+            (0..<40).map { cluster($0, galaxy: "first", radius: radius) }
+                + (0..<40).map { cluster($0, galaxy: "second", center: secondCenter, radius: radius) }
+        }
+        provider.explicitClusters = clusters(radius: 100)
+        provider.galaxySnapshots = [galaxy("first", count: 80), galaxy("second", center: secondCenter, count: 80)]
+        let system = NebulaBatchSystem(), container = Entity()
+        for _ in 0..<60 {
+            update(system, container, provider, camera: .zero)
+            try assertActualDetailBudget(container)
+        }
+        let original = Set(try assertActualDetailBudget(container).map(\.name))
+        #expect((original.count) == (24))
+        #expect(original.allSatisfy { $0.hasPrefix("Nebula_first|") })
+        var sawOutgoingFade = false
+        for _ in 0..<60 {
+            update(system, container, provider, camera: secondCenter)
+            let enabled = try assertActualDetailBudget(container)
+            sawOutgoingFade = sawOutgoingFade || enabled.contains {
+                original.contains($0.name) && ($0.components[OpacityComponent.self]?.opacity ?? 1) < 1
+            }
+        }
+        #expect(sawOutgoingFade)
+        #expect(try assertActualDetailBudget(container).allSatisfy { $0.name.hasPrefix("Nebula_second|") })
+        provider.explicitClusters = clusters(radius: 300)
+        for _ in 0..<90 {
+            update(system, container, provider, camera: secondCenter)
+            try assertActualDetailBudget(container)
+        }
+        let grown = try assertActualDetailBudget(container)
+        #expect((grown.count) == (16))
+        for entity in grown {
+            #expect((try #require(entity.components[ParticleEmitterComponent.self]).mainEmitter.birthRate) == (15))
+        }
+    }
+
+    @Test("WorldSpaceSelectionSurvivesScaleChangesAndRespondsToClusterGeometry")
+    func worldSpaceSelectionSurvivesScaleChangesAndRespondsToClusterGeometry() throws {
+        let provider = NebulaTestProvider()
+        let center = SIMD3<Float>(10_000, 4000, -5000)
+        let distant = center + SIMD3<Float>(6000, 0, 0)
+        provider.explicitClusters = [cluster(0, center: center, radius: 100), cluster(1, center: distant, radius: 100)]
+        provider.galaxySnapshots = [galaxy("main", center: center, radius: 20_000, count: 4)]
+        let system = NebulaBatchSystem(), container = Entity()
+        update(system, container, provider, camera: center, scaleFactor: 0.005)
+        let nearby = try #require(container.children.first { $0.name == "Nebula_main|P000" })
+        let remote = try #require(container.children.first { $0.name == "Nebula_main|P001" })
+        #expect(nearby.isEnabled)
+        #expect(!(remote.isEnabled) , "Being inside a large galaxy does not admit a distant individual cluster")
+        let originalSize = try #require(nearby.components[ParticleEmitterComponent.self]).emitterShapeSize
+        update(system, container, provider, camera: center, scaleFactor: 0.02)
+        #expect(container.children.first { $0.name == nearby.name } === nearby)
+        #expect(nearby.isEnabled)
+        #expect(!(remote.isEnabled))
+        #expect((nearby.position) == (center * 0.02))
+        #expect((remote.position) == (distant * 0.02))
+        #expect((try #require(nearby.components[ParticleEmitterComponent.self]).emitterShapeSize) == (originalSize * 4))
+        let beforeJitter = try #require(nearby.components[ParticleEmitterComponent.self])
+        provider.explicitClusters = [cluster(0, center: center, radius: 110), cluster(1, center: distant, radius: 100)]
+        update(system, container, provider, camera: center, scaleFactor: 0.02)
+        let afterJitter = try #require(nearby.components[ParticleEmitterComponent.self])
+        #expect((afterJitter.emitterShapeSize) == (beforeJitter.emitterShapeSize))
+        #expect((afterJitter.mainEmitter.birthRate) == (beforeJitter.mainEmitter.birthRate) , "Subthreshold live-radius jitter must not rewrite particle configuration through rate admission")
+        provider.explicitClusters = [cluster(0, center: center, radius: 110), cluster(1, center: distant, radius: 10_000)]
+        update(system, container, provider, camera: center, scaleFactor: 0.02)
+        #expect(remote.isEnabled , "Radius changes refresh local desire even without a topology change")
+        try assertActualDetailBudget(container)
+    }
+
+    @Test("MissingGalaxySnapshotGetsBoundedDetailsAndRetainedCoarseFallback")
+    func missingGalaxySnapshotGetsBoundedDetailsAndRetainedCoarseFallback() throws {
+        let provider = NebulaTestProvider()
+        let center = SIMD3<Float>(1000, -100, 50)
+        provider.explicitClusters = (0..<166).map { cluster($0, center: center) }
+        let system = NebulaBatchSystem(), container = Entity()
+        for _ in 0..<60 {
+            update(system, container, provider, camera: center)
+            try assertActualDetailBudget(container)
+        }
+        let aggregate = try #require(container.children.first { $0.name == "GalaxyGas_main" })
+        #expect(aggregate.isEnabled)
+        let expectedPosition = center * 0.01
+        // Summing 166 Float-weighted centers introduces tiny rounding error.
+        // This tolerance is 0.01 world unit at the fixture's 0.01 render scale.
+        let positionTolerance: Float = 0.0001
+        let positionError = simd_length(aggregate.position - expectedPosition)
+        #expect(positionError <= positionTolerance,
+                "Fallback center expected \(expectedPosition), actual \(aggregate.position), error \(positionError), tolerance \(positionTolerance)")
+        #expect((try #require(aggregate.components[OpacityComponent.self]?.opacity)) > (0.8))
+        update(system, container, provider, camera: center + SIMD3<Float>(6000, 0, 0))
+        #expect(container.children.first { $0.name == "GalaxyGas_main" } === aggregate)
+        #expect(try assertActualDetailBudget(container).isEmpty)
+        #expect((aggregate.components[OpacityComponent.self]?.opacity) == (1))
+    }
+
+    @Test("InitialNearAndFarVisibility")
     func initialNearAndFarVisibility() throws {
         for distance in [Float(0), Float(6000)] {
             let provider = self.provider()
@@ -276,7 +450,7 @@ struct NebulaLODVisibilityTests {
         }
     }
 
-    @Test("Exact fade endpoints and tiny reentry bypass the visible opacity deadband")
+    @Test("FadeEndpointsAndTinyReentry")
     func fadeEndpointsAndTinyReentry() throws {
         let provider = self.provider()
         let system = NebulaBatchSystem()
@@ -318,7 +492,7 @@ struct NebulaLODVisibilityTests {
         #expect(cluster.isEnabled && galaxy.isEnabled)
     }
 
-    @Test("Hidden LOD retains live transforms and resizing and is removed and recreated with topology")
+    @Test("HiddenMovementResizeAndRecreation")
     func hiddenMovementResizeAndRecreation() throws {
         for distance in [Float(0), Float(6000)] {
             let provider = self.provider()

@@ -4,6 +4,62 @@ enum GalaxyLoadStatus: String, Sendable {
     case waiting, loading, complete, failed, cancelled
 }
 
+/// Database reads remain small; only detached edge values are combined before
+/// one MainActor publication. The caller retains ownership of scan completion
+/// and observer reconciliation. A failed/cancelled group is never returned.
+enum GalaxyEdgeScan {
+    static let queryLimit = 50
+    static let pagesPerPublication = 4
+    typealias Row = (pk: Int64, edge: EdgeData)
+
+    struct Page: Sendable {
+        let rawCount: Int
+        let lastPrimaryKey: Int64?
+        let rows: [Row]
+    }
+
+    struct Group: Sendable {
+        let cursor: Int64
+        let rows: [Row]
+        let reachedEnd: Bool
+    }
+
+    enum Failure: Error { case invalidPage }
+
+    static func readGroup(after initialCursor: Int64, check: () throws -> Void,
+                          readPage: (Int64, Int) throws -> Page) throws -> Group {
+        var cursor = initialCursor
+        var rows: [Row] = []
+        rows.reserveCapacity(queryLimit * pagesPerPublication)
+        for _ in 0..<pagesPerPublication {
+            try check()
+            let page = try readPage(cursor, queryLimit)
+            try check()
+            guard (0...queryLimit).contains(page.rawCount), page.rows.count <= page.rawCount else {
+                throw Failure.invalidPage
+            }
+            if page.rawCount == 0 {
+                guard page.lastPrimaryKey == nil, page.rows.isEmpty else { throw Failure.invalidPage }
+                return Group(cursor: cursor, rows: rows, reachedEnd: true)
+            }
+            guard let last = page.lastPrimaryKey, last > cursor,
+                  page.rows.allSatisfy({ $0.pk > cursor && $0.pk <= last }) else {
+                throw Failure.invalidPage
+            }
+            rows.append(contentsOf: page.rows)
+            cursor = last
+        }
+        return Group(cursor: cursor, rows: rows, reachedEnd: false)
+    }
+}
+
+#if DEBUG
+enum GalaxyEdgeScanEvent: Sendable {
+    case pageRead(limit: Int, rawCount: Int)
+    case willPublish(rowCount: Int)
+}
+#endif
+
 /// Observers retain keys, never hydrated rows or one Task per notification.
 /// Overflow requests another complete scan (including missing-row removal).
 /// The rendered graph is necessarily O(rows); queued work is bounded separately.

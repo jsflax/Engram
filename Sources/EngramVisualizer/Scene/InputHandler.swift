@@ -1,230 +1,165 @@
-import simd
+import Foundation
 import GameController
-import SwiftUI
-import os
 import EngramRealityKit
 
-/// Handles keyboard, gamepad, and selection input extracted from MetalSceneManager.
-/// Pure input state + polling — no render data, no Metal dependencies.
+/// Values read once per scene frame. Keeping hardware reads separate lets tests
+/// exercise the same camera/action path without synthesizing OS input events.
+struct GamepadInputState: Sendable {
+    struct Buttons: OptionSet, Sendable {
+        let rawValue: UInt8
+        static let a = Self(rawValue: 1 << 0)
+        static let b = Self(rawValue: 1 << 1)
+        static let x = Self(rawValue: 1 << 2)
+        static let y = Self(rawValue: 1 << 3)
+        static let leftShoulder = Self(rawValue: 1 << 4)
+        static let rightShoulder = Self(rawValue: 1 << 5)
+    }
+
+    let identity: ObjectIdentifier
+    // HID attachment generations distinguish rapid reconnects even if an
+    // allocator reuses a released connection token's address. GC uses zero.
+    var connectionGeneration: UInt64 = 0
+    var leftX: Float = 0
+    var leftY: Float = 0
+    var rightX: Float = 0
+    var rightY: Float = 0
+    var leftTrigger: Float = 0
+    var rightTrigger: Float = 0
+    var sprint = false
+    var buttons: Buttons = []
+}
+
+enum GamepadAction: Equatable {
+    case select, cancel, previousProject, nextProject, previousGalaxy, nextGalaxy
+}
+
+/// Shared by the normal and instrumented RealityKit frame callbacks. No graph
+/// snapshots or hit tests are needed to read a controller or move the camera.
 @MainActor
 final class InputHandler {
+    private var controllerIdentity: ObjectIdentifier?
+    private var controllerGeneration: UInt64?
+    private var previousButtons: GamepadInputState.Buttons = []
+    private var awaitingButtonRelease = true
 
-    // MARK: - References
-
-    unowned let camera: CameraController
-
-    // MARK: - Selection State
-
-    var selectedNode: UUID?
-    var selectionCallback: ((UUID?) -> Void)?
-
-    // MARK: - Reticle (gamepad targeting)
-
-    var reticleTarget: UUID?
-    /// Callback for SwiftUI to observe reticle target changes (MetalSceneManager is not @Observable).
-    var reticleCallback: ((UUID?) -> Void)?
-
-    // MARK: - Teleport State
-
-    /// Callback for SwiftUI to observe teleport label/counter changes (MetalSceneManager is not @Observable).
-    var teleportCallback: ((String?, Int) -> Void)?
-    var teleportLabel: String?
-    var teleportCounter: Int = 0
-    var teleportProjectIndex: Int = 0
-    var teleportGalaxyIndex: Int = 0
-
-    // MARK: - Keyboard Input
-
-    var heldKeys: Set<String> = []
-
-    // MARK: - Drag State
-
-    var isDragging = false
-
-    // MARK: - Gamepad Button State (rising-edge detection)
-
-    private var prevButtonA = false
-    private var prevButtonB = false
-    private var prevLB = false
-    private var prevRB = false
-    private var prevButtonY = false
-
-    // MARK: - Instrumentation
-
-    #if ENGRAM_INSTRUMENTATION
-    var jitterReticleCallbackFired = false
-    #endif
-
-    // MARK: - Init
-
-    init(camera: CameraController) {
-        self.camera = camera
+    static func readGamepad() -> GamepadInputState? {
+        readGamepad(captureDiagnostics: false).state
     }
 
-    // MARK: - Gamepad
+    /// Select one backend, even when the preferred controller is neutral.
+    /// The HID snapshot never bypasses the scene's foreground/input gate.
+    static func preferredReading(primary: GamepadInputReading,
+                                 fallback: HIDGamepadInputSnapshot?,
+                                 active: Bool) -> GamepadInputReading {
+        if primary.state != nil { return primary }
+        guard active, let fallback else { return primary }
+        return GamepadInputReading(state: fallback.state, enumeration: primary.enumeration,
+            backend: fallback.state == nil ? .none : .hidGamepad,
+            hidStatus: fallback.status.rawValue)
+    }
 
-    func pollGamepad(
-        dt: Float,
-        positions: [UUID: SIMD3<Float>],
-        renderNodes: [NodeData],
-        renderEdges: [EdgeData],
-        renderHubs: Set<UUID>,
-        renderViewSize: CGSize,
-        hubExpansion: HubExpansionController
-    ) {
-        guard let gp = GCController.current?.extendedGamepad else { return }
-        let sprint: Float = (gp.leftThumbstickButton?.isPressed ?? false) || (gp.rightThumbstickButton?.isPressed ?? false) ? 3.0 : 1.0
+    static func readGamepad(captureDiagnostics: Bool) -> GamepadInputReading {
+        readGamepad(current: GCController.current, controllers: GCController.controllers(),
+                    captureDiagnostics: captureDiagnostics)
+    }
 
-        // Movement
-        let lx = gp.leftThumbstick.xAxis.value
-        let ly = gp.leftThumbstick.yAxis.value
-        if abs(ly) > 0.1 { camera.dolly(amount: ly * 200 * dt * sprint) }
-        if abs(lx) > 0.1 { camera.pan(dx: -lx * 300 * dt * sprint, dy: 0) }
+    static func readGamepad(current: GCController?, controllers: [GCController]) -> GamepadInputState? {
+        readGamepad(current: current, controllers: controllers, captureDiagnostics: false).state
+    }
 
-        // Look
-        let rx = gp.rightThumbstick.xAxis.value
-        let ry = gp.rightThumbstick.yAxis.value
-        if abs(rx) > 0.1 || abs(ry) > 0.1 {
-            camera.lookRotate(deltaAz: -rx * 2.0 * dt, deltaEl: ry * 2.0 * dt)
+    static func readGamepad(current: GCController?, controllers: [GCController],
+                            captureDiagnostics: Bool) -> GamepadInputReading {
+        // `current` is the most recently used controller, not the list of
+        // connected devices. Include one already connected before app launch.
+        let controller: GCController?
+        if let current, current.extendedGamepad != nil {
+            controller = current
+        } else {
+            controller = controllers.first { $0.extendedGamepad != nil }
         }
-
-        // Triggers
-        let lt = gp.leftTrigger.value
-        let rt = gp.rightTrigger.value
-        if rt > 0.05 { camera.pan(dx: 0, dy: rt * 300 * dt * sprint) }
-        if lt > 0.05 { camera.pan(dx: 0, dy: -lt * 300 * dt * sprint) }
-
-        // Buttons (rising-edge)
-        let aPressed = gp.buttonA.isPressed
-        if aPressed && !prevButtonA {
-            if let target = reticleTarget {
-                if renderHubs.contains(target) {
-                    let edgeTuples = renderEdges.map { (sourceId: $0.sourceId, targetId: $0.targetId, relation: $0.relation) }
-                    hubExpansion.toggleHubExpansion(hubId: target, positions: positions, edges: edgeTuples)
-                }
-                selectedNode = target
-                selectionCallback?(selectedNode)
-            }
+        let enumeration: GamepadEnumerationDiagnostics?
+        if captureDiagnostics {
+            enumeration = GamepadEnumerationDiagnostics(
+                connectedCount: controllers.count,
+                supportedCount: controllers.filter { $0.extendedGamepad != nil }.count,
+                connected: controllers.prefix(8).map(describeController),
+                current: current.map(describeController), selected: controller.map(describeController),
+                selection: controller == nil ? "none" : (controller === current ? "current" : "connected-fallback"),
+                currentConnectedIndex: current.flatMap { selected in controllers.firstIndex { $0 === selected } },
+                selectedConnectedIndex: controller.flatMap { selected in controllers.firstIndex { $0 === selected } })
+        } else {
+            enumeration = nil
         }
-        prevButtonA = aPressed
-
-        let bPressed = gp.buttonB.isPressed
-        if bPressed && !prevButtonB {
-            let edgeTuples = renderEdges.map { (sourceId: $0.sourceId, targetId: $0.targetId, relation: $0.relation) }
-            for hubId in hubExpansion.expandedHubs { hubExpansion.toggleHubExpansion(hubId: hubId, positions: positions, edges: edgeTuples) }
-            selectedNode = nil
-            selectionCallback?(nil)
+        guard let controller, let gamepad = controller.extendedGamepad else {
+            return GamepadInputReading(state: nil, enumeration: enumeration)
         }
-        prevButtonB = bPressed
+        var state = GamepadInputState(identity: ObjectIdentifier(controller))
+        state.leftX = gamepad.leftThumbstick.xAxis.value
+        state.leftY = gamepad.leftThumbstick.yAxis.value
+        state.rightX = gamepad.rightThumbstick.xAxis.value
+        state.rightY = gamepad.rightThumbstick.yAxis.value
+        state.leftTrigger = gamepad.leftTrigger.value
+        state.rightTrigger = gamepad.rightTrigger.value
+        state.sprint = (gamepad.leftThumbstickButton?.isPressed ?? false)
+            || (gamepad.rightThumbstickButton?.isPressed ?? false)
+        if gamepad.buttonA.isPressed { state.buttons.insert(.a) }
+        if gamepad.buttonB.isPressed { state.buttons.insert(.b) }
+        if gamepad.buttonX.isPressed { state.buttons.insert(.x) }
+        if gamepad.buttonY.isPressed { state.buttons.insert(.y) }
+        if gamepad.leftShoulder.isPressed { state.buttons.insert(.leftShoulder) }
+        if gamepad.rightShoulder.isPressed { state.buttons.insert(.rightShoulder) }
+        return GamepadInputReading(state: state, enumeration: enumeration)
+    }
 
-        // Teleport
-        let yPressed = gp.buttonY.isPressed
-        if yPressed && !prevButtonY {
-            teleportToNextProject(direction: 1, positions: positions, nodes: renderNodes, hubs: renderHubs)
+    private static func describeController(_ controller: GCController) -> GamepadControllerDescription {
+        GamepadControllerDescription(productCategory: String(controller.productCategory.prefix(128)),
+            vendorName: controller.vendorName.map { String($0.prefix(128)) },
+            controllerClass: NSStringFromClass(type(of: controller)),
+            extendedProfileClass: controller.extendedGamepad.map { NSStringFromClass(type(of: $0)) })
+    }
+
+    func reset() {
+        controllerIdentity = nil
+        controllerGeneration = nil
+        previousButtons = []
+        awaitingButtonRelease = true
+    }
+
+    func update(state: GamepadInputState?, camera: CameraController,
+                dt: Float, active: Bool) -> [GamepadAction] {
+        guard active, let state else { reset(); return [] }
+        if controllerIdentity != state.identity || controllerGeneration != state.connectionGeneration {
+            reset()
+            controllerIdentity = state.identity
+            controllerGeneration = state.connectionGeneration
         }
-        prevButtonY = yPressed
-
-        // Reticle hit test — guard write to avoid per-frame callback spam
-        if renderViewSize.width > 0 {
-            let center = CGPoint(x: renderViewSize.width / 2, y: renderViewSize.height / 2)
-            let newTarget = camera.hitTest(at: center, viewSize: renderViewSize, positions: positions,
-                                              currentTarget: reticleTarget)
-            if newTarget != reticleTarget {
-                reticleTarget = newTarget
-                reticleCallback?(newTarget)
-                #if ENGRAM_INSTRUMENTATION
-                jitterReticleCallbackFired = true
-                #endif
-            }
+        // A stalled render frame must not turn a held stick into a huge jump.
+        let step = dt.isFinite ? min(0.05, max(0, dt)) : 0
+        let sprint: Float = state.sprint ? 3 : 1
+        if abs(state.leftY) > 0.1 { camera.dolly(amount: state.leftY * 200 * step * sprint) }
+        if abs(state.leftX) > 0.1 { camera.pan(dx: -state.leftX * 300 * step * sprint, dy: 0) }
+        if abs(state.rightX) > 0.1 || abs(state.rightY) > 0.1 {
+            camera.lookRotate(deltaAz: -state.rightX * 2 * step, deltaEl: state.rightY * 2 * step)
         }
-    }
+        if state.rightTrigger > 0.05 { camera.pan(dx: 0, dy: state.rightTrigger * 300 * step * sprint) }
+        if state.leftTrigger > 0.05 { camera.pan(dx: 0, dy: -state.leftTrigger * 300 * step * sprint) }
 
-    // MARK: - Teleport
-
-    func teleportToNextProject(direction: Int, positions: [UUID: SIMD3<Float>],
-                                nodes: [NodeData], hubs: Set<UUID>) {
-        let snapshots = nodes.map { RKNodeSnapshot(id: $0.id, project: $0.project, topic: $0.topic, label: $0.label, importance: $0.importance, isHub: hubs.contains($0.id)) }
-        camera.teleportToNextProject(positions: positions, nodes: snapshots,
-                                     hubs: hubs, direction: direction)
-        teleportLabel = camera.teleportLabel
-        teleportCounter = camera.teleportCounter
-        teleportCallback?(teleportLabel, teleportCounter)
-    }
-
-    /// Smoothly drive the camera to a named project using cached render data.
-    func driveToProject(_ project: String, positions: [UUID: SIMD3<Float>],
-                        nodes: [NodeData], hubs: Set<UUID>) {
-        let snapshots = nodes.map { RKNodeSnapshot(id: $0.id, project: $0.project, topic: $0.topic, label: $0.label, importance: $0.importance, isHub: hubs.contains($0.id)) }
-        camera.driveToProject(project, positions: positions, nodes: snapshots, hubs: hubs)
-        teleportLabel = camera.teleportLabel
-        teleportCounter = camera.teleportCounter
-        teleportCallback?(teleportLabel, teleportCounter)
-    }
-
-    func teleportToNextGalaxy(direction: Int, galaxyRegistry: GalaxyRegistry?) {
-        guard let registry = galaxyRegistry else { return }
-        let sorted = registry.galaxies.values.sorted(by: { $0.id < $1.id })
-        guard !sorted.isEmpty else { return }
-        teleportGalaxyIndex = (teleportGalaxyIndex + direction + sorted.count) % sorted.count
-        let galaxy = sorted[teleportGalaxyIndex]
-
-        // Compute radius from galaxy's node spread
-        var maxSpread: Float = 200
-        let galPositions = registry.unifiedSimulation.positions
-        let center = galaxy.worldCenter
-        for (_, pos) in galPositions {
-            maxSpread = max(maxSpread, simd_length(pos - center))
+        // Ignore buttons held while connecting, switching controllers, or
+        // returning from another window. Require release before a new action.
+        if awaitingButtonRelease {
+            previousButtons = state.buttons
+            awaitingButtonRelease = !state.buttons.isEmpty
+            return []
         }
-
-        camera.teleportToGalaxy(center: center, radius: maxSpread * 0.5, label: galaxy.displayName)
-        teleportLabel = camera.teleportLabel
-        teleportCounter = camera.teleportCounter
-        teleportCallback?(teleportLabel, teleportCounter)
-    }
-
-    // MARK: - Hit Testing
-
-    func hitTest(at location: CGPoint, viewSize: CGSize, positions: [UUID: SIMD3<Float>]) -> UUID? {
-        camera.hitTest(at: location, viewSize: viewSize, positions: positions)
-    }
-
-    /// Hit test any mascot in any fleet — returns true if the tap is within 50px of a mascot's screen position.
-    func hitTestMascot(at location: CGPoint, viewSize: CGSize, galaxyRegistry: GalaxyRegistry?) -> Bool {
-        let sf = camera.scaleFactor
-        guard sf > 0, let registry = galaxyRegistry else { return false }
-        for galaxy in registry.galaxies.values {
-            for mascot in galaxy.mascotFleet?.mascots.values ?? [:].values {
-                let pos = mascot.currentPosition / sf
-                guard let screenPos = camera.project(point3D: pos, viewSize: viewSize) else { continue }
-                let dist = hypot(location.x - screenPos.x, location.y - screenPos.y)
-                if dist < 50 { return true }
-            }
-        }
-        return false
-    }
-
-    // MARK: - Fleet Chat
-
-    func enterFleetChat(galaxyRegistry: GalaxyRegistry?) {
-        let camPos = camera.cameraPosition * camera.scaleFactor
-        galaxyRegistry?.galaxies.values.forEach { $0.mascotFleet?.enterChat(cameraPosition: camPos) }
-    }
-
-    func exitFleetChat(galaxyRegistry: GalaxyRegistry?) {
-        galaxyRegistry?.galaxies.values.forEach { $0.mascotFleet?.exitChat() }
-    }
-
-    // MARK: - Drag Support
-
-    func captureLookState() -> (azimuth: Float, elevation: Float, camPos: SIMD3<Float>) {
-        camera.captureLookState()
-    }
-
-    func applyLookDrag(start: (azimuth: Float, elevation: Float, camPos: SIMD3<Float>), dx: Float, dy: Float) {
-        camera.applyLookDrag(start: start, dx: dx, dy: dy)
-    }
-
-    func endDrag() {
-        isDragging = false
+        let pressed = state.buttons.subtracting(previousButtons)
+        previousButtons = state.buttons
+        var actions: [GamepadAction] = []
+        if pressed.contains(.a) { actions.append(.select) }
+        if pressed.contains(.b) { actions.append(.cancel) }
+        if pressed.contains(.x) { actions.append(.previousProject) }
+        if pressed.contains(.y) { actions.append(.nextProject) }
+        if pressed.contains(.leftShoulder) { actions.append(.previousGalaxy) }
+        if pressed.contains(.rightShoulder) { actions.append(.nextGalaxy) }
+        return actions
     }
 }

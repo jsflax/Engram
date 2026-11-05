@@ -391,6 +391,47 @@ raise SystemExit(code or (int(os.environ['FAKE_WRAPPER_EXIT']) if command[1]=='b
                         self.assertTrue(all(call['ibtool_mode'] == 'inherited-value' for call in calls[2:]))
                         self.assertEqual(calls[4]['args'][0], 'test-without-building')
 
+    def test_visualizer_diagnostic_archive_is_release_and_preserves_failure(self):
+        with tempfile.TemporaryDirectory(prefix='engram diagnostic gate ') as temporary:
+            root = Path(temporary).resolve()
+            validation = root / 'validation'
+            (validation / 'repo').mkdir(parents=True)
+            bin_dir = root / 'bin'; bin_dir.mkdir()
+            log = root / 'calls.jsonl'
+            fake = bin_dir / 'python3'
+            fake.write_text('#!' + sys.executable + '\nimport json,os,sys\n'
+                'with open(os.environ["CALL_LOG"], "a") as stream:\n'
+                ' stream.write(json.dumps({"args":sys.argv[1:],"ibtool":os.environ.get("IBToolNeverDeque")})+"\\n")\n'
+                'raise SystemExit(int(os.environ["FAKE_GATE_EXIT"]) if "scripts/run_native_tests.py" in sys.argv else 0)\n')
+            fake.chmod(0o700)
+            script = run_block('visualizer-validation.yml', 'Archive optimized diagnostic visualizer')
+            for code in (0, 23, 125):
+                log.unlink(missing_ok=True)
+                result = subprocess.run(['/bin/bash', '-e', '-c', script], cwd=root,
+                    env=dict(os.environ, PATH=str(bin_dir), CALL_LOG=str(log), VALIDATION_ROOT=str(validation),
+                             FAKE_GATE_EXIT=str(code)), capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                calls = [json.loads(line) for line in log.read_text().splitlines()]
+                self.assertEqual(len(calls), 1 if code else 2)
+                self.assertEqual(calls[0]['ibtool'], '1')
+                arguments = calls[0]['args']
+                self.assertEqual(arguments[arguments.index('--timeout-seconds') + 1], '2400')
+                command = arguments[arguments.index('--') + 1:]
+                self.assertEqual(command[:2], ['xcodebuild', 'archive'])
+                for flag, value in (('-configuration', 'Release'), ('-jobs', '2'),
+                    ('-archivePath', str(validation / 'diagnostic/Engram.xcarchive')),
+                    ('-derivedDataPath', str(validation / 'derived-release'))):
+                    self.assertEqual(command[command.index(flag) + 1], value)
+                for setting in ('ARCHS=arm64', 'DEBUG_INFORMATION_FORMAT=dwarf-with-dsym',
+                                'CODE_SIGNING_ALLOWED=NO', '-onlyUsePackageVersionsFromResolvedFile'):
+                    self.assertIn(setting, command)
+                if not code:
+                    self.assertEqual(calls[1]['args'], ['-B', 'scripts/prepare_visualizer_tests.py',
+                                                      'verify-diagnostic-inputs', '--root', str(validation)])
+            upload = step_section('visualizer-validation.yml', 'Upload optimized diagnostic visualizer')
+            self.assertNotIn('always()', upload)
+            self.assertIn('}/diagnostic-artifact', upload)
+
     def test_linux_installs_python_before_builds_and_propagates_tooling_failure(self):
         name = 'Install portable test Python runtime'
         workflow = (ROOT / '.github/workflows/linux-core.yml').read_text()
@@ -673,6 +714,10 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
             self.assertRegex(charge_source, r'@Test\s+@MainActor\s+func ' + method + r'\(\)')
         names += charge_names
         selected = '|'.join(names)
+        csr_names = ['exactOrdering', 'changingTopologies', 'largeTopology', 'rejectsInvalidInput', 'unusedCapacity']
+        csr_source = (ROOT / 'Tests/EngramSceneKitTests/ForceEdgeCSRTests.swift').read_text()
+        for method in csr_names:
+            self.assertRegex(csr_source, r'@Test(?:\([^\n]*\))?\s+func ' + method + r'\(\)')
         for workflow in ('native-validation.yml', 'release.yml'):
             with self.subTest(workflow=workflow), tempfile.TemporaryDirectory(prefix='engram force gate ') as temporary:
                 root = Path(temporary).resolve()
@@ -694,10 +739,11 @@ raise SystemExit(int(os.environ['FAKE_GATE_EXIT']) if kind=='python3' else 0)
                            'test', '--force-resolved-versions']
                 if not release:
                     command += ['--disable-index-store']
-                command += ['--skip-build', '--no-parallel', '--filter', selected]
+                command += ['--skip-build', '--no-parallel', '--filter',
+                            selected if release else selected + '|ForceEdgeCSRTests']
                 expected = ['-B', 'scripts/run_native_tests.py', '--diagnostics-dir', str(diagnostics),
                             '--timeout-seconds', '120', '--silence-seconds', '60']
-                for method in names:
+                for method in names + ([] if release else csr_names):
                     expected += ['--require-swift-test', method]
                 expected += ['--', *command]
                 section = step_section(workflow, name)

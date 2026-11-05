@@ -103,13 +103,13 @@ public final class ForceSimulation3D {
     private let alphaFloor: Float = 0.01
     private var topologyVersion: UInt64 = 0
 
-    /// Set by addNode/addEdge, drained by tick(). Coalesces multiple topology changes
-    /// into a single wake per tick instead of one per call.
+    /// Set by topology mutations, drained by an active tick(). Coalesces changes
+    /// into one decision about whether the layout needs a full reheat.
     private var hasPendingTopologyChanges = false
-    /// Magnitude of pending topology changes (nodes/edges added or removed
-    /// since the last tick). Lets a settled graph absorb SMALL live deltas
-    /// (one remembered memory + its auto-connect edges) without re-exciting
-    /// the whole simulation.
+    /// Actual node/unique-edge additions and removals since the last active
+    /// tick; migrations explicitly force a bulk relayout. Lets a settled graph
+    /// absorb small live deltas (one remembered memory + its auto-connect edges)
+    /// without re-exciting the whole simulation.
     private var pendingTopologyDelta = 0
 
     /// Set by topology changes, cleared after CSR rebuild in dispatchForceComputation.
@@ -175,7 +175,7 @@ public final class ForceSimulation3D {
         topologyDirtyForGPU = true
     }
 
-    /// Wake the simulation from settled state (e.g. after topology change or user interaction).
+    /// Fully reheat after initial loading, a bulk topology change or explicit user interaction.
     public func wake() {
         isSettled = false
         settledFrameCount = 0
@@ -300,6 +300,9 @@ public final class ForceSimulation3D {
                 newIdx += 1
             }
         }
+        let removedNodeCount = oldCount - newIdx
+        guard removedNodeCount > 0 else { return }
+        let oldEdgeCount = edgeIndexSet.count
 
         // Compact SoA arrays
         let cap = newIdx
@@ -349,12 +352,12 @@ public final class ForceSimulation3D {
         _positionsGeneration &+= 1
 
         hasPendingTopologyChanges = true
-        pendingTopologyDelta += idsToRemove.count
+        pendingTopologyDelta += removedNodeCount + (oldEdgeCount - edgeIndexSet.count)
         topologyDirtyForGPU = true
     }
 
     /// Surgically insert a single node without rebuilding the entire graph.
-    /// When the sim is settled, activates local wake instead of full wake.
+    /// Settled layouts seed near the project; tick() reheats only bulk changes.
     public func addNode(_ id: UUID, project: String, topic: String, galaxyId: String? = nil) {
         guard idToIndex[id] == nil else { return }
 
@@ -479,17 +482,8 @@ public final class ForceSimulation3D {
 
     public func tick() {
         guard isActive else { return }
-        let n = ids.count
-        guard n > 1 else {
-            if n == 1, x[0] != center.x || y[0] != center.y || z[0] != center.z {
-                x[0] = center.x; y[0] = center.y; z[0] = center.z
-                syncPositions()
-            }
-            return
-        }
-
-        // Coalesce topology changes into a single wake per tick regardless of how many
-        // addNode/addEdge calls arrived since the last tick.
+        // Drain even with zero or one node, so old changes cannot accumulate
+        // across active ticks and reheat an unrelated later small insertion.
         if hasPendingTopologyChanges {
             hasPendingTopologyChanges = false
             topologyVersion &+= 1
@@ -497,14 +491,20 @@ public final class ForceSimulation3D {
             pendingTopologyDelta = 0
             // A settled graph absorbs small live deltas in place: addNode
             // already seeds new nodes at their project centroid, and
-            // re-exciting the sim re-applies full-strength forces to a
-            // layout that never fully equilibrates at scale — one new
-            // memory used to visibly re-arrange the whole graph. Bulk
-            // loads/migrations (large delta) still relayout.
-            if !(isSettled && delta <= 24) {
-                isSettled = false
-                settledFrameCount = 0
+            // re-exciting the sim re-applies full-strength forces to the
+            // whole graph. Small active changes also preserve cooling progress.
+            // Bulk loads/migrations must restore alpha, not merely clear the
+            // settled flag at the alpha floor and stop again thirty ticks later.
+            if delta > 24 { wake() }
+        }
+
+        let n = ids.count
+        guard n > 1 else {
+            if n == 1, x[0] != center.x || y[0] != center.y || z[0] != center.z {
+                x[0] = center.x; y[0] = center.y; z[0] = center.z
+                syncPositions()
             }
+            return
         }
 
         // Fast path: when settled, skip all work (no integration, no sync, no force dispatch)

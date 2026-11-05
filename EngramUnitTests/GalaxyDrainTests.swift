@@ -4,6 +4,15 @@ import Foundation
 import Lattice
 import SwiftUI
 import XCTest
+import os
+
+#if DEBUG
+private struct EdgeScanObservation: Sendable {
+    var events: [GalaxyEdgeScanEvent] = []
+    var pageCount = 0
+    var error: String?
+}
+#endif
 
 private extension Galaxy {
     /// The fixture producer enters the Galaxy actor just like loadData/observers;
@@ -15,6 +24,132 @@ private extension Galaxy {
 
 @MainActor
 final class GalaxyDrainTests: XCTestCase {
+    #if DEBUG
+    private func edgeScanFixture() throws -> (Lattice, [MemoryEdge], [UUID]) {
+        let environment = ProcessInfo.processInfo.environment
+        let root = URL(fileURLWithPath: try XCTUnwrap(environment["ENGRAM_TEST_ROOT"]), isDirectory: true)
+        let temporary = URL(fileURLWithPath: try XCTUnwrap(environment["TMPDIR"]), isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
+        let expectedTemporary = root.deletingLastPathComponent().appendingPathComponent("tmp", isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
+        _ = try XCTUnwrap(temporary == expectedTemporary ? temporary : nil,
+                          "Use the test lane's explicit owned temporary directory")
+        let directory = temporary.appendingPathComponent("edge-scan-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        // Retain this owned fixture until hosted-runner teardown; background
+        // observers/readers may still be releasing their references after stop.
+        let lattice = try Lattice(Memory.self, MemoryEdge.self,
+            configuration: .init(fileURL: directory.appendingPathComponent("memory.sqlite")))
+        let source = Memory(content: "Edge source", topic: "general", project: "Stream", importance: 1)
+        let target = Memory(content: "Edge target", topic: "general", project: "Stream", importance: 1)
+        try lattice.add(source)
+        try lattice.add(target)
+        let ids = [try XCTUnwrap(source.globalId), try XCTUnwrap(target.globalId)]
+        var edges: [MemoryEdge] = []
+        for index in 0..<405 {
+            let edge = MemoryEdge(sourceGlobalId: ids[0], targetGlobalId: index == 404 ? UUID() : ids[1],
+                                  relation: .relatesTo)
+            try lattice.add(edge)
+            // One raw page in the middle is entirely malformed. It must not
+            // end the scan, grow the buffer, or mutate these stored values.
+            if (50..<100).contains(index) { edge.asRefType.setString(named: "sourceGlobalId", "not-a-uuid") }
+            edges.append(edge)
+        }
+        return (lattice, edges, ids)
+    }
+
+    func testCoalescedEdgeScanKeepsReadBoundsAndReplaysConcurrentEditAndDelete() async throws {
+        let (lattice, edges, _) = try edgeScanFixture()
+        let originalIDs = try edges.map { try XCTUnwrap($0.globalId) }
+        let editedPK = try XCTUnwrap(edges[0].primaryKey), deletedPK = try XCTUnwrap(edges[1].primaryKey)
+        let reference = lattice.sendableReference
+        let observation = OSAllocatedUnfairLock(initialState: EdgeScanObservation())
+        let galaxy = Galaxy(id: "coalesced", displayName: "Coalesced", lattice: reference)
+        await galaxy.setEdgeScanObserverForTesting { event in
+            let mutate = observation.withLock { state in
+                state.events.append(event)
+                guard case .pageRead(_, let count) = event, count > 0 else { return false }
+                state.pageCount += 1
+                return state.pageCount == 1
+            }
+            guard mutate else { return }
+            // The first page's detached values already contain the old rows.
+            // Actual registered observers must replay these writes afterward.
+            guard let writer = reference.resolve(),
+                  let edited = writer.object(MemoryEdge.self, primaryKey: editedPK),
+                  let deleted = writer.object(MemoryEdge.self, primaryKey: deletedPK) else {
+                observation.withLock { $0.error = "Could not resolve fixture rows" }
+                return
+            }
+            edited.relation = .contradicts
+            writer.delete(deleted)
+            if let error = writer.lastQueryError() {
+                observation.withLock { $0.error = String(describing: error) }
+            }
+        }
+        await galaxy.loadData()
+        let changes = await galaxy.loadChanges
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if galaxy.renderStore.allEdges[originalIDs[0]]?.relation == "contradicts",
+               galaxy.renderStore.allEdges[originalIDs[1]] == nil,
+               !changes.withLock({ $0.workerRunning }) { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        let observed = observation.withLock { $0 }
+        await galaxy.stopObservers()
+        XCTAssertNil(observed.error)
+        let reads = observed.events.compactMap { event -> (Int, Int)? in
+            if case .pageRead(let limit, let count) = event { return (limit, count) }
+            return nil
+        }
+        let publications = observed.events.compactMap { event -> Int? in
+            if case .willPublish(let count) = event { return count }
+            return nil
+        }
+        XCTAssertEqual(reads.map { $0.0 }, Array(repeating: 50, count: 10))
+        XCTAssertEqual(reads.map { $0.1 }, Array(repeating: 50, count: 8) + [5, 0])
+        XCTAssertEqual(publications, [150, 200, 5], "Invalid raw pages count toward the four-page publication bound")
+        let expectedIDs = Set(originalIDs.enumerated().filter { !(50..<100).contains($0.offset) && $0.offset != 1 }.map(\.element))
+        XCTAssertEqual(Set(galaxy.renderStore.allEdges.keys), expectedIDs)
+        XCTAssertEqual(Set(galaxy.renderStore.edges.map(\.id)), expectedIDs.subtracting([originalIDs[404]]),
+                       "A valid dangling edge remains stored without becoming a visible edge")
+        XCTAssertEqual(galaxy.renderStore.allEdges[originalIDs[0]]?.relation, "contradicts")
+        XCTAssertTrue(galaxy.isLoaded)
+        XCTAssertEqual(galaxy.loadStatus, .complete)
+        for edge in edges[50..<100] {
+            XCTAssertEqual(edge.asRefType.getString(named: "sourceGlobalId"), "not-a-uuid")
+        }
+    }
+
+    func testCancelledCoalescedEdgeScanDiscardsPartialGroupAndDoesNotPrune() async throws {
+        let (lattice, _, nodeIDs) = try edgeScanFixture()
+        let galaxy = Galaxy(id: "cancelled", displayName: "Cancelled", lattice: lattice.sendableReference)
+        let changes = await galaxy.loadChanges
+        let earlierGeneration = changes.withLock { $0.begin() }
+        let stale = EdgeData(id: UUID(), sourceId: nodeIDs[0], targetId: nodeIDs[1], relation: "relates_to")
+        galaxy.applyLoadChunk(edges: [(999_999, stale)], generation: earlierGeneration)
+        let observation = OSAllocatedUnfairLock(initialState: EdgeScanObservation())
+        await galaxy.setEdgeScanObserverForTesting { event in
+            observation.withLock { $0.events.append(event) }
+            if case .pageRead = event { galaxy.cancelLoading() }
+        }
+        await galaxy.loadData()
+        let events = observation.withLock { $0.events }
+        await galaxy.stopObservers()
+        XCTAssertEqual(events.count, 1, "Cancellation after the first page prevents another read or publication")
+        if case .pageRead(let limit, let count)? = events.first {
+            XCTAssertEqual(limit, 50)
+            XCTAssertEqual(count, 50)
+        } else { XCTFail("Expected a page read, not publication") }
+        XCTAssertEqual(Set(galaxy.renderStore.allEdges.keys), [stale.id],
+                       "An incomplete scan cannot publish its partial group or prune existing rows")
+        XCTAssertEqual(galaxy.renderStore.edgePkToGlobalId[999_999], stale.id)
+        XCTAssertFalse(galaxy.isLoaded)
+    }
+    #endif
+
     private let config = DrainConfig(hiddenProjects: [], hiddenRelations: [], timeFilter: nil,
                                      is3D: true, soundEnabled: false, notificationsEnabled: false)
 
@@ -172,7 +307,11 @@ final class GalaxyDrainTests: XCTestCase {
         }
         XCTAssertEqual(registry.panelSnapshot.totalCount, 3)
         XCTAssertEqual(registry.panelSnapshot.projectCounts["Changed"], 1)
-        XCTAssertEqual(registry.unifiedSimulation.alpha, 1, "Structural completion still wakes the simulation")
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 0.5,
+                       "Live completion refreshes derived data without restarting active cooling")
+        registry.unifiedSimulation.tick()
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 0.4975, accuracy: 0.000_001,
+                       "The small pending topology delta preserves cooling on the next tick")
     }
 
     func testLoaderCompletionRejectsPendingRescanRevisionAndRetiredGeneration() async throws {
@@ -183,6 +322,7 @@ final class GalaxyDrainTests: XCTestCase {
         let changes = await galaxy.loadChanges
         let generation = changes.withLock { $0.begin() }
         galaxy.applyLoadChunk(nodes: [(1, makeNodes(1)[0])], generation: generation)
+        registry.unifiedSimulation.setPositions([:])
         let originalRevision = changes.withLock { $0.revision }
         let initialTopology = galaxy.renderStore.topologyVersion
         XCTAssertFalse(galaxy.finishLoad(generation: generation, revision: originalRevision, rebuildDerivedData: true),
@@ -190,25 +330,35 @@ final class GalaxyDrainTests: XCTestCase {
         XCTAssertTrue(galaxy.isInitialLoad)
         XCTAssertFalse(galaxy.isLoaded)
         XCTAssertEqual(galaxy.renderStore.topologyVersion, initialTopology)
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 0.5)
         _ = changes.withLock { $0.next(generation: generation) }
         _ = changes.withLock { $0.record(1, edge: false, generation: generation) }
         XCTAssertFalse(galaxy.finishLoad(generation: generation, revision: originalRevision, rebuildDerivedData: true))
+        XCTAssertTrue(galaxy.isInitialLoad)
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 0.5)
         _ = changes.withLock { $0.next(generation: generation) }
         XCTAssertFalse(galaxy.finishLoad(generation: generation, revision: originalRevision, rebuildDerivedData: true),
                        "Draining the queue does not make an old revision current")
+        XCTAssertTrue(galaxy.isInitialLoad)
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 0.5)
         XCTAssertNil(changes.withLock { $0.requestScan() })
         let scanRevision = changes.withLock { $0.revision }
         XCTAssertFalse(galaxy.finishLoad(generation: generation, revision: scanRevision, rebuildDerivedData: true))
+        XCTAssertTrue(galaxy.isInitialLoad)
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 0.5)
         guard case .scan = changes.withLock({ $0.next(generation: generation) }) else {
             return XCTFail("Requested rescan must be retained")
         }
         XCTAssertTrue(galaxy.finishLoad(generation: generation, revision: scanRevision, rebuildDerivedData: true))
         XCTAssertFalse(galaxy.isInitialLoad)
         XCTAssertTrue(galaxy.isLoaded)
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 1, "The first accepted completion still wakes the graph")
         let completedTopology = galaxy.renderStore.topologyVersion
         galaxy.cancelLoading()
+        registry.unifiedSimulation.setPositions([:])
         XCTAssertFalse(galaxy.finishLoad(generation: generation, revision: scanRevision, rebuildDerivedData: true))
         XCTAssertEqual(galaxy.renderStore.topologyVersion, completedTopology)
+        XCTAssertEqual(registry.unifiedSimulation.alpha, 0.5, "Retired completions cannot reheat the graph")
     }
 
     func testRemovedGalaxyRejectsQueuedStreamChunksAndOldGeneration() async throws {
@@ -283,11 +433,19 @@ final class GalaxyDrainTests: XCTestCase {
             try lattice.add(edge)
             let galaxy = Galaxy(id: "stream", displayName: "Stream", lattice: lattice.sendableReference)
             observedGalaxy = galaxy
+            let registry = GalaxyRegistry()
+            registry.register(galaxy)
+            registry.unifiedSimulation.setPositions([:])
             await galaxy.loadData()
             XCTAssertTrue(galaxy.isLoaded)
             XCTAssertEqual(galaxy.loadStatus, .complete)
             XCTAssertEqual(galaxy.renderStore.allNodes.count, 151)
             XCTAssertEqual(galaxy.renderStore.allEdges.count, 1)
+            XCTAssertEqual(registry.unifiedSimulation.alpha, 1, "The real initial load must wake the unified simulation")
+            for _ in 0..<1_000 { registry.unifiedSimulation.tick() }
+            XCTAssertTrue(registry.unifiedSimulation.isSettled)
+            let settledAlpha = registry.unifiedSimulation.alpha
+            let settledFrames = registry.unifiedSimulation.framesSinceWake
             // Exercise the observer -> reconcile -> finishLoad path, not only
             // handleNodeUpdate: completion used to overwrite this fresh value.
             let changes = await galaxy.loadChanges
@@ -304,6 +462,8 @@ final class GalaxyDrainTests: XCTestCase {
             XCTAssertEqual(galaxy.renderStore.nodeById[firstID]?.lastAccessedAt, accessedAt)
             XCTAssertFalse(changes.withLock { $0.workerRunning }, "Recall must finish its loader run")
             XCTAssertEqual(galaxy.renderStore.topologyVersion, topologyBeforeRecall)
+            XCTAssertTrue(registry.unifiedSimulation.isSettled)
+            XCTAssertEqual(registry.unifiedSimulation.alpha, settledAlpha)
             rows[0].content = "Changed after baseline"
             lattice.delete(rows[150])
             lattice.delete(edge)
@@ -318,15 +478,42 @@ final class GalaxyDrainTests: XCTestCase {
                 if galaxy.renderStore.allNodes[firstID]?.content == "Changed after baseline",
                    galaxy.renderStore.allNodes[lastID] == nil,
                    galaxy.renderStore.allNodes[addedID] != nil,
-                   galaxy.renderStore.allEdges.isEmpty { break }
+                   galaxy.renderStore.allEdges.isEmpty,
+                   !changes.withLock({ $0.workerRunning }) { break }
                 try await Task.sleep(for: .milliseconds(10))
             }
-            await galaxy.stopObservers()
+            XCTAssertFalse(changes.withLock { $0.workerRunning }, "Structural observer reconciliation must finish")
             XCTAssertEqual(galaxy.renderStore.allNodes[firstID]?.content, "Changed after baseline")
             XCTAssertNil(galaxy.renderStore.allNodes[lastID])
             XCTAssertNotNil(galaxy.renderStore.allNodes[addedID])
             XCTAssertEqual(galaxy.renderStore.allNodes.count, 151)
             XCTAssertTrue(galaxy.renderStore.allEdges.isEmpty)
+            XCTAssertTrue(registry.unifiedSimulation.isSettled,
+                          "Small live observer changes must not reheat the graph during completion")
+            registry.unifiedSimulation.tick()
+            XCTAssertTrue(registry.unifiedSimulation.isSettled)
+            XCTAssertEqual(registry.unifiedSimulation.alpha, settledAlpha)
+            XCTAssertEqual(registry.unifiedSimulation.framesSinceWake, settledFrames)
+            XCTAssertEqual(Set(registry.unifiedSimulation.nodeIds), Set(galaxy.renderStore.allNodes.keys))
+
+            // An unchanged full scan still rebuilds derived data. It must not
+            // inherit the initial-completion wake after the graph has settled.
+            let topologyBeforeRescan = galaxy.renderStore.topologyVersion
+            galaxy.setNodeFilter(nil)
+            let rescanDeadline = Date().addingTimeInterval(3)
+            while changes.withLock({ $0.workerRunning }) && Date() < rescanDeadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertFalse(changes.withLock { $0.workerRunning })
+            XCTAssertGreaterThan(galaxy.renderStore.topologyVersion, topologyBeforeRescan,
+                                 "The requested full rescan must actually complete its derived-data refresh")
+            XCTAssertTrue(galaxy.isLoaded)
+            XCTAssertFalse(galaxy.isInitialLoad)
+            registry.unifiedSimulation.tick()
+            XCTAssertTrue(registry.unifiedSimulation.isSettled)
+            XCTAssertEqual(registry.unifiedSimulation.alpha, settledAlpha)
+            XCTAssertEqual(registry.unifiedSimulation.framesSinceWake, settledFrames)
+            await galaxy.stopObservers()
         } catch {
             // Stop subscriptions on errors too. This cancels optional cluster
             // work; stopObservers does not promise to join an in-flight pass.
@@ -502,6 +689,64 @@ final class GalaxyDrainTests: XCTestCase {
         XCTAssertEqual(snapshot.edge.sourceId, expected.1)
         XCTAssertEqual(snapshot.edge.targetId, expected.2)
         XCTAssertEqual(snapshot.edge.relation, expected.3)
+    }
+
+    func testEdgeSnapshotRejectsMalformedEndpointsWithoutChangingStoredRows() throws {
+        // Only Edge is registered: valid endpoint UUIDs are deliberately
+        // dangling and must survive validation without a Memory lookup.
+        let lattice = try Lattice(MemoryEdge.self, configuration: .init(storage: .memory()))
+        defer { lattice.close() }
+        let source = try XCTUnwrap(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"))
+        let target = try XCTUnwrap(UUID(uuidString: "FFFFFFFF-2222-3333-4444-555555555555"))
+        let zero = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000000"))
+        let fixtures = [
+            ("", target.uuidString, false),
+            ("not-a-uuid", target.uuidString, false),
+            (source.uuidString, "", false),
+            (source.uuidString, "not-a-uuid", false),
+            ("", "", false),
+            (source.uuidString.uppercased(), target.uuidString.lowercased(), true),
+            (zero.uuidString, target.uuidString, true),
+        ]
+        var stored: [Int64: (id: UUID, source: String, target: String)] = [:]
+        var validRows: [UUID: (source: UUID, target: UUID)] = [:]
+        for fixture in fixtures {
+            let edge = MemoryEdge(sourceGlobalId: source, targetGlobalId: target, relation: .partOf)
+            try lattice.add(edge)
+            let pk = try XCTUnwrap(edge.primaryKey)
+            let id = try XCTUnwrap(edge.globalId)
+            // Exercise the persisted scalar representation without the UUID
+            // accessor that would hide malformed text behind random UUIDs.
+            edge.asRefType.setString(named: "sourceGlobalId", fixture.0)
+            edge.asRefType.setString(named: "targetGlobalId", fixture.1)
+            stored[pk] = (id, fixture.0, fixture.1)
+            if fixture.2 {
+                validRows[id] = (try XCTUnwrap(UUID(uuidString: fixture.0)),
+                                 try XCTUnwrap(UUID(uuidString: fixture.1)))
+            }
+        }
+
+        for _ in 0..<3 {
+            // Fresh handles mirror repeated loader scans of the same rows.
+            let rows = lattice.objects(MemoryEdge.self).snapshot()
+            XCTAssertEqual(rows.count, fixtures.count)
+            let snapshots = rows.compactMap(Galaxy.snapshotEdge)
+            XCTAssertEqual(snapshots.count, 2, "Each malformed endpoint must be rejected independently")
+            XCTAssertEqual(Set(snapshots.map(\.edge.id)), Set(validRows.keys))
+            for snapshot in snapshots {
+                let expected = try XCTUnwrap(validRows[snapshot.edge.id])
+                XCTAssertEqual(snapshot.edge.sourceId, expected.source)
+                XCTAssertEqual(snapshot.edge.targetId, expected.target)
+                XCTAssertEqual(snapshot.edge.relation, "part_of")
+            }
+            for row in rows {
+                let expected = try XCTUnwrap(stored[try XCTUnwrap(row.primaryKey)])
+                XCTAssertFalse(row.isMaterialized, "Validation must restore the caller's read mode")
+                XCTAssertEqual(row.globalId, expected.id)
+                XCTAssertEqual(row.asRefType.getString(named: "sourceGlobalId"), expected.source)
+                XCTAssertEqual(row.asRefType.getString(named: "targetGlobalId"), expected.target)
+            }
+        }
     }
 
     func testInitialFinalizeMatchesFullDerivationWithFiltersAndDanglingEdges() async throws {
@@ -1159,6 +1404,54 @@ final class GalaxyDrainTests: XCTestCase {
         galaxy.renderStore.glowingNodes.removeValue(forKey: node.id)
         adapter.tick(dt: 1 / 60)
         XCTAssertTrue(adapter.glowingNodes.isEmpty)
+    }
+
+    func testIdenticalEdgeUpdateCancelsStalePendingInsertAndStillAppliesRealEdit() throws {
+        let lattice = try Lattice(Memory.self, configuration: .init(storage: .memory()))
+        defer { lattice.close() }
+        let registry = GalaxyRegistry()
+        let galaxy = Galaxy(id: "personal", displayName: "Personal", lattice: lattice.sendableReference)
+        registry.register(galaxy)
+        let nodes = makeNodes(3)
+        galaxy.insertNodeBatch(nodes, config: config)
+        let current = EdgeData(id: UUID(), sourceId: nodes[0].id, targetId: nodes[1].id, relation: "part_of")
+        galaxy.handleEdgeUpdate(current, config: config)
+        registry.mergeRenderData()
+        let store = galaxy.renderStore
+        let allEdgesVersion = store.allEdgesVersion, topology = store.topologyVersion
+        let insertionGeneration = store.edgeInsertionGeneration, edgesVersion = store.edgesVersion
+        let edited = EdgeData(id: current.id, sourceId: nodes[0].id, targetId: nodes[2].id, relation: "relates_to")
+
+        // The newest observation matches committed state but supersedes an
+        // older deferred insert. Equality must not skip cancelling that insert.
+        galaxy.handleEdgeInsert(edited, config: config)
+        galaxy.handleEdgeUpdate(current, config: config)
+        galaxy.flushPendingEdgeInserts(config: config)
+        XCTAssertTrue(store.pendingEdgeInserts.isEmpty)
+        XCTAssertEqual(store.allEdgesVersion, allEdgesVersion)
+        XCTAssertEqual(store.edgeInsertionGeneration, insertionGeneration)
+        XCTAssertEqual(store.edgesVersion, edgesVersion)
+        XCTAssertEqual(store.topologyVersion, topology)
+        XCTAssertEqual(store.allEdges[current.id]?.targetId, nodes[1].id)
+        XCTAssertEqual(store.edges.map(\.id), [current.id])
+        XCTAssertEqual(store.edgeCountByNode[nodes[0].id], 1)
+        XCTAssertEqual(store.edgeCountByNode[nodes[1].id], 1)
+        XCTAssertEqual(store.edgeCountByNode[nodes[2].id] ?? 0, 0)
+        XCTAssertTrue(store.hubs.contains(nodes[1].id))
+        XCTAssertEqual(registry.unifiedSimulation.edgeIndicesPublic.count, 1)
+
+        // A genuine endpoint/relation change still takes the structural path.
+        galaxy.handleEdgeUpdate(edited, config: config)
+        registry.mergeRenderData()
+        XCTAssertGreaterThan(store.allEdgesVersion, allEdgesVersion)
+        XCTAssertGreaterThan(store.edgeInsertionGeneration, insertionGeneration)
+        XCTAssertGreaterThan(store.topologyVersion, topology)
+        XCTAssertEqual(registry.mergedEdges.first?.targetId, nodes[2].id)
+        XCTAssertEqual(registry.mergedEdges.first?.relation, "relates_to")
+        XCTAssertEqual(store.edgesByNode[nodes[1].id]?.count ?? 0, 0)
+        XCTAssertEqual(store.edgesByNode[nodes[2].id]?.map(\.id), [current.id])
+        XCTAssertFalse(store.hubs.contains(nodes[1].id))
+        XCTAssertEqual(registry.unifiedSimulation.edgeIndicesPublic.count, 1)
     }
 
     func testEdgeEditsInvalidateHubStyleAndKeepSimulationConsistent() throws {

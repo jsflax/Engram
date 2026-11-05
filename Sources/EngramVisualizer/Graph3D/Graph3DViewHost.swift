@@ -2,7 +2,6 @@ import SwiftUI
 import EngramSceneKit
 import EngramRealityKit
 import RealityKit
-import GameController
 import simd
 import os
 import Lattice
@@ -31,6 +30,10 @@ struct Graph3DView: View {
     @State private var rkSceneManager: RKSceneManager?
     @State private var scrollMonitor: Any?
     @State private var reticleTarget: UUID?
+    @State private var hasGamepad = false
+    @State private var hidInputStatus: HIDGamepadInputStatus = .inactive
+    @State private var isControllerSetupPresented = false
+    @Environment(\.appearsActive) private var appearsActive
     @State private var teleportLabelText: String?
     @State private var teleportCounterValue: Int = 0
 
@@ -80,9 +83,15 @@ struct Graph3DView: View {
                 }
 
                 // Center reticle (only when gamepad connected)
-                if GCController.current != nil {
+                if hasGamepad {
                     reticleOverlay
                 }
+
+                GamepadAccessView(status: hidInputStatus, isPresented: $isControllerSetupPresented)
+                    .frame(maxWidth: 340)
+                    .padding(.leading, 12)
+                    .padding(.bottom, 100)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
 
                 // Teleport project label (fades after 2s)
                 if let label = teleportLabelText {
@@ -151,7 +160,7 @@ struct Graph3DView: View {
                             Label("T/R teleport", systemImage: "keyboard")
                             Label("[/] galaxy", systemImage: "keyboard")
                         }
-                        if GCController.current != nil {
+                        if hasGamepad {
                             HStack(spacing: 16) {
                                 Label("L-Stick move", systemImage: "l.joystick")
                                 Label("R-Stick look", systemImage: "r.joystick")
@@ -174,7 +183,18 @@ struct Graph3DView: View {
             }
         }
         .accessibilityIdentifier("graph-3d-view")
-        .onDisappear { removeInputMonitor() }
+        .onAppear {
+            rkSceneManager?.graphHostIsVisible = true
+            updateControllerFocus()
+        }
+        .onDisappear {
+            rkSceneManager?.graphHostIsVisible = false
+            rkSceneManager?.isGraphInputActive = false
+            removeInputMonitor()
+        }
+        .onChange(of: appearsActive) { _, _ in updateControllerFocus() }
+        .onChange(of: isMascotChatOpen) { _, _ in updateControllerFocus() }
+        .onChange(of: isControllerSetupPresented) { _, _ in updateControllerFocus() }
         .onChange(of: soundEnabled) { _, enabled in
             rkSceneManager?.soundEnabled = enabled
         }
@@ -209,11 +229,20 @@ struct Graph3DView: View {
     private func setupRKRenderer() {
         guard rkSceneManager == nil else { return }
         guard let mgr = RKSceneManager(registry: galaxyRegistry) else { return }
+        mgr.renderViewSize = viewFrame.size
         rkSceneManager = mgr
 
         mgr.galaxyRegistry = galaxyRegistry
         mgr.soundEnabled = soundEnabled
         mgr.camera3DState = camera3DState
+        mgr.controllerConnectionCallback = { connected in
+            hasGamepad = connected
+        }
+        mgr.hidInputStatusCallback = { status in
+            hidInputStatus = status
+        }
+        mgr.graphHostIsVisible = true
+        updateControllerFocus()
         mgr.selectionCallback = { newSelection in
             selectedNode = newSelection
         }
@@ -255,6 +284,11 @@ struct Graph3DView: View {
                 }
             }
         }
+    }
+
+    private func updateControllerFocus() {
+        rkSceneManager?.updateGraphInputFocus(appearsActive: appearsActive,
+            mascotChatVisible: isMascotChatOpen, controllerSetupVisible: isControllerSetupPresented)
     }
 
     private func pushDataToRKScene() {

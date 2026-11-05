@@ -145,9 +145,11 @@ final class FrameLookupInvalidationTests: XCTestCase {
 
     func testFrameGapWorkAggregatesAndSaturates() {
         let diagnostics = FrameGapDiagnostics(enabled: true), owner = NSObject()
-        diagnostics.recordLoad(rows: 2, accepted: true, queuedAt: 10, startedAt: 20, endedAt: 50)
+        diagnostics.recordLoad(rows: 2, accepted: true, queuedAt: 10, startedAt: 20, endedAt: 50,
+                               newEdgeRows: 1, unchangedEdgeRows: 1)
         diagnostics.recordLoad(rows: 3, accepted: false, queuedAt: nil, startedAt: 40, endedAt: 45)
-        diagnostics.recordLoad(rows: 4, accepted: true, queuedAt: 100, startedAt: 60, endedAt: 70)
+        diagnostics.recordLoad(rows: 4, accepted: true, queuedAt: 100, startedAt: 60, endedAt: 70,
+                               unchangedEdgeRows: 1, changedEdgeRows: 3)
         diagnostics.recordForce(outcome: .positionsApplied, queuedAt: 15, startedAt: 20, endedAt: 30)
         diagnostics.recordForce(outcome: .rejected, queuedAt: nil, startedAt: 40, endedAt: 60)
         diagnostics.recordForce(outcome: .rawFallback, queuedAt: 30, startedAt: 30, endedAt: 34)
@@ -156,6 +158,9 @@ final class FrameLookupInvalidationTests: XCTestCase {
         XCTAssertTrue(sample?.load.acceptedCount == 2)
         XCTAssertTrue(sample?.load.rejectedCount == 1)
         XCTAssertTrue(sample?.load.rows == 9)
+        XCTAssertTrue(sample?.load.newEdgeRows == 1)
+        XCTAssertTrue(sample?.load.unchangedEdgeRows == 2)
+        XCTAssertTrue(sample?.load.changedEdgeRows == 3)
         XCTAssertTrue(sample?.load.durationNanoseconds == 45)
         XCTAssertTrue(sample?.load.maximumDurationNanoseconds == 30)
         XCTAssertTrue(sample?.load.queueSamples == 1)
@@ -175,13 +180,14 @@ final class FrameLookupInvalidationTests: XCTestCase {
         // including queue availability and previous-callback attribution.
         let csv = FrameGapDiagnostics(enabled: true)
         csv.recordLoad(rows: 2, accepted: true, queuedAt: 1_000_000,
-                       startedAt: 3_000_000, endedAt: 8_000_000)
+                       startedAt: 3_000_000, endedAt: 8_000_000,
+                       newEdgeRows: 1, unchangedEdgeRows: 1)
         csv.recordForce(outcome: .rawFallback, queuedAt: nil,
                         startedAt: 9_000_000, endedAt: 12_000_000)
         let csvFirst = csv.beginCallback(owner: owner, at: 20_000_000)
         let columns = FrameGapDiagnostics.csvHeader.components(separatedBy: ",")
         let firstValues = FrameGapDiagnostics.csvValues(csvFirst).components(separatedBy: ",")
-        XCTAssertTrue(columns.count == 24)
+        XCTAssertTrue(columns.count == 27)
         XCTAssertTrue(Set(columns).count == columns.count)
         XCTAssertTrue(firstValues.count == columns.count)
         let firstFields = Dictionary(uniqueKeysWithValues: zip(columns, firstValues))
@@ -189,6 +195,9 @@ final class FrameLookupInvalidationTests: XCTestCase {
         XCTAssertTrue(firstFields["load_count"] == "1")
         XCTAssertTrue(firstFields["load_accepted"] == "1")
         XCTAssertTrue(firstFields["load_rows"] == "2")
+        XCTAssertTrue(firstFields["load_new_edges"] == "1")
+        XCTAssertTrue(firstFields["load_unchanged_edges"] == "1")
+        XCTAssertTrue(firstFields["load_changed_edges"] == "0")
         XCTAssertTrue(firstFields["load_apply_ms"] == "5.000")
         XCTAssertTrue(firstFields["load_apply_max_ms"] == "5.000")
         XCTAssertTrue(firstFields["load_queue_samples"] == "1")
@@ -209,18 +218,26 @@ final class FrameLookupInvalidationTests: XCTestCase {
         XCTAssertTrue(nextFields["callback_outside_ms"] == "18.000")
         XCTAssertTrue(nextFields["previous_logger_tail_ms"] == "2.000")
         XCTAssertTrue(nextFields["load_count"] == "0")
+        XCTAssertTrue(nextFields["load_new_edges"] == "0")
+        XCTAssertTrue(nextFields["load_unchanged_edges"] == "0")
+        XCTAssertTrue(nextFields["load_changed_edges"] == "0")
         XCTAssertTrue(nextFields["force_apply_count"] == "0")
 
-        diagnostics.recordLoad(rows: Int.max, accepted: true, queuedAt: nil, startedAt: 0, endedAt: .max)
-        diagnostics.recordLoad(rows: Int.max, accepted: true, queuedAt: nil, startedAt: 0, endedAt: .max)
-        diagnostics.recordLoad(rows: Int.max, accepted: false, queuedAt: 0, startedAt: .max, endedAt: .max)
-        diagnostics.recordLoad(rows: -1, accepted: false, queuedAt: 0, startedAt: .max, endedAt: .max)
+        for _ in 0..<3 {
+            diagnostics.recordLoad(rows: Int.max, accepted: true, queuedAt: nil, startedAt: 0, endedAt: .max,
+                                   newEdgeRows: Int.max, unchangedEdgeRows: Int.max, changedEdgeRows: Int.max)
+        }
+        diagnostics.recordLoad(rows: -1, accepted: false, queuedAt: 0, startedAt: .max, endedAt: .max,
+                               newEdgeRows: -1, unchangedEdgeRows: -1, changedEdgeRows: -1)
         let saturated = diagnostics.beginCallback(owner: owner, at: .max)
         XCTAssertTrue(saturated?.load.count == 4)
         XCTAssertTrue(saturated?.load.rows == UInt64.max)
+        XCTAssertTrue(saturated?.load.newEdgeRows == UInt64.max)
+        XCTAssertTrue(saturated?.load.unchangedEdgeRows == UInt64.max)
+        XCTAssertTrue(saturated?.load.changedEdgeRows == UInt64.max)
         XCTAssertTrue(saturated?.load.durationNanoseconds == UInt64.max)
         XCTAssertTrue(saturated?.load.maximumDurationNanoseconds == UInt64.max)
-        XCTAssertTrue(saturated?.load.queueSamples == 2)
+        XCTAssertTrue(saturated?.load.queueSamples == 1)
         XCTAssertTrue(saturated?.load.queueNanoseconds == UInt64.max)
         XCTAssertTrue(saturated?.load.maximumQueueNanoseconds == UInt64.max)
         XCTAssertTrue(saturated?.force.count == 0)
@@ -238,7 +255,8 @@ final class FrameLookupInvalidationTests: XCTestCase {
         XCTAssertTrue(enabledStamp == 42)
         XCTAssertTrue(clockReads == 1)
         let diagnostics = FrameGapDiagnostics(enabled: false), owner = NSObject()
-        diagnostics.recordLoad(rows: 50, accepted: true, queuedAt: 1, startedAt: 2, endedAt: 3)
+        diagnostics.recordLoad(rows: 50, accepted: true, queuedAt: 1, startedAt: 2, endedAt: 3,
+                               newEdgeRows: 10, unchangedEdgeRows: 30, changedEdgeRows: 10)
         diagnostics.recordForce(outcome: .positionsApplied, queuedAt: 1, startedAt: 2, endedAt: 3)
         XCTAssertTrue(diagnostics.beginCallback(owner: owner, at: 4) == nil)
         diagnostics.finishCallback(owner: owner, bodyEndedAt: 5, exitedAt: 6)

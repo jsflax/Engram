@@ -17,7 +17,14 @@ public final class RKMascotSystem {
     private var animationTimes: [String: Float] = [:]
     private var currentPositions: [String: SIMD3<Float>] = [:]
     private var currentYaws: [String: Float] = [:]
-    private var mascotLoadingProjects: Set<String> = []
+    private var loadTokens: [String: UInt64] = [:]
+    private var nextLoadToken: UInt64 = 0
+    private let makeMascot: @MainActor (String, SIMD3<Float>) async -> Entity
+    private weak var latestContainer: Entity?
+    private weak var latestDataProvider: SceneDataProvider?
+    private var latestScaleFactor: Float = 1
+    private var latestVisibilityCamera: MascotVisibilityCamera?
+    private var visualRadii: [String: Float] = [:]
     private struct Effects {
         let arcaneCircle: Entity?
         let conjureOrb: Entity?
@@ -29,6 +36,11 @@ public final class RKMascotSystem {
     private var holoTasks: [String: Task<Void, Never>] = [:]
     private var preparedHoloImages: [String: (key: MascotHoloKey, image: CGImage)] = [:]
     private var appliedHoloOpacities: [String: Float] = [:]
+
+    /// Constant-time counts; no entity traversal or state changes.
+    var diagnosticCounts: (tracked: Int, loading: Int) {
+        (activeMascots.count, loadTokens.count)
+    }
 
     /// Priority-comparable task type for mascot behavior.
     public enum MascotTask: Comparable {
@@ -58,14 +70,47 @@ public final class RKMascotSystem {
     private let patrolHoverDuration: Float = 8.0
     private let patrolSpeed: Float = 0.3
 
-    public init() {}
+    public init() {
+        makeMascot = { project, tint in
+            await MascotEntityFactory.createMascotGroup(project: project, tint: tint)
+        }
+    }
+
+    /// Asset-independent construction seam; the ordinary initializer retains
+    /// the shared prototype cache and factory.
+    init(makeMascot: @escaping @MainActor (String, SIMD3<Float>) async -> Entity) {
+        self.makeMascot = makeMascot
+    }
+
+    func retainedState(for project: String)
+        -> (behavior: MascotBehavior?, queuedTaskCount: Int, animationTime: Float) {
+        (mascotStates[project], taskQueues[project]?.count ?? 0, animationTimes[project] ?? 0)
+    }
 
     public func update(
         container: Entity,
         dataProvider: SceneDataProvider,
         dt: Float,
-        scaleFactor: Float
+        scaleFactor: Float,
+        visibilityCamera: MascotVisibilityCamera? = nil
     ) {
+        if latestDataProvider !== dataProvider || latestContainer !== container {
+            // A completion from an earlier provider/container must not consume
+            // a replacement request's token or attach its stale entity.
+            loadTokens.removeAll()
+        }
+        if latestContainer !== container {
+            // The app normally keeps one container. If a host replaces it,
+            // retained groups must move with it before scene-space culling.
+            for entity in activeMascots.values {
+                entity.isEnabled = false
+                container.addChild(entity)
+            }
+        }
+        latestDataProvider = dataProvider
+        latestContainer = container
+        latestScaleFactor = scaleFactor
+        latestVisibilityCamera = visibilityCamera
         let colorMap = dataProvider.projectColorMap
         let nodes = dataProvider.nodes
 
@@ -76,12 +121,13 @@ public final class RKMascotSystem {
                           nodeAppendGeneration: dataProvider.nodeAppendGeneration, provider: dataProvider)
         let activeProjects = graphIndex.projects
 
-        // Remove mascots for gone projects
-        for (project, entity) in activeMascots where !activeProjects.contains(project) {
-            entity.removeFromParent()
-        }
-        for project in activeMascots.keys where !activeProjects.contains(project) {
-            activeMascots.removeValue(forKey: project)
+        // Loading-only projects participate in removal, too: otherwise a
+        // removed/readded project's old completion could become current again.
+        let retainedProjects = Set(activeMascots.keys).union(loadTokens.keys)
+        for project in retainedProjects.subtracting(activeProjects) {
+            activeMascots.removeValue(forKey: project)?.removeFromParent()
+            loadTokens.removeValue(forKey: project)
+            visualRadii.removeValue(forKey: project)
             mascotStates.removeValue(forKey: project)
             taskQueues.removeValue(forKey: project)
             idleTimers.removeValue(forKey: project)
@@ -97,36 +143,54 @@ public final class RKMascotSystem {
             appliedHoloOpacities.removeValue(forKey: project)
         }
 
-        // Create mascots for new projects
-        for project in activeProjects where activeMascots[project] == nil && !mascotLoadingProjects.contains(project) {
+        // Load through the existing shared prototype cache. Before the first
+        // model exists there is no reliable visual bound to cull against.
+        for project in activeProjects where activeMascots[project] == nil && loadTokens[project] == nil {
             let tint = colorMap[project] ?? SIMD3<Float>(0, 0.8, 1.0)
-            mascotLoadingProjects.insert(project)
-            let proj = project
+            nextLoadToken &+= 1
+            let token = nextLoadToken
+            loadTokens[project] = token
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                let entity = await MascotEntityFactory.createMascotGroup(project: proj, tint: tint)
-                self.mascotLoadingProjects.remove(proj)
-                guard self.graphIndex.projects.contains(proj), self.activeMascots[proj] == nil else { return }
-                container.addChild(entity)
-                self.activeMascots[proj] = entity
-                self.mascotStates[proj] = .idle(.awake)
-                self.idleTimers[proj] = 0
-                self.patrolThresholds[proj] = Float.random(in: 12...30)
-                self.animationTimes[proj] = 0
-                self.effects[proj] = Effects(
+                let entity = await self.makeMascot(project, tint)
+                entity.isEnabled = false
+                guard self.loadTokens[project] == token,
+                      self.graphIndex.projects.contains(project), self.activeMascots[project] == nil,
+                      let container = self.latestContainer,
+                      let provider = self.latestDataProvider else { return }
+                self.loadTokens.removeValue(forKey: project)
+                self.activeMascots[project] = entity
+                self.mascotStates[project] = .idle(.awake)
+                self.idleTimers[project] = 0
+                self.patrolThresholds[project] = Float.random(in: 12...30)
+                self.animationTimes[project] = 0
+                self.effects[project] = Effects(
                     arcaneCircle: entity.children.first { $0.name == "ArcaneCircle" },
                     conjureOrb: entity.children.first { $0.name == "ConjureOrb" },
                     holoScreen: entity.children.first { $0.name == "HoloScreen" } as? ModelEntity
                 )
-
-                // Initial position near project centroid
-                if let centroid = dataProvider.projectCentroids[proj] {
-                    self.currentPositions[proj] = centroid + SIMD3(0, 50, 0)
-                    entity.position = (centroid + SIMD3(0, 50, 0)) * scaleFactor
+                // Include disabled effects and scaled descendants once. The
+                // origin-centered sphere encloses all root yaw orientations.
+                let bounds = entity.visualBounds(recursive: true, relativeTo: entity, excludeInactive: false)
+                self.visualRadii[project] = simd_length(bounds.center) + 0.5 * simd_length(bounds.extents)
+                if let centroid = provider.projectCentroids[project] {
+                    self.currentPositions[project] = centroid + SIMD3(0, 50, 0)
                 }
+                // Use the latest frame context, not the camera/scale captured
+                // when the asynchronous model request began. Never attach an
+                // enabled clone before its current eligibility is known.
+                let containerTransform = container.transformMatrix(relativeTo: nil)
+                self.updateRendering(project: project, entity: entity, containerTransform: containerTransform,
+                                     containerStretch: self.maximumStretch(containerTransform), state: .idle(.awake), time: 0, dt: 0, nodes: provider.nodes,
+                                     scaleFactor: self.latestScaleFactor,
+                                     camera: self.latestVisibilityCamera)
+                container.addChild(entity)
             }
         }
 
+        // Shared ancestry is inspected once per frame, not once per bot.
+        let containerTransform = container.transformMatrix(relativeTo: nil)
+        let containerStretch = maximumStretch(containerTransform)
         // Update each active mascot
         for (project, entity) in activeMascots {
             let state = mascotStates[project] ?? .idle(.awake)
@@ -147,35 +211,66 @@ public final class RKMascotSystem {
             )
             mascotStates[project] = newState
 
-            // Compute joint angles from state
-            let angles = computeJointAngles(state: newState, time: time)
-
-            // Update entity transform
-            if let pos = currentPositions[project] {
-                let scaled = pos * scaleFactor
-                if entity.position != scaled { entity.position = scaled }
-            }
-            let yaw = currentYaws[project] ?? 0
-            let orientation = simd_quatf(angle: yaw, axis: SIMD3(0, 1, 0))
-            if entity.orientation.vector != orientation.vector { entity.orientation = orientation }
-
-            // Update MascotComponent
-            var comp = entity.components[MascotComponent.self] ?? MascotComponent(project: project)
-            comp.state = newState
-            comp.jointAngles = angles
-            comp.animationTime = time
-            comp.yaw = yaw
-            if let pos = currentPositions[project] { comp.position = pos }
-            entity.components.set(comp)
-
-            // Toggle child effects + update holo texture
-            // Prewarm during travel, before the existing 1.5-second hover delay.
-            // Texture replacement stays asynchronous and does not alter visibility.
-            if case .patrol(let nodeId, _) = newState, let holo = effects[project]?.holoScreen {
-                updateHoloTexture(entity: holo, nodeId: nodeId, nodes: nodes, project: project)
-            }
-            updateEffectVisibility(state: newState, dt: dt, project: project, nodes: nodes)
+            updateRendering(project: project, entity: entity, containerTransform: containerTransform,
+                            containerStretch: containerStretch, state: newState, time: time, dt: dt, nodes: nodes,
+                            scaleFactor: scaleFactor, camera: visibilityCamera)
         }
+    }
+
+    /// Bound the linear transform's maximum stretch. Ordinary rotation/scale
+    /// uses its largest axis; sheared ancestors use a conservative matrix norm.
+    private func maximumStretch(_ matrix: simd_float4x4) -> Float {
+        let x = SIMD3(matrix.columns.0.x, matrix.columns.0.y, matrix.columns.0.z)
+        let y = SIMD3(matrix.columns.1.x, matrix.columns.1.y, matrix.columns.1.z)
+        let z = SIMD3(matrix.columns.2.x, matrix.columns.2.y, matrix.columns.2.z)
+        let xx = simd_length_squared(x), yy = simd_length_squared(y), zz = simd_length_squared(z)
+        // The largest absolute row sum of AᵀA bounds its largest eigenvalue,
+        // including shear. It is exact for orthogonal rotation/scale columns.
+        let xy = abs(simd_dot(x, y)), xz = abs(simd_dot(x, z)), yz = abs(simd_dot(y, z))
+        return sqrt(max(xx + xy + xz, max(yy + xy + yz, zz + xz + yz)))
+    }
+
+    private func updateRendering(project: String, entity: Entity, containerTransform: simd_float4x4,
+                                 containerStretch: Float, state: MascotBehavior, time: Float, dt: Float,
+                                 nodes: [RKNodeSnapshot], scaleFactor: Float,
+                                 camera: MascotVisibilityCamera?) {
+        // scaleFactor translates graph coordinates only; authored model and
+        // effect sizes are already scene units. Hidden roots keep their old
+        // transform, so evaluate their current logical position explicitly.
+        let position = currentPositions[project].map { $0 * scaleFactor } ?? entity.position
+        let scenePosition = containerTransform * SIMD4(position, 1)
+        let center = SIMD3(scenePosition.x, scenePosition.y, scenePosition.z)
+        let rootScale = max(abs(entity.scale.x), max(abs(entity.scale.y), abs(entity.scale.z)))
+        let radius = (visualRadii[project] ?? .nan) * rootScale
+            * containerStretch
+        let visible = MascotVisibilityPolicy.isVisible(center: center, radius: radius,
+                                                       camera: camera, wasVisible: entity.isEnabled)
+        if !visible {
+            if entity.isEnabled { entity.isEnabled = false }
+            // Preserve logical time/effect fades and queued work without
+            // dirtying invisible skinned clones or requesting new textures.
+            updateEffectVisibility(state: state, dt: dt, project: project, nodes: nodes, renderEnabled: false)
+            return
+        }
+
+        // Apply the current pose and effects while a returning root is still
+        // disabled, then enable it. There is no stale pose or catch-up delta.
+        if entity.position != position { entity.position = position }
+        let yaw = currentYaws[project] ?? 0
+        let orientation = simd_quatf(angle: yaw, axis: SIMD3(0, 1, 0))
+        if entity.orientation.vector != orientation.vector { entity.orientation = orientation }
+        var comp = entity.components[MascotComponent.self] ?? MascotComponent(project: project)
+        comp.state = state
+        comp.jointAngles = computeJointAngles(state: state, time: time)
+        comp.animationTime = time
+        comp.yaw = yaw
+        if let pos = currentPositions[project] { comp.position = pos }
+        entity.components.set(comp)
+        if case .patrol(let nodeId, _) = state, let holo = effects[project]?.holoScreen {
+            updateHoloTexture(entity: holo, nodeId: nodeId, nodes: nodes, project: project)
+        }
+        updateEffectVisibility(state: state, dt: dt, project: project, nodes: nodes, renderEnabled: true)
+        if !entity.isEnabled { entity.isEnabled = true }
     }
 
     // MARK: - State Machine
@@ -337,7 +432,7 @@ public final class RKMascotSystem {
 
     // MARK: - Effect Visibility
 
-    private func updateEffectVisibility(state: MascotBehavior, dt: Float, project: String, nodes: [RKNodeSnapshot]) {
+    private func updateEffectVisibility(state: MascotBehavior, dt: Float, project: String, nodes: [RKNodeSnapshot], renderEnabled: Bool) {
         let wantsArcane: Bool
         let wantsOrb: Bool
         let wantsHolo: Bool
@@ -366,7 +461,7 @@ public final class RKMascotSystem {
             wantsHolo = false
         }
 
-        if let nodeId = hoverNodeId, let holo = effects[project]?.holoScreen {
+        if renderEnabled, let nodeId = hoverNodeId, let holo = effects[project]?.holoScreen {
             updateHoloTexture(entity: holo, nodeId: nodeId, nodes: nodes, project: project)
         }
         let textureReady = hoverNodeId.map { holoRequestCache.isReady(nodeID: $0, for: project) } ?? true
@@ -380,6 +475,7 @@ public final class RKMascotSystem {
         let fadeSpeed: Float = holoReady ? 2.5 : 4.0
         let newOpacity = currentOpacity + (targetOpacity - currentOpacity) * min(dt * fadeSpeed, 1.0)
         holoOpacities[project] = newOpacity
+        guard renderEnabled else { return }
 
         if let circle = effects[project]?.arcaneCircle, circle.isEnabled != wantsArcane {
             circle.isEnabled = wantsArcane

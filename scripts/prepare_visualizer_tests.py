@@ -10,9 +10,11 @@ import plistlib
 import re
 import subprocess
 
-CLASSES = ('GalaxyLoadChangesTests', 'GalaxyDrainTests', 'VisualizerHostIsolationTests', 'AdapterSnapshotTests',
+CLASSES = ('GalaxyLoadChangesTests', 'GalaxyDrainTests', 'ForceWakePolicyTests', 'VisualizerHostIsolationTests', 'AdapterSnapshotTests',
            'FrameLookupInvalidationTests', 'SceneMetadataDomainTests', 'LogsViewTests', 'NebulaLODVisibilityTests',
-           'SidebarSelectionTests')
+           'NebulaDetailPlannerTests', 'MascotVisibilityTests',
+           'SidebarSelectionTests', 'GamepadInputTests', 'HIDGamepadInputTests',
+           'SidebarDatabaseMaintenanceTests', 'SidebarSyncSnapshotTests')
 # These functional regressions share a class with device-dependent performance
 # budgets. Select their methods explicitly rather than widening that class.
 METHODS = {'PanelPerformanceTests': (
@@ -163,7 +165,10 @@ def dependency_checkouts(repo, pins, dependencies):
     require(set(checkouts) == expected, 'dependency set changed')
     return checkouts, local
 
-def verify_inputs(root):
+def verify_inputs(root, receipt_phase=None):
+    require(receipt_phase in (None, 'diagnostic'), 'unknown input verification phase')
+    if receipt_phase == 'diagnostic':
+        require((root / 'evidence/inputs-final.json').is_file(), 'diagnostic verification requires final test inputs')
     repo = root / 'repo'
     identity = json.loads((root / 'evidence/source-identity.json').read_text())
     require(subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
@@ -182,7 +187,7 @@ def verify_inputs(root):
     for path in ('Package.resolved', 'Engram.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved'):
         require((repo / path).read_bytes() == original_lock, 'dependency lock changed')
     pins = json.loads(original_lock)['pins']
-    suffix = 'final' if (root / 'evidence/inputs-initial.json').exists() else 'initial'
+    suffix = receipt_phase or ('final' if (root / 'evidence/inputs-initial.json').exists() else 'initial')
     state_bytes = (root / 'scratch/workspace-state.json').read_bytes()
     with (root / 'evidence' / ('workspace-state-' + suffix + '.json')).open('xb') as output:
         output.write(state_bytes)
@@ -235,9 +240,11 @@ def audit(root):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('phase', choices=('prepare', 'audit', 'verify-inputs'))
+    parser.add_argument('phase', choices=('prepare', 'audit', 'verify-inputs', 'verify-diagnostic-inputs'))
     parser.add_argument('--root', required=True, type=Path)
     args = parser.parse_args()
     root = args.root.resolve(strict=True)
     require(root.parent == Path.home() / 'localdev', 'validation root must be a direct localdev child')
-    print(json.dumps({'prepare': prepare, 'audit': audit, 'verify-inputs': verify_inputs}[args.phase](root), sort_keys=True))
+    handlers = {'prepare': prepare, 'audit': audit, 'verify-inputs': verify_inputs,
+                'verify-diagnostic-inputs': lambda value: verify_inputs(value, receipt_phase='diagnostic')}
+    print(json.dumps(handlers[args.phase](root), sort_keys=True))

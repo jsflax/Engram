@@ -177,6 +177,13 @@ actor Galaxy: Identifiable {
     let loadChanges = OSAllocatedUnfairLock(initialState: GalaxyLoadChanges())
     private var clusterTask: Task<Void, Never>?
 
+    #if DEBUG
+    private var edgeScanObserver: (@Sendable (GalaxyEdgeScanEvent) -> Void)?
+    func setEdgeScanObserverForTesting(_ observer: @escaping @Sendable (GalaxyEdgeScanEvent) -> Void) {
+        edgeScanObserver = observer
+    }
+    #endif
+
     private enum LoadFailure: Error { case storageUnavailable }
 
     @MainActor init(id: String, displayName: String, lattice: LatticeThreadSafeReference,
@@ -263,9 +270,10 @@ actor Galaxy: Identifiable {
         }
     }
 
-    /// There is only one producer. Each 50-row chunk is consumed on MainActor
-    /// before the next query; neither hydrated models nor an unbounded batch
-    /// queue survive the await. A full scan is nodes-first, then edges.
+    /// There is only one producer. Database reads stay bounded at 50 rows;
+    /// initial edges combine at most four detached value pages per MainActor
+    /// publication. No hydrated edge models or unbounded queue cross that await.
+    /// A full scan is nodes-first, then edges; live changes reconcile afterward.
     private func runLoader(generation: UInt64) async {
         var needsDerivedData = false
         do {
@@ -329,22 +337,28 @@ actor Galaxy: Identifiable {
         }
         cursor = Int64.min
         while true {
+            let group = try GalaxyEdgeScan.readGroup(after: cursor,
+                check: { try checkLoad(generation) },
+                readPage: { try readInitialEdgePage(after: $0, limit: $1) })
+            cursor = group.cursor
+            seenEdges.formUnion(group.rows.map(\.pk))
+            if !group.rows.isEmpty {
+                #if DEBUG
+                edgeScanObserver?(.willPublish(rowCount: group.rows.count))
+                #endif
+                await applyLoadChunk(edges: group.rows, generation: generation,
+                                     diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
+            } else if !group.reachedEnd {
+                // Long runs of malformed rows still yield once per four raw
+                // pages, even though there is nothing to publish on MainActor.
+                await Task.yield()
+            }
             try checkLoad(generation)
-            guard let lattice = latticeRef.resolve() else { throw LoadFailure.storageUnavailable }
-            let after = cursor
-            let rows = lattice.objects(MemoryEdge.self).where { $0.primaryKey > after }
-                .sortedBy(\.primaryKey).snapshot(limit: 50)
-            guard lattice.lastQueryError() == nil else { throw LoadFailure.storageUnavailable }
-            if rows.isEmpty { break }
-            guard let last = rows.last?.primaryKey, last > cursor else { throw LoadFailure.storageUnavailable }
-            cursor = last
-            let batch = rows.compactMap(Self.snapshotEdge)
-            seenEdges.formUnion(batch.map(\.pk))
-            await applyLoadChunk(edges: batch, generation: generation,
-                                 diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
+            if group.reachedEnd { break }
         }
         // Required on overflow/retry: rows deleted before a fresh scan have no
         // new callback to replay. Only a successful complete scan may prune.
+        try checkLoad(generation)
         let missing = await missingKeys(nodes: seenNodes, edges: seenEdges, generation: generation)
         for offset in stride(from: 0, to: missing.nodes.count, by: 50) {
             try checkLoad(generation)
@@ -356,6 +370,21 @@ actor Galaxy: Identifiable {
             await applyLoadChunk(removedEdges: Array(missing.edges[offset..<min(offset + 50, missing.edges.count)]), generation: generation,
                                  diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
         }
+    }
+
+    /// Native query/model lifetimes end before the next page or publication.
+    /// Keep this reader unit unchanged when tuning value-publication batching.
+    private func readInitialEdgePage(after: Int64, limit: Int) throws -> GalaxyEdgeScan.Page {
+        guard let lattice = latticeRef.resolve() else { throw LoadFailure.storageUnavailable }
+        let rows = lattice.objects(MemoryEdge.self).where { $0.primaryKey > after }
+            .sortedBy(\.primaryKey).snapshot(limit: Int64(limit))
+        guard lattice.lastQueryError() == nil else { throw LoadFailure.storageUnavailable }
+        let page = GalaxyEdgeScan.Page(rawCount: rows.count, lastPrimaryKey: rows.last?.primaryKey,
+                                      rows: rows.compactMap(Self.snapshotEdge))
+        #if DEBUG
+        edgeScanObserver?(.pageRead(limit: limit, rawCount: page.rawCount))
+        #endif
+        return page
     }
 
     private func reconcile(nodes: [Int64], edges: [Int64], generation: UInt64) async throws -> Bool {
@@ -400,12 +429,15 @@ actor Galaxy: Identifiable {
     ) -> Bool {
         let diagnosticStart = FrameGapDiagnostics.timestamp()
         var accepted = false
+        var newEdgeRows = 0, unchangedEdgeRows = 0, changedEdgeRows = 0
         defer {
             if let diagnosticStart {
                 FrameGapDiagnostics.shared.recordLoad(
                     rows: nodes.count + edges.count + removedNodes.count + removedEdges.count,
                     accepted: accepted, queuedAt: diagnosticEnqueuedAt, startedAt: diagnosticStart,
-                    endedAt: DispatchTime.now().uptimeNanoseconds)
+                    endedAt: DispatchTime.now().uptimeNanoseconds,
+                    newEdgeRows: newEdgeRows, unchangedEdgeRows: unchangedEdgeRows,
+                    changedEdgeRows: changedEdgeRows)
             }
         }
         guard !Task.isCancelled, loadChanges.withLock({ $0.accepts(generation) }) else { return false }
@@ -447,8 +479,19 @@ actor Galaxy: Identifiable {
             self.flushPendingNodeInserts(config: config)
             for (pk, edge) in edges {
                 store.edgePkToGlobalId[pk] = edge.id
-                if store.allEdges[edge.id] == nil { store.pendingEdgeInserts.append((edge.id, edge)) }
-                else { self.handleEdgeUpdate(edge, config: config) }
+                if store.allEdges[edge.id] == nil {
+                    store.pendingEdgeInserts.append((edge.id, edge))
+                    if diagnosticStart != nil { newEdgeRows += 1 }
+                } else {
+                    let revision = diagnosticStart != nil ? store.allEdgesVersion : nil
+                    self.handleEdgeUpdate(edge, config: config)
+                    // Measure the mutation decision itself, without logging
+                    // identifiers or repeating endpoint comparisons per row.
+                    if let revision {
+                        if store.allEdgesVersion == revision { unchangedEdgeRows += 1 }
+                        else { changedEdgeRows += 1 }
+                    }
+                }
             }
             self.flushPendingEdgeInserts(config: config)
         }
@@ -466,17 +509,19 @@ actor Galaxy: Identifiable {
     }
 
     /// A full scan or graph change still finalizes all derived data. A live
-    /// access-only reconciliation is already complete after its lookup writes;
-    /// rebuilding here would repeat whole-graph work and wake a settled graph.
+    /// access-only reconciliation is already complete after its lookup writes.
+    /// Only initial completion explicitly wakes the shared simulation; live
+    /// changes use its coalesced topology-delta policy, even after a full rescan.
     @discardableResult
     @MainActor func finishLoad(generation: UInt64, revision: UInt64, rebuildDerivedData: Bool) -> Bool {
         guard !Task.isCancelled, loadChanges.withLock({ $0.accepts(generation) && $0.revision == revision && !$0.needsScan && $0.nodes.isEmpty && $0.edges.isEmpty }) else { return false }
+        let completedInitialLoad = isInitialLoad
         if rebuildDerivedData { recomputeDerivedData() }
         isInitialLoad = false
         if rebuildDerivedData || loadStatus != .complete || !isLoaded {
             setLoadStatus(.complete, generation: generation)
         }
-        if rebuildDerivedData { simulation3D?.wake() }
+        if completedInitialLoad { simulation3D?.wake() }
         return true
     }
 
@@ -541,8 +586,14 @@ actor Galaxy: Identifiable {
     nonisolated static func snapshotEdge(_ edge: MemoryEdge) -> (pk: Int64, edge: EdgeData)? {
         edge.withMaterializedReads {
             guard let pk = edge.primaryKey, let gid = edge.globalId else { return nil }
-            return (pk, EdgeData(id: gid, sourceId: edge.sourceGlobalId,
-                                 targetId: edge.targetGlobalId, relation: edge.relation.rawValue))
+            // Lattice's nonoptional UUID getter substitutes a new UUID for
+            // malformed stored text. Reject those endpoints before conversion
+            // so rescans cannot turn one invalid row into changing topology.
+            let fields = edge.asRefType
+            guard let source = UUID(uuidString: fields.getString(named: "sourceGlobalId")),
+                  let target = UUID(uuidString: fields.getString(named: "targetGlobalId")) else { return nil }
+            return (pk, EdgeData(id: gid, sourceId: source,
+                                 targetId: target, relation: edge.relation.rawValue))
         }
     }
     
@@ -1023,14 +1074,15 @@ actor Galaxy: Identifiable {
         // Updating an edge whose insert has not flushed supersedes that old row.
         store.pendingEdgeInserts.removeAll { $0.edge.id == data.id }
         let old = store.allEdges[data.id]
-        store.allEdges[data.id] = data
-        // Only scan the edges array when structural fields changed (relation, endpoints).
-        // Edge updates that don't change routing (rare) skip the O(edges) linear scan.
+        // Replayed rows and non-rendering database edits can produce identical
+        // EdgeData. Do not even reassign them: allEdges' mutation observer would
+        // invalidate the insertion journal and force a full multi-galaxy merge.
         let structuralChange = old == nil ||
             old!.relation != data.relation ||
             old!.sourceId != data.sourceId ||
             old!.targetId != data.targetId
         if structuralChange {
+            store.allEdges[data.id] = data
             store.edges.removeAll { $0.id == data.id }
             store.filteredEdgeIds.remove(data.id)
             if let old {

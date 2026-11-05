@@ -128,6 +128,7 @@ public final class MetalForceCompute: @unchecked Sendable {
     private let treeCacheMaxAge: Int = 10
 
     // CSR topology
+    private var edgeCSR = ForceEdgeCSR()
     private var csrEdgeCount: Int = 0
     public private(set) var topologyDirtyForDispatch = true
     private var dispatchEdges: [(Int, Int)] = []
@@ -211,45 +212,37 @@ public final class MetalForceCompute: @unchecked Sendable {
         x: [Float], y: [Float], z: [Float]
     ) {
         let e = edges.count
+        precondition(n >= 0 && n <= Int(UInt32.max)
+                     && e <= Int(UInt32.max) / 2, "Force topology exceeds UInt32 CSR storage")
 
         // Ensure node buffer capacity
         ensureNodeCapacity(n)
 
-        // Build edge CSR: per-node (start, count) into flat edge array
-        // JS uses per-node edge ranges pointing into a flattened edge list
-        var edgesPerNode: [[Int]] = Array(repeating: [], count: n)
-        for (idx, (s, t)) in edges.enumerated() {
-            edgesPerNode[s].append(idx)
-            edgesPerNode[t].append(idx)
-        }
-
-        // Flatten into CSR
-        var flatEdges: [(UInt32, UInt32)] = []
-        flatEdges.reserveCapacity(e * 2) // each edge referenced by both endpoints
+        // Each edge is referenced by both endpoints. Count/prefix/scatter
+        // writes directly into shared GPU storage, preserving input order
+        // without allocating one adjacency array per node on every load batch.
+        let flatEdgeCount = e * 2
         guard let erBuf = edgeRangeBuffer else { return }
         let erPtr = erBuf.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: n)
-
-        for i in 0..<n {
-            erPtr[i] = SIMD2<UInt32>(UInt32(flatEdges.count), UInt32(edgesPerNode[i].count))
-            for edgeIdx in edgesPerNode[i] {
-                let (s, t) = edges[edgeIdx]
-                flatEdges.append((UInt32(s), UInt32(t)))
-            }
-        }
-
-        // Upload flat edges
-        let flatEdgeCount = flatEdges.count
-        if flatEdgeCount > edgeCapacity {
+        if flatEdgeCount > edgeCapacity || (flatEdgeCount > 0 && edgeBuffer == nil) {
             let cap = max(flatEdgeCount * 2, 256)
-            edgeBuffer = device.makeBuffer(length: cap * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared)
+            guard let allocated = device.makeBuffer(
+                length: cap * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared
+            ) else {
+                edgeBuffer = nil
+                edgeCapacity = 0
+                return
+            }
+            edgeBuffer = allocated
             edgeCapacity = cap
         }
-        if let eBuf = edgeBuffer, !flatEdges.isEmpty {
-            let ePtr = eBuf.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: flatEdgeCount)
-            for (i, (s, t)) in flatEdges.enumerated() {
-                ePtr[i] = SIMD2<UInt32>(s, t)
-            }
-        }
+        let ePtr = edgeBuffer?.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: flatEdgeCount)
+        let wroteEdges = edgeCSR.write(
+            nodeCount: n, edges: edges,
+            ranges: UnsafeMutableBufferPointer(start: erPtr, count: n),
+            adjacency: UnsafeMutableBufferPointer(start: ePtr, count: flatEdgeCount)
+        )
+        precondition(wroteEdges, "Force topology contains an invalid endpoint or insufficient CSR storage")
         csrEdgeCount = e
 
         let groupInputs = GroupInputs(

@@ -9,12 +9,53 @@ import plistlib
 import re
 import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('visualizer_preparation', Path(__file__).with_name('prepare_visualizer_tests.py'))
 M = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(M)
 
 class HostPreparationTests(unittest.TestCase):
+    def test_diagnostic_input_verification_preserves_both_test_receipts(self):
+        with tempfile.TemporaryDirectory(prefix='visualizer input phases ') as directory:
+            root = Path(directory).resolve()
+            repo = root / 'repo'
+            for name in ('evidence', 'private', 'scratch', 'repo/.swiftpm/configuration',
+                         'repo/Engram.xcodeproj/project.xcworkspace/xcshareddata/swiftpm'):
+                (root / name).mkdir(parents=True, exist_ok=True)
+            identity = {'source_sha': 'a' * 40, 'files_sha256': {}}
+            (root / 'evidence/source-identity.json').write_text(json.dumps(identity))
+            pins = [{'identity': 'fixture' + str(index), 'state': {'revision': identity['source_sha']}}
+                    for index in range(46)]
+            lock = json.dumps({'pins': pins})
+            for path in ('private/Package.resolved', 'repo/Package.resolved',
+                         'repo/Engram.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved'):
+                (root / path).write_text(lock)
+            (root / 'private/mirrors.json').write_text(json.dumps({'object': []}))
+            extra = {'original': 'https://github.com/sparkle-project/Sparkle/releases/download/2.8.1/Sparkle-for-Swift-Package-Manager.zip',
+                     'mirror': 'http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip'}
+            (repo / '.swiftpm/configuration/mirrors.json').write_text(json.dumps({'object': [extra]}))
+            dependencies = [{'packageRef': {'identity': pin['identity'], 'kind': 'remoteSourceControl'},
+                             'subpath': pin['identity']} for pin in pins]
+            for pin in pins:
+                (root / 'scratch/checkouts' / pin['identity']).mkdir(parents=True)
+            (root / 'scratch/workspace-state.json').write_text(json.dumps({'object': {'dependencies': dependencies}}))
+            with mock.patch.object(M.subprocess, 'check_output', return_value=identity['source_sha'] + '\n'):
+                with self.assertRaisesRegex(ValueError, 'requires final'):
+                    M.verify_inputs(root, receipt_phase='diagnostic')
+                M.verify_inputs(root)
+                M.verify_inputs(root)
+                before = {path.name: path.read_bytes() for path in (root / 'evidence').iterdir()}
+                result = M.verify_inputs(root, receipt_phase='diagnostic')
+                self.assertTrue(result['input_receipt'].endswith('/inputs-diagnostic.json'))
+                self.assertTrue((root / 'evidence/workspace-state-diagnostic.json').is_file())
+                for name, content in before.items():
+                    self.assertEqual((root / 'evidence' / name).read_bytes(), content)
+                with self.assertRaises(FileExistsError):
+                    M.verify_inputs(root, receipt_phase='diagnostic')
+                for name, content in before.items():
+                    self.assertEqual((root / 'evidence' / name).read_bytes(), content)
+
     def setUp(self):
         self.host = {'BlueprintName': 'EngramUnitTests',
             'TestBundlePath': '__TESTHOST__/Contents/PlugIns/EngramUnitTests.xctest',
@@ -87,7 +128,7 @@ class HostPreparationTests(unittest.TestCase):
             original = products / 'Engram.xctestrun'
             original.write_bytes(plistlib.dumps(self.original))
             result = M.prepare(root)
-            self.assertEqual(result['expected_tests'], 15)
+            self.assertEqual(result['expected_tests'], 22)
             output = plistlib.loads(Path(result['prepared']).read_bytes())
             environment = output['TestConfigurations'][0]['TestTargets'][0]['EnvironmentVariables']
             self.assertEqual(environment['CLAUDE_MEMORY_DB'], str(root / 'fixtures/app-memory.sqlite'))
@@ -142,7 +183,43 @@ class HostPreparationTests(unittest.TestCase):
             'testMascotInsertionRangesMatchFullRebuild',
             'testInsertionMembershipFallbacksMatchFullRebuild')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 152)
+        self.assertEqual(len(inventory), 236)
+        self.assertIn('MascotVisibilityTests/testSphereIntersectingViewportEdgeRemainsVisibleWhenItsCenterIsOutside', inventory)
+        self.assertIn('MascotVisibilityTests/testHiddenBehaviorAdvancesNormallyWhileVisualWritesAndQueueRemainRetained', inventory)
+        self.assertIn('MascotVisibilityTests/testLateFactoryCompletionUsesLatestCameraBeforeAttaching', inventory)
+        self.assertIn('ForceWakePolicyTests/testExactly24ActualChangesStaySettledDespiteDuplicateAndAbsentOperations', inventory)
+        self.assertIn('ForceWakePolicyTests/test25ActualChangesReheatFromTheSettledFloor', inventory)
+        self.assertIn('ForceWakePolicyTests/testHubRemovalCountsIncidentEdgesTowardBulkWake', inventory)
+        self.assertIn('NebulaDetailPlannerTests/testOutgoingPositiveOpacityRemainsChargedThroughoutReplacement', inventory)
+        self.assertIn('NebulaLODVisibilityTests/testOverlapping166ProjectsBoundActualEnabledEntitiesAndPreserveAggregateCoverage', inventory)
+        self.assertIn('NebulaLODVisibilityTests/testGlobalBudgetIncludesOutgoingEntitiesDuringCameraTeleportAndRateGrowth', inventory)
+        self.assertIn('GalaxyDrainTests/testCoalescedEdgeScanKeepsReadBoundsAndReplaysConcurrentEditAndDelete', inventory)
+        self.assertIn('GalaxyDrainTests/testCancelledCoalescedEdgeScanDiscardsPartialGroupAndDoesNotPrune', inventory)
+        self.assertIn('AdapterSnapshotTests/testIdenticalEdgeReplayPreservesRevisionsAndMixedAppendReuse', inventory)
+        self.assertIn('GalaxyDrainTests/testIdenticalEdgeUpdateCancelsStalePendingInsertAndStillAppliesRealEdit', inventory)
+        self.assertIn('GalaxyDrainTests/testEdgeSnapshotRejectsMalformedEndpointsWithoutChangingStoredRows', inventory)
+        self.assertIn('SidebarSyncSnapshotTests/testDatabaseReadsScaleWithConfigsAndLazyRowsDoNotReadSQL', inventory)
+        self.assertIn('SidebarSyncSnapshotTests/testParentObservationRefreshesPolicyExposureAndQueryMembership', inventory)
+        self.assertIn('SidebarDatabaseMaintenanceTests/testBlockedMaintenanceLeavesMainActorResponsiveAndRejectsDuplicateStarts', inventory)
+        self.assertIn('GamepadInputTests/testRealSceneFrameCallbackConsumesControllerExactlyOnce', inventory)
+        self.assertIn('GamepadInputTests/testCancelButtonReachesSelectionCallbackThroughSceneFrame', inventory)
+        self.assertIn('GamepadInputTests/testControllerDiagnosticCadenceWaitsForActiveWindowAndThenStops', inventory)
+        for name in (
+            'testDescriptorRejectsOtherReportsAndCollectionAncestry',
+            'testDescriptorRejectsRelativeAxesAndWrongElementTypes',
+            'testSchemaRequiresExactlyOneOfEveryControl',
+            'testRecordedReportOneSelectsMappedControlsAndIgnoresAuxiliary',
+            'testAuxiliaryDescriptorAllowlistRejectsMalformedAndUnrecognizedEntries',
+            'testAuxiliaryDoesNotMaskDuplicateOrMissingMappedControls',
+            'testIncompleteStateNeverProducesInput',
+            'testHeldControlsMustReturnToNeutralBeforeFirstOutput',
+            'testResetRequiresFreshCompleteNeutralState',
+            'testNeutralGameControllerAlwaysTakesPriorityOverHID',
+            'testInactiveSceneCannotSelectHIDSnapshot',
+            'testHIDSelectionKeepsAppleEnumerationAndReportsSeparateBackendStatus',
+            'testNewConnectionGenerationRequiresReleaseEvenWhenIdentityIsReused',
+        ):
+            self.assertIn('HIDGamepadInputTests/' + name, inventory)
         self.assertIn('AdapterSnapshotTests/testCurrentNodeLookupPreservesPrecedenceAndIndependentSnapshots', inventory)
         for name in (
             'testAccessOnlyLoaderCompletionPreservesFreshLookupsWithoutWakingSimulation',
@@ -217,6 +294,10 @@ class HostPreparationTests(unittest.TestCase):
         mirrored = mirrored.replace('#expect(', 'XCTAssertTrue(').replace('#require(', 'XCTUnwrap(')
         self.assertEqual((repo / 'EngramUnitTests/NebulaLODVisibilityTests.swift').read_text(), mirrored)
         expected = ['NebulaLODVisibilityTests/' + name for name in (
+            'testOverlapping166ProjectsBoundActualEnabledEntitiesAndPreserveAggregateCoverage',
+            'testGlobalBudgetIncludesOutgoingEntitiesDuringCameraTeleportAndRateGrowth',
+            'testWorldSpaceSelectionSurvivesScaleChangesAndRespondsToClusterGeometry',
+            'testMissingGalaxySnapshotGetsBoundedDetailsAndRetainedCoarseFallback',
             'testInitialNearAndFarVisibility',
             'testFadeEndpointsAndTinyReentry',
             'testHiddenMovementResizeAndRecreation')]
