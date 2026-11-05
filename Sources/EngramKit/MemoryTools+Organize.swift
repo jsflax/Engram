@@ -108,20 +108,19 @@ extension MemoryTools {
             return CallTool.Result(content: [.text("Label cannot be empty.")], isError: true)
         }
 
-        // Verify memories exist and determine project
-        var sources: [(memory: Memory, lattice: Lattice)] = []
-        for gid in ids {
-            guard let source = findMemory(id: gid) else {
-                return CallTool.Result(content: [.text("Memory [id:\(gid.uuidString)] not found.")], isError: true)
-            }
-            sources.append(source)
+        let inputs: DerivationInputs
+        do {
+            inputs = try derivationSources(ids)
+        } catch let refusal as DerivationScopeError {
+            return refusal.result
         }
+        let sources = inputs.targets
 
         let project = a.project ?? sources[0].memory.project
-        let initialScope = try derivationSnapshot(sources: sources, project: project)
-
+        let initialScope: DerivationSnapshot
         do {
-            _ = try derivationPrivacy(sources: try derivationSources(ids), project: project, updatesSourceLabels: true)
+            initialScope = try derivationSnapshot(sources: inputs, project: project)
+            _ = try derivationPrivacy(sources: inputs, project: project, updatesSourceLabels: true)
         } catch let refusal as DerivationScopeError {
             return refusal.result
         }
@@ -132,14 +131,15 @@ extension MemoryTools {
         if let floats = try await embedder.embed(text: hubContent) {
             hubEmbedding = Vector<Float>(floats)
         }
-        // Hub, edges and topic updates share one checked transaction with a
-        // bounded BEGIN retry (previously an autocommit add followed by an
-        // unchecked transaction whose failed BEGIN trapped the process).
+        // The hub, edges and local topic updates share a checked transaction
+        // with bounded BEGIN retry. Other stores are rechecked, not locked
+        // atomically with the local destination.
         let hubGlobalId: UUID
         do {
             hubGlobalId = try LatticeBeginRetry.run(on: localLattice, log: { log("[organize] \($0)") }) {
-                let sources = try derivationSources(ids)
-                let isPrivate = try derivationPrivacy(sources: sources, project: project, updatesSourceLabels: true, unchangedFrom: initialScope)
+                let inputs = try derivationSources(ids)
+                let sources = inputs.targets
+                let isPrivate = try derivationPrivacy(sources: inputs, project: project, updatesSourceLabels: true, unchangedFrom: initialScope)
                 let hub = Memory(
                     content: hubContent, topic: label, project: project, source: "organize",
                     embedding: hubEmbedding, isPrivate: isPrivate, authorUserId: currentUserId

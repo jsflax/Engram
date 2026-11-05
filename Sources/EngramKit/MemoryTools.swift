@@ -161,6 +161,17 @@ public actor MemoryTools {
         _ = try resolveDatabases()
     }
 
+    /// Derivations must distinguish absent configuration from a configured
+    /// reference omitted by legacy read resolution. Never infer missing input
+    /// from a partial cached bundle, or recreate a missing replica as empty.
+    func validateDerivationStorageCompleteness() throws {
+        let databases = try resolveDatabases()
+        guard (syncedReference == nil || databases.synced != nil),
+              databases.groups.count == groupReferences.count else {
+            throw DerivationScopeError(message: "A configured source store is unavailable. Restore access and reopen the memory service before deriving.")
+        }
+    }
+
     // Public throwing entrypoints prepare storage before using these legacy
     // nonthrowing internal accessors, so open errors remain catchable.
     private func requireDatabases() -> ResolvedDatabases {
