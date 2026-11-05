@@ -31,6 +31,8 @@ struct Graph3DView: View {
     @State private var scrollMonitor: Any?
     @State private var reticleTarget: UUID?
     @State private var hasGamepad = false
+    @State private var hidInputStatus: HIDGamepadInputStatus = .inactive
+    @State private var isControllerSetupPresented = false
     @Environment(\.appearsActive) private var appearsActive
     @State private var teleportLabelText: String?
     @State private var teleportCounterValue: Int = 0
@@ -84,6 +86,12 @@ struct Graph3DView: View {
                 if hasGamepad {
                     reticleOverlay
                 }
+
+                GamepadAccessView(status: hidInputStatus, isPresented: $isControllerSetupPresented)
+                    .frame(maxWidth: 340)
+                    .padding(.leading, 12)
+                    .padding(.bottom, 100)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
 
                 // Teleport project label (fades after 2s)
                 if let label = teleportLabelText {
@@ -186,6 +194,7 @@ struct Graph3DView: View {
         }
         .onChange(of: appearsActive) { _, _ in updateControllerFocus() }
         .onChange(of: isMascotChatOpen) { _, _ in updateControllerFocus() }
+        .onChange(of: isControllerSetupPresented) { _, _ in updateControllerFocus() }
         .onChange(of: soundEnabled) { _, enabled in
             rkSceneManager?.soundEnabled = enabled
         }
@@ -227,6 +236,9 @@ struct Graph3DView: View {
         mgr.camera3DState = camera3DState
         mgr.controllerConnectionCallback = { connected in
             hasGamepad = connected
+        }
+        mgr.hidInputStatusCallback = { status in
+            hidInputStatus = status
         }
         mgr.graphHostIsVisible = true
         updateControllerFocus()
@@ -274,7 +286,8 @@ struct Graph3DView: View {
     }
 
     private func updateControllerFocus() {
-        rkSceneManager?.updateGraphInputFocus(appearsActive: appearsActive, mascotChatVisible: isMascotChatOpen)
+        rkSceneManager?.updateGraphInputFocus(appearsActive: appearsActive,
+            mascotChatVisible: isMascotChatOpen, controllerSetupVisible: isControllerSetupPresented)
     }
 
     private func pushDataToRKScene() {

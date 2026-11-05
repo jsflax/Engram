@@ -54,6 +54,19 @@ final class GamepadInputTests: XCTestCase {
         foreground = true
         callback(1 / 60)
         XCTAssertNotEqual(manager.camera.targetCameraPos, before)
+        manager.updateGraphInputFocus(appearsActive: true, mascotChatVisible: false,
+                                      controllerSetupVisible: true)
+        XCTAssertFalse(manager.isGraphInputActive)
+        let beforeSetupFrame = manager.camera.targetCameraPos
+        callback(1 / 60)
+        XCTAssertEqual(manager.camera.targetCameraPos, beforeSetupFrame,
+                       "Controller setup must suspend scene input")
+        manager.updateGraphInputFocus(appearsActive: true, mascotChatVisible: false,
+                                      controllerSetupVisible: false)
+        XCTAssertTrue(manager.isGraphInputActive)
+        callback(1 / 60)
+        XCTAssertNotEqual(manager.camera.targetCameraPos, beforeSetupFrame,
+                          "Dismissing controller setup restores the active graph gate")
         var connections: [Bool] = []
         manager.controllerConnectionCallback = { connections.append($0) }
         input = nil

@@ -4,8 +4,8 @@ import EngramRealityKit
 
 /// Values read once per scene frame. Keeping hardware reads separate lets tests
 /// exercise the same camera/action path without synthesizing OS input events.
-struct GamepadInputState {
-    struct Buttons: OptionSet {
+struct GamepadInputState: Sendable {
+    struct Buttons: OptionSet, Sendable {
         let rawValue: UInt8
         static let a = Self(rawValue: 1 << 0)
         static let b = Self(rawValue: 1 << 1)
@@ -16,6 +16,9 @@ struct GamepadInputState {
     }
 
     let identity: ObjectIdentifier
+    // HID attachment generations distinguish rapid reconnects even if an
+    // allocator reuses a released connection token's address. GC uses zero.
+    var connectionGeneration: UInt64 = 0
     var leftX: Float = 0
     var leftY: Float = 0
     var rightX: Float = 0
@@ -35,11 +38,24 @@ enum GamepadAction: Equatable {
 @MainActor
 final class InputHandler {
     private var controllerIdentity: ObjectIdentifier?
+    private var controllerGeneration: UInt64?
     private var previousButtons: GamepadInputState.Buttons = []
     private var awaitingButtonRelease = true
 
     static func readGamepad() -> GamepadInputState? {
         readGamepad(captureDiagnostics: false).state
+    }
+
+    /// Select one backend, even when the preferred controller is neutral.
+    /// The HID snapshot never bypasses the scene's foreground/input gate.
+    static func preferredReading(primary: GamepadInputReading,
+                                 fallback: HIDGamepadInputSnapshot?,
+                                 active: Bool) -> GamepadInputReading {
+        if primary.state != nil { return primary }
+        guard active, let fallback else { return primary }
+        return GamepadInputReading(state: fallback.state, enumeration: primary.enumeration,
+            backend: fallback.state == nil ? .none : .hidGamepad,
+            hidStatus: fallback.status.rawValue)
     }
 
     static func readGamepad(captureDiagnostics: Bool) -> GamepadInputReading {
@@ -104,6 +120,7 @@ final class InputHandler {
 
     func reset() {
         controllerIdentity = nil
+        controllerGeneration = nil
         previousButtons = []
         awaitingButtonRelease = true
     }
@@ -111,9 +128,10 @@ final class InputHandler {
     func update(state: GamepadInputState?, camera: CameraController,
                 dt: Float, active: Bool) -> [GamepadAction] {
         guard active, let state else { reset(); return [] }
-        if controllerIdentity != state.identity {
+        if controllerIdentity != state.identity || controllerGeneration != state.connectionGeneration {
             reset()
             controllerIdentity = state.identity
+            controllerGeneration = state.connectionGeneration
         }
         // A stalled render frame must not turn a held stick into a huge jump.
         let step = dt.isFinite ? min(0.05, max(0, dt)) : 0

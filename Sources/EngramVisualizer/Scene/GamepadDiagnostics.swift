@@ -18,9 +18,23 @@ struct GamepadEnumerationDiagnostics: Codable, Sendable {
     let selectedConnectedIndex: Int?
 }
 
+enum GamepadInputBackend: String, Codable, Sendable {
+    case none, gameController, hidGamepad
+}
+
 struct GamepadInputReading {
     let state: GamepadInputState?
     let enumeration: GamepadEnumerationDiagnostics?
+    let backend: GamepadInputBackend
+    let hidStatus: String?
+
+    init(state: GamepadInputState?, enumeration: GamepadEnumerationDiagnostics?,
+         backend: GamepadInputBackend? = nil, hidStatus: String? = nil) {
+        self.state = state
+        self.enumeration = enumeration
+        self.backend = backend ?? (state == nil ? .none : .gameController)
+        self.hidStatus = hidStatus
+    }
 }
 
 struct GamepadDiagnosticConfiguration {
@@ -132,6 +146,9 @@ struct GamepadDiagnosticRecord: Codable, Sendable {
     let captureElapsed: TimeInterval?
     let captureDuration: TimeInterval
     let enumeration: GamepadEnumerationDiagnostics?
+    /// Enumeration describes Apple's GameController API; HID is reported separately.
+    let backend: GamepadInputBackend
+    let hidStatus: String?
     let input: GamepadInputSummary
     let gate: GamepadGateDiagnostics
     let sincePreviousRecord: GamepadDiagnosticCounts
@@ -178,9 +195,10 @@ final class GamepadDiagnosticRecorder {
         if cameraTargetChanged { counts.framesWithCameraTargetChange += 1 }
         if cameraLookChanged { counts.framesWithCameraLookChange += 1 }
         guard let phase, let gate else { return }
-        emit(GamepadDiagnosticRecord(schemaVersion: 1, processID: ProcessInfo.processInfo.processIdentifier,
+        emit(GamepadDiagnosticRecord(schemaVersion: 2, processID: ProcessInfo.processInfo.processIdentifier,
             phase: phase, uptime: now, captureElapsed: cadence.armedAt.map { now - $0 },
             captureDuration: cadence.duration, enumeration: reading.enumeration,
+            backend: reading.backend, hidStatus: reading.hidStatus,
             input: summary, gate: gate, sincePreviousRecord: counts))
         counts = GamepadDiagnosticCounts()
     }

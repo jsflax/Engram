@@ -67,6 +67,7 @@ final class RKSceneManager {
     var isGraphInputActive = false {
         didSet {
             if !isGraphInputActive {
+                hidInput?.setActive(false)
                 inputHandler.reset()
                 reticleElapsed = .infinity
                 setReticleTarget(nil)
@@ -74,12 +75,17 @@ final class RKSceneManager {
         }
     }
     var controllerConnectionCallback: ((Bool) -> Void)?
+    var hidInputStatusCallback: ((HIDGamepadInputStatus) -> Void)?
+    private var reportedHIDStatus: HIDGamepadInputStatus = .inactive
     private(set) var hasGamepad = false
     private(set) var reticleTarget: UUID?
     private let inputHandler = InputHandler()
     private let readGamepad: @MainActor (Bool) -> GamepadInputReading
+    private let hidInput: HIDGamepadInputProvider?
     private let controllerDiagnostics: GamepadDiagnosticRecorder?
-    var graphHostIsVisible = false
+    var graphHostIsVisible = false {
+        didSet { if !graphHostIsVisible { hidInput?.setActive(false) } }
+    }
     private var graphHostAppearsActive: Bool?
     private var graphHostChatVisible: Bool?
     private let acceptsGamepadInput: @MainActor () -> Bool
@@ -97,8 +103,10 @@ final class RKSceneManager {
           }) {
         if let readGamepad {
             self.readGamepad = { _ in GamepadInputReading(state: readGamepad(), enumeration: nil) }
+            self.hidInput = nil
         } else {
             self.readGamepad = { InputHandler.readGamepad(captureDiagnostics: $0) }
+            self.hidInput = HIDGamepadInputProvider()
         }
         self.controllerDiagnostics = controllerDiagnostics
         self.acceptsGamepadInput = acceptsGamepadInput
@@ -192,12 +200,13 @@ final class RKSceneManager {
         }
     }
 
-    /// Keep the original input gate unchanged while retaining its host context
-    /// for an explicitly enabled controller diagnostic.
-    func updateGraphInputFocus(appearsActive: Bool, mascotChatVisible: Bool) {
+    /// Preserve graph/chat focus rules and suspend input during controller setup.
+    /// Retain the host context for explicitly enabled controller diagnostics.
+    func updateGraphInputFocus(appearsActive: Bool, mascotChatVisible: Bool,
+                              controllerSetupVisible: Bool = false) {
         graphHostAppearsActive = appearsActive
         graphHostChatVisible = mascotChatVisible
-        isGraphInputActive = appearsActive && !mascotChatVisible
+        isGraphInputActive = appearsActive && !mascotChatVisible && !controllerSetupVisible
     }
 
     private func pollGamepad(dt: Float) {
@@ -205,15 +214,25 @@ final class RKSceneManager {
         let now = recorder == nil ? 0 : ProcessInfo.processInfo.systemUptime
         let phase = recorder?.nextPhase(now: now, armReady: graphHostIsVisible
             && NSApp?.isActive == true && NSApp?.keyWindow != nil)
-        let reading = readGamepad(phase != nil)
+        let primary = readGamepad(phase != nil)
+        let applicationGate = isGraphInputActive ? acceptsGamepadInput() : nil
+        let active = isGraphInputActive && applicationGate == true
+        // Hardware discovery and IO live on the provider's serial queue. The
+        // frame only changes activation when necessary and reads a value snapshot.
+        hidInput?.setActive(active && primary.state == nil && graphHostIsVisible)
+        let fallback = hidInput?.snapshot()
+        let reading = InputHandler.preferredReading(primary: primary, fallback: fallback, active: active)
+        let hidStatus = primary.state == nil ? (fallback?.status ?? .inactive) : .inactive
+        if (active || primary.state != nil), reportedHIDStatus != hidStatus {
+            reportedHIDStatus = hidStatus
+            hidInputStatusCallback?(hidStatus)
+        }
         let state = reading.state
         let connected = state != nil
         if hasGamepad != connected {
             hasGamepad = connected
             controllerConnectionCallback?(connected)
         }
-        let applicationGate = isGraphInputActive ? acceptsGamepadInput() : nil
-        let active = isGraphInputActive && applicationGate == true
         let cameraBefore = recorder.map { _ in (camera.targetCameraPos, camera.targetAzimuth, camera.targetElevation) }
         defer {
             if let recorder, let cameraBefore {

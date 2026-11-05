@@ -128,7 +128,7 @@ class HostPreparationTests(unittest.TestCase):
             original = products / 'Engram.xctestrun'
             original.write_bytes(plistlib.dumps(self.original))
             result = M.prepare(root)
-            self.assertEqual(result['expected_tests'], 18)
+            self.assertEqual(result['expected_tests'], 19)
             output = plistlib.loads(Path(result['prepared']).read_bytes())
             environment = output['TestConfigurations'][0]['TestTargets'][0]['EnvironmentVariables']
             self.assertEqual(environment['CLAUDE_MEMORY_DB'], str(root / 'fixtures/app-memory.sqlite'))
@@ -183,7 +183,7 @@ class HostPreparationTests(unittest.TestCase):
             'testMascotInsertionRangesMatchFullRebuild',
             'testInsertionMembershipFallbacksMatchFullRebuild')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 178)
+        self.assertEqual(len(inventory), 197)
         self.assertIn('AdapterSnapshotTests/testIdenticalEdgeReplayPreservesRevisionsAndMixedAppendReuse', inventory)
         self.assertIn('GalaxyDrainTests/testIdenticalEdgeUpdateCancelsStalePendingInsertAndStillAppliesRealEdit', inventory)
         self.assertIn('GalaxyDrainTests/testEdgeSnapshotRejectsMalformedEndpointsWithoutChangingStoredRows', inventory)
@@ -193,6 +193,19 @@ class HostPreparationTests(unittest.TestCase):
         self.assertIn('GamepadInputTests/testRealSceneFrameCallbackConsumesControllerExactlyOnce', inventory)
         self.assertIn('GamepadInputTests/testCancelButtonReachesSelectionCallbackThroughSceneFrame', inventory)
         self.assertIn('GamepadInputTests/testControllerDiagnosticCadenceWaitsForActiveWindowAndThenStops', inventory)
+        for name in (
+            'testDescriptorRejectsOtherReportsAndCollectionAncestry',
+            'testDescriptorRejectsRelativeAxesAndWrongElementTypes',
+            'testSchemaRequiresExactlyOneOfEveryControl',
+            'testIncompleteStateNeverProducesInput',
+            'testHeldControlsMustReturnToNeutralBeforeFirstOutput',
+            'testResetRequiresFreshCompleteNeutralState',
+            'testNeutralGameControllerAlwaysTakesPriorityOverHID',
+            'testInactiveSceneCannotSelectHIDSnapshot',
+            'testHIDSelectionKeepsAppleEnumerationAndReportsSeparateBackendStatus',
+            'testNewConnectionGenerationRequiresReleaseEvenWhenIdentityIsReused',
+        ):
+            self.assertIn('HIDGamepadInputTests/' + name, inventory)
         self.assertIn('AdapterSnapshotTests/testCurrentNodeLookupPreservesPrecedenceAndIndependentSnapshots', inventory)
         for name in (
             'testAccessOnlyLoaderCompletionPreservesFreshLookupsWithoutWakingSimulation',
