@@ -177,6 +177,13 @@ actor Galaxy: Identifiable {
     let loadChanges = OSAllocatedUnfairLock(initialState: GalaxyLoadChanges())
     private var clusterTask: Task<Void, Never>?
 
+    #if DEBUG
+    private var edgeScanObserver: (@Sendable (GalaxyEdgeScanEvent) -> Void)?
+    func setEdgeScanObserverForTesting(_ observer: @escaping @Sendable (GalaxyEdgeScanEvent) -> Void) {
+        edgeScanObserver = observer
+    }
+    #endif
+
     private enum LoadFailure: Error { case storageUnavailable }
 
     @MainActor init(id: String, displayName: String, lattice: LatticeThreadSafeReference,
@@ -263,9 +270,10 @@ actor Galaxy: Identifiable {
         }
     }
 
-    /// There is only one producer. Each 50-row chunk is consumed on MainActor
-    /// before the next query; neither hydrated models nor an unbounded batch
-    /// queue survive the await. A full scan is nodes-first, then edges.
+    /// There is only one producer. Database reads stay bounded at 50 rows;
+    /// initial edges combine at most four detached value pages per MainActor
+    /// publication. No hydrated edge models or unbounded queue cross that await.
+    /// A full scan is nodes-first, then edges; live changes reconcile afterward.
     private func runLoader(generation: UInt64) async {
         var needsDerivedData = false
         do {
@@ -329,22 +337,28 @@ actor Galaxy: Identifiable {
         }
         cursor = Int64.min
         while true {
+            let group = try GalaxyEdgeScan.readGroup(after: cursor,
+                check: { try checkLoad(generation) },
+                readPage: { try readInitialEdgePage(after: $0, limit: $1) })
+            cursor = group.cursor
+            seenEdges.formUnion(group.rows.map(\.pk))
+            if !group.rows.isEmpty {
+                #if DEBUG
+                edgeScanObserver?(.willPublish(rowCount: group.rows.count))
+                #endif
+                await applyLoadChunk(edges: group.rows, generation: generation,
+                                     diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
+            } else if !group.reachedEnd {
+                // Long runs of malformed rows still yield once per four raw
+                // pages, even though there is nothing to publish on MainActor.
+                await Task.yield()
+            }
             try checkLoad(generation)
-            guard let lattice = latticeRef.resolve() else { throw LoadFailure.storageUnavailable }
-            let after = cursor
-            let rows = lattice.objects(MemoryEdge.self).where { $0.primaryKey > after }
-                .sortedBy(\.primaryKey).snapshot(limit: 50)
-            guard lattice.lastQueryError() == nil else { throw LoadFailure.storageUnavailable }
-            if rows.isEmpty { break }
-            guard let last = rows.last?.primaryKey, last > cursor else { throw LoadFailure.storageUnavailable }
-            cursor = last
-            let batch = rows.compactMap(Self.snapshotEdge)
-            seenEdges.formUnion(batch.map(\.pk))
-            await applyLoadChunk(edges: batch, generation: generation,
-                                 diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
+            if group.reachedEnd { break }
         }
         // Required on overflow/retry: rows deleted before a fresh scan have no
         // new callback to replay. Only a successful complete scan may prune.
+        try checkLoad(generation)
         let missing = await missingKeys(nodes: seenNodes, edges: seenEdges, generation: generation)
         for offset in stride(from: 0, to: missing.nodes.count, by: 50) {
             try checkLoad(generation)
@@ -356,6 +370,21 @@ actor Galaxy: Identifiable {
             await applyLoadChunk(removedEdges: Array(missing.edges[offset..<min(offset + 50, missing.edges.count)]), generation: generation,
                                  diagnosticEnqueuedAt: FrameGapDiagnostics.timestamp())
         }
+    }
+
+    /// Native query/model lifetimes end before the next page or publication.
+    /// Keep this reader unit unchanged when tuning value-publication batching.
+    private func readInitialEdgePage(after: Int64, limit: Int) throws -> GalaxyEdgeScan.Page {
+        guard let lattice = latticeRef.resolve() else { throw LoadFailure.storageUnavailable }
+        let rows = lattice.objects(MemoryEdge.self).where { $0.primaryKey > after }
+            .sortedBy(\.primaryKey).snapshot(limit: Int64(limit))
+        guard lattice.lastQueryError() == nil else { throw LoadFailure.storageUnavailable }
+        let page = GalaxyEdgeScan.Page(rawCount: rows.count, lastPrimaryKey: rows.last?.primaryKey,
+                                      rows: rows.compactMap(Self.snapshotEdge))
+        #if DEBUG
+        edgeScanObserver?(.pageRead(limit: limit, rawCount: page.rawCount))
+        #endif
+        return page
     }
 
     private func reconcile(nodes: [Int64], edges: [Int64], generation: UInt64) async throws -> Bool {

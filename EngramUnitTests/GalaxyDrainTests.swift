@@ -4,6 +4,15 @@ import Foundation
 import Lattice
 import SwiftUI
 import XCTest
+import os
+
+#if DEBUG
+private struct EdgeScanObservation: Sendable {
+    var events: [GalaxyEdgeScanEvent] = []
+    var pageCount = 0
+    var error: String?
+}
+#endif
 
 private extension Galaxy {
     /// The fixture producer enters the Galaxy actor just like loadData/observers;
@@ -15,6 +24,132 @@ private extension Galaxy {
 
 @MainActor
 final class GalaxyDrainTests: XCTestCase {
+    #if DEBUG
+    private func edgeScanFixture() throws -> (Lattice, [MemoryEdge], [UUID]) {
+        let environment = ProcessInfo.processInfo.environment
+        let root = URL(fileURLWithPath: try XCTUnwrap(environment["ENGRAM_TEST_ROOT"]), isDirectory: true)
+        let temporary = URL(fileURLWithPath: try XCTUnwrap(environment["TMPDIR"]), isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
+        let expectedTemporary = root.deletingLastPathComponent().appendingPathComponent("tmp", isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
+        _ = try XCTUnwrap(temporary == expectedTemporary ? temporary : nil,
+                          "Use the test lane's explicit owned temporary directory")
+        let directory = temporary.appendingPathComponent("edge-scan-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        // Retain this owned fixture until hosted-runner teardown; background
+        // observers/readers may still be releasing their references after stop.
+        let lattice = try Lattice(Memory.self, MemoryEdge.self,
+            configuration: .init(fileURL: directory.appendingPathComponent("memory.sqlite")))
+        let source = Memory(content: "Edge source", topic: "general", project: "Stream", importance: 1)
+        let target = Memory(content: "Edge target", topic: "general", project: "Stream", importance: 1)
+        try lattice.add(source)
+        try lattice.add(target)
+        let ids = [try XCTUnwrap(source.globalId), try XCTUnwrap(target.globalId)]
+        var edges: [MemoryEdge] = []
+        for index in 0..<405 {
+            let edge = MemoryEdge(sourceGlobalId: ids[0], targetGlobalId: index == 404 ? UUID() : ids[1],
+                                  relation: .relatesTo)
+            try lattice.add(edge)
+            // One raw page in the middle is entirely malformed. It must not
+            // end the scan, grow the buffer, or mutate these stored values.
+            if (50..<100).contains(index) { edge.asRefType.setString(named: "sourceGlobalId", "not-a-uuid") }
+            edges.append(edge)
+        }
+        return (lattice, edges, ids)
+    }
+
+    func testCoalescedEdgeScanKeepsReadBoundsAndReplaysConcurrentEditAndDelete() async throws {
+        let (lattice, edges, _) = try edgeScanFixture()
+        let originalIDs = try edges.map { try XCTUnwrap($0.globalId) }
+        let editedPK = try XCTUnwrap(edges[0].primaryKey), deletedPK = try XCTUnwrap(edges[1].primaryKey)
+        let reference = lattice.sendableReference
+        let observation = OSAllocatedUnfairLock(initialState: EdgeScanObservation())
+        let galaxy = Galaxy(id: "coalesced", displayName: "Coalesced", lattice: reference)
+        await galaxy.setEdgeScanObserverForTesting { event in
+            let mutate = observation.withLock { state in
+                state.events.append(event)
+                guard case .pageRead(_, let count) = event, count > 0 else { return false }
+                state.pageCount += 1
+                return state.pageCount == 1
+            }
+            guard mutate else { return }
+            // The first page's detached values already contain the old rows.
+            // Actual registered observers must replay these writes afterward.
+            guard let writer = reference.resolve(),
+                  let edited = writer.object(MemoryEdge.self, primaryKey: editedPK),
+                  let deleted = writer.object(MemoryEdge.self, primaryKey: deletedPK) else {
+                observation.withLock { $0.error = "Could not resolve fixture rows" }
+                return
+            }
+            edited.relation = .contradicts
+            writer.delete(deleted)
+            if let error = writer.lastQueryError() {
+                observation.withLock { $0.error = String(describing: error) }
+            }
+        }
+        await galaxy.loadData()
+        let changes = await galaxy.loadChanges
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if galaxy.renderStore.allEdges[originalIDs[0]]?.relation == "contradicts",
+               galaxy.renderStore.allEdges[originalIDs[1]] == nil,
+               !changes.withLock({ $0.workerRunning }) { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        let observed = observation.withLock { $0 }
+        await galaxy.stopObservers()
+        XCTAssertNil(observed.error)
+        let reads = observed.events.compactMap { event -> (Int, Int)? in
+            if case .pageRead(let limit, let count) = event { return (limit, count) }
+            return nil
+        }
+        let publications = observed.events.compactMap { event -> Int? in
+            if case .willPublish(let count) = event { return count }
+            return nil
+        }
+        XCTAssertEqual(reads.map { $0.0 }, Array(repeating: 50, count: 10))
+        XCTAssertEqual(reads.map { $0.1 }, Array(repeating: 50, count: 8) + [5, 0])
+        XCTAssertEqual(publications, [150, 200, 5], "Invalid raw pages count toward the four-page publication bound")
+        let expectedIDs = Set(originalIDs.enumerated().filter { !(50..<100).contains($0.offset) && $0.offset != 1 }.map(\.element))
+        XCTAssertEqual(Set(galaxy.renderStore.allEdges.keys), expectedIDs)
+        XCTAssertEqual(Set(galaxy.renderStore.edges.map(\.id)), expectedIDs.subtracting([originalIDs[404]]),
+                       "A valid dangling edge remains stored without becoming a visible edge")
+        XCTAssertEqual(galaxy.renderStore.allEdges[originalIDs[0]]?.relation, "contradicts")
+        XCTAssertTrue(galaxy.isLoaded)
+        XCTAssertEqual(galaxy.loadStatus, .complete)
+        for edge in edges[50..<100] {
+            XCTAssertEqual(edge.asRefType.getString(named: "sourceGlobalId"), "not-a-uuid")
+        }
+    }
+
+    func testCancelledCoalescedEdgeScanDiscardsPartialGroupAndDoesNotPrune() async throws {
+        let (lattice, _, nodeIDs) = try edgeScanFixture()
+        let galaxy = Galaxy(id: "cancelled", displayName: "Cancelled", lattice: lattice.sendableReference)
+        let changes = await galaxy.loadChanges
+        let earlierGeneration = changes.withLock { $0.begin() }
+        let stale = EdgeData(id: UUID(), sourceId: nodeIDs[0], targetId: nodeIDs[1], relation: "relates_to")
+        galaxy.applyLoadChunk(edges: [(999_999, stale)], generation: earlierGeneration)
+        let observation = OSAllocatedUnfairLock(initialState: EdgeScanObservation())
+        await galaxy.setEdgeScanObserverForTesting { event in
+            observation.withLock { $0.events.append(event) }
+            if case .pageRead = event { galaxy.cancelLoading() }
+        }
+        await galaxy.loadData()
+        let events = observation.withLock { $0.events }
+        await galaxy.stopObservers()
+        XCTAssertEqual(events.count, 1, "Cancellation after the first page prevents another read or publication")
+        if case .pageRead(let limit, let count)? = events.first {
+            XCTAssertEqual(limit, 50)
+            XCTAssertEqual(count, 50)
+        } else { XCTFail("Expected a page read, not publication") }
+        XCTAssertEqual(Set(galaxy.renderStore.allEdges.keys), [stale.id],
+                       "An incomplete scan cannot publish its partial group or prune existing rows")
+        XCTAssertEqual(galaxy.renderStore.edgePkToGlobalId[999_999], stale.id)
+        XCTAssertFalse(galaxy.isLoaded)
+    }
+    #endif
+
     private let config = DrainConfig(hiddenProjects: [], hiddenRelations: [], timeFilter: nil,
                                      is3D: true, soundEnabled: false, notificationsEnabled: false)
 

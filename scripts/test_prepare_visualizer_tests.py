@@ -183,7 +183,9 @@ class HostPreparationTests(unittest.TestCase):
             'testMascotInsertionRangesMatchFullRebuild',
             'testInsertionMembershipFallbacksMatchFullRebuild')]
         inventory = M.inventory(repo)
-        self.assertEqual(len(inventory), 200)
+        self.assertEqual(len(inventory), 206)
+        self.assertIn('GalaxyDrainTests/testCoalescedEdgeScanKeepsReadBoundsAndReplaysConcurrentEditAndDelete', inventory)
+        self.assertIn('GalaxyDrainTests/testCancelledCoalescedEdgeScanDiscardsPartialGroupAndDoesNotPrune', inventory)
         self.assertIn('AdapterSnapshotTests/testIdenticalEdgeReplayPreservesRevisionsAndMixedAppendReuse', inventory)
         self.assertIn('GalaxyDrainTests/testIdenticalEdgeUpdateCancelsStalePendingInsertAndStillAppliesRealEdit', inventory)
         self.assertIn('GalaxyDrainTests/testEdgeSnapshotRejectsMalformedEndpointsWithoutChangingStoredRows', inventory)
