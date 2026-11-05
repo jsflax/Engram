@@ -3,7 +3,8 @@
 
 Usage: python memory_proxy.py /absolute/private/config.json
 No transcript, tool arguments, memory content, or child environment is audited.
-The child transport is stdio; HTTP configurations are explicitly unsupported.
+Stdio retains its durable native path. Explicit HTTPS configurations expose
+read tools only until the hosted operation protocol is qualified.
 """
 
 from __future__ import annotations
@@ -686,9 +687,18 @@ def load_config(path: Path) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise ProxyError("Proxy configuration must be an object")
     transport = config.get("transport")
-    if not isinstance(transport, dict) or "url" in transport or transport.get("type", "stdio") != "stdio":
-        raise ProxyError("Only stdio memory MCP transports are supported; HTTP is unsupported")
-    if not isinstance(transport.get("command"), str) or not transport["command"]:
+    if isinstance(transport, dict) and transport.get("type") == "http":
+        try:
+            if __package__:
+                from .http_bridge import validate_transport
+            else:
+                from http_bridge import validate_transport
+            validate_transport(transport)
+        except Exception:
+            raise ProxyError("Invalid HTTPS memory transport") from None
+    elif not isinstance(transport, dict) or "url" in transport or transport.get("type", "stdio") != "stdio":
+        raise ProxyError("Unsupported memory transport")
+    elif not isinstance(transport.get("command"), str) or not transport["command"]:
         raise ProxyError("A stdio memory command is required")
     if not isinstance(transport.get("args", []), list) or any(not isinstance(arg, str) for arg in transport.get("args", [])):
         raise ProxyError("Memory args must be an array of strings")
@@ -720,6 +730,9 @@ def run(config: dict[str, Any]) -> int:
         from .stdio_bridge import RelayLimits, run_relay
     except ImportError:  # Direct execution from a packaged runtime.
         from stdio_bridge import RelayLimits, run_relay
+    http = config["transport"].get("type") == "http"
+    if http and "execution" in config:
+        raise ProxyError("Hosted durable execution is not qualified; no request was sent")
     with contextlib.ExitStack() as cleanup:
         operations, fence, transport = None, None, config["transport"]
         diagnostic = _StartupDiagnostic()
@@ -732,10 +745,19 @@ def run(config: dict[str, Any]) -> int:
             diagnostic.record(error)
             raise
         cleanup.callback(audit.close)
+        allowed = config.get("allowed_tools")
+        if http:
+            allowed = sorted(READ_TOOLS.intersection(ALLOWED_TOOLS if allowed is None else allowed))
         policy = Policy(audit, config["provenance"], config["max_tool_calls"],
-                        config["max_writes"], config.get("allowed_tools"), operations=operations,
+                        0 if http else config["max_writes"], allowed, operations=operations,
                         provider_mode=config.get("provider_mode"))
         try:
+            if http:
+                if __package__:
+                    from .http_bridge import run_relay as run_http_relay
+                else:
+                    from http_bridge import run_relay as run_http_relay
+                return run_http_relay(transport, policy.client_message, policy.server_message, audit=audit.write)
             return run_relay(transport, policy.client_message,
                              policy.server_message, limits=RelayLimits(max_inflight=64),
                              audit=audit.write, writer_fence=fence)
