@@ -81,5 +81,10 @@ nonisolated(unsafe) public let engramMigrations: [Int: Migration] = [
             // Preserve creation timestamp
             new.createdAt = old.createdAt
         }
-    )
+    ),
+    // An explicit target makes the existing Lattice version guard refuse a
+    // cold writable reopen by older binaries whose highest migration is 2.
+    // The nullable policy column still uses normal schema reconciliation;
+    // this entry performs no row transform or legacy policy backfill.
+    4: Migration()
 ]

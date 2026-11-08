@@ -4,6 +4,7 @@ import EngramModels
 import Lattice
 import Foundation
 import SQLite3
+import CxxStdlib
 
 // Exact v3 fields: the upgrade fixture opens a truly absent column, not a
 // current-schema row deliberately assigned NULL.
@@ -203,5 +204,97 @@ struct DerivationRestrictionMigrationTests {
             "engram-policy:1:direct:extra", String(repeating: "x", count: 4097)]
         for value in values { #expect(MemoryDerivationPolicy(rawValue: value) == nil) }
         #expect(MemoryDerivationPolicy.derived(privateFloor: false, groupCeiling: Set((0..<65).map { _ in UUID().uuidString })) == nil)
+    }
+
+    private func storedSchemaVersion(_ path: URL) throws -> String {
+        var db: OpaquePointer?, statement: OpaquePointer?
+        defer { sqlite3_finalize(statement); sqlite3_close(db) }
+        try #require(sqlite3_open_v2(path.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK)
+        try #require(sqlite3_prepare_v2(db, "SELECT value FROM _lattice_meta WHERE key = 'schema_version' LIMIT 2", -1, &statement, nil) == SQLITE_OK)
+        try #require(sqlite3_step(statement) == SQLITE_ROW)
+        let value = String(cString: try #require(sqlite3_column_text(statement, 0)))
+        try #require(sqlite3_step(statement) == SQLITE_DONE)
+        return value
+    }
+
+    @Test func versionFourMigrationPreservesLegacyUnknownAndCompatibleReopen() throws {
+        let path = try directory().appendingPathComponent("version-four-compatible.sqlite")
+        let legacyMigrations = engramMigrations.filter { $0.key == 2 }
+        try #require(legacyMigrations.keys.sorted() == [2])
+        try #require(engramMigrations.keys.sorted() == [2, 4])
+        do {
+            let old = try Lattice(RestrictionV3.Memory.self, configuration: .init(fileURL: path, migration: legacyMigrations))
+            defer { old.close() }
+            try old.add(RestrictionV3.Memory(content: "Synthetic legacy version two", project: "p"))
+        }
+        try #require(try storedSchemaVersion(path) == "2")
+        try #require(try !columnPresent(path, "derivationPolicy"))
+        let policy = try #require(MemoryDerivationPolicy.derived(privateFloor: true, groupCeiling: []))
+        do {
+            let current = try Lattice(Memory.self, configuration: .init(fileURL: path, migration: engramMigrations))
+            defer { current.close() }
+            let legacy = try #require(current.objects(Memory.self).first)
+            #expect(legacy.content == "Synthetic legacy version two")
+            #expect(legacy.derivationPolicy == nil)
+            #expect(!legacy.isPrivate)
+            #expect(legacy.effectiveIsPrivate)
+            try current.add(Memory(content: "Synthetic protected version four", isPrivate: true, derivationPolicy: policy.rawValue))
+        }
+        try #require(try storedSchemaVersion(path) == "4")
+        try #require(try columnPresent(path, "derivationPolicy"))
+        do {
+            let current = try Lattice(Memory.self, configuration: .init(fileURL: path, migration: engramMigrations))
+            defer { current.close() }
+            #expect(current.objects(Memory.self).count == 2)
+            let legacy = try #require(current.objects(Memory.self).where { $0.content == "Synthetic legacy version two" }.first)
+            #expect(legacy.derivationPolicy == nil)
+            #expect(!legacy.isPrivate)
+            #expect(legacy.effectiveIsPrivate)
+            let protected = try #require(current.objects(Memory.self).where { $0.content == "Synthetic protected version four" }.first)
+            #expect(protected.isPrivate)
+            #expect(protected.effectiveIsPrivate)
+            #expect(protected.derivationPolicy == policy.rawValue)
+        }
+        #expect(try storedSchemaVersion(path) == "4")
+    }
+
+    @Test func versionFourStoreRefusesLegacyMaxTwoColdWritableReopen() throws {
+        let path = try directory().appendingPathComponent("version-four-cold-refusal.sqlite")
+        let legacyMigrations = engramMigrations.filter { $0.key == 2 }
+        try #require(legacyMigrations.keys.sorted() == [2])
+        try #require(engramMigrations.keys.sorted() == [2, 4])
+        let policy = try #require(MemoryDerivationPolicy.derived(privateFloor: true, groupCeiling: []))
+        do {
+            let current = try Lattice(Memory.self, configuration: .init(fileURL: path, migration: engramMigrations))
+            defer { current.close() }
+            try current.add(Memory(content: "Synthetic protected cold reopen", isPrivate: true, derivationPolicy: policy.rawValue))
+        }
+        try #require(try storedSchemaVersion(path) == "4")
+        try #require(try columnPresent(path, "derivationPolicy"))
+        var refusedAsVersionFour = false
+        do {
+            let old = try Lattice(RestrictionV3.Memory.self, configuration: .init(fileURL: path, migration: legacyMigrations))
+            old.close()
+        } catch let error as lattice.cxx_error {
+            // Compare only to the pinned constructor's fixed version refusal.
+            // An unrelated setup error must not qualify the barrier.
+            refusedAsVersionFour = String(error.msg) == "Database schema version (4) is newer than this binary supports (2). Update the application."
+        } catch {
+            refusedAsVersionFour = false
+        }
+        #expect(refusedAsVersionFour)
+        // Check before a compatible reopen could reconcile a missing column.
+        try #require(try storedSchemaVersion(path) == "4")
+        try #require(try columnPresent(path, "derivationPolicy"))
+        do {
+            let current = try Lattice(Memory.self, configuration: .init(fileURL: path, migration: engramMigrations))
+            defer { current.close() }
+            #expect(current.objects(Memory.self).count == 1)
+            let protected = try #require(current.objects(Memory.self).first)
+            #expect(protected.content == "Synthetic protected cold reopen")
+            #expect(protected.isPrivate)
+            #expect(protected.effectiveIsPrivate)
+            #expect(protected.derivationPolicy == policy.rawValue)
+        }
     }
 }
