@@ -158,6 +158,26 @@ struct DerivationRestrictionSyncTests {
         withExtendedLifetime(sender) {}
     }
 
+    // The existing Gate stays unchanged for every other test. This copy only
+    // records the result of the same one-shot five-second semaphore wait.
+    private final class RefreshTraceGate: @unchecked Sendable {
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var first = true
+        private var recordedOutcome: UInt64 = 0
+        var outcome: UInt64 { lock.withLock { recordedOutcome } }
+        func run() {
+            let block = lock.withLock { if !first { return false }; first = false; return true }
+            if block {
+                entered.signal()
+                let result = release.wait(timeout: .now() + 5)
+                lock.withLock { recordedOutcome = result == .success ? 1 : 2 }
+            }
+        }
+        private func blockingWait() -> Bool { entered.wait(timeout: .now() + 5) == .success }
+        func waitForEntry() async -> Bool { await Task.detached { self.blockingWait() }.value }
+    }
+
     @Test func readFailureAndCatalogOverflowDenyInsteadOfRetainingAnAllowlist() async throws {
         let path = try directory(), a = UUID()
         let seed = try store(path.appendingPathComponent("hub.sqlite"))
@@ -168,43 +188,94 @@ struct DerivationRestrictionSyncTests {
             syncFilter: SyncService.buildGroupSyncFilter(from: seed, groupId: a), narrowingEmitsRemovals: false))
         let receiver = try store(path.appendingPathComponent("receiver.sqlite"), target: .init(channel: channel))
         let observer = SyncService.PolicyObservation(lattice: sender, relay: .hub(personalChannel: "unused", groupIds: [a]))
+        // One bounded numeric trace, emitted after the original cancellation.
+        // Rows: phase, event, elapsed ms, polls, result, pending, gate, wait ms.
+        let traceStart = DispatchTime.now().uptimeNanoseconds
+        var tracePhase: UInt64 = 0
+        var traceRows: [[UInt64]] = []
+        var traceOverflow = false
+        var traceGate: RefreshTraceGate?
+        func elapsedMilliseconds(_ start: UInt64) -> UInt64 {
+            min((DispatchTime.now().uptimeNanoseconds &- start) / 1_000_000, 3_600_000)
+        }
+        func recordTrace(_ event: UInt64, polls: UInt64 = 0, result: Bool = false, waitMilliseconds: UInt64 = 0) {
+            guard traceRows.count < 32 else { traceOverflow = true; return }
+            traceRows.append([tracePhase, event, elapsedMilliseconds(traceStart), polls,
+                              result ? 1 : 0, observer.hasPendingRefresh ? 1 : 0,
+                              traceGate?.outcome ?? 0, waitMilliseconds])
+        }
+        func beginTrace(_ phase: UInt64) { tracePhase = phase; recordTrace(1) }
+        func wait(_ condition: () -> Bool) async -> Bool {
+            let deadline = Date().addingTimeInterval(10)
+            let started = DispatchTime.now().uptimeNanoseconds
+            var polls: UInt64 = 0
+            var result = false
+            defer { recordTrace(2, polls: polls, result: result, waitMilliseconds: elapsedMilliseconds(started)) }
+            while Date() < deadline {
+                polls = min(polls + 1, 65_535)
+                if condition() { result = true; return true }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            polls = min(polls + 1, 65_535)
+            result = condition()
+            return result
+        }
+        defer {
+            recordTrace(3)
+            print("RESTRICTION_REFRESH_TRACE_V1 overflow=\(traceOverflow) rows=\(traceRows)")
+        }
         defer { observer.cancel() }
+        beginTrace(1)
         #expect(await wait { contains(receiver, "initial") && !observer.hasPendingRefresh })
+        beginTrace(2)
         try sql(seed.configuration.fileURL, "ALTER TABLE SyncConfig RENAME TO HeldSyncConfig")
         #expect(SyncService.buildGroupSyncFilter(from: seed, groupId: a) == SyncService.denyPolicyFilter())
         observer.refresh()
+        beginTrace(3)
         #expect(await wait { !observer.hasPendingRefresh })
+        beginTrace(4)
         _ = try put(seed, "during-read-failure")
         try await Task.sleep(for: .milliseconds(300))
         #expect(!contains(receiver, "during-read-failure"))
+        beginTrace(5)
         try sql(seed.configuration.fileURL, "ALTER TABLE HeldSyncConfig RENAME TO SyncConfig")
         observer.refresh()
+        beginTrace(6)
         #expect(await wait { contains(receiver, "during-read-failure") })
         // Hold an older successful read across the overflow. Its eventual
         // completion must not reinstall that old permissive policy catalog.
-        let staleSuccess = Gate(); observer.beforeInstall = { staleSuccess.run() }
+        beginTrace(7)
+        let staleSuccess = RefreshTraceGate(); traceGate = staleSuccess
+        observer.beforeInstall = { staleSuccess.run() }
         observer.refresh()
         #expect(await staleSuccess.waitForEntry())
+        beginTrace(8)
         try LatticeBeginRetry.run(on: seed) {
             for index in 0...SyncService.maximumPolicyValues {
                 _ = try put(seed, "overflow-\(index)", policy: "unknown-\(index)")
             }
         }
+        beginTrace(9)
         #expect(SyncService.buildGroupSyncFilter(from: seed, groupId: a) == SyncService.denyPolicyFilter())
         observer.refresh()
         staleSuccess.release.signal()
         observer.beforeInstall = nil
+        beginTrace(10)
         #expect(await wait { !observer.hasPendingRefresh })
+        beginTrace(11)
         _ = try put(seed, "during-overflow")
         try await Task.sleep(for: .milliseconds(300))
         #expect(!contains(receiver, "during-overflow"))
+        beginTrace(12)
         seed.delete(Memory.self, where: { $0.content.hasPrefix("overflow-") })
         observer.refresh()
+        beginTrace(13)
         let recovered = await wait { contains(receiver, "during-overflow") }
         if !recovered {
             print("RESTRICTION_RECOVERY pending=\(observer.hasPendingRefresh) currentDenies=\(SyncService.buildGroupSyncFilter(from: seed, groupId: a) == SyncService.denyPolicyFilter()) rows=\(seed.objects(Memory.self).count) received=\(receiver.objects(Memory.self).count)")
         }
         #expect(recovered)
+        beginTrace(14)
         withExtendedLifetime(sender) {}
     }
     @Test func stableReadFailureRecoversWithoutAnotherNotificationAndDelayedReadCannotUndoIt() async throws {
