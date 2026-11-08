@@ -178,6 +178,20 @@ struct DerivationRestrictionSyncTests {
         func waitForEntry() async -> Bool { await Task.detached { self.blockingWait() }.value }
     }
 
+    // Counts visits after the first read and early denial, not drain starts.
+    // The counter lock never encloses an observer read or the one-shot gate.
+    private final class RefreshTraceHookEntries: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count: UInt64 = 0
+        private var overflow = false
+        func record() {
+            lock.withLock {
+                if count < 65_535 { count += 1 } else { overflow = true }
+            }
+        }
+        var sample: (count: UInt64, overflow: Bool) { lock.withLock { (count, overflow) } }
+    }
+
     @Test func readFailureAndCatalogOverflowDenyInsteadOfRetainingAnAllowlist() async throws {
         let path = try directory(), a = UUID()
         let seed = try store(path.appendingPathComponent("hub.sqlite"))
@@ -189,20 +203,30 @@ struct DerivationRestrictionSyncTests {
         let receiver = try store(path.appendingPathComponent("receiver.sqlite"), target: .init(channel: channel))
         let observer = SyncService.PolicyObservation(lattice: sender, relay: .hub(personalChannel: "unused", groupIds: [a]))
         // One bounded numeric trace, emitted after the original cancellation.
-        // Rows: phase, event, elapsed ms, polls, result, pending, gate, wait ms.
+        // V2 rows retain the first eight fields: phase, event, elapsed ms,
+        // polls, result, pending, gate, wait ms. Appended fields: generation,
+        // reconcile, backoff step, hook entries after first read, hook overflow.
+        // Observer state is locked together; counter/gate/time are separate samples.
         let traceStart = DispatchTime.now().uptimeNanoseconds
         var tracePhase: UInt64 = 0
         var traceRows: [[UInt64]] = []
         var traceOverflow = false
         var traceGate: RefreshTraceGate?
+        let traceHookEntries = RefreshTraceHookEntries()
         func elapsedMilliseconds(_ start: UInt64) -> UInt64 {
             min((DispatchTime.now().uptimeNanoseconds &- start) / 1_000_000, 3_600_000)
         }
         func recordTrace(_ event: UInt64, polls: UInt64 = 0, result: Bool = false, waitMilliseconds: UInt64 = 0) {
             guard traceRows.count < 32 else { traceOverflow = true; return }
-            traceRows.append([tracePhase, event, elapsedMilliseconds(traceStart), polls,
-                              result ? 1 : 0, observer.hasPendingRefresh ? 1 : 0,
-                              traceGate?.outcome ?? 0, waitMilliseconds])
+            let elapsed = elapsedMilliseconds(traceStart)
+            let state = observer.refreshTraceState
+            let gateOutcome = traceGate?.outcome ?? 0
+            let hookEntriesAfterFirstRead = traceHookEntries.sample
+            traceRows.append([tracePhase, event, elapsed, polls,
+                              result ? 1 : 0, state.scheduled ? 1 : 0,
+                              gateOutcome, waitMilliseconds, state.generation,
+                              state.reconcile ? 1 : 0, UInt64(state.backoffStep),
+                              hookEntriesAfterFirstRead.count, hookEntriesAfterFirstRead.overflow ? 1 : 0])
         }
         func beginTrace(_ phase: UInt64) { tracePhase = phase; recordTrace(1) }
         func wait(_ condition: () -> Bool) async -> Bool {
@@ -222,7 +246,7 @@ struct DerivationRestrictionSyncTests {
         }
         defer {
             recordTrace(3)
-            print("RESTRICTION_REFRESH_TRACE_V1 overflow=\(traceOverflow) rows=\(traceRows)")
+            print("RESTRICTION_REFRESH_TRACE_V2 overflow=\(traceOverflow) rows=\(traceRows)")
         }
         defer { observer.cancel() }
         beginTrace(1)
@@ -246,7 +270,10 @@ struct DerivationRestrictionSyncTests {
         // completion must not reinstall that old permissive policy catalog.
         beginTrace(7)
         let staleSuccess = RefreshTraceGate(); traceGate = staleSuccess
-        observer.beforeInstall = { staleSuccess.run() }
+        observer.beforeInstall = {
+            traceHookEntries.record()
+            staleSuccess.run()
+        }
         observer.refresh()
         #expect(await staleSuccess.waitForEntry())
         beginTrace(8)
@@ -259,7 +286,8 @@ struct DerivationRestrictionSyncTests {
         #expect(SyncService.buildGroupSyncFilter(from: seed, groupId: a) == SyncService.denyPolicyFilter())
         observer.refresh()
         staleSuccess.release.signal()
-        observer.beforeInstall = nil
+        // Keep a counter-only continuation after the original one-shot release.
+        observer.beforeInstall = { traceHookEntries.record() }
         beginTrace(10)
         #expect(await wait { !observer.hasPendingRefresh })
         beginTrace(11)

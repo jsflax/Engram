@@ -421,6 +421,10 @@ public enum SyncService {
             set { lock.withLock { installHook = newValue } }
         }
         var hasPendingRefresh: Bool { lock.withLock { scheduled } }
+        // Internal test trace only. No refresh, database read or native ACK.
+        var refreshTraceState: (generation: UInt64, scheduled: Bool, reconcile: Bool, backoffStep: Int) {
+            lock.withLock { (generation, scheduled, reconciliationRequested, reconciliationStep) }
+        }
 
         public init(lattice: Lattice, relay: PolicyRelay) {
             self.lattice = lattice; self.relay = relay
