@@ -108,16 +108,25 @@ extension MemoryTools {
             return CallTool.Result(content: [.text("Label cannot be empty.")], isError: true)
         }
 
-        // Verify memories exist and determine project
-        var memories: [UUID: Memory] = [:]
-        for gid in ids {
-            guard let (mem, _) = findMemory(id: gid) else {
-                return CallTool.Result(content: [.text("Memory [id:\(gid.uuidString)] not found.")], isError: true)
-            }
-            memories[gid] = mem
+        let inputs: DerivationInputs
+        do {
+            inputs = try derivationSources(ids)
+        } catch let refusal as DerivationScopeError {
+            return refusal.result
+        }
+        let sources = inputs.targets
+        guard sources.allSatisfy({ $0.lattice.configuration.fileURL.standardizedFileURL == localLattice.configuration.fileURL.standardizedFileURL }) else {
+            return DerivationScopeError(message: "Organize cross-store relabeling is unavailable until label and policy writes can share one supported transaction. No rows were changed.").result
         }
 
-        let project = a.project ?? memories[ids[0]]?.project ?? "global"
+        let project = a.project ?? sources[0].memory.project
+        let initialScope: DerivationSnapshot
+        do {
+            initialScope = try derivationSnapshot(sources: inputs, project: project)
+            _ = try derivationPrivacy(sources: inputs, project: project, updatesSourceLabels: true)
+        } catch let refusal as DerivationScopeError {
+            return refusal.result
+        }
 
         // Create hub memory
         let hubContent = a.summary ?? "Hub: \(label)"
@@ -125,32 +134,40 @@ extension MemoryTools {
         if let floats = try await embedder.embed(text: hubContent) {
             hubEmbedding = Vector<Float>(floats)
         }
-        let hub = Memory(
-            content: hubContent,
-            topic: label,
-            project: project,
-            source: "organize",
-            embedding: hubEmbedding
-        )
-        // Hub, edges and topic updates share one checked transaction with a
-        // bounded BEGIN retry (previously an autocommit add followed by an
-        // unchecked transaction whose failed BEGIN trapped the process).
+        // The hub, edges and local topic updates share a checked transaction
+        // with bounded BEGIN retry. Other policy copies are rechecked, but
+        // every selected row being relabeled must belong to this local store.
         let hubGlobalId: UUID
         do {
             hubGlobalId = try LatticeBeginRetry.run(on: localLattice, log: { log("[organize] \($0)") }) {
+                let inputs = try derivationSources(ids)
+                let sources = inputs.targets
+                let policy = try derivationRestriction(sources: inputs, project: project, updatesSourceLabels: true, unchangedFrom: initialScope)
+                guard sources.allSatisfy({ $0.lattice.configuration.fileURL.standardizedFileURL == localLattice.configuration.fileURL.standardizedFileURL }) else {
+                    throw DerivationScopeError(message: "A selected source moved to an unsupported cross-store destination.")
+                }
+                let hub = Memory(
+                    content: hubContent, topic: label, project: project, source: "organize",
+                    embedding: hubEmbedding, isPrivate: policy.privateFloor, authorUserId: currentUserId, derivationPolicy: policy.rawValue
+                )
                 try localLattice.add(hub)
                 guard let hubGid = hub.globalId else {
                     throw MCPError.internalError("Failed to get hub globalId.")
                 }
-                for gid in ids {
-                    if let mem = memories[gid] {
+                for source in sources {
+                    if let gid = source.memory.globalId {
                         let edge = Edge(sourceGlobalId: gid, targetGlobalId: hubGid, relation: .partOf, authorUserId: currentUserId)
                         try localLattice.add(edge)
-                        mem.topic = label
+                        // The selected sources and hub share this checked
+                        // transaction. Remote replicas remain policy inputs.
+                        source.memory.derivationPolicy = policy.rawValue
+                        source.memory.topic = label
                     }
                 }
                 return hubGid
             }.value
+        } catch let refusal as DerivationScopeError {
+            return refusal.result
         } catch let contention as LatticeBeginRetry.Contention {
             log("[organize] not organized: \(contention)")
             return Self.busyReceipt(tool: "organize", verb: "organized", contention: contention)

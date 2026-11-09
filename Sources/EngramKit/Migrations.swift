@@ -35,7 +35,11 @@ public enum V1 {
 /// `SyncConfig.exposedTeams` column name is deliberately KEPT (renaming
 /// would skew the personal-sync wire format across the user's own app
 /// versions); new code uses the `exposedGroups` computed alias.
-public let currentSchemaVersion = 3
+/// v4 adds nullable Memory.derivationPolicy. Lattice adds the column without
+/// backfilling: absent old policy stays NULL/unclassified. It must not receive
+/// the new-row initializer's direct-policy value. Legacy publication requires
+/// separate reviewed classification; this migration does not certify lineage.
+public let currentSchemaVersion = 4
 
 // MARK: - Migration Definitions
 
@@ -77,5 +81,10 @@ nonisolated(unsafe) public let engramMigrations: [Int: Migration] = [
             // Preserve creation timestamp
             new.createdAt = old.createdAt
         }
-    )
+    ),
+    // An explicit target makes the existing Lattice version guard refuse a
+    // cold writable reopen by older binaries whose highest migration is 2.
+    // The nullable policy column still uses normal schema reconciliation;
+    // this entry performs no row transform or legacy policy backfill.
+    4: Migration()
 ]

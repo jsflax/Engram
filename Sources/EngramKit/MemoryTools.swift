@@ -106,7 +106,7 @@ public actor MemoryTools {
             source: m.source,
             importance: m.importance,
             accessCount: m.accessCount,
-            isPrivate: m.isPrivate,
+            isPrivate: m.effectiveIsPrivate,
             authorUserId: m.authorUserId,
             createdAt: m.createdAt,
             modifiedAt: m.modifiedAt,
@@ -159,6 +159,17 @@ public actor MemoryTools {
     /// load embeddings or wait for the independent embedding migration.
     public func prepareStorage() throws {
         _ = try resolveDatabases()
+    }
+
+    /// Derivations must distinguish absent configuration from a configured
+    /// reference omitted by legacy read resolution. Never infer missing input
+    /// from a partial cached bundle, or recreate a missing replica as empty.
+    func validateDerivationStorageCompleteness() throws {
+        let databases = try resolveDatabases()
+        guard (syncedReference == nil || databases.synced != nil),
+              databases.groups.count == groupReferences.count else {
+            throw DerivationScopeError(message: "A configured source store is unavailable. Restore access and reopen the memory service before deriving.")
+        }
     }
 
     // Public throwing entrypoints prepare storage before using these legacy

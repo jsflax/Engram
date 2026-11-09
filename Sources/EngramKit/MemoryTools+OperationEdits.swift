@@ -32,6 +32,7 @@ extension MemoryTools {
                              ledger: MemoryOperationLedger) async throws -> MemoryOperationReceipt {
         let original = try operationLocalMemory(id: value.id)
         let oldContent = original.content
+        let policyBefore = try operationMutationRestriction(value.id)
         try operationCheckPrivacyEdit(value, memory: original, principal: identity.currentPrincipal())
 
         let newContent: String?
@@ -69,6 +70,18 @@ extension MemoryTools {
                 throw MemoryOperationError.invalidRequest("Memory content changed during operation preparation")
             }
             try operationCheckPrivacyEdit(value, memory: memory, principal: currentPrincipal)
+            let currentPolicy = try operationMutationRestriction(value.id)
+            guard currentPolicy == policyBefore else {
+                throw MemoryOperationError.invalidRequest("Memory derivation policy changed during operation preparation")
+            }
+            do {
+                try validateMutationRestriction(currentPolicy.policy, project: value.project ?? memory.project,
+                    isPrivate: value.isPrivate ?? (memory.isPrivate || currentPolicy.policy.privateFloor))
+            } catch is DerivationScopeError {
+                throw MemoryOperationError.invalidRequest("Inherited derivation policy refuses this update")
+            }
+            if memory.derivationPolicy != currentPolicy.policy.rawValue { memory.derivationPolicy = currentPolicy.policy.rawValue }
+            if currentPolicy.policy.privateFloor && !memory.isPrivate { memory.isPrivate = true }
 
             let now = Date()
             if let newContent, let newEmbedding {
@@ -128,6 +141,11 @@ extension MemoryTools {
             return .init(outcome: .applied, memoryIDs: operationEndpointIDs(value), edgeIDs: [id])
         }
         return commit.receipt
+    }
+
+    private func operationMutationRestriction(_ id: UUID) throws -> MutationRestrictionSnapshot {
+        do { return try mutationRestriction(id) }
+        catch is DerivationScopeError { throw MemoryOperationError.invalidRequest("Memory derivation policy is unavailable or unclassified") }
     }
 
     private func operationCurrentPrincipal(for prepared: MemoryOperationCanonicalPayload) throws -> Principal {

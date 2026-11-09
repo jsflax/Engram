@@ -454,21 +454,19 @@ struct EngramDaemon: AsyncParsableCommand {
             log("Skipping spoke retirement — membership list is cached, not authoritative")
         }
 
-        // 7. Observe SyncConfig changes — rebuild filter dynamically
-        // A SyncConfig write can change the personal policy OR a project's
-        // group exposure — both live in the same row, so every channel is
-        // rebuilt, each against its own filter.
-        let observedGroupIds = memberships.map(\.id)
-        let syncConfigObserver = localLattice.observe(SyncConfig.self) { _ in
-            localLattice.updateSyncFilter(SyncService.buildSyncFilter(from: localLattice),
-                                          forChannel: channel)
-            for groupId in observedGroupIds {
-                localLattice.updateSyncFilter(
-                    SyncService.buildGroupSyncFilter(from: localLattice, groupId: groupId),
-                    forChannel: SyncService.groupChannel(groupId))
-            }
-            log("Sync filters rebuilt (SyncConfig changed)")
+        // 7. Retain policy observers for exactly these owned relays. Startup
+        // filters already fail closed; the observers admit newly committed
+        // canonical policy values and rebuild each destination independently.
+        var policyObservers = [SyncService.PolicyObservation(lattice: localLattice,
+            relay: .hub(personalChannel: channel, groupIds: memberships.map(\.id)))]
+        if let syncedLattice {
+            policyObservers.append(SyncService.PolicyObservation(lattice: syncedLattice, relay: .personal(channel: channel)))
         }
+        for (id, spoke) in groupSpokes {
+            policyObservers.append(SyncService.PolicyObservation(lattice: spoke, relay: .group(id: id, author: selfUserId)))
+        }
+        let retainedPolicyObservers = policyObservers
+        defer { retainedPolicyObservers.forEach { $0.cancel() } }
 
         // 8. Wire sync error, state, and progress logging
         // Lattice 1.x: the callback registrations became AsyncStreams.
@@ -528,13 +526,15 @@ struct EngramDaemon: AsyncParsableCommand {
                             credentials: credentials,
                             knownGroupIds: Set(memberships.map(\.id)),
                             startupPermitted: startupPermitted,
-                            lockFd: lockFd)
+                            lockFd: lockFd,
+                            beforeRestart: { retainedPolicyObservers.forEach { $0.cancel() } })
 
         // Handle graceful shutdown
         signal(SIGTERM, SIG_IGN)
         let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         termSource.setEventHandler {
             log("SIGTERM received, shutting down...")
+            retainedPolicyObservers.forEach { $0.cancel() }
             DaemonStatus.write(state: "stopped", detail: "SIGTERM")
             flock(lockFd, LOCK_UN)
             close(lockFd)
@@ -546,6 +546,7 @@ struct EngramDaemon: AsyncParsableCommand {
         let intSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         intSource.setEventHandler {
             log("SIGINT received, shutting down...")
+            retainedPolicyObservers.forEach { $0.cancel() }
             flock(lockFd, LOCK_UN)
             close(lockFd)
             Darwin.exit(0)
@@ -564,6 +565,7 @@ struct EngramDaemon: AsyncParsableCommand {
                 let events = watchdog.data
                 if events.contains(.delete) || events.contains(.rename) {
                     log("CRITICAL: Synced database was deleted/renamed — restarting daemon")
+                    retainedPolicyObservers.forEach { $0.cancel() }
                     DaemonStatus.write(state: "restarting", detail: "synced DB deleted")
                     Darwin.close(watchdogFd)
                     flock(lockFd, LOCK_UN)
@@ -601,7 +603,7 @@ struct EngramDaemon: AsyncParsableCommand {
         // standalone repro before this change.
         while true {
             try await Task.sleep(for: .seconds(3600))
-            withExtendedLifetime(syncConfigObserver) {}
+            withExtendedLifetime(retainedPolicyObservers) {}
             // Periodic compaction (Aug 2026 incident, fix 2d): floors now
             // advance between restarts (empty-pass advance in the core), so
             // startup-only compaction left reclaimed history sitting until
@@ -960,7 +962,8 @@ private func startMembershipPoll(
     credentials: SyncCredentials,
     knownGroupIds: Set<UUID>,
     startupPermitted: [UUID: Bool],
-    lockFd: Int32
+    lockFd: Int32,
+    beforeRestart: @escaping @Sendable () -> Void
 ) {
     Task.detached {
         while true {
@@ -999,6 +1002,7 @@ private func startMembershipPoll(
                     if permitted != wasPermitted {
                         log("Group billing changed for \(membership.name) (\(billing ?? "unknown")) — restarting")
                         DaemonStatus.write(state: "restarting", detail: "group billing changed")
+                        beforeRestart()
                         flock(lockFd, LOCK_UN)
                         close(lockFd)
                         Darwin.exit(1)
@@ -1016,6 +1020,7 @@ private func startMembershipPoll(
                     let removed = knownGroupIds.subtracting(current).count
                     log("Groups changed (+\(added)/-\(removed)) — restarting to rebuild IPC targets")
                     DaemonStatus.write(state: "restarting", detail: "group membership changed")
+                    beforeRestart()
                     flock(lockFd, LOCK_UN)
                     close(lockFd)
                     // Non-zero: launchd's KeepAlive(SuccessfulExit:false)
