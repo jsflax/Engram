@@ -38,6 +38,24 @@ def prepare(repository: Path, destination: Path, source_sha: str | None = None) 
                 if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
                     raise ValueError(f"Copy mismatch: {name}")
                 hashes[name] = digest
+    # This exact JSON fixture is read relative to the copied queue test source.
+    # Keep it in source-identity.json; no fixture-directory wildcard or external lookup.
+    relative = "Tests/Fixtures/LearnerPublicationQueue/v1.json"
+    checked = repository
+    for part in Path(relative).parts[:-1]:
+        checked /= part
+        if checked.is_symlink() or not checked.is_dir():
+            raise ValueError(f"Portable fixture parent must be a real directory: {checked}")
+    source = repository / relative
+    if source.is_symlink() or not source.is_file() or source.stat().st_size > 256 * 1024:
+        raise ValueError(f"Portable queue fixture must be a bounded regular file: {source}")
+    target = destination / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+        raise ValueError(f"Copy mismatch: {relative}")
+    hashes[relative] = digest
     manifest = '''// swift-tools-version: 6.2
 import PackageDescription
 let package = Package(

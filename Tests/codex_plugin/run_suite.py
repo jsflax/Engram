@@ -38,6 +38,7 @@ MODULES = (
     'test_residual_policy',
     'test_residual_publication_contract',
     'test_learner_residual',
+    "test_learner_publication_queue",
 )
 FSYNC_MODULES = {"test_host", "test_migration", "test_execution_context", "test_parser_context",
                  "test_publication_coordinator", "test_settlement", "test_runner_publication", "test_zero_intent_retry", "test_runner_reconnect", "test_runner_planning", "test_plan_publication",
