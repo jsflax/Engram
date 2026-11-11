@@ -1,4 +1,5 @@
 """Exercise release command blocks with fake tools; never resolve or build Swift."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -394,7 +395,7 @@ raise SystemExit(code or (int(os.environ['FAKE_WRAPPER_EXIT']) if command[1]=='b
     def test_linux_installs_python_before_builds_and_propagates_tooling_failure(self):
         name = 'Install portable test Python runtime'
         workflow = (ROOT / '.github/workflows/linux-core.yml').read_text()
-        order = ['Prepare isolated Linux work and output paths', name,
+        order = [name, 'Prepare isolated Linux work and output paths',
                  'Build EngramMemoryCore (Linux)', 'Compile its tests (Linux)',
                  'Execute exact portable core tests (Linux)']
         positions = [workflow.index('      - name: ' + step + '\n') for step in order]
@@ -447,11 +448,40 @@ else:
             root = Path(temporary).resolve()
             checkout = root / 'checkout with spaces'; checkout.mkdir()
             bin_dir = root / 'bin'; bin_dir.mkdir()
+            account_home = root / 'account home'; account_home.mkdir(mode=0o700)
+            helper_log = root / 'helper-calls.jsonl'
+            helper_source = block.split("<<'PY'\n", 1)[1].split('\nPY\n', 1)[0] + '\n'
+            helper_sha = hashlib.sha256(helper_source.encode()).hexdigest()
             (bin_dir / 'git').symlink_to(shutil.which('git'))
             swift = bin_dir / 'swift'
             swift.write_text('#!/bin/sh\n[ "$#" = 1 ] && [ "$1" = --version ] || exit 99\n'
                              'printf "fixture Swift version\\n"\n')
             swift.chmod(0o700)
+            # Execute the exact workflow helper, routing only pwd metadata to
+            # this owned account home. Keep HOME isolated for the existing Git test.
+            python = bin_dir / 'python3'
+            python.write_text('#!' + sys.executable + '\n' + '''import hashlib,json,os,pwd,sys
+from pathlib import Path
+from types import SimpleNamespace
+def record(value):
+    with open(os.environ['HELPER_LOG'], 'a') as output:
+        output.write(json.dumps(value) + '\\n')
+record({'event': 'invoked', 'args': sys.argv[1:]})
+assert sys.argv[1:] == ['-B', '-'], sys.argv
+source = sys.stdin.buffer.read(16 * 1024 + 1)
+assert len(source) <= 16 * 1024
+assert hashlib.sha256(source).hexdigest() == os.environ['EXPECTED_HELPER_SHA256']
+account_home = Path(os.environ['FIXTURE_ACCOUNT_HOME'])
+assert account_home.is_absolute() and account_home != Path(os.environ['HOME'])
+record({'event': 'helper', 'sha256': hashlib.sha256(source).hexdigest()})
+def account(uid):
+    assert uid == os.getuid()
+    record({'event': 'passwd', 'uid': uid, 'home': str(account_home)})
+    return SimpleNamespace(pw_uid=uid, pw_dir=str(account_home))
+pwd.getpwuid = account
+exec(compile(source, '<exact-workflow-helper>', 'exec'), {'__name__': '__main__'})
+''')
+            python.chmod(0o700)
             github_env = root / 'github-env'
             # Isolate Git from user configuration and preserve the job's existing
             # environment-based private dependency rewrite alongside per-command trust.
@@ -461,7 +491,9 @@ else:
                 GIT_CONFIG_KEY_0='url.https://example.invalid/private/.insteadOf',
                 GIT_CONFIG_VALUE_0='https://example.invalid/source/',
                 GITHUB_WORKSPACE=str(checkout), GITHUB_ENV=str(github_env),
-                GITHUB_RUN_ID='987654321', GITHUB_RUN_ATTEMPT='2')
+                GITHUB_RUN_ID='987654321', GITHUB_RUN_ATTEMPT='2',
+                FIXTURE_ACCOUNT_HOME=str(account_home), HELPER_LOG=str(helper_log),
+                EXPECTED_HELPER_SHA256=helper_sha)
 
             def git(*args, check=True):
                 return subprocess.run(['git', *args], cwd=checkout, env=env,
@@ -479,7 +511,8 @@ else:
             refused = git('rev-parse', 'HEAD', check=False)
             self.assertNotEqual(refused.returncode, 0)
             self.assertIn('dubious ownership', refused.stderr)
-            task_root = root / 'home/localdev/engram-linux-987654321-2'
+            task_root = account_home / 'localdev/engram-linux-987654321-2'
+            self.assertNotEqual(account_home, Path(env['HOME']))
             for scenario, overrides in (
                 ('wrong-workspace', {'GITHUB_WORKSPACE': str(root)}),
                 ('wrong-source', {'SOURCE_SHA': '0' * 40}),
@@ -492,11 +525,20 @@ else:
                         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                         self.assertFalse(task_root.exists())
                         self.assertFalse(github_env.exists())
+                        self.assertFalse(helper_log.exists())
+                        self.assertFalse((account_home / 'localdev').exists())
                     else:
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                         self.assertEqual((task_root / 'repo/source.txt').read_text(), 'committed source\n')
                         self.assertFalse((task_root / 'repo/untracked.txt').exists())
                         self.assertIn('LINUX_ROOT=' + str(task_root) + '\n', github_env.read_text())
+                        self.assertEqual([json.loads(line) for line in helper_log.read_text().splitlines()], [
+                            {'event': 'invoked', 'args': ['-B', '-']},
+                            {'event': 'helper', 'sha256': helper_sha},
+                            {'event': 'passwd', 'uid': os.getuid(), 'home': str(account_home)},
+                        ])
+                        self.assertFalse((Path(env['HOME']) / 'localdev').exists())
+                        self.assertEqual(account_home.stat().st_mode & 0o777, 0o700)
             # Trust must not persist, and -c must not replace the existing rewrite.
             self.assertIn('dubious ownership', git('rev-parse', 'HEAD', check=False).stderr)
             rewrite = git('-c', 'safe.directory=' + str(checkout), 'config', '--get', env['GIT_CONFIG_KEY_0'])

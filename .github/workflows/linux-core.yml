@@ -50,13 +50,88 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install portable test Python runtime
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install --no-install-recommends -y python3
+          python3 --version
       - name: Prepare isolated Linux work and output paths
         shell: bash
         run: |
           set -euo pipefail
           test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$SOURCE_SHA"
-          task_root="$HOME/localdev/engram-linux-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -m 700 -p "$task_root"/{repo,tmp,cache,config,security,module-cache,evidence}
+          # Runner HOME may be a shared mount. Use the current UID passwd home, without changing HOME.
+          # These bounded numeric checks admit the fixture only; the queue retains its own guard.
+          task_root=$(python3 -B - <<'PY'
+          # BEGIN QUEUE_PRIVATE_SANDBOX_V1
+          import json, os, pathlib, pwd, re, stat, sys
+
+          def private_workspace(home, uid, run_id, attempt, sink):
+              parts = home.split("/")
+              if (not home.startswith("/") or len(home.encode()) > 1024 or
+                  not 1 <= len(parts) - 1 <= 24 or any(p in ("", ".", "..") for p in parts[1:]) or
+                  any(ord(c) < 32 or ord(c) == 127 for c in home) or
+                  not re.fullmatch(r"[1-9][0-9]{0,19}", run_id) or
+                  not re.fullmatch(r"[1-9][0-9]{0,5}", attempt)):
+                  raise ValueError("input")
+              ordinal = 0
+              def admit(path, private=False):
+                  nonlocal ordinal
+                  if ordinal >= 40:
+                      raise ValueError("admission_count")
+                  info = path.lstat()  # Never follow a symbolic link for admission.
+                  mode = stat.S_IMODE(info.st_mode)
+                  good = stat.S_ISDIR(info.st_mode) and info.st_uid in (0, uid) and mode & 0o022 == 0
+                  if private:
+                      good = good and info.st_uid == uid and mode == 0o700
+                  sink(json.dumps({"ordinal": ordinal, "uid": info.st_uid, "currentUid": uid, "mode": mode,
+                                   "directory": int(stat.S_ISDIR(info.st_mode)), "private": int(private), "accepted": int(good)}, separators=(",", ":")))
+                  ordinal += 1
+                  if not good:
+                      raise ValueError("ancestor")
+              cursor = pathlib.Path("/")
+              admit(cursor)
+              for part in parts[1:]:
+                  cursor /= part
+                  admit(cursor)
+              localdev = cursor / "localdev"
+              try:
+                  localdev.mkdir(mode=0o700)
+              except FileExistsError:
+                  pass  # Existing directories are checked, never chmodded.
+              admit(localdev, private=True)
+              task = localdev / ("engram-linux-" + run_id + "-" + attempt)
+              task.mkdir(mode=0o700)  # Exclusive; never reuse or delete a prior job leaf.
+              admit(task, private=True)
+              for child in ("repo", "tmp", "cache", "config", "security", "module-cache", "evidence"):
+                  leaf = task / child
+                  leaf.mkdir(mode=0o700)
+                  admit(leaf, private=True)
+              return str(task)
+
+          def main():
+              try:
+                  uid = os.getuid()
+                  account = pwd.getpwuid(uid)
+                  if os.geteuid() != uid or account.pw_uid != uid:
+                      raise ValueError("account")
+                  task = private_workspace(account.pw_dir, uid, os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"],
+                                           lambda row: print(row, file=sys.stderr, flush=True))
+              except (OSError, ValueError, KeyError) as error:
+                  print(json.dumps({"accepted": 0, "errno": (error.errno or 0) if isinstance(error, OSError) else 0}),
+                        file=sys.stderr, flush=True)
+                  return 1
+              print(task)
+              return 0
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          # END QUEUE_PRIVATE_SANDBOX_V1
+          PY
+          )
           git -c safe.directory="$GITHUB_WORKSPACE" archive HEAD | tar -x -C "$task_root/repo"
           {
             echo "LINUX_ROOT=$task_root"
@@ -67,14 +142,6 @@ jobs:
             echo "PYTHONDONTWRITEBYTECODE=1"
           } >> "$GITHUB_ENV"
           swift --version > "$task_root/evidence/swift-version.txt"
-      - name: Install portable test Python runtime
-        timeout-minutes: 3
-        shell: bash
-        run: |
-          set -euo pipefail
-          apt-get update
-          apt-get install --no-install-recommends -y python3
-          python3 --version
       - name: Build EngramMemoryCore (Linux)
         run: |
           swift build --package-path "$LINUX_ROOT/repo" --scratch-path "$LINUX_ROOT/root-build" \
