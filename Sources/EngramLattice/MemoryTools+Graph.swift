@@ -258,7 +258,10 @@ extension MemoryTools {
                     // Edge between two non-root nodes (deeper traversal)
                     let sourceMem = rootLattice.objects(Memory.self).where { $0.globalId == edge.sourceGlobalId }.first
                     let targetMem = rootLattice.objects(Memory.self).where { $0.globalId == edge.targetGlobalId }.first
-                    if excluded(sourceMem) || excluded(targetMem) { continue }
+                    // Keep non-Sendable model references on this actor; Swift 6.4
+                    // treats the right side of || as a separately isolated autoclosure.
+                    if excluded(sourceMem) { continue }
+                    if excluded(targetMem) { continue }
                     let sourceContent = sourceMem?.content ?? "(deleted)"
                     let targetContent = targetMem?.content ?? "(deleted)"
                     output += "\n  [id:\(edge.sourceGlobalId.uuidString)]\(badge(sourceMem)) \(sourceContent.prefix(40))... --[\(edge.relation.rawValue)]--> [id:\(edge.targetGlobalId.uuidString)]\(badge(targetMem)) \(targetContent.prefix(40))..."
