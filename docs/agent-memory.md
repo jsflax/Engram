@@ -75,8 +75,7 @@ for either `Engram_EngramCoreML.bundle` or `EngramPortable_EngramCoreML.bundle`
 before evaluating SwiftPM's generated bundle accessor. App-root resource links
 are unnecessary.
 
-`ENGRAM_LATTICE_PATH` and `ENGRAM_LATTICECORE_PATH` are optional local dependency
-overrides for coordinated development. They are not required by the public API.
+All package manifests pin the database library to one integration revision. This is interim and becomes a version requirement when the matching database release is tagged. There are no environment overrides. For coordinated local development use an uncommitted `swift package edit`.
 The current implementation needs the accompanying Lattice checked-transaction,
 immutable synchronization, and readonly legacy-schema attachment changes. Before
 publishing a consumer release: publish LatticeCore, publish Lattice pinned to that
