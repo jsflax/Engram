@@ -58,14 +58,14 @@ extension MemoryTools {
         }
 
         // Create edge (always in localLattice), attributed to the writer
-        let edge = Edge(sourceGlobalId: fromGid, targetGlobalId: toGid, relation: relationEnum, authorUserId: currentUserId)
-        try localLattice.withTransaction {
+        let edgeGid = try localLattice.withTransaction {
             try requireSessionLearningWriteAdmission()
+            let edge = Edge(sourceGlobalId: fromGid, targetGlobalId: toGid, relation: relationEnum, authorUserId: currentUserId)
             try localLattice.add(edge)
-        }
-
-        guard let edgeGid = edge.globalId else {
-            throw MCPError.internalError("Failed to persist edge — globalId is nil after add()")
+            guard let id = edge.globalId else {
+                throw MCPError.internalError("Failed to persist edge — globalId is nil after add()")
+            }
+            return id
         }
 
         log("Connected [id:\(fromGid.uuidString)] --[\(relation)]--> [id:\(toGid.uuidString)]")
