@@ -2,9 +2,9 @@
 import PackageDescription
 import Foundation
 
-let latticeDependency: Package.Dependency = ProcessInfo.processInfo.environment["ENGRAM_LATTICE_PATH"]
-    .map { .package(path: $0) }
-    ?? .package(url: "https://github.com/jsflax/lattice.git", from: "1.6.2")
+let latticeDependency: Package.Dependency = .package(
+    url: "https://github.com/jsflax/lattice.git",
+    revision: "405353c9a0a66583d9b338492efe9258ece93ff5")
 
 let package = Package(
     name: "Engram",
@@ -17,7 +17,7 @@ let package = Package(
     ],
     dependencies: [
         latticeDependency,
-        .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.12.0"),
+        .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.1"),
     ],
     targets: [
         .target(name: "EngramMemoryCore"),
@@ -37,9 +37,6 @@ let package = Package(
     ]
 )
 
-if let corePath = ProcessInfo.processInfo.environment["ENGRAM_LATTICECORE_PATH"] {
-    package.dependencies.append(.package(path: corePath))
-}
 
 // Keep the existing remote hook executable available on Linux. macOS desktop
 // hooks and the visualizer are built from Desktop/Package.swift.
@@ -75,4 +72,36 @@ package.dependencies.append(.package(url: "https://github.com/apple/swift-crypto
 if let target = package.targets.first(where: { $0.name == "EngramLattice" }) {
     target.dependencies.append(.product(name: "Crypto", package: "swift-crypto"))
 }
+// Share the portable fixture's system SQLite module with the root test target.
+if let target = package.targets.first(where: { $0.name == "EngramLatticeTests" }) {
+    target.dependencies.append(.target(name: "CEngramLedgerSQLite"))
+}
+package.targets.append(.systemLibrary(name: "CEngramLedgerSQLite",
+    path: "Portable/SystemLibraries/CEngramLedgerSQLite", pkgConfig: "sqlite3",
+    providers: [.apt(["libsqlite3-dev"])]))
+#endif
+
+// The same renderer sources/resources as Engram Desktop. Evaluated on macOS for
+// both native Mac and iOS destinations; never enters the portable Linux graph.
+#if os(macOS)
+for name in ["CEngramSceneTypes", "EngramSceneKit", "EngramMetalShaders", "EngramRealityKit", "EngramGraphUI"] {
+    package.products.append(.library(name: name, targets: [name]))
+}
+package.targets.append(contentsOf: [
+    .target(name: "CEngramSceneTypes"),
+    .target(name: "EngramSceneKit", dependencies: ["CEngramSceneTypes"],
+            swiftSettings: [.interoperabilityMode(.Cxx)],
+            linkerSettings: [.linkedFramework("Metal"), .linkedFramework("Accelerate")]),
+    .target(name: "EngramMetalShaders", resources: [.process("Shaders")]),
+    .target(name: "EngramRealityKit", dependencies: ["EngramSceneKit", "CEngramSceneTypes"],
+            resources: [.process("Shaders"), .copy("Resources/mascot.usdz")],
+            swiftSettings: [.interoperabilityMode(.Cxx)],
+            linkerSettings: [.linkedFramework("RealityKit"), .linkedFramework("Metal")]),
+    .target(name: "EngramGraphUI", dependencies: ["EngramRealityKit", "EngramSceneKit", "EngramMetalShaders"],
+            swiftSettings: [.interoperabilityMode(.Cxx)]),
+    .testTarget(name: "EngramRealityKitTests", dependencies: ["EngramRealityKit", "EngramSceneKit", "EngramMetalShaders"],
+                swiftSettings: [.interoperabilityMode(.Cxx)]),
+    .testTarget(name: "EngramGraphUITests", dependencies: ["EngramGraphUI"],
+                swiftSettings: [.interoperabilityMode(.Cxx)]),
+])
 #endif

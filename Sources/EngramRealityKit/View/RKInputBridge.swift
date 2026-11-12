@@ -43,7 +43,9 @@ public final class RKInputBridge {
             NSEvent.removeMonitor(monitor)
             eventMonitor = nil
         }
-        camera?.heldKeys.removeAll()
+        // Repeated hidden-surface updates must not emit an Observation change
+        // for an already-empty set, which would invalidate that same update.
+        if let camera, !camera.heldKeys.isEmpty { camera.heldKeys.removeAll() }
     }
 
     private func handleEvent(_ event: NSEvent) -> NSEvent? {

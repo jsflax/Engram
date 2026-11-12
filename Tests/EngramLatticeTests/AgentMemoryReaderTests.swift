@@ -7,6 +7,8 @@ import EngramLattice
 import SQLite3
 #elseif canImport(CSQLite)
 import CSQLite
+#elseif canImport(CEngramLedgerSQLite)
+import CEngramLedgerSQLite
 #endif
 
 @Suite("Read-only selected agent memory browser")
@@ -96,6 +98,46 @@ struct AgentMemoryReaderTests {
         }
     }
 
+    @Test func rawFixtureWriterWithoutStorageEpochIsRefusedWithoutChangingGraph() throws {
+        #if canImport(SQLite3) || canImport(CSQLite) || canImport(CEngramLedgerSQLite)
+        let directory = FileManager.default.temporaryDirectory.appending(path: "engram-reader-writer-guard-" + UUID().uuidString).resolvingSymlinksInPath()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let binding = AgentMemoryBinding(agentId: UUID()), memoryID = UUID()
+        let file = directory.appending(path: "graph.sqlite")
+        let db = try Lattice(for: AgentMemoryStore.schema, configuration: AgentMemoryStore.configuration(fileURL: file))
+        try db.withTransaction {
+            try db.add(AgentMemoryGraph(agentId: binding.agentId, graphId: binding.graphId))
+            try db.add(Memory(content: "Original valid memory", embedding: Vector<Float>([1, 0, 1]), accessCount: 7),
+                       preservingGlobalId: memoryID)
+        }
+        db.checkpoint(); db.close()
+        let bytes = try Data(contentsOf: file)
+        do {
+            try replaceOwnedFixtureEmbedding(file: file, memoryID: memoryID,
+                blob: Vector<Float>([.nan, 0, 1]).toData(), registerWriterEpoch: false)
+            Issue.record("An unregistered fixture writer changed the stored vector")
+        } catch FixtureFailure.sqlite(let operation, let code, let message) {
+            #expect(operation == "prepare damaged scalar update")
+            #expect(code == SQLITE_ERROR)
+            #expect(message == "no such function: lattice_storage_writer_epoch")
+        }
+        // The fixture connection has rolled back and closed. The checkpointed
+        // file includes the original scalar data, vector index and trigger schema.
+        #expect(try Data(contentsOf: file) == bytes)
+        let snapshot = try AgentMemoryReader.readGraph(fileURL: file, binding: binding)
+        #expect(snapshot.totalMemoryCount == 1 && snapshot.memories.map(\.id) == [memoryID])
+        #expect(snapshot.memories.first?.content == "Original valid memory")
+        #expect(snapshot.memories.first?.accessCount == 7)
+        #expect(snapshot.embeddings == [memoryID: [1, 0, 1]])
+        #expect(snapshot.invalidEmbeddingCount == 0 && snapshot.omittedEmbeddingCount == 0)
+        #expect(snapshot.edges.isEmpty && snapshot.truncation.isEmpty)
+        #expect(try Data(contentsOf: file) == bytes)
+        #else
+        throw FixtureFailure.sqliteUnavailable
+        #endif
+    }
+
     @Test func searchConnectionsAndDetailLeaveGraphByteUnchanged() throws {
         let directory = FileManager.default.temporaryDirectory.appending(path: "engram-reader-" + UUID().uuidString).resolvingSymlinksInPath()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -175,8 +217,9 @@ struct AgentMemoryReaderTests {
     /// remove just the embedding UPDATE trigger (not insert/delete/index/schema),
     /// then restore its exact stored SQL before committing. Reader invocations
     /// start only after this fixture connection is checkpointed and closed.
-    private func replaceOwnedFixtureEmbedding(file: URL, memoryID: UUID, blob: Data) throws {
-        #if canImport(SQLite3) || canImport(CSQLite)
+    private func replaceOwnedFixtureEmbedding(file: URL, memoryID: UUID, blob: Data,
+                                             registerWriterEpoch: Bool = true) throws {
+        #if canImport(SQLite3) || canImport(CSQLite) || canImport(CEngramLedgerSQLite)
         var opened: OpaquePointer?
         let openCode = sqlite3_open_v2(file.path, &opened, SQLITE_OPEN_READWRITE, nil)
         guard openCode == SQLITE_OK, let db = opened else {
@@ -205,6 +248,12 @@ struct AgentMemoryReaderTests {
         try check(sqlite3_busy_timeout(db, 5_000), "set fixture timeout")
         try check(sqlite3_create_function(db, "sync_disabled", 0, SQLITE_UTF8, nil,
             { context, _, _ in sqlite3_result_int(context, 1) }, nil, nil), "register fixture audit suppression")
+        if registerWriterEpoch {
+            // Simulate a current storage writer only on this disposable fixture connection.
+            try check(sqlite3_create_function(db, "lattice_storage_writer_epoch", 0,
+                SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS, nil,
+                { context, _, _ in sqlite3_result_int(context, 9) }, nil, nil), "register fixture writer epoch")
+        }
         let originalTrigger = try triggerSQL()
         try execute("BEGIN IMMEDIATE")
         var committed = false

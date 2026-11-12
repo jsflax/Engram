@@ -41,7 +41,10 @@ extension MemoryTools {
         if let edge = existing.first {
             let edgeGid = edge.globalId?.uuidString ?? "?"
             if edge.deletedAt != nil {
-                edge.deletedAt = nil
+                try localLattice.withTransaction {
+                    try requireSessionLearningWriteAdmission()
+                    edge.deletedAt = nil
+                }
                 log("Revived tombstoned edge [id:\(edgeGid)]")
                 return CallTool.Result(
                     content: [.text("Revived tombstoned edge (edge id: \(edgeGid), \(fromGid.uuidString) --[\(relation)]--> \(toGid.uuidString)).")],
@@ -55,11 +58,14 @@ extension MemoryTools {
         }
 
         // Create edge (always in localLattice), attributed to the writer
-        let edge = Edge(sourceGlobalId: fromGid, targetGlobalId: toGid, relation: relationEnum, authorUserId: currentUserId)
-        try localLattice.add(edge)
-
-        guard let edgeGid = edge.globalId else {
-            throw MCPError.internalError("Failed to persist edge — globalId is nil after add()")
+        let edgeGid = try localLattice.withTransaction {
+            try requireSessionLearningWriteAdmission()
+            let edge = Edge(sourceGlobalId: fromGid, targetGlobalId: toGid, relation: relationEnum, authorUserId: currentUserId)
+            try localLattice.add(edge)
+            guard let id = edge.globalId else {
+                throw MCPError.internalError("Failed to persist edge — globalId is nil after add()")
+            }
+            return id
         }
 
         log("Connected [id:\(fromGid.uuidString)] --[\(relation)]--> [id:\(toGid.uuidString)]")
@@ -258,7 +264,10 @@ extension MemoryTools {
                     // Edge between two non-root nodes (deeper traversal)
                     let sourceMem = rootLattice.objects(Memory.self).where { $0.globalId == edge.sourceGlobalId }.first
                     let targetMem = rootLattice.objects(Memory.self).where { $0.globalId == edge.targetGlobalId }.first
-                    if excluded(sourceMem) || excluded(targetMem) { continue }
+                    // Keep non-Sendable model references on this actor; Swift 6.4
+                    // treats the right side of || as a separately isolated autoclosure.
+                    if excluded(sourceMem) { continue }
+                    if excluded(targetMem) { continue }
                     let sourceContent = sourceMem?.content ?? "(deleted)"
                     let targetContent = targetMem?.content ?? "(deleted)"
                     output += "\n  [id:\(edge.sourceGlobalId.uuidString)]\(badge(sourceMem)) \(sourceContent.prefix(40))... --[\(edge.relation.rawValue)]--> [id:\(edge.targetGlobalId.uuidString)]\(badge(targetMem)) \(targetContent.prefix(40))..."

@@ -85,6 +85,9 @@ public actor MemoryTools {
     /// The globalId of the last remembered row — same capture contract.
     var lastRememberedEmbeddingPending = false
     var lastRememberedId: UUID?
+    /// Set only by the scoped learner gateway; mutation handlers recheck it
+    /// inside their write transaction after any embedding await.
+    var sessionLearningWriteIdentity: SessionLearningIdentity?
 
     /// DTO mapping for the contract surface (never leaks live rows).
     func record(from m: Memory) -> MemoryRecord {

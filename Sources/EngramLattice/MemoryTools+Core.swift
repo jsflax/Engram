@@ -209,16 +209,18 @@ extension MemoryTools {
 
         let isPrivate = a.isPrivate ?? false
 
-        log("[remember] creating Memory object")
-        let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, embeddingPending: floats.isEmpty, expiresAt: expiresAt, importance: importance, isPrivate: isPrivate, authorUserId: currentUserId, modifiedAt: Date())
         log("[remember] calling localLattice.add()")
-        try localLattice.add(memory)
-        log("[remember] add() complete")
-
-        lastRememberedId = memory.globalId
-        guard let memoryGlobalId = memory.globalId else {
-            throw MCPError.internalError("Failed to persist memory — globalId is nil after add()")
+        let memoryGlobalId = try localLattice.withTransaction {
+            try requireSessionLearningWriteAdmission()
+            let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, embeddingPending: floats.isEmpty, expiresAt: expiresAt, importance: importance, isPrivate: isPrivate, authorUserId: currentUserId, modifiedAt: Date())
+            try localLattice.add(memory)
+            guard let id = memory.globalId else {
+                throw MCPError.internalError("Failed to persist memory — globalId is nil after add()")
+            }
+            return id
         }
+        log("[remember] add() complete")
+        lastRememberedId = memoryGlobalId
 
         // Auto-connect, link, and organize — all writes in one transaction
         var parentNote = ""
@@ -231,7 +233,8 @@ extension MemoryTools {
             }
         }
 
-        try localLattice.transaction {
+        try localLattice.withTransaction {
+            try requireSessionLearningWriteAdmission()
             // Auto-create part_of edge when parent_id is provided
             if let parentGid = parentGidValue {
                 let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: parentGid, relation: .partOf, authorUserId: currentUserId)
@@ -360,6 +363,9 @@ extension MemoryTools {
                 if topic == "general",
                    let (consensusTopic, count) = topicCounts.max(by: { $0.value < $1.value }),
                    count >= 2 {
+                    guard let memory = localLattice.object(Memory.self, globalId: memoryGlobalId) else {
+                        throw MCPError.internalError("Stored memory is unavailable for topic inference")
+                    }
                     memory.topic = consensusTopic
                     log("Auto-inferred topic '\(consensusTopic)' for [\(memoryGlobalId.uuidString)]")
                 }
@@ -1037,7 +1043,8 @@ extension MemoryTools {
             }
         }
 
-        try localLattice.transaction {
+        try localLattice.withTransaction {
+            try requireSessionLearningWriteAdmission()
             if let content = a.content {
                 mem.content = content
                 contentChanged = true

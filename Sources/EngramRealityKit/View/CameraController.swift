@@ -123,6 +123,9 @@ public final class CameraController: CameraProvider {
     }
 
     public func endDrag() {
+        // SwiftUI can retire the same hidden input surface on repeated updates.
+        // Avoid publishing an unchanged value back into that update cycle.
+        guard isDragging else { return }
         isDragging = false
     }
 

@@ -2,9 +2,9 @@
 import PackageDescription
 import Foundation
 
-let latticeDependency: Package.Dependency = ProcessInfo.processInfo.environment["ENGRAM_LATTICE_PATH"]
-    .map { .package(path: $0) }
-    ?? .package(url: "https://github.com/jsflax/lattice.git", from: "1.6.2")
+let latticeDependency: Package.Dependency = .package(
+    url: "https://github.com/jsflax/lattice.git",
+    revision: "405353c9a0a66583d9b338492efe9258ece93ff5")
 
 let package = Package(
     name: "EngramPortable",
@@ -17,7 +17,7 @@ let package = Package(
     ],
     dependencies: [
         latticeDependency,
-        .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.12.0"),
+        .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.1"),
     ],
     targets: [
         .target(name: "EngramMemoryCore"),
@@ -37,9 +37,6 @@ let package = Package(
     ]
 )
 
-if let corePath = ProcessInfo.processInfo.environment["ENGRAM_LATTICECORE_PATH"] {
-    package.dependencies.append(.package(path: corePath))
-}
 
 // Native semantic memory uses the same bundled MiniLM assets as desktop Engram.
 // Only Apple products resolve the tokenizer dependency; Linux remains portable.
@@ -65,6 +62,13 @@ package.dependencies.append(.package(url: "https://github.com/apple/swift-crypto
 if let target = package.targets.first(where: { $0.name == "EngramLattice" }) {
     target.dependencies.append(.product(name: "Crypto", package: "swift-crypto"))
 }
+// The Linux SDK has no `SQLite3` module, and EngramLatticeTests' fixture helper fails closed without one.
+if let target = package.targets.first(where: { $0.name == "EngramLatticeTests" }) {
+    target.dependencies.append(.target(name: "CEngramLedgerSQLite"))
+}
+package.targets.append(.systemLibrary(name: "CEngramLedgerSQLite",
+    path: "SystemLibraries/CEngramLedgerSQLite", pkgConfig: "sqlite3",
+    providers: [.apt(["libsqlite3-dev"])]))
 #endif
 
 // The same renderer sources/resources as Engram Desktop. Evaluated on macOS for
