@@ -956,8 +956,16 @@ struct EmbeddedRendererLifecycleTests {
         defer { event.signaledValue = 1; scene.teardown() }
         scene.update(dt: 1 / 60)
         #expect(scene.pendingFrameSubmissionCount > 0)
+        #if os(macOS)
+        // The shipping macOS backend owns LowLevelMesh resources, not instance textures.
+        // Retain identities only so the fixture does not extend their object lifetimes.
+        let nodeMeshID = try #require(scene.nodeBatchMesh.map(ObjectIdentifier.init))
+        let edgeMeshID = try #require(scene.edgeBatchMesh.map(ObjectIdentifier.init))
+        let labelMeshID = try #require(scene.labelBatchMesh.map(ObjectIdentifier.init))
+        #else
         #expect(scene.nodeInstanceTexture != nil && scene.edgeInstanceTexture != nil)
         #expect(scene.nodeInstanceData != nil && scene.edgeInstanceData != nil && scene.labelBatchMesh != nil)
+        #endif
         scene.teardown()
         #expect(scene.isTornDown && !scene.isActive && !root.isEnabled)
         #expect(scene.dataProvider == nil && scene.cameraProvider == nil)
@@ -967,17 +975,32 @@ struct EmbeddedRendererLifecycleTests {
         let drain = Task { @MainActor in await scene.drainPendingWork(); completion.returned = true }
         for _ in 0..<10 { await Task.yield() }
         #expect(!completion.returned && !scene.resourcesReleased)
+        #if os(macOS)
+        #expect(scene.nodeBatchMesh.map(ObjectIdentifier.init) == nodeMeshID)
+        #expect(scene.edgeBatchMesh.map(ObjectIdentifier.init) == edgeMeshID)
+        #expect(scene.labelBatchMesh.map(ObjectIdentifier.init) == labelMeshID)
+        #else
         #expect(scene.nodeInstanceTexture != nil && scene.edgeInstanceTexture != nil)
         #expect(scene.nodeInstanceData != nil && scene.edgeInstanceData != nil && scene.labelBatchMesh != nil)
+        #endif
         drain.cancel()
         for _ in 0..<10 { await Task.yield() }
         #expect(!completion.returned && !scene.resourcesReleased)
+        #if os(macOS)
+        #expect(scene.nodeBatchMesh.map(ObjectIdentifier.init) == nodeMeshID)
+        #expect(scene.edgeBatchMesh.map(ObjectIdentifier.init) == edgeMeshID)
+        #expect(scene.labelBatchMesh.map(ObjectIdentifier.init) == labelMeshID)
+        #else
+        #expect(scene.nodeInstanceTexture != nil && scene.edgeInstanceTexture != nil)
+        #expect(scene.nodeInstanceData != nil && scene.edgeInstanceData != nil && scene.labelBatchMesh != nil)
+        #endif
         event.signaledValue = 1
         await drain.value
         #expect(blocker.status == .completed)
         #expect(completion.returned && scene.resourcesReleased && scene.pendingFrameSubmissionCount == 0)
         #expect(scene.nodeInstanceTexture == nil && scene.edgeInstanceTexture == nil)
         #expect(scene.nodeInstanceData == nil && scene.edgeInstanceData == nil && scene.labelBatchMesh == nil)
+        #expect(scene.nodeBatchMesh == nil && scene.edgeBatchMesh == nil)
         #expect(root.children.isEmpty)
         scene.teardown(); await scene.drainPendingWork()
         #expect(detachCalls == (hosted ? 1 : 0))

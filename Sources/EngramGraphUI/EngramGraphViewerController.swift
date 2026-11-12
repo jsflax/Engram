@@ -92,7 +92,17 @@ public final class EngramGraphViewerController {
         adapter.selectedNode = selectedMemoryID
         if !query.isEmpty { setQuery(query) }
         topologyRevision &+= 1
-        if isActive { activateRenderer() }
+        if value.memories.isEmpty {
+            // The empty graph is ordinary SwiftUI content. Withdraw any prior
+            // renderer without clearing the current graph identity or search.
+            retireRenderer()
+            // The retired camera cannot retain manual placement. A later
+            // populated snapshot needs its own initial fit in this viewport.
+            followsInitialLayout = true; lastFittedRevision = nil
+            viewportFraming = .graph
+            adapter.simulation.isActive = false
+            rendererError = nil
+        } else if isActive { activateRenderer() }
     }
 
     public func clear() {
@@ -105,6 +115,15 @@ public final class EngramGraphViewerController {
         connectionAnchor = nil; connectionIndex = 0
         searchMatches.removeAll(); query = ""; hiddenProjects.removeAll(); hiddenRelations.removeAll()
         layout = .forceDirected; projectionMessage = nil; rendererError = nil; soundEnabled = false
+        retireRenderer()
+        searchWork = nil
+        adapter = EngramGraphDataAdapter()
+        topologyRevision &+= 1
+        recordLifecycleDiagnostic(.controllerClearFinished)
+    }
+
+    private func retireRenderer() {
+        adapter.onFramingUpdate = nil
         if let sceneManager {
             sceneManager.camera.onUserInteraction = nil
             sceneManager.teardown()
@@ -116,10 +135,7 @@ public final class EngramGraphViewerController {
                 self?.work.removeValue(forKey: drainID)
             }
         }
-        searchWork = nil
-        sceneManager = nil; adapter = EngramGraphDataAdapter()
-        topologyRevision &+= 1
-        recordLifecycleDiagnostic(.controllerClearFinished)
+        sceneManager = nil
     }
 
     public func clearAndDrain() async {
@@ -163,7 +179,7 @@ public final class EngramGraphViewerController {
     }
 
     private func activateRenderer() {
-        guard isActive, snapshot != nil else { return }
+        guard isActive, let snapshot, !snapshot.memories.isEmpty else { return }
         if sceneManager == nil {
             do {
                 sceneManager = try EngramGraphSceneManager(adapter: adapter)

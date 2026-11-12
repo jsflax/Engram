@@ -37,6 +37,116 @@ struct EngramGraphViewerTests {
         #expect(controller.sceneManager == nil)
     }
 
+    @Test("An active empty graph never creates a renderer", arguments: [false, true])
+    func emptySnapshotDoesNotAllocateRenderer(activateBeforeLoad: Bool) async throws {
+        let controller = EngramGraphViewerController()
+        let value = snapshot([])
+        if activateBeforeLoad { controller.setActive(true) }
+        try controller.replaceSnapshot(value)
+        if !activateBeforeLoad { controller.setActive(true) }
+        #expect(controller.isActive)
+        #expect(controller.snapshot?.graphID == value.graphID)
+        #expect(controller.snapshot?.ownerID == value.ownerID)
+        #expect(controller.visibleMemoryCount == 0)
+        #expect(controller.sceneManager == nil)
+        #expect(controller.rendererError == nil)
+        controller.setActive(false)
+        controller.setActive(true)
+        controller.setQuery("kept search")
+        await controller.drainRetiredWork()
+        #expect(controller.query == "kept search")
+        #expect(controller.searchMatches.isEmpty)
+        #expect(controller.sceneManager == nil)
+        #expect(!controller.adapter.isActive)
+        await controller.clearAndDrain()
+    }
+
+    @Test("Same-graph empty refresh retires its renderer and later memories get a fresh owner",
+          arguments: [false, true])
+    func emptyRefreshRetiresRendererAndLaterMemoriesRecover(whileInactive: Bool) async throws {
+        let controller = EngramGraphViewerController()
+        let row = memory(content: "Retained search match")
+        let empty = snapshot([])
+        func populated() -> EngramGraphSnapshot {
+            EngramGraphSnapshot(scopeID: empty.scopeID, graphID: empty.graphID, ownerID: empty.ownerID,
+                revisionID: UUID().uuidString, title: empty.title, memories: [row], edges: [],
+                coverage: EngramGraphCoverage(totalMemoryCount: 1, totalEdgeCount: 0))
+        }
+        do {
+            try controller.replaceSnapshot(empty)
+            controller.setActive(true)
+            #expect(controller.sceneManager == nil)
+            try controller.replaceSnapshot(populated())
+            let original = try #require(controller.sceneManager)
+            #expect(original.scene.isActive && !original.scene.isTornDown)
+            controller.select(row.id)
+            #expect(controller.adapter.onFramingUpdate == nil)
+            controller.setQuery("Retained search")
+            await controller.drainRetiredWork()
+            #expect(controller.searchMatches == [row.id])
+            if whileInactive { await controller.pauseAndDrain() }
+
+            try controller.replaceSnapshot(empty)
+            #expect(controller.isActive == !whileInactive)
+            #expect(controller.sceneManager == nil)
+            #expect(original.scene.isTornDown && !original.scene.isActive)
+            #expect(original.scene.dataProvider == nil)
+            #expect(controller.snapshot?.graphID == empty.graphID)
+            #expect(controller.snapshot?.ownerID == empty.ownerID)
+            #expect(controller.query == "Retained search")
+            #expect(controller.selectedMemory == nil)
+            #expect(!controller.adapter.isActive && !controller.adapter.simulation.isActive)
+            await controller.drainRetiredWork()
+            #expect(controller.searchMatches.isEmpty)
+            let retired = original.scene.renderDiagnosticSnapshot()
+            #expect(retired.flags["resourcesReleased"] == true)
+            #expect(retired.counts["pendingFrameSubmissions"] == 0)
+            #expect(!original.hasPendingForce)
+            original.scene.update(dt: 1.0 / 60.0)
+            #expect(original.scene.renderDiagnosticSnapshot().frame == retired.frame)
+
+            try controller.replaceSnapshot(populated())
+            if whileInactive {
+                #expect(controller.sceneManager == nil)
+                controller.setActive(true)
+            }
+            let replacement = try #require(controller.sceneManager)
+            #expect(replacement !== original)
+            #expect(replacement.scene.isActive && !replacement.scene.isTornDown)
+            #expect(controller.adapter.onFramingUpdate != nil)
+            #expect(replacement.camera.orbitRadius < 4200)
+            #expect(controller.adapter.nodes.map(\.id) == [row.id])
+            await controller.drainRetiredWork()
+            #expect(controller.query == "Retained search" && controller.searchMatches == [row.id])
+        } catch {
+            await controller.clearAndDrain()
+            throw error
+        }
+        await controller.clearAndDrain()
+    }
+
+    @Test("Filtering loaded memories does not retire the nonempty graph's camera owner")
+    func filteredGraphRetainsRenderer() async throws {
+        let controller = EngramGraphViewerController()
+        let row = memory(project: "hidden")
+        do {
+            try controller.replaceSnapshot(snapshot([row]))
+            controller.setActive(true)
+            let manager = try #require(controller.sceneManager)
+            controller.toggleProject("hidden")
+            #expect(controller.visibleMemoryCount == 0)
+            #expect(controller.sceneManager === manager)
+            #expect(!manager.scene.isTornDown)
+            controller.toggleProject("hidden")
+            #expect(controller.visibleMemoryCount == 1)
+            #expect(controller.sceneManager === manager)
+        } catch {
+            await controller.clearAndDrain()
+            throw error
+        }
+        await controller.clearAndDrain()
+    }
+
     @Test func projectRelationFiltersPreserveRealHubEdgesAndNebulaIdentity() throws {
         let hub = memory(project: "a"), child = memory(project: "a"), other = memory(project: "b")
         let edge = EngramGraphEdge(id: UUID(), sourceID: child.id, targetID: hub.id, relation: "part_of")
