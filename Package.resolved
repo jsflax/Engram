@@ -1,5 +1,5 @@
 {
-  "originHash" : "5785d9b3d4a46d6108be847c579cac432936bcc1cfac6248d6961862de2eb87d",
+  "originHash" : "f0f8a707b0f0bd6a5e33b437daf1f25ac51138e90f6241a2b435e1f82eb65c97",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -35,6 +35,24 @@
       "state" : {
         "revision" : "ca2a9d90cbe49e09b92f4b6ebd922c03ebea51d0",
         "version" : "1.3.0"
+      }
+    },
+    {
+      "identity" : "lattice",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/jsflax/lattice.git",
+      "state" : {
+        "revision" : "284cb1591bd9f6de42b5d7fd38bf96faaeb05f23",
+        "version" : "3.0.0"
+      }
+    },
+    {
+      "identity" : "latticecore",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/jsflax/LatticeCore.git",
+      "state" : {
+        "revision" : "992bf3e26a6eaca8ba235de1156bbfbbac8564b0",
+        "version" : "3.1.0"
       }
     },
     {
@@ -238,10 +256,10 @@
     {
       "identity" : "swift-sdk",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/modelcontextprotocol/swift-sdk.git",
+      "location" : "https://github.com/jsflax/swift-sdk.git",
       "state" : {
-        "revision" : "6132fd4b5b4217ce4717c4775e4607f5c3120129",
-        "version" : "0.12.0"
+        "revision" : "82951cc9cd05de216e8dd6425f951ce31d76fa0a",
+        "version" : "0.13.1"
       }
     },
     {

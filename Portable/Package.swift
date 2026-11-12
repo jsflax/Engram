@@ -4,7 +4,7 @@ import Foundation
 
 let latticeDependency: Package.Dependency = .package(
     url: "https://github.com/jsflax/lattice.git",
-    revision: "405353c9a0a66583d9b338492efe9258ece93ff5")
+    from: "3.0.0")
 
 let package = Package(
     name: "EngramPortable",
@@ -17,6 +17,8 @@ let package = Package(
     ],
     dependencies: [
         latticeDependency,
+        // Compatible read-only legacy attachments require the 3.1.0 core.
+        .package(url: "https://github.com/jsflax/LatticeCore.git", from: "3.1.0"),
         .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.1"),
     ],
     targets: [
