@@ -65,6 +65,13 @@ package.dependencies.append(.package(url: "https://github.com/apple/swift-crypto
 if let target = package.targets.first(where: { $0.name == "EngramLattice" }) {
     target.dependencies.append(.product(name: "Crypto", package: "swift-crypto"))
 }
+// The Linux SDK has no `SQLite3` module, and EngramLatticeTests' fixture helper fails closed without one.
+if let target = package.targets.first(where: { $0.name == "EngramLatticeTests" }) {
+    target.dependencies.append(.target(name: "CEngramLedgerSQLite"))
+}
+package.targets.append(.systemLibrary(name: "CEngramLedgerSQLite",
+    path: "SystemLibraries/CEngramLedgerSQLite", pkgConfig: "sqlite3",
+    providers: [.apt(["libsqlite3-dev"])]))
 #endif
 
 // The same renderer sources/resources as Engram Desktop. Evaluated on macOS for

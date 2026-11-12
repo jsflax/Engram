@@ -7,6 +7,8 @@ import EngramLattice
 import SQLite3
 #elseif canImport(CSQLite)
 import CSQLite
+#elseif canImport(CEngramLedgerSQLite)
+import CEngramLedgerSQLite
 #endif
 
 @Suite("Read-only selected agent memory browser")
@@ -176,7 +178,7 @@ struct AgentMemoryReaderTests {
     /// then restore its exact stored SQL before committing. Reader invocations
     /// start only after this fixture connection is checkpointed and closed.
     private func replaceOwnedFixtureEmbedding(file: URL, memoryID: UUID, blob: Data) throws {
-        #if canImport(SQLite3) || canImport(CSQLite)
+        #if canImport(SQLite3) || canImport(CSQLite) || canImport(CEngramLedgerSQLite)
         var opened: OpaquePointer?
         let openCode = sqlite3_open_v2(file.path, &opened, SQLITE_OPEN_READWRITE, nil)
         guard openCode == SQLITE_OK, let db = opened else {
