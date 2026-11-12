@@ -2,9 +2,9 @@
 import PackageDescription
 import Foundation
 
-let latticeDependency: Package.Dependency = ProcessInfo.processInfo.environment["ENGRAM_LATTICE_PATH"]
-    .map { .package(path: $0) }
-    ?? .package(url: "https://github.com/jsflax/lattice.git", from: "1.6.2")
+let latticeDependency: Package.Dependency = .package(
+    url: "https://github.com/jsflax/lattice.git",
+    revision: "405353c9a0a66583d9b338492efe9258ece93ff5")
 
 let package = Package(
     name: "Engram",
@@ -17,7 +17,7 @@ let package = Package(
     ],
     dependencies: [
         latticeDependency,
-        .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.12.0"),
+        .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.1"),
     ],
     targets: [
         .target(name: "EngramMemoryCore"),
@@ -37,9 +37,6 @@ let package = Package(
     ]
 )
 
-if let corePath = ProcessInfo.processInfo.environment["ENGRAM_LATTICECORE_PATH"] {
-    package.dependencies.append(.package(path: corePath))
-}
 
 // Keep the existing remote hook executable available on Linux. macOS desktop
 // hooks and the visualizer are built from Desktop/Package.swift.

@@ -23,9 +23,9 @@ var engramMetalShaders: PackageDescription.Target {
     #endif
 }
 
-let latticeDependency: Package.Dependency = ProcessInfo.processInfo.environment["ENGRAM_LATTICE_PATH"]
-    .map { .package(path: $0) }
-    ?? .package(url: "https://github.com/jsflax/lattice.git", from: "1.6.2")
+let latticeDependency: Package.Dependency = .package(
+    url: "https://github.com/jsflax/lattice.git",
+    revision: "405353c9a0a66583d9b338492efe9258ece93ff5")
 
 let package = Package(
     name: "Engram",
@@ -44,10 +44,8 @@ let package = Package(
         .library(name: "EngramGraphUI", targets: ["EngramGraphUI"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.12.0"),
-        // 1.6.2 floor (0.14.3): coherence — the hook's 2s busyTimeoutMs only
-        // bounds explicit BEGINs on a core with the begin_transaction fix,
-        // and the daemon's WAL self-defense assumes the keeper interlock.
+        .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.1"),
+        // Keep the database release line aligned with the root library package.
         latticeDependency,
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
@@ -304,9 +302,6 @@ let package = Package(
     ]
 )
 
-if let corePath = ProcessInfo.processInfo.environment["ENGRAM_LATTICECORE_PATH"] {
-    package.dependencies.append(.package(path: corePath))
-}
 
 // Native semantic memory uses the same bundled MiniLM assets as desktop Engram.
 // Only Apple products resolve the tokenizer dependency; Linux remains portable.
