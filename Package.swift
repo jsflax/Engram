@@ -75,4 +75,36 @@ package.dependencies.append(.package(url: "https://github.com/apple/swift-crypto
 if let target = package.targets.first(where: { $0.name == "EngramLattice" }) {
     target.dependencies.append(.product(name: "Crypto", package: "swift-crypto"))
 }
+// Share the portable fixture's system SQLite module with the root test target.
+if let target = package.targets.first(where: { $0.name == "EngramLatticeTests" }) {
+    target.dependencies.append(.target(name: "CEngramLedgerSQLite"))
+}
+package.targets.append(.systemLibrary(name: "CEngramLedgerSQLite",
+    path: "Portable/SystemLibraries/CEngramLedgerSQLite", pkgConfig: "sqlite3",
+    providers: [.apt(["libsqlite3-dev"])]))
+#endif
+
+// The same renderer sources/resources as Engram Desktop. Evaluated on macOS for
+// both native Mac and iOS destinations; never enters the portable Linux graph.
+#if os(macOS)
+for name in ["CEngramSceneTypes", "EngramSceneKit", "EngramMetalShaders", "EngramRealityKit", "EngramGraphUI"] {
+    package.products.append(.library(name: name, targets: [name]))
+}
+package.targets.append(contentsOf: [
+    .target(name: "CEngramSceneTypes"),
+    .target(name: "EngramSceneKit", dependencies: ["CEngramSceneTypes"],
+            swiftSettings: [.interoperabilityMode(.Cxx)],
+            linkerSettings: [.linkedFramework("Metal"), .linkedFramework("Accelerate")]),
+    .target(name: "EngramMetalShaders", resources: [.process("Shaders")]),
+    .target(name: "EngramRealityKit", dependencies: ["EngramSceneKit", "CEngramSceneTypes"],
+            resources: [.process("Shaders"), .copy("Resources/mascot.usdz")],
+            swiftSettings: [.interoperabilityMode(.Cxx)],
+            linkerSettings: [.linkedFramework("RealityKit"), .linkedFramework("Metal")]),
+    .target(name: "EngramGraphUI", dependencies: ["EngramRealityKit", "EngramSceneKit", "EngramMetalShaders"],
+            swiftSettings: [.interoperabilityMode(.Cxx)]),
+    .testTarget(name: "EngramRealityKitTests", dependencies: ["EngramRealityKit", "EngramSceneKit", "EngramMetalShaders"],
+                swiftSettings: [.interoperabilityMode(.Cxx)]),
+    .testTarget(name: "EngramGraphUITests", dependencies: ["EngramGraphUI"],
+                swiftSettings: [.interoperabilityMode(.Cxx)]),
+])
 #endif
