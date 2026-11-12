@@ -28,6 +28,8 @@ public final class HookState {
         /// Host-owned metadata travels with a scoped graph; it is never a memory body.
         case agentSessionLearningReceipt = "agent.sessionLearning.receipt"
         case agentSessionLearningGate = "agent.sessionLearning.gate"
+        /// Append-only owner recovery metadata; the original uncertain receipt is unchanged.
+        case agentSessionLearningRecovery = "agent.sessionLearning.recovery"
     }
 
     /// The state key.
