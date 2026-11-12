@@ -212,7 +212,10 @@ extension MemoryTools {
         log("[remember] creating Memory object")
         let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, embeddingPending: floats.isEmpty, expiresAt: expiresAt, importance: importance, isPrivate: isPrivate, authorUserId: currentUserId, modifiedAt: Date())
         log("[remember] calling localLattice.add()")
-        try localLattice.add(memory)
+        try localLattice.withTransaction {
+            try requireSessionLearningWriteAdmission()
+            try localLattice.add(memory)
+        }
         log("[remember] add() complete")
 
         lastRememberedId = memory.globalId
@@ -231,7 +234,8 @@ extension MemoryTools {
             }
         }
 
-        try localLattice.transaction {
+        try localLattice.withTransaction {
+            try requireSessionLearningWriteAdmission()
             // Auto-create part_of edge when parent_id is provided
             if let parentGid = parentGidValue {
                 let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: parentGid, relation: .partOf, authorUserId: currentUserId)
@@ -1037,7 +1041,8 @@ extension MemoryTools {
             }
         }
 
-        try localLattice.transaction {
+        try localLattice.withTransaction {
+            try requireSessionLearningWriteAdmission()
             if let content = a.content {
                 mem.content = content
                 contentChanged = true

@@ -25,6 +25,9 @@ public final class HookState {
         /// key-filtered SQL-side, so an unknown enum value never reaches
         /// their decoder.
         case embeddingSpaceVersion = "embedding.spaceVersion"
+        /// Host-owned metadata travels with a scoped graph; it is never a memory body.
+        case agentSessionLearningReceipt = "agent.sessionLearning.receipt"
+        case agentSessionLearningGate = "agent.sessionLearning.gate"
     }
 
     /// The state key.

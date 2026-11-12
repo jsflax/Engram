@@ -41,7 +41,10 @@ extension MemoryTools {
         if let edge = existing.first {
             let edgeGid = edge.globalId?.uuidString ?? "?"
             if edge.deletedAt != nil {
-                edge.deletedAt = nil
+                try localLattice.withTransaction {
+                    try requireSessionLearningWriteAdmission()
+                    edge.deletedAt = nil
+                }
                 log("Revived tombstoned edge [id:\(edgeGid)]")
                 return CallTool.Result(
                     content: [.text("Revived tombstoned edge (edge id: \(edgeGid), \(fromGid.uuidString) --[\(relation)]--> \(toGid.uuidString)).")],
@@ -56,7 +59,10 @@ extension MemoryTools {
 
         // Create edge (always in localLattice), attributed to the writer
         let edge = Edge(sourceGlobalId: fromGid, targetGlobalId: toGid, relation: relationEnum, authorUserId: currentUserId)
-        try localLattice.add(edge)
+        try localLattice.withTransaction {
+            try requireSessionLearningWriteAdmission()
+            try localLattice.add(edge)
+        }
 
         guard let edgeGid = edge.globalId else {
             throw MCPError.internalError("Failed to persist edge — globalId is nil after add()")
