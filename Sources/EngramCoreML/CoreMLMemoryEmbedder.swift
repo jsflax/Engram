@@ -1,8 +1,6 @@
 import Foundation
 @preconcurrency import CoreML
 import EngramMemoryCore
-import Tokenizers
-import Hub
 
 /// Canonical bundled assets shared with the existing desktop EmbeddingService.
 /// Keeping these in one resource bundle preserves exactly the same vector space.
@@ -59,8 +57,8 @@ public actor CoreMLMemoryEmbedder: Embedder {
 
     private let policy: ComputePolicy
     private let resourceDirectory: URL?
-    private var loaded: Loaded?
-    private var loading: Task<Loaded, Error>?
+    private var loaded: CoreMLEmbeddingEngine?
+    private var loading: Task<CoreMLEmbeddingEngine, Error>?
 
     /// Pass a local resource directory only for explicit host packaging or
     /// verification; it must contain both bundled-named model and tokenizer.
@@ -76,12 +74,12 @@ public actor CoreMLMemoryEmbedder: Embedder {
     /// show this failure in memory status; MemoryTools still persists offline.
     public func load() async throws {
         if loaded != nil { return }
-        let task: Task<Loaded, Error>
+        let task: Task<CoreMLEmbeddingEngine, Error>
         if let existing = loading { task = existing }
         else {
             let policy = policy, directory = resourceDirectory
             task = Task.detached(priority: .utility) {
-                try Loaded.load(policy: policy, directory: directory)
+                try Self.loadBundled(policy: policy, directory: directory)
             }
             loading = task
         }
@@ -99,14 +97,7 @@ public actor CoreMLMemoryEmbedder: Embedder {
         try Task.checkCancellation()
         try await load()
         guard let loaded else { throw LoadError.incompatibleModel }
-        let tokens = Array(loaded.tokenizer.encode(text: text).prefix(512))
-        guard !tokens.isEmpty else { throw LoadError.invalidEmbedding }
-        let input = try MLDictionaryFeatureProvider(dictionary: [
-            "inputIds": MLFeatureValue(shapedArray: MLShapedArray<Int32>(
-                scalars: tokens.map(Int32.init), shape: [1, tokens.count])),
-            "attentionMask": MLFeatureValue(shapedArray: MLShapedArray<Float>(
-                scalars: Array(repeating: 1, count: tokens.count), shape: [1, tokens.count])),
-        ])
+        let input = try loaded.input(text: text, limit: 512, requireTokens: true)
         // A synchronous prediction inside this actor prevents overlapping GPU
         // jobs from concurrent recall/backfill calls. This is never MainActor.
         let prediction = try loaded.predict(input)
@@ -118,55 +109,36 @@ public actor CoreMLMemoryEmbedder: Embedder {
         return vector
     }
 
-    /// Immutable after loading; accessed only by the owning embedder actor.
-    private final class Loaded: @unchecked Sendable {
-        let model: MLModel
-        let tokenizer: any Tokenizer
-        init(model: MLModel, tokenizer: any Tokenizer) {
-            self.model = model; self.tokenizer = tokenizer
-        }
-
-        func predict(_ input: any MLFeatureProvider) throws -> any MLFeatureProvider {
-            try model.prediction(from: input)
-        }
-
-        static func load(policy: ComputePolicy, directory: URL?) throws -> Loaded {
-            if let directory, !directory.isFileURL { throw LoadError.invalidLocalAssets }
-            func asset(_ name: String, _ ext: String?) throws -> URL {
-                if let directory {
-                    let url = directory.appendingPathComponent(name + (ext.map { "." + $0 } ?? ""))
-                    guard FileManager.default.fileExists(atPath: url.path) else {
-                        throw LoadError.missingBundledResource(name)
-                    }
-                    return url
-                }
-                guard let url = CoreMLMemoryAssets.assetURL(name, extension: ext) else {
+    private nonisolated static func loadBundled(policy: ComputePolicy, directory: URL?) throws -> CoreMLEmbeddingEngine {
+        if let directory, !directory.isFileURL { throw LoadError.invalidLocalAssets }
+        func asset(_ name: String, _ ext: String?) throws -> URL {
+            if let directory {
+                let url = directory.appendingPathComponent(name + (ext.map { "." + $0 } ?? ""))
+                guard FileManager.default.fileExists(atPath: url.path) else {
                     throw LoadError.missingBundledResource(name)
                 }
                 return url
             }
-            let modelURL = try asset("paraphrase-MiniLM-L6-v2_Embedding", "mlmodelc")
-            let tokenizerURL = try asset("paraphrase-MiniLM-L6-v2_tokenizer", nil)
-            // Use the existing SwiftLM local JSON path. In particular, never
-            // call AutoTokenizer.from(pretrained:), which can download assets.
-            func config(_ name: String) throws -> Config {
-                let json = try JSONSerialization.jsonObject(with: Data(contentsOf: tokenizerURL.appendingPathComponent(name)))
-                guard let dictionary = json as? [NSString: Any] else { throw LoadError.invalidLocalAssets }
-                return Config(dictionary)
+            guard let url = CoreMLMemoryAssets.assetURL(name, extension: ext) else {
+                throw LoadError.missingBundledResource(name)
             }
-            let tokenizer = try AutoTokenizer.from(tokenizerConfig: config("tokenizer_config.json"),
-                                                   tokenizerData: config("tokenizer.json"))
-            let configuration = MLModelConfiguration()
-            configuration.computeUnits = policy == .cpuOnly ? .cpuOnly : .all
-            let model = try MLModel(contentsOf: modelURL, configuration: configuration)
-            let metadata = model.modelDescription.metadata[.creatorDefinedKey] as? [String: String] ?? [:]
-            guard metadata["co.swiftlm.embedding_dim"] == "384",
-                  metadata["co.swiftlm.pooling_strategy"] == "mean",
-                  metadata["co.swiftlm.normalize_embeddings"] == "true",
-                  metadata["co.huggingface.exporters.name"] == CoreMLMemoryEmbedder.modelIdentifier else {
-                throw LoadError.incompatibleModel
-            }
-            return Loaded(model: model, tokenizer: tokenizer)
+            return url
         }
+        let modelURL = try asset("paraphrase-MiniLM-L6-v2_Embedding", "mlmodelc")
+        let tokenizerURL = try asset("paraphrase-MiniLM-L6-v2_tokenizer", nil)
+        // The portable encoder only uses local JSON; its loader never
+        // selects the desktop encoder's metadata-based Hub fallback.
+        let tokenizer = try CoreMLEmbeddingEngine.localTokenizer(at: tokenizerURL)
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = policy == .cpuOnly ? .cpuOnly : .all
+        let model = try MLModel(contentsOf: modelURL, configuration: configuration)
+        let metadata = model.modelDescription.metadata[.creatorDefinedKey] as? [String: String] ?? [:]
+        guard metadata["co.swiftlm.embedding_dim"] == "384",
+              metadata["co.swiftlm.pooling_strategy"] == "mean",
+              metadata["co.swiftlm.normalize_embeddings"] == "true",
+              metadata["co.huggingface.exporters.name"] == CoreMLMemoryEmbedder.modelIdentifier else {
+            throw LoadError.incompatibleModel
+        }
+        return CoreMLEmbeddingEngine(model: model, tokenizer: tokenizer)
     }
 }

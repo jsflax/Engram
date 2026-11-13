@@ -47,7 +47,6 @@ let package = Package(
         .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.1"),
         // Keep the database release line aligned with the root library package.
         latticeDependency,
-        .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
         .package(url: "https://github.com/google/GoogleSignIn-iOS.git", from: "7.0.0"),
@@ -129,7 +128,6 @@ let package = Package(
                 "EngramMemoryCore",
                 .product(name: "MCP", package: "swift-sdk"),
                 .product(name: "Lattice", package: "lattice"),
-                .product(name: "SwiftLM", package: "SwiftLM"),
             ],
             resources: [
                 .copy("Resources/RecallGateClassifier.mlmodelc"),
