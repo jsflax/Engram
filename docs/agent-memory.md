@@ -54,14 +54,21 @@ the legacy personal `~/.claude` hook diagnostic logs.
 
 ## Build boundaries
 
-The repository root is the portable Swift package consumed through the normal
-Engram Git URL. It exports `EngramLattice`, `EngramMemoryCore`, `EngramModels`, and
-`EngramMemoryContract` with no environment flag. It does not resolve SwiftLM,
-Sparkle, sign-in, or desktop UI. The Apple-only optional `EngramCoreML` product
-uses the existing Tokenizers/Hub library for local JSON tokenization; its runtime
-never invokes Hub network loading. NaturalLanguage is used when available;
-Linux uses the portable content-word extractor. iOS does not expose the desktop
-subprocess launcher in the core module. Linux retains the remote `EngramHooks` CLI.
+The repository root is the Swift package consumed through the normal Engram Git
+URL. It exports `EngramLattice`, `EngramMemoryCore`, `EngramModels`, and
+`EngramMemoryContract` without an environment flag. On macOS manifest hosts, it
+also declares the renderer libraries and the `EngramGraphContract` and
+`EngramHUDContract` products. The root retains its declared macOS 15 and iOS 18
+minimums. Its manifest does not declare SwiftLM, Sparkle or GoogleSignIn
+dependencies; desktop applications and executables use the Desktop package.
+
+Apple consumers can select `EngramCoreML`. Its `CoreMLMemoryEmbedder` loads local
+bundled model/tokenizer assets without Hub downloads. Desktop's `EmbeddingService`
+uses the owned `CoreMLTextModel`; when no tokenizer directory is supplied, that
+loader can select the model metadata's Hub tokenizer. NaturalLanguage is used when
+available; Linux uses the portable content-word extractor and retains the remote
+`EngramHooks` CLI. iOS does not expose the desktop subprocess launcher in the core
+module.
 
 The desktop package is `Desktop/Package.swift`. Its Sources, Tests, and Plugins
 symlinks keep one canonical implementation. Build desktop commands from the repo
@@ -75,19 +82,30 @@ for either `Engram_EngramCoreML.bundle` or `EngramPortable_EngramCoreML.bundle`
 before evaluating SwiftPM's generated bundle accessor. App-root resource links
 are unnecessary.
 
-All package manifests pin the database library to one integration revision. This is interim and becomes a version requirement when the matching database release is tagged. There are no environment overrides. For coordinated local development use an uncommitted `swift package edit`.
-The current implementation needs the accompanying Lattice checked-transaction,
-immutable synchronization, and readonly legacy-schema attachment changes. Before
-publishing a consumer release: publish LatticeCore, publish Lattice pinned to that
-Core release, update Engram's minimum Lattice version and release Engram, then pin
-Orbital/engram-server to that actual Engram release. No placeholder commit or tag
-is a valid remote pin; the isolated local workspace is the verified integration
-until that release train is committed and published.
+The root, Portable and Desktop manifests require lattice from 3.1.0, direct
+LatticeCore from 3.1.1, and the `jsflax/swift-sdk` package at exact 0.13.1. Their
+committed SwiftPM locks record those published releases. Dependencies are consumed
+from their own repositories by version; no integration revision, copied source or
+local-path substitute is required for these changes.
+
+Consumers need an actual Engram release containing these APIs before adopting
+them by version. Engram's release version and publication remain separate from
+the already published database dependencies. The Xcode project's owning graph,
+selected builds/runtime tests, consumer integration and release packaging require
+their own qualification; three successful SwiftPM resolves do not establish
+those results.
 
 This library does not enroll devices, discover personal credentials, mount hooks,
 start servers, or migrate a production database. Those are host integration tasks.
 
-## Verification
+## Historical verification
+
+The following notes describe the historical local implementation associated with
+the September 9 verification record. Their counts, timings, source hashes and
+platform claims are retained as historical records, not qualification of the
+current committed package or dependency graph. Current source selections require
+new exact-input execution evidence. The current desktop/portable parity test
+shares one owned engine and is not an independent comparison with SwiftLM.
 
 The final portable run passed **42 tests in 12 suites (0.854 s)**. A separately
 compiled focused run passed **11 tests in 3 suites (1.312 s)**, including actual
