@@ -1,5 +1,5 @@
 import Testing
-import EngramKit
+@testable import EngramKit
 import EngramModels
 import Lattice
 import Foundation
@@ -117,7 +117,7 @@ struct EmbeddingMigrationTests {
                                topic: "general", project: "demo",
                                embedding: staleVector()))
 
-        let broken = EmbeddingService(modelPath: "/nonexistent/model/path")
+        let broken = EmbeddingService(modelPath: "/nonexistent/model/path", diagnosticSink: { _ in })
         await #expect(throws: EmbeddingMigration.MigrationError.self) {
             try await EmbeddingMigration.runIfNeeded(on: lattice, embedder: broken)
         }

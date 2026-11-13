@@ -1,8 +1,8 @@
 import Testing
 import EngramCoreML
-import EngramKit
+@testable import EngramKit
 @Test func bundledPortableAndDesktopVectorsAgree() async throws {
-    let desktop = EmbeddingService()
+    let desktop = EmbeddingService(diagnosticSink: { _ in })
     await desktop.load()
     let portable = CoreMLMemoryEmbedder(computePolicy: .cpuOnly)
     let corpus = [
