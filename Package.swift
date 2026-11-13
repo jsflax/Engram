@@ -105,3 +105,22 @@ package.targets.append(contentsOf: [
                 swiftSettings: [.interoperabilityMode(.Cxx)]),
 ])
 #endif
+
+// Pure graph contracts share their existing source and test files.
+// CryptoKit keeps this exposure in the Apple-hosted package graph.
+#if os(macOS)
+package.products.append(contentsOf: [
+    .library(name: "EngramGraphContract", targets: ["EngramGraphContract"]),
+    .library(name: "EngramHUDContract", targets: ["EngramHUDContract"]),
+])
+package.targets.append(contentsOf: [
+    .target(name: "EngramGraphContract",
+            path: "Packages/EngramGraphContracts/Sources/EngramGraphContract"),
+    .target(name: "EngramHUDContract", dependencies: ["EngramGraphContract"],
+            path: "Packages/EngramGraphContracts/Sources/EngramHUDContract"),
+    .testTarget(name: "EngramGraphContractTests", dependencies: ["EngramGraphContract"],
+                path: "Packages/EngramGraphContracts/Tests/EngramGraphContractTests"),
+    .testTarget(name: "EngramHUDContractTests", dependencies: ["EngramHUDContract", "EngramGraphContract"],
+                path: "Packages/EngramGraphContracts/Tests/EngramHUDContractTests"),
+])
+#endif
