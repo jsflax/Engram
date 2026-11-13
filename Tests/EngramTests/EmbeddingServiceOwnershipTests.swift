@@ -62,6 +62,7 @@ struct EmbeddingServiceOwnershipTests: Sendable {
 
     @Test func backgroundLoadIsJoinedAndDimensionStaysZeroUntilAdoption() async throws {
         let gate = LoadGate()
+        defer { gate.release() }
         let calls = Calls()
         let service = EmbeddingService(modelPath: nil, bundledModel: { model },
             bundledTokenizer: { tokenizer }, loader: { url, tokenizer in
@@ -70,13 +71,14 @@ struct EmbeddingServiceOwnershipTests: Sendable {
                 return Self.loadedModel
             })
         await service.startLoading()
-        await gate.waitForEntry()
+        let entered = await gate.waitForEntry()
+        try #require(entered, "Background loading never reached the loader")
         await service.startLoading()
         #expect(await calls.inputs.count == 1)
         #expect(await service.dimension == 0)
         #expect(await service.isLoaded == false)
         let read = Task { try await service.embed(text: "one") }
-        await gate.release()
+        gate.release()
         #expect(try await read.value == [3, 0, 0])
         #expect(await service.dimension == 3)
         #expect(await service.isLoaded)
@@ -107,20 +109,28 @@ struct EmbeddingServiceOwnershipTests: Sendable {
         func record(_ model: URL, _ tokenizer: URL?) { inputs.append((model, tokenizer)) }
     }
 
-    private actor LoadGate {
-        private var entered = false
-        private var entryWaiter: CheckedContinuation<Void, Never>?
-        private var releaseWaiter: CheckedContinuation<Void, Never>?
+    private final class LoadGate: Sendable {
+        private let entry = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        private let completion = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         func enterAndWait() async {
-            entered = true
-            entryWaiter?.resume()
-            entryWaiter = nil
-            await withCheckedContinuation { releaseWaiter = $0 }
+            entry.continuation.yield(())
+            var iterator = completion.stream.makeAsyncIterator()
+            _ = await iterator.next()
         }
-        func waitForEntry() async {
-            if entered { return }
-            await withCheckedContinuation { entryWaiter = $0 }
+        func waitForEntry() async -> Bool {
+            await withTaskGroup(of: Bool.self) { group in
+                group.addTask {
+                    var iterator = self.entry.stream.makeAsyncIterator()
+                    return await iterator.next() != nil
+                }
+                group.addTask {
+                    try? await Task.sleep(for: .seconds(10))
+                    return false
+                }
+                defer { group.cancelAll() }
+                return await group.next() ?? false
+            }
         }
-        func release() { releaseWaiter?.resume(); releaseWaiter = nil }
+        func release() { completion.continuation.finish() }
     }
 }
