@@ -1,4 +1,4 @@
-import EngramLattice
+@testable import EngramLattice
 import EngramMemoryContract
 import EngramMemoryCore
 import EngramModels
@@ -45,6 +45,17 @@ struct PortableLatticeContractHarness: ContractHarness {
     }
 
     private let registry = Registry()
+    private let diagnostics: MemoryToolsDiagnostics
+
+    init() {
+        self.init(diagnostics: MemoryToolsDiagnostics(
+            log: { _ in }, sessionLog: { _ in },
+            appendSessionSaveLog: { _, _, _, _, _ in }))
+    }
+
+    init(diagnostics: MemoryToolsDiagnostics) {
+        self.diagnostics = diagnostics
+    }
 
     private func embedder(for mode: ContractEmbedding) -> any Embedder {
         switch mode {
@@ -82,7 +93,8 @@ struct PortableLatticeContractHarness: ContractHarness {
                        fencing: Bool) async throws -> any MemoryService {
         let tools = MemoryTools(localRef: ref, syncedRef: nil,
                                 embedder: embedder(for: embedding),
-                                identity: StaticIdentityProvider(principal))
+                                identity: StaticIdentityProvider(principal),
+                                diagnostics: diagnostics)
         if fencing {
             await tools.setForeignContentPolicy(fence: true, exclude: false)
         }
