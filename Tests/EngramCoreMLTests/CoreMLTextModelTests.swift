@@ -104,7 +104,8 @@ struct CoreMLTextModelTests {
         #expect(model.embeddingDimension == 384)
         let vector = try await model.embed(text: "A puppy plays outside.")
         #expect(vector.count == 384)
-        #expect(vector.allSatisfy(\.isFinite))
+        let allValuesAreFinite = vector.allSatisfy(\.isFinite)
+        #expect(allValuesAreFinite)
         let same = try await model.similarity("A puppy plays outside.", "A puppy plays outside.")
         #expect(abs(same - 1) < 0.00001)
     }
