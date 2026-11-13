@@ -1,4 +1,3 @@
-import SwiftLM
 import EngramCoreML
 import Foundation
 
@@ -11,15 +10,43 @@ import Foundation
 /// Model loading happens in the background so it doesn't block MCP server startup.
 /// The first call to `embed()` will await loading completion.
 public actor EmbeddingService {
-    private var model: CoreMLEmbeddingModel?
+    struct Model: Sendable {
+        let dimension: Int
+        let embed: @Sendable (String) async throws -> [Float]
+        let similarity: @Sendable (String, String) async throws -> Float
+    }
+    typealias Loader = @Sendable (URL, URL?) async throws -> Model
+
+    private var model: Model?
     private let modelPath: String?
-    private var loadingTask: Task<CoreMLEmbeddingModel?, Never>?
+    private let bundledModel: @Sendable () -> URL?
+    private let bundledTokenizer: @Sendable () -> URL?
+    private let loader: Loader
+    private var loadingTask: Task<Model?, Never>?
 
     /// Create an embedding service.
     /// - Parameter modelPath: Path to a `.mlpackage` or `.mlmodelc` model. If nil, uses the
     ///   bundled paraphrase-MiniLM-L6-v2 model from the app's resource bundle.
     public init(modelPath: String? = nil) {
         self.modelPath = modelPath
+        bundledModel = { CoreMLMemoryAssets.modelURL }
+        bundledTokenizer = { CoreMLMemoryAssets.tokenizerDirectory }
+        loader = { url, tokenizer in
+            let model = try await CoreMLTextModel.load(url: url, tokenizerDirectory: tokenizer)
+            return Model(dimension: model.embeddingDimension,
+                embed: { try await model.embed(text: $0) },
+                similarity: { try await model.similarity($0, $1) })
+        }
+    }
+
+    /// The same loading boundary used by production, with deterministic assets
+    /// and a suspended loader available to lifecycle tests.
+    init(modelPath: String?, bundledModel: @escaping @Sendable () -> URL?,
+         bundledTokenizer: @escaping @Sendable () -> URL?, loader: @escaping Loader) {
+        self.modelPath = modelPath
+        self.bundledModel = bundledModel
+        self.bundledTokenizer = bundledTokenizer
+        self.loader = loader
     }
 
     /// Begin loading the model in the background.
@@ -44,12 +71,12 @@ public actor EmbeddingService {
     }
 
     /// Internal loading implementation.
-    private func _load(customPath: String?) async -> CoreMLEmbeddingModel? {
+    private func _load(customPath: String?) async -> Model? {
         let url: URL
 
         if let customPath {
             url = URL(fileURLWithPath: customPath)
-        } else if let bundledURL = CoreMLMemoryAssets.modelURL {
+        } else if let bundledURL = bundledModel() {
             url = bundledURL
         } else {
             log("No embedding model found (not bundled, no CLAUDE_MEMORY_MODEL). Running in degraded mode (text search only).")
@@ -57,16 +84,10 @@ public actor EmbeddingService {
         }
 
         do {
-            // Find the tokenizer — check bundle first, then auto-discover alongside model
-            let tokenizerDir: URL?
-            if let bundledTokenizer = CoreMLMemoryAssets.tokenizerDirectory {
-                tokenizerDir = bundledTokenizer
-            } else {
-                tokenizerDir = nil  // Let SwiftLM auto-discover from model path
-            }
-
-            let loaded = try await CoreMLEmbeddingModel.load(url: url, tokenizerDirectory: tokenizerDir)
-            log("Loaded embedding model (dim=\(loaded.embeddingDimension))")
+            // Preserve the explicit-optional loading route: the bundle wins,
+            // otherwise the model metadata selects the Hub tokenizer.
+            let loaded = try await loader(url, bundledTokenizer())
+            log("Loaded embedding model (dim=\(loaded.dimension))")
             return loaded
         } catch {
             log("Failed to load embedding model: \(error). Running in degraded mode.")
@@ -85,12 +106,12 @@ public actor EmbeddingService {
 
     public var isLoaded: Bool { model != nil }
 
-    public var dimension: Int { model?.embeddingDimension ?? 0 }
+    public var dimension: Int { model?.dimension ?? 0 }
 
     public func embed(text: String) async throws -> [Float]? {
         await ensureLoaded()
         guard let model else { return nil }
-        return try await model.embed(text: text)
+        return try await model.embed(text)
     }
 
     public func similarity(_ text1: String, _ text2: String) async throws -> Float? {
