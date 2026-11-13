@@ -32,7 +32,6 @@ if [ "$1" = "--from-source" ]; then
     cp -R .build/release/Engram_EngramKit.bundle "$INSTALL_DIR/"
     cp -R .build/release/Engram_EngramCoreML.bundle "$INSTALL_DIR/"
     cp -R .build/release/swift-transformers_Hub.bundle "$INSTALL_DIR/"
-    cp -R .build/release/SwiftLM_SwiftLM.bundle "$INSTALL_DIR/"
     # Re-sign binaries — linker-signed ad-hoc binaries can be rejected by macOS Taskgated
     codesign --force --sign - "$INSTALL_DIR/memory"
     codesign --force --sign - "$INSTALL_DIR/memory-hooks"
