@@ -3,6 +3,7 @@ import EngramMemoryContract
 import EngramMemoryCore
 import EngramModels
 import Foundation
+import EngramTestSupport
 import Lattice
 import Testing
 
@@ -55,7 +56,7 @@ struct PortableLatticeContractHarness: ContractHarness {
     func makeService(principal: Principal,
                      embedding: ContractEmbedding,
                      fencing: Bool) async throws -> any MemoryService {
-        let path = FileManager.default.temporaryDirectory
+        let path = try EngramTestFixtureRoot.directory()
             .appending(path: "contract-\(UUID().uuidString).sqlite")
         let lattice = try Lattice(
             Memory.self, Edge.self, Checkpoint.self, HookState.self, SyncConfig.self,

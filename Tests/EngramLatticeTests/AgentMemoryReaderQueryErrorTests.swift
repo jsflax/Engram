@@ -1,4 +1,5 @@
 import Foundation
+import EngramTestSupport
 import Testing
 import Lattice
 import EngramModels
@@ -14,7 +15,7 @@ struct AgentMemoryReaderQueryErrorTests {
 
     @Test(arguments: ["Memory", "Edge", "AgentMemoryGraph"])
     func compatibleStoredSchemaWithMissingTableFailsInsteadOfReturningCompleteGraph(table: String) throws {
-        let directory = FileManager.default.temporaryDirectory.appending(path: "engram-query-failure-" + UUID().uuidString)
+        let directory = try EngramTestFixtureRoot.directory().appending(path: "engram-query-failure-" + UUID().uuidString)
             .resolvingSymlinksInPath()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }

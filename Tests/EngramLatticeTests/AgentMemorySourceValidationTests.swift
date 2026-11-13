@@ -1,4 +1,5 @@
 import Foundation
+import EngramTestSupport
 import Testing
 import Lattice
 import EngramModels
@@ -8,7 +9,7 @@ import EngramLattice
 struct AgentMemorySourceValidationTests {
     @Test(arguments: [false, true])
     func legacyAndCurrentGraphsRemainByteUnchanged(current: Bool) throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("engram-validation-" + UUID().uuidString)
+        let directory = try EngramTestFixtureRoot.directory().appendingPathComponent("engram-validation-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let file = directory.appendingPathComponent("collection.sqlite")
@@ -30,7 +31,7 @@ struct AgentMemorySourceValidationTests {
     }
 
     @Test func unrelatedSQLiteAndMissingFileAreRejectedWithoutCreation() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("engram-validation-" + UUID().uuidString)
+        let directory = try EngramTestFixtureRoot.directory().appendingPathComponent("engram-validation-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let file = directory.appendingPathComponent("unrelated.sqlite")

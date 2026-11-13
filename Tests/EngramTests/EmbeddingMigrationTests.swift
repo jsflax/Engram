@@ -3,6 +3,7 @@ import EngramKit
 import EngramModels
 import Lattice
 import Foundation
+import EngramTestSupport
 
 // ============================================================================
 // EmbeddingMigration — the v2 space sweep every 0.14.0 machine runs.
@@ -20,7 +21,7 @@ import Foundation
 struct EmbeddingMigrationTests {
 
     private func makeLattice(withHookState: Bool = true) throws -> (Lattice, URL) {
-        let dir = FileManager.default.temporaryDirectory
+        let dir = try EngramTestFixtureRoot.directory()
             .appending(path: "embed-migration-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appending(path: "db.sqlite")

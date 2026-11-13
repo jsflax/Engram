@@ -1,4 +1,5 @@
 import Foundation
+import EngramTestSupport
 import Lattice
 import EngramModels
 import EngramLattice
@@ -7,7 +8,7 @@ import Testing
 @Suite("AgentMemoryTransfer")
 struct AgentMemoryTransferTests {
     @Test func actualAuditTransportPreservesCompleteSnapshotIncludingDatesAndVectors() throws {
-        let root = FileManager.default.temporaryDirectory.appending(path: "engram-transfer-wire-\(UUID())")
+        let root = try EngramTestFixtureRoot.directory().appending(path: "engram-transfer-wire-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let source = try Lattice(for: AgentMemoryStore.schema,
@@ -52,7 +53,7 @@ struct AgentMemoryTransferTests {
     }
 
     @Test func fencingCallbacksRunInsideCheckedTransactionAndOnlyWhenReady() throws {
-        let root = FileManager.default.temporaryDirectory.appending(path: "engram-transfer-fence-\(UUID())")
+        let root = try EngramTestFixtureRoot.directory().appending(path: "engram-transfer-fence-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let graph = try Lattice(for: AgentMemoryStore.schema, configuration: AgentMemoryStore.configuration(fileURL: root.appending(path: "graph.sqlite")))
@@ -89,7 +90,7 @@ struct AgentMemoryTransferTests {
     }
 
     @Test func durableWriterFenceIsVisibleAcrossHandlesButExcludedFromMemorySnapshot() throws {
-        let root = FileManager.default.temporaryDirectory.appending(path: "engram-writer-fence-\(UUID())")
+        let root = try EngramTestFixtureRoot.directory().appending(path: "engram-writer-fence-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let file = root.appending(path: "graph.sqlite")
@@ -153,7 +154,7 @@ struct AgentMemoryTransferTests {
     }
 
     @Test func ownerFirstMixedBatchesUpdatesAndDeletionRequireCompleteSnapshot() throws {
-        let root = FileManager.default.temporaryDirectory.appending(path: "engram-transfer-\(UUID())")
+        let root = try EngramTestFixtureRoot.directory().appending(path: "engram-transfer-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let source = try Lattice(for: AgentMemoryStore.schema, configuration: AgentMemoryStore.configuration(fileURL: root.appending(path: "source.sqlite")))
@@ -235,7 +236,7 @@ struct AgentMemoryTransferTests {
     }
 
     @Test func rejectsWrongOwnerUnsupportedSealAndOversizedVerification() throws {
-        let root = FileManager.default.temporaryDirectory.appending(path: "engram-transfer-bounds-\(UUID())")
+        let root = try EngramTestFixtureRoot.directory().appending(path: "engram-transfer-bounds-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try Lattice(for: AgentMemoryStore.schema, configuration: AgentMemoryStore.configuration(fileURL: root.appending(path: "graph.sqlite")))
