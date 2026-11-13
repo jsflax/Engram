@@ -17,6 +17,10 @@ public enum EngramTestFixtureRoot {
                 && isDirectory.boolValue
         }
     ) throws -> URL {
-        fallback()
+        guard let path = environment["ENGRAM_TEST_FIXTURE_ROOT"] else { return fallback() }
+        guard path.hasPrefix("/") else { throw Failure.notAbsolute }
+        let root = URL(fileURLWithPath: path, isDirectory: true)
+        guard isExistingDirectory(root) else { throw Failure.missingOrNotDirectory }
+        return root
     }
 }
