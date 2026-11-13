@@ -1,4 +1,5 @@
 import Foundation
+import EngramTestSupport
 import Testing
 @testable import EngramCoreML
 import EngramLattice
@@ -7,7 +8,7 @@ import EngramLattice
 struct CoreMLMemoryEmbedderTests {
     @Test(arguments: ["EngramPortable_EngramCoreML.bundle", "Engram_EngramCoreML.bundle"])
     func installedAppAndHelperBundlesPrecedeGeneratedFallback(bundleName: String) throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("engram-assets-" + UUID().uuidString)
+        let root = try EngramTestFixtureRoot.directory().appendingPathComponent("engram-assets-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         for relativeRoot in ["Orbital.app/Contents/Resources", "helpers"] {
             let bundleRoot = root.appendingPathComponent(relativeRoot)
@@ -24,7 +25,7 @@ struct CoreMLMemoryEmbedderTests {
     }
 
     @Test func bundledModelProducesSemanticVectorsAndIndexesPendingMemory() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("engram-coreml-" + UUID().uuidString)
+        let root = try EngramTestFixtureRoot.directory().appendingPathComponent("engram-coreml-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let binding = AgentMemoryBinding(agentId: UUID())
         let offline = try AgentMemoryStore.open(binding: binding, directory: root)

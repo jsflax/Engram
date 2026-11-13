@@ -1,13 +1,18 @@
 import Foundation
+import Synchronization
 import Testing
 @testable import EngramKit
 
 @Suite("Desktop embedding lifecycle", .timeLimit(.minutes(1)))
 struct EmbeddingServiceOwnershipTests: Sendable {
     @Test func missingModelStaysDegraded() async throws {
-        let service = EmbeddingService(modelPath: "/missing-embedding-" + UUID().uuidString)
+        let diagnostics = Diagnostics()
+        let service = EmbeddingService(modelPath: "/missing-embedding-" + UUID().uuidString,
+                                       diagnosticSink: { diagnostics.append($0) })
         #expect(await service.dimension == 0)
         await service.load()
+        #expect(diagnostics.snapshot.count == 1)
+        #expect(diagnostics.snapshot.first?.hasPrefix("Failed to load embedding model:") == true)
         #expect(await service.isLoaded == false)
         #expect(await service.dimension == 0)
         #expect(try await service.embed(text: "unavailable") == nil)
@@ -54,7 +59,7 @@ struct EmbeddingServiceOwnershipTests: Sendable {
             bundledTokenizer: { nil }, loader: { url, tokenizer in
                 await calls.record(url, tokenizer)
                 return Self.loadedModel
-            })
+            }, diagnosticSink: { _ in })
         await service.load()
         #expect(await service.dimension == 0)
         #expect(await calls.inputs.isEmpty)
@@ -69,7 +74,7 @@ struct EmbeddingServiceOwnershipTests: Sendable {
                 await calls.record(url, tokenizer)
                 await gate.enterAndWait()
                 return Self.loadedModel
-            })
+            }, diagnosticSink: { _ in })
         await service.startLoading()
         let entered = await gate.waitForEntry()
         try #require(entered, "Background loading never reached the loader")
@@ -85,6 +90,42 @@ struct EmbeddingServiceOwnershipTests: Sendable {
         #expect(await calls.inputs.count == 1)
     }
 
+    @Test(arguments: ["no-model", "loaded", "failed"])
+    func loadDiagnosticsUseTheProvidedSink(mode: String) async throws {
+        let diagnostics = Diagnostics()
+        let service = EmbeddingService(modelPath: nil,
+            bundledModel: { mode == "no-model" ? nil : URL(fileURLWithPath: "/fixture/model.mlmodelc") },
+            bundledTokenizer: { nil }, loader: { _, _ in
+                if mode == "failed" { throw DiagnosticFailure.rejected }
+                return Self.loadedModel
+            }, diagnosticSink: { diagnostics.append($0) })
+        #expect(diagnostics.snapshot.isEmpty)
+        await service.load()
+        let messages = diagnostics.snapshot
+        #expect(messages.count == 1)
+        #expect(await service.isLoaded == (mode == "loaded"))
+        #expect(await service.dimension == (mode == "loaded" ? 3 : 0))
+        switch mode {
+        case "no-model":
+            #expect(messages == ["No embedding model found (not bundled, no CLAUDE_MEMORY_MODEL). Running in degraded mode (text search only)."])
+        case "loaded":
+            #expect(messages == ["Loaded embedding model (dim=3)"])
+        default:
+            #expect(messages == ["Failed to load embedding model: fixture rejection. Running in degraded mode."])
+        }
+    }
+
+    private enum DiagnosticFailure: Error, CustomStringConvertible {
+        case rejected
+        var description: String { "fixture rejection" }
+    }
+
+    private final class Diagnostics: Sendable {
+        private let storage = Mutex<[String]>([])
+        func append(_ message: String) { storage.withLock { $0.append(message) } }
+        var snapshot: [String] { storage.withLock { $0 } }
+    }
+
     private var model: URL { URL(fileURLWithPath: "/bundled/model.mlmodelc") }
     private var tokenizer: URL { URL(fileURLWithPath: "/bundled/tokenizer") }
 
@@ -94,7 +135,7 @@ struct EmbeddingServiceOwnershipTests: Sendable {
             bundledTokenizer: { tokenizerURL }, loader: { url, tokenizer in
                 await calls.record(url, tokenizer)
                 return Self.loadedModel
-            })
+            }, diagnosticSink: { _ in })
     }
 
     private static var loadedModel: EmbeddingService.Model {

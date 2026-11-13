@@ -1,5 +1,5 @@
 import Testing
-import EngramKit
+@testable import EngramKit
 import Lattice
 import MCP
 import Foundation
@@ -16,8 +16,9 @@ func text(from result: CallTool.Result) -> String {
 }
 
 /// Shared embedder — loads the bundled CoreML model once for all tests.
+/// Every test using this helper keeps embedding diagnostics out of desktop logs.
 let sharedEmbedder: EmbeddingService = {
-    let e = EmbeddingService()
+    let e = EmbeddingService(diagnosticSink: { _ in })
     return e
 }()
 

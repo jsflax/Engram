@@ -121,18 +121,17 @@ extension MemoryTools {
     // memories or queries. Hosts own their own telemetry and retention policy.
     func log(_ message: String) {
         guard !privateGraphOnly else { return }
-        EngramLattice.log(message)
+        diagnostics.log(message)
     }
 
     func sessionLog(_ message: String) {
         guard !privateGraphOnly else { return }
-        EngramMemoryCore.sessionLog(message)
+        diagnostics.sessionLog(message)
     }
 
     func appendSessionSaveLog(sessionId: String?, globalId: String, project: String, topic: String, preview: String) {
         guard !privateGraphOnly else { return }
-        EngramLattice.appendSessionSaveLog(sessionId: sessionId, globalId: globalId,
-                                           project: project, topic: topic, preview: preview)
+        diagnostics.appendSessionSaveLog(sessionId, globalId, project, topic, preview)
     }
 
     public nonisolated var agentMemoryBinding: AgentMemoryBinding? { graphBinding }

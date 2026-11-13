@@ -332,3 +332,14 @@ if let target = package.targets.first(where: { $0.name == "EngramLattice" }) {
     target.dependencies.append(.product(name: "Crypto", package: "swift-crypto"))
 }
 #endif
+
+// Shared fixture support is reachable only from test targets.
+package.targets.append(.target(name: "EngramTestSupport",
+    path: "Tests/EngramTestSupport"))
+package.targets.append(.testTarget(name: "EngramTestSupportTests",
+    dependencies: ["EngramTestSupport"], path: "Tests/EngramTestSupportTests"))
+for name in ["EngramLatticeTests", "EngramCoreMLTests", "EngramTests"] {
+    if let target = package.targets.first(where: { $0.name == name }) {
+        target.dependencies.append(.target(name: "EngramTestSupport"))
+    }
+}

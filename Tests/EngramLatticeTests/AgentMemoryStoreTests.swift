@@ -1,5 +1,6 @@
 import EngramLattice
 import Foundation
+import EngramTestSupport
 import Lattice
 import MCP
 import Testing
@@ -7,7 +8,7 @@ import Testing
 @Suite("Portable agent memory")
 struct AgentMemoryStoreTests {
     private func directory() throws -> URL {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("agent-memory-tests-\(UUID())")
+        let dir = try EngramTestFixtureRoot.directory().appendingPathComponent("agent-memory-tests-\(UUID())")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }

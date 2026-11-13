@@ -3,6 +3,22 @@ import Lattice
 import MCP
 import Foundation
 
+/// Per-instance diagnostic routes; callers remain synchronous inside MemoryTools.
+/// The public initializer retains the existing production writers.
+struct MemoryToolsDiagnostics: Sendable {
+    let log: @Sendable (String) -> Void
+    let sessionLog: @Sendable (String) -> Void
+    let appendSessionSaveLog: @Sendable (String?, String, String, String, String) -> Void
+
+    static let live = Self(
+        log: { EngramLattice.log($0) },
+        sessionLog: { EngramMemoryCore.sessionLog($0) },
+        appendSessionSaveLog: { sessionId, globalId, project, topic, preview in
+            EngramLattice.appendSessionSaveLog(sessionId: sessionId, globalId: globalId,
+                                               project: project, topic: topic, preview: preview)
+        })
+}
+
 /// Implements the MCP tool handlers for the Engram memory server.
 ///
 /// Tools:
@@ -28,6 +44,7 @@ public actor MemoryTools {
     /// `any Embedder` (not the concrete CoreML actor): the contract suite
     /// injects a deterministic embedder; production passes EmbeddingService.
     package let embedder: any Embedder
+    let diagnostics: MemoryToolsDiagnostics
 
     /// Tracks the currently active episode globalId for this session.
     var activeEpisodeId: UUID? = nil
@@ -118,6 +135,22 @@ public actor MemoryTools {
                 privateGraphOnly: Bool = false,
                 graphBinding: AgentMemoryBinding? = nil,
                 sharedGraphNames: [UUID: String] = [:]) {
+        self.init(localRef: localRef, syncedRef: syncedRef, groupRefs: groupRefs,
+                  embedder: embedder, identity: identity, privateGraphOnly: privateGraphOnly,
+                  graphBinding: graphBinding, sharedGraphNames: sharedGraphNames,
+                  diagnostics: .live)
+    }
+
+    /// Internal injection keeps the normal service contract independent of process logging.
+    init(localRef: LatticeThreadSafeReference,
+         syncedRef: LatticeThreadSafeReference?,
+         groupRefs: [GroupSpokeRef] = [],
+         embedder: any Embedder,
+         identity: any IdentityProviding = GroupDirectoryIdentityProvider(),
+         privateGraphOnly: Bool = false,
+         graphBinding: AgentMemoryBinding? = nil,
+         sharedGraphNames: [UUID: String] = [:],
+         diagnostics: MemoryToolsDiagnostics) {
         guard let local = localRef.resolve() else {
             fatalError("Failed to resolve local lattice reference")
         }
@@ -133,6 +166,7 @@ public actor MemoryTools {
         }
         self.embedder = embedder
         self.identity = identity
+        self.diagnostics = diagnostics
         // Hard default, not opt-in: any MemoryTools living inside the
         // maintenance subprocess tree excludes foreign content everywhere.
         self.excludeForeignAuthored = Self.maintenanceEnvironmentDetected

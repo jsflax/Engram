@@ -1,4 +1,5 @@
 import Foundation
+import EngramTestSupport
 import Testing
 import Lattice
 import EngramModels
@@ -14,7 +15,7 @@ import CEngramLedgerSQLite
 @Suite("Read-only selected agent memory browser")
 struct AgentMemoryReaderTests {
     @Test func oversizedStoredRowsAreExcludedBeforeGraphMaterialization() throws {
-        let directory = FileManager.default.temporaryDirectory.appending(path: "engram-reader-budget-" + UUID().uuidString).resolvingSymlinksInPath()
+        let directory = try EngramTestFixtureRoot.directory().appending(path: "engram-reader-budget-" + UUID().uuidString).resolvingSymlinksInPath()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let binding = AgentMemoryBinding(agentId: UUID()), visibleID = UUID(), hugeID = UUID(), oversizedVectorID = UUID()
@@ -42,7 +43,7 @@ struct AgentMemoryReaderTests {
     }
 
     @Test func fullGraphCrossesPageBoundariesAndReadsOnlyExistingCurrentVectors() throws {
-        let directory = FileManager.default.temporaryDirectory.appending(path: "engram-full-reader-" + UUID().uuidString).resolvingSymlinksInPath()
+        let directory = try EngramTestFixtureRoot.directory().appending(path: "engram-full-reader-" + UUID().uuidString).resolvingSymlinksInPath()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let binding = AgentMemoryBinding(agentId: UUID())
@@ -100,7 +101,7 @@ struct AgentMemoryReaderTests {
 
     @Test func rawFixtureWriterWithoutStorageEpochIsRefusedWithoutChangingGraph() throws {
         #if canImport(SQLite3) || canImport(CSQLite) || canImport(CEngramLedgerSQLite)
-        let directory = FileManager.default.temporaryDirectory.appending(path: "engram-reader-writer-guard-" + UUID().uuidString).resolvingSymlinksInPath()
+        let directory = try EngramTestFixtureRoot.directory().appending(path: "engram-reader-writer-guard-" + UUID().uuidString).resolvingSymlinksInPath()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let binding = AgentMemoryBinding(agentId: UUID()), memoryID = UUID()
@@ -139,7 +140,7 @@ struct AgentMemoryReaderTests {
     }
 
     @Test func searchConnectionsAndDetailLeaveGraphByteUnchanged() throws {
-        let directory = FileManager.default.temporaryDirectory.appending(path: "engram-reader-" + UUID().uuidString).resolvingSymlinksInPath()
+        let directory = try EngramTestFixtureRoot.directory().appending(path: "engram-reader-" + UUID().uuidString).resolvingSymlinksInPath()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let graphID = UUID(), agentID = UUID(), a = UUID(), b = UUID(), gone = UUID()
@@ -177,7 +178,7 @@ struct AgentMemoryReaderTests {
     }
 
     @Test func missingGraphNeverCreatesAReplacementAndPageIsBounded() throws {
-        let directory = FileManager.default.temporaryDirectory.appending(path: "engram-reader-" + UUID().uuidString).resolvingSymlinksInPath()
+        let directory = try EngramTestFixtureRoot.directory().appending(path: "engram-reader-" + UUID().uuidString).resolvingSymlinksInPath()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let binding = AgentMemoryBinding(agentId: UUID())
