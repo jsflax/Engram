@@ -25,7 +25,7 @@ var engramMetalShaders: PackageDescription.Target {
 
 let latticeDependency: Package.Dependency = .package(
     url: "https://github.com/jsflax/lattice.git",
-    revision: "405353c9a0a66583d9b338492efe9258ece93ff5")
+    from: "3.1.0")
 
 let package = Package(
     name: "Engram",
@@ -47,6 +47,8 @@ let package = Package(
         .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.1"),
         // Keep the database release line aligned with the root library package.
         latticeDependency,
+        // Include protected legacy attachments and shared Linux notification listeners.
+        .package(url: "https://github.com/jsflax/LatticeCore.git", from: "3.1.1"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
         .package(url: "https://github.com/google/GoogleSignIn-iOS.git", from: "7.0.0"),
