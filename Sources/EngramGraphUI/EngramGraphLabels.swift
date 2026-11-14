@@ -35,4 +35,3 @@ public func engramGraphTruncateLabel(_ text: String, to maxLen: Int) -> String {
     if text.count <= maxLen { return text }
     return String(text.prefix(maxLen - 1)) + "…"
 }
-
