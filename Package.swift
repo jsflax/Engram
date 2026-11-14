@@ -329,7 +329,7 @@ package.targets.append(contentsOf: [
 ])
 
 #if os(Linux)
-package.dependencies.append(.package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"))
+package.dependencies.append(.package(url: "https://github.com/apple/swift-crypto.git", from: "4.0.0"))
 package.targets.append(.systemLibrary(name: "CEngramLedgerSQLite",
     path: "SystemLibraries/CEngramLedgerSQLite", pkgConfig: "sqlite3",
     providers: [.apt(["libsqlite3-dev"]), .brew(["sqlite"])]))
