@@ -137,7 +137,7 @@ extension MemoryTools {
         // unchecked transaction whose failed BEGIN trapped the process).
         let hubGlobalId: UUID
         do {
-            hubGlobalId = try LatticeBeginRetry.run(on: localLattice, log: { log("[organize] \($0)") }) {
+            hubGlobalId = try LatticeBeginRetry.run(on: localLattice, log: { self.log("[organize] \($0)") }) {
                 try localLattice.add(hub)
                 guard let hubGid = hub.globalId else {
                     throw MCPError.internalError("Failed to get hub globalId.")

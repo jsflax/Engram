@@ -210,7 +210,7 @@ extension MemoryTools {
         // other error still propagates without claiming that rollback settled.
         let effects: RememberCommitEffects
         do {
-            effects = try LatticeBeginRetry.run(on: localLattice, log: { log("[remember] \($0)") }) {
+            effects = try LatticeBeginRetry.run(on: localLattice, log: { self.log("[remember] \($0)") }) {
                 try requireSessionLearningWriteAdmission()
                 return try commitRemember(memory, parentGidValue: parentGidValue,
                                    episodeId: episodeId,
@@ -1215,7 +1215,7 @@ extension MemoryTools {
         }
 
         do {
-            try LatticeBeginRetry.run(on: writeLattice, log: { log("[update] \($0)") }) {
+            try LatticeBeginRetry.run(on: writeLattice, log: { self.log("[update] \($0)") }) {
                 try requireSessionLearningWriteAdmission()
                 if let content = a.content {
                     mem.content = content
@@ -1382,7 +1382,7 @@ extension MemoryTools {
         var edgeCount = 0
         let selfId = currentUserId
         do {
-            try LatticeBeginRetry.run(on: localLattice, log: { log("[merge] \($0)") }) {
+            try LatticeBeginRetry.run(on: localLattice, log: { self.log("[merge] \($0)") }) {
             try localLattice.add(merged)
 
             guard let gid = merged.globalId else {

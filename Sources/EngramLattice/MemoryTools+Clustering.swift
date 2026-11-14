@@ -399,7 +399,7 @@ extension MemoryTools {
         let sourceGlobalIds = sourceMemories.compactMap(\.globalId)
         let summaryGlobalId: UUID
         do {
-            summaryGlobalId = try LatticeBeginRetry.run(on: localLattice, log: { log("[consolidate] \($0)") }) {
+            summaryGlobalId = try LatticeBeginRetry.run(on: localLattice, log: { self.log("[consolidate] \($0)") }) {
                 try localLattice.add(summary)
                 guard let summaryGid = summary.globalId else {
                     throw MCPError.internalError("Failed to get summary globalId after persist")

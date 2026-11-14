@@ -41,7 +41,7 @@ extension MemoryTools {
         if let edge = existing.first {
             let edgeGid = edge.globalId?.uuidString ?? "?"
             if edge.deletedAt != nil {
-                try LatticeBeginRetry.run(on: localLattice, log: { log("[connect] \($0)") }) {
+                try LatticeBeginRetry.run(on: localLattice, log: { self.log("[connect] \($0)") }) {
                     try requireSessionLearningWriteAdmission()
                     edge.deletedAt = nil
                 }
@@ -63,7 +63,7 @@ extension MemoryTools {
         let edge = Edge(sourceGlobalId: fromGid, targetGlobalId: toGid, relation: relationEnum, authorUserId: currentUserId)
         let edgeGid: UUID
         do {
-            edgeGid = try LatticeBeginRetry.run(on: localLattice, log: { log("[connect] \($0)") }) {
+            edgeGid = try LatticeBeginRetry.run(on: localLattice, log: { self.log("[connect] \($0)") }) {
                 try requireSessionLearningWriteAdmission()
                 try localLattice.add(edge)
                 guard let gid = edge.globalId else {
