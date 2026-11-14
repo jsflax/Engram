@@ -41,6 +41,17 @@ struct DaemonHubContentionTests {
             sqlite3_busy_timeout(database, 100)
         }
 
+        init(inMemoryForReadbackControl: Void) throws {
+            var pointer: OpaquePointer?
+            let result = sqlite3_open(":memory:", &pointer)
+            guard result == SQLITE_OK, let pointer else {
+                if let pointer { sqlite3_close(pointer) }
+                throw FixtureError.sqlite("open readback control", result)
+            }
+            database = pointer
+            readsApplyReceipts = false
+        }
+
         deinit { sqlite3_close(database) }
 
         func row(_ sql: String, bindings: [String] = []) throws -> [String?] {
@@ -90,6 +101,51 @@ struct DaemonHubContentionTests {
                             receiveCursor: values[4], acknowledged: try integer(values[5]) == 1)
         }
 
+        /// A fresh peer replaces pre-reset history with a new snapshot cohort.
+        /// Only the warm-up accepts that replacement; later writes retain the
+        /// strict all-audit acknowledgement assertion in snapshot(_:channel:).
+        func warmAcknowledged(_ id: UUID, channel: String) throws -> Bool {
+            let values = try row("""
+                WITH cutoff AS (
+                  SELECT COUNT(*) AS entries, MIN(typeof(value)) AS storageType, MIN(value) AS rawValue
+                  FROM _lattice_meta WHERE key = ?3
+                ), eligible AS (
+                  SELECT a.id, a.isSynchronized FROM AuditLog a, cutoff
+                  WHERE a.tableName = 'Memory' AND a.globalRowId = ?1 COLLATE NOCASE
+                    AND a.id > CASE WHEN cutoff.entries = 0 THEN 0 ELSE CAST(cutoff.rawValue AS INTEGER) END
+                )
+                SELECT cutoff.entries, cutoff.storageType, cutoff.rawValue,
+                  length(CAST(cutoff.rawValue AS BLOB)),
+                  EXISTS (SELECT 1 FROM Memory WHERE globalId = ?1 COLLATE NOCASE),
+                  EXISTS (SELECT 1 FROM _lattice_replication_slots WHERE sync_id = ?2),
+                  EXISTS (SELECT 1 FROM eligible),
+                  NOT EXISTS (
+                    SELECT 1 FROM eligible a
+                    WHERE COALESCE((SELECT s.is_synchronized FROM _lattice_sync_state s
+                                    WHERE s.audit_entry_id = a.id AND s.sync_id = ?2),
+                                    a.isSynchronized) != 1)
+                FROM cutoff
+                """, bindings: [id.uuidString, "ipc:\(channel)", "sync_reset_through_v1:ipc:\(channel)"])
+            let metadataRows = try integer(values[0])
+            if metadataRows == 0 {
+                guard values[1] == nil && values[2] == nil && values[3] == nil else {
+                    throw FixtureError.invalidReadback
+                }
+            } else {
+                // Match the pinned Core's canonical nonnegative Int64 format.
+                // Validate the raw value from this same SQL snapshot, never a
+                // second query; SQLite CAST alone silently accepts malformed text.
+                guard metadataRows == 1, values[1] == "text", let raw = values[2],
+                      !raw.isEmpty, raw.utf8.count <= 19,
+                      try integer(values[3]) == raw.utf8.count,
+                      raw == "0" || raw.first != "0",
+                      raw.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+                      Int64(raw) != nil else { throw FixtureError.invalidReadback }
+            }
+            return try integer(values[4]) == 1 && integer(values[5]) == 1
+                && integer(values[6]) == 1 && integer(values[7]) == 1
+        }
+
         func auditEventIDs(_ id: UUID) throws -> Set<String> {
             let values = try row("""
                 SELECT GROUP_CONCAT(globalId, ',') FROM AuditLog
@@ -107,6 +163,93 @@ struct DaemonHubContentionTests {
     private enum FixtureError: Error {
         case sqlite(String, Int32)
         case invalidReadback
+    }
+
+    private func verifyWarmAcknowledgementReadbackControls() throws {
+        let scenarios = [
+            "retiredPendingAndCurrentAck", "retiredPendingAndCurrentChannelAck",
+            "absentCutoff", "zeroCutoff", "onlyRetiredAudit", "noAudit", "currentPending",
+            "otherChannelAck", "currentChannelPending", "missingSlot", "otherMemory", "missingMemory",
+            "invalidText", "invalidLeadingZero", "invalidOverflow", "invalidNull", "invalidBlob", "invalidNUL"
+        ]
+        for scenario in scenarios {
+            try verifyWarmAcknowledgementReadbackControl(scenario)
+        }
+        print("Warm ACK readback controls: \(scenarios.count)/\(scenarios.count) passed.")
+    }
+
+    private func verifyWarmAcknowledgementReadbackControl(_ scenario: String) throws {
+        let reader = try Reader(inMemoryForReadbackControl: ())
+        let id = try #require(UUID(uuidString: "11111111-1111-1111-1111-111111111111"))
+        let channel = "readback-control"
+        func execute(_ sql: String) throws {
+            let result = sqlite3_exec(reader.database, sql, nil, nil, nil)
+            guard result == SQLITE_OK else {
+                throw FixtureError.sqlite("seed readback control: \(scenario)", result)
+            }
+        }
+        // Plain in-memory SQLite models readback states only; it is not a
+        // Lattice store and does not bypass a store's writer protection.
+        try execute("""
+            CREATE TABLE Memory(globalId TEXT);
+            CREATE TABLE AuditLog(id INTEGER PRIMARY KEY, tableName TEXT, globalRowId TEXT, isSynchronized INTEGER);
+            CREATE TABLE _lattice_replication_slots(sync_id TEXT PRIMARY KEY, last_received_event_id TEXT);
+            CREATE TABLE _lattice_sync_state(audit_entry_id INTEGER, sync_id TEXT, is_synchronized INTEGER,
+                                             PRIMARY KEY(audit_entry_id, sync_id));
+            CREATE TABLE _lattice_meta(key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO Memory VALUES ('\(id.uuidString)');
+            INSERT INTO AuditLog VALUES (2, 'Memory', '\(id.uuidString)', 1);
+            INSERT INTO _lattice_replication_slots VALUES ('ipc:\(channel)', 'warm-event');
+            """)
+        let cutoffKey = "sync_reset_through_v1:ipc:\(channel)"
+        var expected = false
+        switch scenario {
+        case "retiredPendingAndCurrentAck", "retiredPendingAndCurrentChannelAck":
+            try execute("INSERT INTO _lattice_meta VALUES ('\(cutoffKey)', '1');")
+            try execute("INSERT INTO AuditLog VALUES (1, 'Memory', '\(id.uuidString)', 0);")
+            if scenario == "retiredPendingAndCurrentChannelAck" {
+                try execute("UPDATE AuditLog SET isSynchronized = 0 WHERE id = 2;")
+                try execute("INSERT INTO _lattice_sync_state VALUES (2, 'ipc:\(channel)', 1);")
+            }
+            let strict = try reader.snapshot(id, channel: channel).acknowledged
+            try #require(!strict, "Strict original acknowledgement control: \(scenario)")
+            expected = true
+        case "absentCutoff": expected = true
+        case "zeroCutoff":
+            try execute("INSERT INTO _lattice_meta VALUES ('\(cutoffKey)', '0');")
+            expected = true
+        case "onlyRetiredAudit": try execute("INSERT INTO _lattice_meta VALUES ('\(cutoffKey)', '2');")
+        case "noAudit": try execute("DELETE FROM AuditLog;")
+        case "currentPending":
+            try execute("INSERT INTO _lattice_meta VALUES ('\(cutoffKey)', '1');")
+            try execute("UPDATE AuditLog SET isSynchronized = 0;")
+        case "otherChannelAck":
+            try execute("UPDATE AuditLog SET isSynchronized = 0;")
+            try execute("INSERT INTO _lattice_sync_state VALUES (2, 'ipc:other-channel', 1);")
+        case "currentChannelPending":
+            try execute("INSERT INTO _lattice_sync_state VALUES (2, 'ipc:\(channel)', 0);")
+        case "missingSlot": try execute("UPDATE _lattice_replication_slots SET sync_id = 'ipc:other-channel';")
+        case "otherMemory": try execute("UPDATE AuditLog SET globalRowId = '22222222-2222-2222-2222-222222222222';")
+        case "missingMemory": try execute("DELETE FROM Memory;")
+        case "invalidText": try execute("INSERT INTO _lattice_meta VALUES ('\(cutoffKey)', 'not-a-cutoff');")
+        case "invalidLeadingZero": try execute("INSERT INTO _lattice_meta VALUES ('\(cutoffKey)', '01');")
+        case "invalidOverflow": try execute("INSERT INTO _lattice_meta VALUES ('\(cutoffKey)', '9223372036854775808');")
+        case "invalidNull": try execute("INSERT INTO _lattice_meta VALUES ('\(cutoffKey)', NULL);")
+        case "invalidBlob": try execute("INSERT INTO _lattice_meta VALUES ('\(cutoffKey)', CAST('1' AS BLOB));")
+        case "invalidNUL": try execute("INSERT INTO _lattice_meta VALUES ('\(cutoffKey)', '1' || char(0) || 'x');")
+        default:
+            Issue.record("Unknown readback control: \(scenario)")
+            throw FixtureError.invalidReadback
+        }
+        if scenario.hasPrefix("invalid") {
+            var rejected = false
+            do { _ = try reader.warmAcknowledged(id, channel: channel) }
+            catch FixtureError.invalidReadback { rejected = true }
+            try #require(rejected, "Malformed cutoff control: \(scenario)")
+        } else {
+            let acknowledged = try reader.warmAcknowledged(id, channel: channel)
+            try #require(acknowledged == expected, "Current cohort acknowledgement control: \(scenario)")
+        }
     }
 
     private func waitUntil(seconds: TimeInterval, _ ready: () throws -> Bool) async throws -> Bool {
@@ -174,6 +317,7 @@ struct DaemonHubContentionTests {
 
     @Test(.timeLimit(.minutes(3)))
     func realHubBeginContentionPreservesUnacknowledgedWorkAndRecovers() async throws {
+        try verifyWarmAcknowledgementReadbackControls()
         let environment = ProcessInfo.processInfo.environment
         let fixtureRoot = try #require(environment["ENGRAM_TEST_ROOT"], "Provide an explicit short fixture root")
         try #require(fixtureRoot.hasPrefix("/"), "The fixture root must be absolute")
@@ -225,14 +369,15 @@ struct DaemonHubContentionTests {
         let sourceReader = try Reader(sourceURL, readsApplyReceipts: false)
         let hubReader = try Reader(hubURL)
         try #require(await waitUntil(seconds: 30) {
-            try sourceReader.snapshot(warmID, channel: channel).acknowledged
-                && hubReader.snapshot(warmID, channel: channel).acknowledged
+            try sourceReader.warmAcknowledged(warmID, channel: channel)
+                && hubReader.warmAcknowledged(warmID, channel: channel)
         }, "Warm barrier was not acknowledged on both sides of this IPC channel")
         let nearest = hub.objects(Memory.self).nearest(to: vector, on: \.embedding, limit: 1, distance: .cosine)
         try #require(nearest.first?.globalId == warmID, "The first vector query must complete before locking")
         try #require(hub.lastQueryError() == nil, "Warm vector query failed")
         let baseline = try hubReader.snapshot(warmID, channel: channel)
-        try #require(baseline.memoryRows == 1 && baseline.auditRows > 0 && baseline.acknowledged)
+        try #require(baseline.memoryRows == 1 && baseline.auditRows > 0)
+        try #require(hubReader.warmAcknowledged(warmID, channel: channel))
         try #require(baseline.receiveCursor?.isEmpty == false, "Warm receive cursor is missing")
         let logStart = try Data(contentsOf: logURL).count
 
@@ -264,8 +409,8 @@ struct DaemonHubContentionTests {
         try #require(held.receipts == baseline.receipts, "Failed chunk must not mint idempotency receipts")
         try #require(held.receiveCursor == baseline.receiveCursor, "Failed chunk must not advance the download cursor")
         try #require(!sourceReader.snapshot(pendingID, channel: channel).acknowledged)
-        try #require(sourceReader.snapshot(warmID, channel: channel).acknowledged)
-        try #require(hubReader.snapshot(warmID, channel: channel).acknowledged)
+        try #require(sourceReader.warmAcknowledged(warmID, channel: channel))
+        try #require(hubReader.warmAcknowledged(warmID, channel: channel))
         holder.release()
 
         // No reconnect, explicit resend, filter refresh, mutation replay, or
