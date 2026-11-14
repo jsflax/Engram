@@ -481,7 +481,11 @@ else:
             )
             identity_inputs = {
                 'Package.swift': '// root manifest fixture\n',
-                'Package.resolved': '{"version":3,"pins":[]}\n',
+                'Package.resolved': json.dumps({'version': 3, 'pins': [{
+                    'identity': 'fixture', 'kind': 'remoteSourceControl',
+                    'location': 'https://example.invalid/fixture.git',
+                    'state': {'revision': 'f' * 40, 'version': '1.0.0'},
+                }]}) + '\n',
                 '.github/workflows/linux-core.yml': (ROOT / '.github/workflows/linux-core.yml').read_text(),
             }
             identity_inputs.update({name + '/input.txt': name + '\n' for name in directories})
@@ -537,6 +541,48 @@ else:
                         self.assertEqual(identity['manifest_sha256'], expected_hashes['Package.swift'])
                         self.assertEqual(identity['resolved_sha256'], expected_hashes['Package.resolved'])
                         self.assertFalse((task_root / 'portable').exists())
+                        # Reuse this exact-source fixture for the reporting step;
+                        # Swift remains a fake, and the outputs are fixture data.
+                        workspace = {'version': 7, 'object': {'dependencies': [
+                            {'packageRef': {'identity': 'fixture'}}]}}
+                        (task_root / 'root-build').mkdir()
+                        workspace_path = task_root / 'root-build/workspace-state.json'
+                        workspace_path.write_text(json.dumps(workspace) + '\n')
+                        swift.write_text('#!' + sys.executable + '\n' + """import json,os,sys
+from pathlib import Path
+root=Path(os.environ['LINUX_ROOT'])
+assert sys.argv[1:]==['package','--package-path',str(root/'repo'),
+    '--scratch-path',str(root/'root-build'),'--cache-path',str(root/'cache'),
+    '--config-path',str(root/'config'),'--security-path',str(root/'security'),
+    '--force-resolved-versions','show-dependencies','--format','json'],sys.argv
+print(json.dumps({'name':'Engram','path':str(root/'repo'),
+    'dependencies':[{'identity':'fixture','dependencies':[]}]}))
+""")
+                        graph_result = subprocess.run(['/bin/bash', '-e', '-c',
+                            run_block('linux-core.yml', 'Record actual root Linux dependency graph')],
+                            cwd=checkout, env=dict(env, LINUX_ROOT=str(task_root)),
+                            capture_output=True, text=True, timeout=10)
+                        self.assertEqual(graph_result.returncode, 0,
+                                         graph_result.stdout + graph_result.stderr)
+                        evidence = task_root / 'evidence'
+                        graph_receipt = json.loads((evidence / 'resolved-graph-receipt.json').read_text())
+                        self.assertEqual(graph_receipt['source_sha'], sha)
+                        self.assertEqual(graph_receipt['source_tree'], tree)
+                        self.assertEqual(graph_receipt['manifest_sha256'], expected_hashes['Package.swift'])
+                        for key in ('input_lock_sha256', 'lock_before_sha256', 'lock_after_sha256'):
+                            self.assertEqual(graph_receipt[key], expected_hashes['Package.resolved'])
+                        self.assertTrue(graph_receipt['lock_unchanged'])
+                        self.assertEqual(graph_receipt['command_timeout_seconds'], 60)
+                        self.assertEqual((evidence / 'Package.resolved').read_bytes(),
+                                         (task_root / 'repo/Package.resolved').read_bytes())
+                        self.assertEqual((evidence / 'workspace-state.json').read_bytes(),
+                                         workspace_path.read_bytes())
+                        self.assertEqual(set(graph_receipt['files']),
+                                         {'resolved-graph.json', 'Package.resolved', 'workspace-state.json'})
+                        for name, record in graph_receipt['files'].items():
+                            content = (evidence / name).read_bytes()
+                            self.assertEqual(record, {'bytes': len(content),
+                                'sha256': hashlib.sha256(content).hexdigest()})
             # Trust must not persist, and -c must not replace the existing rewrite.
             self.assertIn('dubious ownership', git('rev-parse', 'HEAD', check=False).stderr)
             rewrite = git('-c', 'safe.directory=' + str(checkout), 'config', '--get', env['GIT_CONFIG_KEY_0'])

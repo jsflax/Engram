@@ -138,6 +138,60 @@ jobs:
           swift build --package-path "$LINUX_ROOT/repo" --scratch-path "$LINUX_ROOT/root-build" \
             --cache-path "$LINUX_ROOT/cache" --config-path "$LINUX_ROOT/config" --security-path "$LINUX_ROOT/security" \
             --force-resolved-versions --target EngramMemoryCoreTests
+      - name: Record actual root Linux dependency graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY_GRAPH'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['LINUX_ROOT'])
+          repository, evidence = root / 'repo', root / 'evidence'
+          def read_record(path):
+              assert path.is_file() and not path.is_symlink(), str(path)
+              assert 0 < path.stat().st_size <= 16 * 1024 * 1024, str(path)
+              return path.read_bytes()
+          digest = lambda value: hashlib.sha256(value).hexdigest()
+          identity = json.loads(read_record(evidence / 'source-identity.json'))
+          assert identity['source_sha'] == os.environ['SOURCE_SHA']
+          assert identity['source_root'] == str(repository)
+          for name in ('Package.swift', '.github/workflows/linux-core.yml'):
+              assert digest(read_record(repository / name)) == identity['files_sha256'][name], name
+          before = read_record(repository / 'Package.resolved')
+          assert digest(before) == identity['resolved_sha256'], 'input lock drift before graph capture'
+          argv = ['swift', 'package', '--package-path', str(repository),
+                  '--scratch-path', str(root / 'root-build'), '--cache-path', str(root / 'cache'),
+                  '--config-path', str(root / 'config'), '--security-path', str(root / 'security'),
+                  '--force-resolved-versions', 'show-dependencies', '--format', 'json']
+          graph_path = evidence / 'resolved-graph.json'
+          with graph_path.open('xb') as output:
+              subprocess.run(argv, stdout=output, check=True, timeout=60)
+          after = read_record(repository / 'Package.resolved')
+          assert after == before, 'lock drift during graph capture'
+          for name in ('Package.swift', '.github/workflows/linux-core.yml'):
+              assert digest(read_record(repository / name)) == identity['files_sha256'][name], name
+          graph_bytes = read_record(graph_path)
+          workspace_bytes = read_record(root / 'root-build/workspace-state.json')
+          graph, workspace, lock = map(json.loads, (graph_bytes, workspace_bytes, after))
+          assert isinstance(graph, dict) and graph.get('path') == str(repository), 'wrong graph root'
+          assert isinstance(graph.get('dependencies'), list) and graph['dependencies'], 'empty graph'
+          assert isinstance(lock, dict) and isinstance(lock.get('pins'), list) and lock['pins'], 'empty lock'
+          assert isinstance(workspace, dict) and isinstance(workspace.get('object'), dict), 'invalid workspace'
+          dependencies = workspace['object'].get('dependencies')
+          assert isinstance(dependencies, list) and dependencies, 'empty workspace'
+          outputs = {'resolved-graph.json': graph_bytes, 'Package.resolved': after,
+                     'workspace-state.json': workspace_bytes}
+          for name in ('Package.resolved', 'workspace-state.json'):
+              with (evidence / name).open('xb') as output:
+                  output.write(outputs[name])
+          receipt = {'source_sha': identity['source_sha'], 'source_tree': identity['source_tree'],
+                     'manifest_sha256': identity['manifest_sha256'],
+                     'input_lock_sha256': identity['resolved_sha256'],
+                     'lock_before_sha256': digest(before), 'lock_after_sha256': digest(after),
+                     'lock_unchanged': True, 'argv': argv, 'command_timeout_seconds': 60,
+                     'files': {name: {'bytes': len(data), 'sha256': digest(data)}
+                               for name, data in outputs.items()}}
+          (evidence / 'resolved-graph-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          PY_GRAPH
       - name: Execute root memory and backend tests (Linux)
         shell: bash
         run: |
