@@ -340,6 +340,35 @@ if let storage = package.targets.first(where: { $0.name == "EngramLattice" }) {
     storage.dependencies.append(.product(name: "Crypto", package: "swift-crypto"))
     storage.dependencies.append(.target(name: "CEngramLedgerSQLite"))
 }
+
+// SwiftPM builds the package test graph before applying a test filter. Keep the
+// existing portable backend and core tests together without Apple-only targets.
+let linuxProducts: Set<String> = [
+    "EngramLattice", "EngramModels", "EngramMemoryCore", "EngramMemoryContract",
+]
+let linuxTargets: Set<String> = [
+    "EngramMemoryCore", "EngramMemoryCoreTests", "EngramProcessGuardFixture",
+    "EngramMemoryContract", "EngramModels", "EngramLattice", "EngramLatticeTests",
+    "EngramTestSupport", "EngramTestSupportTests", "EngramHooks", "CEngramLedgerSQLite",
+]
+package.products.removeAll { !linuxProducts.contains($0.name) }
+package.targets.removeAll { !linuxTargets.contains($0.name) }
+let appleOnlyDependencyLocations: Set<String> = [
+    "https://github.com/huggingface/swift-transformers",
+    "https://github.com/sparkle-project/Sparkle.git",
+    "https://github.com/google/GoogleSignIn-iOS.git",
+]
+package.dependencies.removeAll {
+    guard case .sourceControl(_, let location, _) = $0.kind else { return false }
+    return appleOnlyDependencyLocations.contains(location)
+}
+// Preserve the Linux remote Hooks backend without its macOS-only EngramKit edge.
+if let hooks = package.targets.first(where: { $0.name == "EngramHooks" }) {
+    hooks.dependencies = [
+        "EngramMemoryCore",
+        .product(name: "ArgumentParser", package: "swift-argument-parser"),
+    ]
+}
 #endif
 
 // Pure graph contracts retain their shared implementation and Apple-hosted exposure.
