@@ -28,6 +28,7 @@ let package = Package(
     platforms: [.macOS(.v15)],
     products: [
         .library(name: "EngramKit", targets: ["EngramKit"]),
+        .library(name: "EngramLattice", targets: ["EngramLattice"]),
         .library(name: "EngramModels", targets: ["EngramModels"]),
         .library(name: "EngramMemoryCore", targets: ["EngramMemoryCore"]),
         .library(name: "EngramMemoryContract", targets: ["EngramMemoryContract"]),
@@ -39,9 +40,10 @@ let package = Package(
     ],
     dependencies: [
         // Preserve the Codex client-capability decoding fix in the owned SDK.
-        .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.0"),
-        // Published checked transactions and matching Core/MCP requirements.
-        .package(url: "https://github.com/jsflax/lattice.git", exact: "2.2.5"),
+        .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.1"),
+        // Published protected legacy attachments and shared Linux notification listeners.
+        .package(url: "https://github.com/jsflax/lattice.git", from: "3.1.0"),
+        .package(url: "https://github.com/jsflax/LatticeCore.git", from: "3.1.1"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
@@ -72,7 +74,7 @@ let package = Package(
         // logic, and the Embedder seam. NO Apple-only frameworks, NO Lattice,
         // NO MCP — this module MUST build on Linux (it is what engram-server
         // consumes for the agents deployment). Apple conformances (CoreML
-        // embedder, NLTagger extractor, Lattice storage) live in EngramKit.
+        // embedder and NLTagger adapters) stay Apple-only; storage lives in EngramLattice.
         .target(
             name: "EngramMemoryCore"
         ),
@@ -108,11 +110,12 @@ let package = Package(
         .target(
             name: "EngramKit",
             dependencies: [
+                "EngramLattice",
+                .product(name: "SwiftLM", package: "SwiftLM"),
                 "EngramModels",
                 "EngramMemoryCore",
                 .product(name: "MCP", package: "swift-sdk"),
                 .product(name: "Lattice", package: "lattice"),
-                .product(name: "SwiftLM", package: "SwiftLM"),
             ],
             resources: [
                 .copy("Resources/paraphrase-MiniLM-L6-v2_Embedding.mlmodelc"),
@@ -241,12 +244,13 @@ let package = Package(
         .testTarget(
             name: "EngramTests",
             dependencies: [
-                "EngramTestSupport",
                 "EngramKit",
+                "EngramLattice",
+                .product(name: "SwiftLM", package: "SwiftLM"),
+                "EngramTestSupport",
                 "EngramMemoryCore",
                 "EngramMemoryContract",
                 .product(name: "Lattice", package: "lattice"),
-                .product(name: "SwiftLM", package: "SwiftLM"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
@@ -287,7 +291,30 @@ let package = Package(
 )
 
 package.targets.append(contentsOf: [
+    .target(name: "EngramLattice", dependencies: [
+        "EngramModels", "EngramMemoryCore",
+        .product(name: "MCP", package: "swift-sdk"),
+        .product(name: "Lattice", package: "lattice"),
+    ], swiftSettings: [.interoperabilityMode(.Cxx)],
+        linkerSettings: [.linkedFramework("NaturalLanguage", .when(platforms: [.macOS, .iOS]))]),
+    .testTarget(name: "EngramLatticeTests", dependencies: [
+        "EngramLattice", "EngramMemoryContract", "EngramTestSupport",
+    ], swiftSettings: [.interoperabilityMode(.Cxx)]),
     .target(name: "EngramTestSupport", path: "Tests/EngramTestSupport"),
     .testTarget(name: "EngramTestSupportTests", dependencies: ["EngramTestSupport"],
         path: "Tests/EngramTestSupportTests"),
 ])
+
+#if os(Linux)
+package.dependencies.append(.package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"))
+package.targets.append(.systemLibrary(name: "CEngramLedgerSQLite",
+    path: "SystemLibraries/CEngramLedgerSQLite", pkgConfig: "sqlite3",
+    providers: [.apt(["libsqlite3-dev"]), .brew(["sqlite"])]))
+if let tests = package.targets.first(where: { $0.name == "EngramLatticeTests" }) {
+    tests.dependencies.append(.target(name: "CEngramLedgerSQLite"))
+}
+if let storage = package.targets.first(where: { $0.name == "EngramLattice" }) {
+    storage.dependencies.append(.product(name: "Crypto", package: "swift-crypto"))
+    storage.dependencies.append(.target(name: "CEngramLedgerSQLite"))
+}
+#endif

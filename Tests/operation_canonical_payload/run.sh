@@ -17,7 +17,7 @@ xcrun swiftc -swift-version 6 -warnings-as-errors -parse-as-library \
     -target "$(uname -m)-apple-macosx15.0" \
     -I "$core_products" -L "$core_products" -lEngramMemoryCore \
     -module-cache-path "$output_dir/module-cache" \
-    "$repo_dir/Sources/EngramKit/MemoryOperationCanonicalPayload.swift" \
+    "$repo_dir/Sources/EngramLattice/MemoryOperationCanonicalPayload.swift" \
     "$test_dir/CanonicalPayloadTests.swift" \
     -o "$output_dir/canonical-payload-tests"
 reference_digest="$(python3 -B "$test_dir/reference_vector.py")"

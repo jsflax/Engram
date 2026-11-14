@@ -31,6 +31,11 @@ public final class HookState {
         /// Unix time of the last ADMITTED session-learner spawn (the
         /// spawn gate itself is file-based: SpawnAdmission). Visibility only.
         case learnerLastSpawnAt = "learner.lastSpawnAt"
+        /// Host-owned metadata travels with a scoped graph, never as a memory body.
+        case agentSessionLearningReceipt = "agent.sessionLearning.receipt"
+        case agentSessionLearningGate = "agent.sessionLearning.gate"
+        /// Append-only recovery metadata leaves the original uncertain receipt intact.
+        case agentSessionLearningRecovery = "agent.sessionLearning.recovery"
     }
 
     /// The state key.

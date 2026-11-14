@@ -43,7 +43,18 @@ extension MemoryTools: MemoryService {
         let result = try await handleRecall(args, bumpAccessStats: bumpAccessStats)
         // Snapshot both captures together before returning across another
         // await; advice must never consult a later call's actor state.
-        return (RecallResult(hits: lastRecallHits,
+        let hits = lastRecallHits.map { original in
+            var hit = original
+            if let sharedId = spokeResidentGroupId(hit.memory.id) {
+                hit.sourceGraphId = sharedId
+                hit.sourceGraphName = sharedGraphNames[sharedId]
+            } else if let graphBinding {
+                hit.sourceGraphId = graphBinding.graphId
+                hit.sourceGraphName = graphBinding.displayName
+            }
+            return hit
+        }
+        return (RecallResult(hits: hits,
                              mode: lastRecallMode,
                              renderedText: Self.text(from: result)), lastRecallRows)
     }
@@ -68,12 +79,12 @@ extension MemoryTools: MemoryService {
                                          query: String, budget: Int) -> AdviseResult {
         guard !recallResult.hits.isEmpty,
               recallResult.renderedText != "No memories found." else {
-            return AdviseResult(block: nil, memoryIds: [], mode: recallResult.mode)
+            return AdviseResult(block: nil, memoryIds: [], mode: recallResult.mode, query: query, hits: [])
         }
         let budget = max(0, budget)
         let overhead = AdviseAssembly.memorySection(renderedRecall: "", query: query).count
         guard budget > overhead else {
-            return AdviseResult(block: nil, memoryIds: [], mode: recallResult.mode)
+            return AdviseResult(block: nil, memoryIds: [], mode: recallResult.mode, query: query, hits: [])
         }
         let available = budget - overhead
         var rendered = recallResult.renderedText
@@ -86,12 +97,13 @@ extension MemoryTools: MemoryService {
         }
         let visibleIds = rows.filter { $0.markerEnd <= retainedCharacters }.map(\.id)
         guard !visibleIds.isEmpty else {
-            return AdviseResult(block: nil, memoryIds: [], mode: recallResult.mode)
+            return AdviseResult(block: nil, memoryIds: [], mode: recallResult.mode, query: query, hits: [])
         }
         return AdviseResult(
             block: AdviseAssembly.memorySection(renderedRecall: rendered, query: query),
             memoryIds: visibleIds,
-            mode: recallResult.mode)
+            mode: recallResult.mode, query: query,
+            hits: recallResult.hits.filter { visibleIds.contains($0.memory.id) })
     }
 
     public func graph(_ request: GraphRequest) async throws -> GraphResult {
@@ -131,7 +143,8 @@ extension MemoryTools: MemoryService {
             // Conflict-warning path: the handler declined to store.
             throw MemoryServiceError.invalidArguments(Self.text(from: result))
         }
-        return RememberResult(id: id, message: Self.text(from: result))
+        return RememberResult(id: id, message: Self.text(from: result),
+                              embeddingPending: lastRememberedEmbeddingPending)
     }
 
     public func update(_ request: UpdateRequest) async throws -> ToolReply {

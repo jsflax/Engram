@@ -341,7 +341,7 @@ extension MemoryTools {
         // Fetch all memories by globalId
         var sources: [(memory: Memory, lattice: Lattice)] = []
         for gid in ids {
-            guard let found = findMemory(id: gid) else {
+            guard let found = findWritableMemory(id: gid) else {
                 return CallTool.Result(content: [.text("Memory with id \(gid.uuidString) not found.")], isError: true)
             }
             sources.append(found)

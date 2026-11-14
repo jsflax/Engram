@@ -3,6 +3,22 @@ import Lattice
 import MCP
 import Foundation
 
+/// Per-instance diagnostic routes; callers remain synchronous inside MemoryTools.
+/// The public initializer retains the existing production writers.
+struct MemoryToolsDiagnostics: Sendable {
+    let log: @Sendable (String) -> Void
+    let sessionLog: @Sendable (String) -> Void
+    let appendSessionSaveLog: @Sendable (String?, String, String, String, String) -> Void
+
+    static let live = Self(
+        log: { EngramLattice.log($0) },
+        sessionLog: { EngramMemoryCore.sessionLog($0) },
+        appendSessionSaveLog: { sessionId, globalId, project, topic, preview in
+            EngramLattice.appendSessionSaveLog(sessionId: sessionId, globalId: globalId,
+                                               project: project, topic: topic, preview: preview)
+        })
+}
+
 /// Implements the MCP tool handlers for the Engram memory server.
 ///
 /// Tools:
@@ -18,6 +34,12 @@ import Foundation
 /// - **disconnect**: Remove edges by ID or by (from, to) pair.
 /// - **graph**: View a memory's neighborhood in the knowledge graph.
 public actor MemoryTools {
+    package let privateGraphOnly: Bool
+    package let graphBinding: AgentMemoryBinding?
+    package let sharedGraphNames: [UUID: String]
+    let diagnostics: MemoryToolsDiagnostics
+    var sessionLearningWriteIdentity: SessionLearningIdentity?
+
     /// Primary store for new memories, included in every composed read.
     /// Edits to existing memories use the store that owns the target row.
     package var localLattice: Lattice { requireDatabases().local }
@@ -94,6 +116,7 @@ public actor MemoryTools {
     var lastRecallRows: [RecallRowBoundary] = []
 
     /// The globalId of the last remembered row — same capture contract.
+    var lastRememberedEmbeddingPending = false
     var lastRememberedId: UUID?
 
     /// DTO mapping for the contract surface (never leaks live rows).
@@ -143,7 +166,33 @@ public actor MemoryTools {
                 groupRefs: [GroupSpokeRef] = [],
                 embedder: any Embedder,
                 identity: any IdentityProviding = GroupDirectoryIdentityProvider(),
-                enableLocalMutationOperations: Bool = false) {
+                enableLocalMutationOperations: Bool = false,
+                privateGraphOnly: Bool = false,
+                graphBinding: AgentMemoryBinding? = nil,
+                sharedGraphNames: [UUID: String] = [:]) {
+        self.init(localRef: localRef, syncedRef: syncedRef, groupRefs: groupRefs,
+                  embedder: embedder, identity: identity,
+                  enableLocalMutationOperations: enableLocalMutationOperations,
+                  privateGraphOnly: privateGraphOnly, graphBinding: graphBinding,
+                  sharedGraphNames: sharedGraphNames, diagnostics: .live)
+    }
+
+    /// Keep handle opening actor-isolated while allowing confined diagnostics.
+    init(localRef: LatticeThreadSafeReference,
+         syncedRef: LatticeThreadSafeReference?,
+         groupRefs: [GroupSpokeRef] = [],
+         embedder: any Embedder,
+         identity: any IdentityProviding = GroupDirectoryIdentityProvider(),
+         enableLocalMutationOperations: Bool = false,
+         privateGraphOnly: Bool = false,
+         graphBinding: AgentMemoryBinding? = nil,
+         sharedGraphNames: [UUID: String] = [:],
+         diagnostics: MemoryToolsDiagnostics) {
+        self.privateGraphOnly = privateGraphOnly
+        self.graphBinding = graphBinding
+        self.sharedGraphNames = sharedGraphNames
+        self.diagnostics = diagnostics
+        self.fenceForeignContent = privateGraphOnly
         self.localReference = localRef
         self.syncedReference = syncedRef
         self.groupReferences = groupRefs
@@ -545,6 +594,27 @@ public actor MemoryTools {
             }
         }
         return nil
+    }
+
+    /// Mutation lookups never traverse an agent's read-only recall sources.
+    func findWritableMemory(id: UUID) -> (memory: Memory, lattice: Lattice)? {
+        guard privateGraphOnly else { return findMemory(id: id) }
+        guard let memory = localLattice.objects(Memory.self).where({ $0.globalId == id }).first else { return nil }
+        return (memory, localLattice)
+    }
+
+    func findWritableEdge(id: UUID) -> (edge: Edge, lattice: Lattice)? {
+        guard privateGraphOnly else { return findEdge(id: id) }
+        guard let edge = localLattice.objects(Edge.self).where({ $0.globalId == id }).first else { return nil }
+        return (edge, localLattice)
+    }
+
+    func writeLattice(for project: String?) -> Lattice {
+        privateGraphOnly ? localLattice : readLattice(for: project)
+    }
+
+    var writableSpokes: [(groupId: UUID, path: String, lattice: Lattice)] {
+        privateGraphOnly ? [] : liveGroupSpokes()
     }
 
     /// Finds an edge by globalId: local, then synced, then group spokes.

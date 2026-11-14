@@ -111,7 +111,7 @@ extension MemoryTools {
         // Verify memories exist and determine project
         var memories: [UUID: Memory] = [:]
         for gid in ids {
-            guard let (mem, _) = findMemory(id: gid) else {
+            guard let (mem, _) = findWritableMemory(id: gid) else {
                 return CallTool.Result(content: [.text("Memory [id:\(gid.uuidString)] not found.")], isError: true)
             }
             memories[gid] = mem

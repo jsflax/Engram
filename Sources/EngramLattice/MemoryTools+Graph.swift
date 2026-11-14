@@ -25,10 +25,10 @@ extension MemoryTools {
         }
 
         // Validate both memories exist
-        guard findMemory(id: fromGid) != nil else {
+        guard findWritableMemory(id: fromGid) != nil else {
             return CallTool.Result(content: [.text("Memory with id \(fromGid.uuidString) not found.")], isError: true)
         }
-        guard findMemory(id: toGid) != nil else {
+        guard findWritableMemory(id: toGid) != nil else {
             return CallTool.Result(content: [.text("Memory with id \(toGid.uuidString) not found.")], isError: true)
         }
 
@@ -41,7 +41,10 @@ extension MemoryTools {
         if let edge = existing.first {
             let edgeGid = edge.globalId?.uuidString ?? "?"
             if edge.deletedAt != nil {
-                edge.deletedAt = nil
+                try LatticeBeginRetry.run(on: localLattice, log: { log("[connect] \($0)") }) {
+                    try requireSessionLearningWriteAdmission()
+                    edge.deletedAt = nil
+                }
                 log("Revived tombstoned edge [id:\(edgeGid)]")
                 return CallTool.Result(
                     content: [.text("Revived tombstoned edge (edge id: \(edgeGid), \(fromGid.uuidString) --[\(relation)]--> \(toGid.uuidString)).")],
@@ -61,6 +64,7 @@ extension MemoryTools {
         let edgeGid: UUID
         do {
             edgeGid = try LatticeBeginRetry.run(on: localLattice, log: { log("[connect] \($0)") }) {
+                try requireSessionLearningWriteAdmission()
                 try localLattice.add(edge)
                 guard let gid = edge.globalId else {
                     throw MCPError.internalError("Failed to persist edge — globalId is nil after add()")
@@ -88,7 +92,7 @@ extension MemoryTools {
         // (a hard edge delete replicates to every member); purely-local
         // edges keep the hard delete.
         if let edgeGid = a.id?.value {
-            guard let (edge, foundLattice) = findEdge(id: edgeGid) else {
+            guard let (edge, foundLattice) = findWritableEdge(id: edgeGid) else {
                 return CallTool.Result(content: [.text("Edge with id \(edgeGid.uuidString) not found.")], isError: true)
             }
             if edgeTouchesGroupSharedMemory(edge) {
@@ -113,10 +117,10 @@ extension MemoryTools {
         }
 
         // Validate memories exist
-        guard findMemory(id: fromGid) != nil else {
+        guard findWritableMemory(id: fromGid) != nil else {
             return CallTool.Result(content: [.text("Memory with id \(fromGid.uuidString) not found.")], isError: true)
         }
-        guard findMemory(id: toGid) != nil else {
+        guard findWritableMemory(id: toGid) != nil else {
             return CallTool.Result(content: [.text("Memory with id \(toGid.uuidString) not found.")], isError: true)
         }
 
@@ -157,7 +161,7 @@ extension MemoryTools {
     /// drives tombstone-vs-hard-delete for edge removal.
     func edgeTouchesGroupSharedMemory(_ edge: Edge) -> Bool {
         for gid in [edge.sourceGlobalId, edge.targetGlobalId] {
-            if let (mem, _) = findMemory(id: gid), isGroupShared(mem) {
+            if let (mem, _) = findWritableMemory(id: gid), isGroupShared(mem) {
                 return true
             }
         }
@@ -313,7 +317,7 @@ extension MemoryTools {
         var total = 0
         let now = Date()
         var lattices: [Lattice] = [localLattice]
-        if let syncedLattice { lattices.append(syncedLattice) }
+        if !privateGraphOnly, let syncedLattice { lattices.append(syncedLattice) }
         for lattice in lattices {
             for gid in globalIds {
                 let edges = lattice.objects(Edge.self)
@@ -337,7 +341,7 @@ extension MemoryTools {
     func reviveEdgesForMemory(_ gid: UUID) throws -> Int {
         var total = 0
         var lattices: [Lattice] = [localLattice]
-        if let syncedLattice { lattices.append(syncedLattice) }
+        if !privateGraphOnly, let syncedLattice { lattices.append(syncedLattice) }
         for lattice in lattices {
             let revived = try lattice.withTransaction {
                 let edges = lattice.objects(Edge.self)
@@ -346,7 +350,7 @@ extension MemoryTools {
                 var count = 0
                 for edge in edges {
                     let otherGid = edge.sourceGlobalId == gid ? edge.targetGlobalId : edge.sourceGlobalId
-                    guard let (other, _) = findMemory(id: otherGid), other.deletedAt == nil else { continue }
+                    guard let (other, _) = findWritableMemory(id: otherGid), other.deletedAt == nil else { continue }
                     edge.deletedAt = nil
                     count += 1
                 }

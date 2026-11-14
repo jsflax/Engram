@@ -2,7 +2,11 @@ import EngramMemoryCore
 import EngramModels
 import Foundation
 import Lattice
+#if canImport(SQLite3)
 import SQLite3
+#else
+import CEngramLedgerSQLite
+#endif
 
 /// Local-store operation ledger. Opening/registration must first pass
 /// `preflightLocalStore(at:)`; merely constructing this object advertises no
