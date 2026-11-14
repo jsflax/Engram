@@ -1,5 +1,5 @@
 {
-  "originHash" : "cb1b4b4dc3562c82ec48b6e5a09a9a29410577eee43871ccdb6689d3ba7d4f81",
+  "originHash" : "b6ceb5363e3c985aba96865c2129ada27a572333b0c45b054274927893534319",
   "pins" : [
     {
       "identity" : "appauth-ios",
@@ -78,8 +78,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/jsflax/lattice.git",
       "state" : {
-        "revision" : "a672e82bb9b6eb52305cbd1857721ce0908d7dc8",
-        "version" : "2.2.5"
+        "revision" : "3110b62ca549452f488ef517ba44ee7c42edd0e6",
+        "version" : "3.1.0"
       }
     },
     {
@@ -87,25 +87,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/jsflax/LatticeCore.git",
       "state" : {
-        "revision" : "543ad0be9d69b65f116c487483b05becb6707990",
-        "version" : "2.2.8"
-      }
-    },
-    {
-      "identity" : "mlx-swift",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/ml-explore/mlx-swift",
-      "state" : {
-        "revision" : "0bb916c67f4b9e5c682cbe02a42c701c93ab5021",
-        "version" : "0.31.6"
-      }
-    },
-    {
-      "identity" : "mlx-swift-lm",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/ml-explore/mlx-swift-lm",
-      "state" : {
-        "revision" : "e3cb1e1b4fb373391a414c33e9221516d02134ef"
+        "revision" : "4cc4085bd19b8da3efc8fb6127a4cad8af950fb7",
+        "version" : "3.1.1"
       }
     },
     {
@@ -327,10 +310,10 @@
     {
       "identity" : "swift-sdk",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/modelcontextprotocol/swift-sdk",
+      "location" : "https://github.com/jsflax/swift-sdk.git",
       "state" : {
-        "revision" : "a2c3c188951448150fe34e8b9a5b17b3b00ca4ac",
-        "version" : "0.13.0"
+        "revision" : "82951cc9cd05de216e8dd6425f951ce31d76fa0a",
+        "version" : "0.13.1"
       }
     },
     {
@@ -376,15 +359,6 @@
       "state" : {
         "revision" : "2fa33e1f5e7131a7fc64c28e6d161dcec0d24820",
         "version" : "1.3.3"
-      }
-    },
-    {
-      "identity" : "swiftlm",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/jsflax/SwiftLM.git",
-      "state" : {
-        "branch" : "main",
-        "revision" : "1d423512d267efa2c5108720fc9fbe3a789c80f6"
       }
     },
     {
