@@ -16,8 +16,10 @@ rm -f "$INSTALL_DIR/memory"
 rm -f "$INSTALL_DIR/memory-hooks"
 rm -f "$INSTALL_DIR/memory-sync"
 rm -rf "$INSTALL_DIR/Engram_EngramKit.bundle"
+rm -rf "$INSTALL_DIR/Engram_EngramCoreML.bundle"
 rm -rf "$INSTALL_DIR/swift-transformers_Hub.bundle"
 rm -rf "$INSTALL_DIR/SwiftLM_SwiftLM.bundle"
+rm -rf "$INSTALL_DIR/swift-crypto_Crypto.bundle"
 mkdir -p "$INSTALL_DIR"
 
 if [ "$1" = "--from-source" ]; then
@@ -30,7 +32,8 @@ if [ "$1" = "--from-source" ]; then
     cp .build/release/EngramDaemon "$INSTALL_DIR/memory-sync"
     cp -R .build/release/Engram_EngramKit.bundle "$INSTALL_DIR/"
     cp -R .build/release/swift-transformers_Hub.bundle "$INSTALL_DIR/"
-    cp -R .build/release/SwiftLM_SwiftLM.bundle "$INSTALL_DIR/"
+    cp -R .build/release/Engram_EngramCoreML.bundle "$INSTALL_DIR/"
+    cp -R .build/release/swift-crypto_Crypto.bundle "$INSTALL_DIR/"
     bash "$REPO_DIR/scripts/package_codex_learner.sh" "$INSTALL_DIR/codex"
     # Re-sign binaries — linker-signed ad-hoc binaries can be rejected by macOS Taskgated
     codesign --force --sign - "$INSTALL_DIR/memory"

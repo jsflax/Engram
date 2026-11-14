@@ -432,7 +432,7 @@ jobs:
           cp .build/release/EngramDaemon "$CLI_DIR/memory-sync"
           cp -R .build/release/Engram_EngramKit.bundle "$CLI_DIR/"
           cp -R .build/release/swift-transformers_Hub.bundle "$CLI_DIR/"
-          cp -R .build/release/SwiftLM_SwiftLM.bundle "$CLI_DIR/"
+          cp -R .build/release/Engram_EngramCoreML.bundle "$CLI_DIR/"
           cp -R .build/release/swift-crypto_Crypto.bundle "$CLI_DIR/"
           cp agents/*.md "$AGENTS_DIR/"
           cp -R skills "$CLI_DIR/skills"
@@ -483,7 +483,7 @@ jobs:
           fi
           cp -R .build/release/Engram_EngramKit.bundle build/staging/
           cp -R .build/release/swift-transformers_Hub.bundle build/staging/
-          cp -R .build/release/SwiftLM_SwiftLM.bundle build/staging/
+          cp -R .build/release/Engram_EngramCoreML.bundle build/staging/
           cp -R .build/release/swift-crypto_Crypto.bundle build/staging/
           cp agents/*.md build/staging/agents/
           cp -R skills build/staging/skills
