@@ -333,3 +333,21 @@ if let storage = package.targets.first(where: { $0.name == "EngramLattice" }) {
     storage.dependencies.append(.target(name: "CEngramLedgerSQLite"))
 }
 #endif
+
+// Pure graph contracts retain their shared implementation and Apple-hosted exposure.
+#if os(macOS)
+package.products.append(contentsOf: [
+    .library(name: "EngramGraphContract", targets: ["EngramGraphContract"]),
+    .library(name: "EngramHUDContract", targets: ["EngramHUDContract"]),
+])
+package.targets.append(contentsOf: [
+    .target(name: "EngramGraphContract",
+        path: "Packages/EngramGraphContracts/Sources/EngramGraphContract"),
+    .target(name: "EngramHUDContract", dependencies: ["EngramGraphContract"],
+        path: "Packages/EngramGraphContracts/Sources/EngramHUDContract"),
+    .testTarget(name: "EngramGraphContractTests", dependencies: ["EngramGraphContract"],
+        path: "Packages/EngramGraphContracts/Tests/EngramGraphContractTests"),
+    .testTarget(name: "EngramHUDContractTests", dependencies: ["EngramHUDContract", "EngramGraphContract"],
+        path: "Packages/EngramGraphContracts/Tests/EngramHUDContractTests"),
+])
+#endif
