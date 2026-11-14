@@ -102,6 +102,8 @@ def seed_preserved_row(store, expected, receipt):
     operation = receipt['operationID']
     with contextlib.closing(sqlite3.connect(store)) as db:
         db.create_function('sync_disabled', 0, lambda: 1)
+        # Simulate a current storage writer only for this disposable historical fixture setup.
+        db.create_function('lattice_storage_writer_epoch', 0, lambda: 9, deterministic=True)
         db.execute('BEGIN IMMEDIATE')
         try:
             require(db.execute('SELECT COUNT(*) FROM Memory').fetchone() == (1,), 'bootstrap_row_count')

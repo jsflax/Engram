@@ -32,6 +32,12 @@ class NativeResidualHarnessTests(unittest.TestCase):
             db.execute('INSERT INTO Memory VALUES(?,?,?)', (receipt['memoryIDs'][0], 'bootstrap', b'exact embedding'))
             db.execute('INSERT INTO EngramOperationReceiptV1 VALUES(?,?)',
                        (receipt['operationID'], json.dumps(receipt)))
+            # Match the native store's guards on the two synthetic setup writes.
+            for table, operation in (('Memory', 'UPDATE'), ('EngramOperationReceiptV1', 'DELETE')):
+                db.execute(f'''CREATE TRIGGER "_lattice_writer_v9_{table}_{operation}"
+                    BEFORE {operation} ON "{table}"
+                    BEGIN SELECT CASE WHEN lattice_storage_writer_epoch() != 9
+                    THEN RAISE(ABORT,'Lattice writer storage epoch mismatch') END; END''')
             db.commit()
         return store, receipt
 
@@ -56,11 +62,30 @@ class NativeResidualHarnessTests(unittest.TestCase):
 
     def test_seed_changes_only_known_fields_and_known_receipt(self):
         store, receipt = self.database()
+        guards = H.rows(store, "SELECT name, sql FROM sqlite_schema WHERE type='trigger' ORDER BY name")
         expected = {'globalId': str(uuid.uuid4()), 'content': 'synthetic historical append'}
         H.seed_preserved_row(store, expected, receipt)
         self.assertEqual(H.rows(store, 'SELECT * FROM Memory'),
                          [(expected['globalId'], expected['content'], b'exact embedding')])
         self.assertEqual(H.rows(store, 'SELECT * FROM EngramOperationReceiptV1'), [])
+        self.assertEqual(H.rows(store,
+            "SELECT name, sql FROM sqlite_schema WHERE type='trigger' ORDER BY name"), guards)
+
+    def test_unregistered_writer_is_refused_without_changing_rows_or_guards(self):
+        store, _ = self.database()
+        before = self.snapshot(store)
+        guards = H.rows(store, "SELECT name, sql FROM sqlite_schema WHERE type='trigger' ORDER BY name")
+        for sql in ("UPDATE Memory SET content='not written'", 'DELETE FROM EngramOperationReceiptV1'):
+            with self.subTest(sql=sql), contextlib.closing(sqlite3.connect(store)) as db:
+                db.create_function('sync_disabled', 0, lambda: 1)
+                db.execute('BEGIN IMMEDIATE')
+                with self.assertRaises(sqlite3.OperationalError) as refused:
+                    db.execute(sql)
+                self.assertEqual(str(refused.exception), 'no such function: lattice_storage_writer_epoch')
+                db.rollback()
+            self.assertEqual(self.snapshot(store), before)
+            self.assertEqual(H.rows(store,
+                "SELECT name, sql FROM sqlite_schema WHERE type='trigger' ORDER BY name"), guards)
 
     def test_seed_refuses_extra_row_before_mutation(self):
         store, receipt = self.database()
