@@ -23,6 +23,7 @@ public final class RKLabelAtlasGenerator {
     public var atlasTexture: TextureResource? { published?.texture }
     /// Changes only when a complete texture and its matching coordinates land.
     public private(set) var atlasVersion: UInt64 = 0
+    public var diagnosticAtlasCreations: UInt64 { atlasVersion }
 
     private struct PublishedAtlas {
         let texture: TextureResource
@@ -63,6 +64,8 @@ public final class RKLabelAtlasGenerator {
     public func cancelPendingBuilds() {
         builds.invalidate()
     }
+
+    public func drainPendingBuilds() async { await builds.drainPendingBuilds() }
 
     private func publish(_ raster: AtlasRaster) -> Bool {
         guard let texture = try? TextureResource(image: raster.image, options: .init(semantic: .raw)) else {

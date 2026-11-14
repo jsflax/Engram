@@ -25,11 +25,12 @@ var engramMetalShaders: PackageDescription.Target {
 
 let package = Package(
     name: "Engram",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS(.v15), .iOS(.v18)],
     products: [
         .library(name: "EngramKit", targets: ["EngramKit"]),
         .library(name: "EngramLattice", targets: ["EngramLattice"]),
         .library(name: "EngramCoreML", targets: ["EngramCoreML"]),
+        .library(name: "EngramGraphUI", targets: ["EngramGraphUI"]),
         .library(name: "EngramModels", targets: ["EngramModels"]),
         .library(name: "EngramMemoryCore", targets: ["EngramMemoryCore"]),
         .library(name: "EngramMemoryContract", targets: ["EngramMemoryContract"]),
@@ -237,7 +238,7 @@ let package = Package(
         ),
         .testTarget(
             name: "EngramRealityKitTests",
-            dependencies: ["EngramRealityKit"],
+            dependencies: ["EngramRealityKit", "EngramSceneKit", "EngramMetalShaders", "EngramTestSupport"],
             swiftSettings: [.interoperabilityMode(.Cxx)]
         ),
         .testTarget(
@@ -289,6 +290,8 @@ let package = Package(
     ]
 )
 
+// Reusable storage and embedding products share the desktop's model contracts.
+// Keep the desktop executables and their existing test graph at the root.
 package.targets.append(contentsOf: [
     .target(name: "EngramLattice", dependencies: [
         "EngramModels", "EngramMemoryCore",
@@ -307,6 +310,9 @@ package.targets.append(contentsOf: [
         .copy("Resources/Apache-2.0.txt"),
         .copy("Resources/SwiftLM-MIT.txt"),
     ]),
+    .target(name: "EngramGraphUI", dependencies: [
+        "EngramRealityKit", "EngramSceneKit", "EngramMetalShaders",
+    ], swiftSettings: [.interoperabilityMode(.Cxx)]),
     .testTarget(name: "EngramLatticeTests", dependencies: [
         "EngramLattice", "EngramMemoryContract", "EngramTestSupport",
     ], swiftSettings: [.interoperabilityMode(.Cxx)]),
@@ -314,6 +320,8 @@ package.targets.append(contentsOf: [
         "EngramCoreML", "EngramLattice", "EngramTestSupport",
     ], swiftSettings: [.interoperabilityMode(.Cxx)]),
     .testTarget(name: "EngramCoreMLParityTests", dependencies: ["EngramCoreML", "EngramKit"],
+        swiftSettings: [.interoperabilityMode(.Cxx)]),
+    .testTarget(name: "EngramGraphUITests", dependencies: ["EngramGraphUI", "EngramTestSupport"],
         swiftSettings: [.interoperabilityMode(.Cxx)]),
     .target(name: "EngramTestSupport", path: "Tests/EngramTestSupport"),
     .testTarget(name: "EngramTestSupportTests", dependencies: ["EngramTestSupport"],

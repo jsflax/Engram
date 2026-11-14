@@ -39,6 +39,10 @@ final class LabelAtlasBuildQueue {
         active?.task.cancel()
     }
 
+    func drainPendingBuilds() async {
+        while let task = active?.task { await task.value }
+    }
+
     private func startPendingIfIdle() {
         guard active == nil, let next = pending else { return }
         pending = nil

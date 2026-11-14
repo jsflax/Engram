@@ -70,7 +70,12 @@ enum MascotEntityFactory {
     /// Clone the prepared USDZ hierarchy. The authored model color is preserved;
     /// the project tint is applied to the separately created effect materials.
     static func loadMascotEntity(tint: SIMD3<Float>) async -> Entity? {
-        await modelCache.clone()
+        guard !Task.isCancelled else { return nil }
+        // Join the shared native load even if this caller is retired while it runs.
+        // Its cancellation must not cancel another project's cached model request.
+        let model = await modelCache.clone()
+        guard !Task.isCancelled else { return nil }
+        return model
     }
 
     /// Preserve main-bundle, module-bundle, then named-asset fallback order.
@@ -147,6 +152,7 @@ enum MascotEntityFactory {
             model.name = "MascotModel"
             group.addChild(model)
         }
+        guard !Task.isCancelled else { return group }
 
         // Arcane circle — flat disk child entity
         let arcaneCircle = createArcaneCircle(tint: tint)

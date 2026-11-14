@@ -5,7 +5,7 @@ import EngramSceneKit
 
 /// Instanced edge rendering — 6-sided cylinder per edge.
 ///
-/// Two code paths controlled by `#available(macOS 26, *)`:
+/// Two code paths controlled by `#available(macOS 26, iOS 26, *)`:
 /// - **macOS 26+**: `MeshInstanceCollection` — one unit cylinder template, N instance
 ///   transforms encoding position + rotation + scale. Visual data in `LowLevelTexture`.
 /// - **< macOS 26**: Single-buffer `LowLevelMesh` — full vertex data per edge (existing approach).
@@ -64,10 +64,10 @@ public final class EdgeBatchSystem {
             let hasEdges = !visibleSet.visibleEdgeIndices.isEmpty
             guard hasEdges else {
                 scene.edgeBatchEntity?.isEnabled = false
-                if #available(macOS 26, *) { scene.edgeTemplateEntity?.isEnabled = false }
+                if #available(macOS 26, iOS 26, *) { scene.edgeTemplateEntity?.isEnabled = false }
                 return true
             }
-            if #available(macOS 26, *) {
+            if #available(macOS 26, iOS 26, *) {
                 let updated = updateWithMeshInstances(
                     scene: scene, dataProvider: dataProvider,
                     visibleSet: visibleSet, scaleFactor: scaleFactor,
@@ -185,14 +185,15 @@ public final class EdgeBatchSystem {
             memset(&staging[usedVerts], 0, (totalVerts - usedVerts) * MemoryLayout<BatchVertex>.stride)
         }
 
-        // GPU-synchronized write
-        guard let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer() else { return false }
-        let destBuffer = mesh.replace(bufferIndex: 0, using: cmdBuf)
-        let dest = destBuffer.contents().bindMemory(to: BatchVertex.self, capacity: totalVerts)
-        staging.withUnsafeBufferPointer { src in
-            dest.update(from: src.baseAddress!, count: totalVerts)
+        // CPU staging uses the synchronous CPU replacement boundary. The GPU
+        // replacement API does not promise CPU-addressable contents on iOS.
+        mesh.replaceUnsafeMutableBytes(bufferIndex: 0) { destination in
+            staging.withUnsafeBytes { source in
+                let byteCount = totalVerts * MemoryLayout<BatchVertex>.stride
+                precondition(byteCount <= destination.count && byteCount <= source.count)
+                destination.baseAddress!.copyMemory(from: source.baseAddress!, byteCount: byteCount)
+            }
         }
-        if commandBuffer == nil { cmdBuf.commit() }
         return true
     }
 
@@ -201,7 +202,7 @@ public final class EdgeBatchSystem {
     /// MeshInstanceCollection path: one unit cylinder template, N instance transforms.
     /// Each transform encodes: translate(src) × rotate(Y→direction) × scale(radius, length, radius).
     /// Per-instance visual data (color, alpha) stored in a LowLevelTexture.
-    @available(macOS 26, *)
+    @available(macOS 26, iOS 26, *)
     private func updateWithMeshInstances(
         scene: EngramRealityScene,
         dataProvider: SceneDataProvider,
@@ -231,11 +232,14 @@ public final class EdgeBatchSystem {
         let positions = positionArray.count == nodes.count ? [:] : dataProvider.positions
 
         let texWidth = scene.edgeInstanceTextureWidth
+        let texHeight = (instanceData.instanceCapacity + texWidth - 1) / texWidth
+        let texelCount = texWidth * texHeight
         let bytesPerRow = texWidth * MemoryLayout<SIMD4<Float16>>.stride
+        let bytesPerImage = bytesPerRow * texHeight
         // Do not change transforms/slots while all staging buffers still have
         // GPU readers. The render cache will retry this same frame state.
         guard let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer(),
-              let upload = textureUploads.acquire(minimumCapacity: bytesPerRow, makeResource: {
+              let upload = textureUploads.acquire(minimumCapacity: bytesPerImage, makeResource: {
                   scene.device.makeBuffer(length: $0, options: .storageModeShared)
               }) else { return false }
         var uploadSubmitted = false
@@ -244,7 +248,7 @@ public final class EdgeBatchSystem {
         instanceValues.prepare(state: frameState, count: edges.count)
         var texData = textureData
         textureData = []
-        if texData.count != texWidth { texData = Array(repeating: .zero, count: texWidth) }
+        if texData.count != texelCount { texData = Array(repeating: .zero, count: texelCount) }
 
         // --- Stable slot maintenance (see NodeBatchSystem) ---
         let capacity = instanceData.instanceCapacity
@@ -298,13 +302,13 @@ public final class EdgeBatchSystem {
         do {
             let texMTL = instanceTexture.replace(using: cmdBuf)
             texData.withUnsafeBytes { ptr in
-                upload.resource.contents().copyMemory(from: ptr.baseAddress!, byteCount: bytesPerRow)
+                upload.resource.contents().copyMemory(from: ptr.baseAddress!, byteCount: bytesPerImage)
             }
             guard let blit = cmdBuf.makeBlitCommandEncoder() else { return false }
             blit.copy(
                 from: upload.resource, sourceOffset: 0,
-                sourceBytesPerRow: bytesPerRow, sourceBytesPerImage: bytesPerRow,
-                sourceSize: MTLSize(width: texWidth, height: 1, depth: 1),
+                sourceBytesPerRow: bytesPerRow, sourceBytesPerImage: bytesPerImage,
+                sourceSize: MTLSize(width: texWidth, height: texHeight, depth: 1),
                 to: texMTL, destinationSlice: 0, destinationLevel: 0,
                 destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
             )
