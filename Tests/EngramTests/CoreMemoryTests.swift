@@ -1,5 +1,6 @@
 import Testing
-import EngramKit
+@testable import EngramKit
+@testable import EngramLattice
 import struct EngramMemoryCore.StaticIdentityProvider
 import Lattice
 import MCP
@@ -537,20 +538,42 @@ import Foundation
     #expect(text(from: statsB).contains("Total memories: 1"))
 }
 
-@Test func remember_failsWithoutEmbeddingModel() async throws {
-    let path = FileManager.default.temporaryDirectory
-        .appending(path: "claude-memory-test-\(UUID().uuidString).sqlite")
-    let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, configuration: .init(fileURL: path))
-    let embedder = EmbeddingService(modelPath: "/nonexistent/path")
-    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder,
-        identity: StaticIdentityProvider(.anonymous))
-
-    await #expect(throws: MCPError.self) {
-        _ = try await tools.handle(CallTool.Parameters(
+@Test func remember_unloadedEmbeddingModelPersistsPendingMemory() async throws {
+    let directory = try testFixtureDirectory()
+        .appending(path: "pending-memory-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let path = directory.appending(path: "memory.sqlite")
+    let content = "Some important fact awaiting an embedding"
+    let id: UUID
+    do {
+        let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, configuration: .init(fileURL: path))
+        defer { lattice.close() }
+        // Deliberately leave the service unloaded; no model or provider is started.
+        let embedder = EmbeddingService(diagnosticSink: { _ in })
+        #expect(await embedder.isLoaded == false)
+        #expect(await embedder.dimension == 0)
+        let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder,
+            identity: StaticIdentityProvider(.anonymous),
+            diagnostics: .init(log: { _ in }, sessionLog: { _ in }, appendSessionSaveLog: { _, _, _, _, _ in }))
+        let result = try await tools.handle(CallTool.Parameters(
             name: "remember",
-            arguments: ["content": .string("Some important fact")]
+            arguments: ["content": .string(content)]
         ))
+        #expect(result.isError != true)
+        let returnedID = try #require(extractId(from: text(from: result)))
+        id = try #require(UUID(uuidString: returnedID))
+        #expect(await embedder.isLoaded == false)
+        #expect(await embedder.dimension == 0)
     }
+    let reopened = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, configuration: .init(fileURL: path))
+    defer { reopened.close() }
+    #expect(reopened.objects(Memory.self).count == 1)
+    let stored = try #require(reopened.object(Memory.self, globalId: id))
+    #expect(stored.globalId == id)
+    #expect(stored.content == content)
+    #expect(stored.embedding.isEmpty)
+    #expect(stored.embeddingPending == true)
 }
 
 @Test func remember_conflictDetection_lowTermOverlap_allows() async throws {
@@ -1217,21 +1240,45 @@ import Foundation
     #expect(output.contains("distance:"))
 }
 
-@Test func recall_fts5_degraded_noEmbeddings_failsOnRemember() async throws {
-    let path = FileManager.default.temporaryDirectory
-        .appending(path: "claude-memory-test-\(UUID().uuidString).sqlite")
+@Test func recall_fts5_unloadedEmbeddingModelFindsPendingMemory() async throws {
+    let directory = try testFixtureDirectory()
+        .appending(path: "pending-recall-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let path = directory.appending(path: "memory.sqlite")
     let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, configuration: .init(fileURL: path))
-    let embedder = EmbeddingService()
+    defer { lattice.close() }
+    // Deliberately leave the service unloaded so recall must use full-text search.
+    let embedder = EmbeddingService(diagnosticSink: { _ in })
+    #expect(await embedder.isLoaded == false)
+    #expect(await embedder.dimension == 0)
     let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder,
-        identity: StaticIdentityProvider(.anonymous))
+        identity: StaticIdentityProvider(.anonymous),
+        diagnostics: .init(log: { _ in }, sessionLog: { _ in }, appendSessionSaveLog: { _, _, _, _, _ in }))
 
-    // Without embedding model, remember should fail rather than store empty vectors
-    await #expect(throws: MCPError.self) {
-        _ = try await tools.handle(CallTool.Parameters(
-            name: "remember",
-            arguments: ["content": .string("The parseJSON function handles deserialization of API responses")]
-        ))
-    }
+    let content = "The amber otter parser handles deserialization of API responses"
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string(content)]
+    ))
+    #expect(result.isError != true)
+    let returnedID = try #require(extractId(from: text(from: result)))
+    let id = try #require(UUID(uuidString: returnedID))
+    #expect(lattice.objects(Memory.self).count == 1)
+    let stored = try #require(lattice.object(Memory.self, globalId: id))
+    #expect(stored.globalId == id)
+    #expect(stored.content == content)
+    #expect(stored.embedding.isEmpty)
+    #expect(stored.embeddingPending == true)
+
+    let recalled = try await tools.recall(.init(query: "amber otter", depth: 0))
+    #expect(recalled.mode == .fullText)
+    #expect(recalled.hits.count == 1)
+    let hit = try #require(recalled.hits.first)
+    #expect(hit.memory.id == id)
+    #expect(hit.memory.content == content)
+    #expect(await embedder.isLoaded == false)
+    #expect(await embedder.dimension == 0)
 }
 
 @Test func recall_fts5_rankInOutput() async throws {

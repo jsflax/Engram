@@ -37,7 +37,7 @@ void nodeGeometryTwoBuffer(realitykit::geometry_parameters params)
 /// Passes color to surface shader via set_color().
 
 [[visible]]
-void nodeGeometryInstanced(realitykit::geometry_parameters params) RK_AVAILABILITY_MACOS_16
+void nodeGeometryInstanced(realitykit::geometry_parameters params) RK_AVAILABILITY_IOS_19 RK_AVAILABILITY_MACOS_16
 {
     uint idx = params.geometry().instance_id();
     float texWidth = params.uniforms().custom_parameter().y;

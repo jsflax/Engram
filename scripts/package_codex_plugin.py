@@ -26,22 +26,25 @@ SKILLS = {"forget", "hook-status", "maintenance", "memory-status", "recall",
 HOOKS = {"SessionStart", "UserPromptSubmit", "SubagentStart", "PreToolUse",
          "PostToolUse", "Stop", "SubagentStop", "PreCompact", "SessionEnd"}
 BUNDLES = ("Engram_EngramKit.bundle", "swift-transformers_Hub.bundle",
-           "SwiftLM_SwiftLM.bundle", "swift-crypto_Crypto.bundle")
+           "Engram_EngramCoreML.bundle", "swift-crypto_Crypto.bundle")
 RESOURCE_FILES = {
     "Engram_EngramKit.bundle": (
         "memory-maintenance.md", "session-learner.md", "sync-reconciliation.md",
+        "RecallGateClassifier.mlmodelc/coremldata.bin",
+    ),
+    "Engram_EngramCoreML.bundle": (
         "paraphrase-MiniLM-L6-v2_tokenizer/vocab.txt",
         "paraphrase-MiniLM-L6-v2_tokenizer/tokenizer.json",
         "paraphrase-MiniLM-L6-v2_tokenizer/tokenizer_config.json",
         "paraphrase-MiniLM-L6-v2_tokenizer/special_tokens_map.json",
+        "paraphrase-MiniLM-L6-v2_Embedding.mlmodelc/analytics/coremldata.bin",
         "paraphrase-MiniLM-L6-v2_Embedding.mlmodelc/coremldata.bin",
+        "paraphrase-MiniLM-L6-v2_Embedding.mlmodelc/metadata.json",
         "paraphrase-MiniLM-L6-v2_Embedding.mlmodelc/model.mil",
         "paraphrase-MiniLM-L6-v2_Embedding.mlmodelc/weights/weight.bin",
-        "RecallGateClassifier.mlmodelc/coremldata.bin",
+        "NOTICE.txt", "Apache-2.0.txt", "SwiftLM-MIT.txt",
     ),
     "swift-transformers_Hub.bundle": ("t5_tokenizer_config.json", "gpt2_tokenizer_config.json"),
-    "SwiftLM_SwiftLM.bundle": ("qwen_tokenizer.json", "qwen_tokenizer_config.json",
-                            "llama_tokenizer.json", "llama_tokenizer_config.json"),
     "swift-crypto_Crypto.bundle": ("PrivacyInfo.xcprivacy",),
 }
 SOURCE_ROOTS = {".codex-plugin", ".mcp.json", "README.md", "LICENSE", "PROVENANCE.json",

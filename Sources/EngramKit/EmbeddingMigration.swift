@@ -112,6 +112,7 @@ public enum EmbeddingMigration {
             try lattice.transaction {
                 for (mem, floats) in pending {
                     mem.embedding = Vector<Float>(floats)
+                    mem.embeddingPending = false
                 }
             }
             report.reembedded += pending.count

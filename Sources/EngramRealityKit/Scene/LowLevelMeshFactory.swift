@@ -144,7 +144,7 @@ enum LowLevelMeshFactory {
         scene.nodeBatchMesh = mesh
         scene.nodeBatchCapacity = newCapacity
 
-        let material = MaterialFactory.makeNodeMaterial(device: scene.device)
+        let material = MaterialFactory.makeNodeMaterial(device: scene.device, onFallback: { [weak scene] in scene?.recordMaterialFallback("node") })
         assignBatchEntity(
             mesh: mesh,
             material: material,
@@ -209,7 +209,7 @@ enum LowLevelMeshFactory {
         scene.edgeBatchMesh = mesh
         scene.edgeBatchCapacity = newCapacity
 
-        let material = MaterialFactory.makeEdgeMaterial(device: scene.device)
+        let material = MaterialFactory.makeEdgeMaterial(device: scene.device, onFallback: { [weak scene] in scene?.recordMaterialFallback("edge") })
         assignBatchEntity(
             mesh: mesh,
             material: material,

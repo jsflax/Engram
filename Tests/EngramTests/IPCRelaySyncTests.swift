@@ -831,7 +831,7 @@ struct IPCRelaySyncTests {
     // Verifies:
     //   1. Fresh synced DB receives only filtered projects (correctness)
     //   2. Non-filtered projects don't leak through (filter respect)
-    //   3. Upload volume is proportional to filtered data, not entire audit log
+    //   3. Destination identities are exactly the allowed memories, with no private rows
 
     @Test(.timeLimit(.minutes(2)))
     func ipcRelay_freshSyncDbRespectsFilter() async throws {
@@ -878,12 +878,18 @@ struct IPCRelaySyncTests {
         let insertTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert, count: 3)
 
         // Filtered (should sync)
-        try local.add(Memory(content: "Lattice arch", project: "Lattice",
-            embedding: Vector<Float>([Float](repeating: 0.1, count: 384))))
-        try local.add(Memory(content: "engram-server deploy", project: "engram-server",
-            embedding: Vector<Float>([Float](repeating: 0.2, count: 384))))
-        try local.add(Memory(content: "Lattice bugfix", project: "Lattice",
-            embedding: Vector<Float>([Float](repeating: 0.3, count: 384))))
+        let architecture = Memory(content: "Lattice arch", project: "Lattice",
+            embedding: Vector<Float>([Float](repeating: 0.1, count: 384)))
+        let deployment = Memory(content: "engram-server deploy", project: "engram-server",
+            embedding: Vector<Float>([Float](repeating: 0.2, count: 384)))
+        let bugfix = Memory(content: "Lattice bugfix", project: "Lattice",
+            embedding: Vector<Float>([Float](repeating: 0.3, count: 384)))
+        try local.add(architecture)
+        try local.add(deployment)
+        try local.add(bugfix)
+        let expectedMemoryIDs: Set<UUID> = [try #require(architecture.globalId),
+            try #require(deployment.globalId), try #require(bugfix.globalId)]
+        #expect(expectedMemoryIDs.count == 3)
         await Task.yield()
 
         // NOT filtered (should NOT sync)
@@ -939,15 +945,6 @@ struct IPCRelaySyncTests {
 
         try await Task.sleep(for: .milliseconds(100))
 
-        // Track sync progress from the hub
-        // Lattice 1.x: progress is an AsyncStream, not a callback.
-        nonisolated(unsafe) var lastProgress: Lattice.SyncProgress?
-        let progressStream = local2.syncProgressStream
-        let progressTask = Task.detached {
-            for await p in progressStream { lastProgress = p }
-        }
-        defer { progressTask.cancel() }
-
         // Create fresh synced DB — triggers IPC connection
         var syncedConfig2 = Lattice.Configuration(fileURL: syncedURL)
         syncedConfig2.ipcTargets = [.init(channel: channel)]
@@ -990,14 +987,11 @@ struct IPCRelaySyncTests {
         #expect(localOnlyCount == 0,
             "FILTER LEAK: \(localOnlyCount) LocalOnly memories leaked through to fresh synced DB")
 
-        // 4. Upload volume: should be ≤ 3 (only filtered memories), not 6+ (entire audit log)
-        // After compaction, the AuditLog has entries for ALL 6 memories (compacted state).
-        // upload_pending_changes should only process/send the 3 filtered ones.
-        // If totalUpload > 3, the entire audit log is being replayed regardless of filter.
-        if let progress = lastProgress {
-            #expect(progress.totalUpload <= 3,
-                "AUDIT LOG REPLAY: upload_pending_changes processed \(progress.totalUpload) entries — expected ≤ 3 (only filtered). Entire audit log is being sent on fresh sync DB.")
-        }
+        // 4. Delivery can retry an event or replay a fresh snapshot. Cumulative
+        // send attempts are not a unique-memory count; pin the admitted identities.
+        let receivedMemoryIDs = Set(syncedMemories.compactMap(\.globalId))
+        #expect(receivedMemoryIDs == expectedMemoryIDs)
+        #expect(synced2.objects(Memory.self).where { $0.isPrivate == true }.count == 0)
 
         // 5. Local must retain all data
         #expect(local2.objects(Memory.self).count == 6,

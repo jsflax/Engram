@@ -13,7 +13,7 @@ struct BatchVertex {
 
 /// Instanced node rendering system.
 ///
-/// Two code paths controlled by `#available(macOS 26, *)`:
+/// Two code paths controlled by `#available(macOS 26, iOS 26, *)`:
 /// - **macOS 26+**: `MeshInstanceCollection` — true GPU instancing with per-instance
 ///   transforms and visual data in a `LowLevelTexture`.
 /// - **< macOS 26**: Two-buffer `LowLevelMesh` — buffer 0 holds static template geometry
@@ -62,7 +62,7 @@ public final class NodeBatchSystem {
         scaleFactor: Float,
         commandBuffer: MTLCommandBuffer? = nil
     ) {
-        if #available(macOS 26, *) {
+        if #available(macOS 26, iOS 26, *) {
             observeInstanceResources(scene: scene)
         }
         if previousNearNodes != visibleSet.nearNodes || previousMidNodes != visibleSet.midNodes || previousFarNodes != visibleSet.farNodes {
@@ -85,10 +85,10 @@ public final class NodeBatchSystem {
             let hasNodes = visibleSet.totalNodeCount > 0
             guard hasNodes else {
                 scene.nodeBatchEntity?.isEnabled = false
-                if #available(macOS 26, *) { scene.nodeTemplateEntity?.isEnabled = false }
+                if #available(macOS 26, iOS 26, *) { scene.nodeTemplateEntity?.isEnabled = false }
                 return true
             }
-            if #available(macOS 26, *) {
+            if #available(macOS 26, iOS 26, *) {
                 let updated = updateWithMeshInstances(
                     scene: scene, dataProvider: dataProvider,
                     visibleSet: visibleSet, animationTime: animationTime,
@@ -220,22 +220,21 @@ public final class NodeBatchSystem {
             }
         }
 
-        // GPU-synchronized write to buffer 1 only (buffer 0 is static template)
-        guard let cmdBuf = commandBuffer ?? scene.commandQueue.makeCommandBuffer() else { return false }
-        let destBuffer = mesh.replace(bufferIndex: 1, using: cmdBuf)
-        let dest = destBuffer.contents().bindMemory(
-            to: LowLevelMeshFactory.NodeInstanceAttribs.self, capacity: totalVerts
-        )
-        instanceStaging.withUnsafeBufferPointer { src in
-            dest.update(from: src.baseAddress!, count: totalVerts)
+        // CPU staging uses the synchronous CPU replacement boundary. The GPU
+        // replacement API does not promise CPU-addressable contents on iOS.
+        mesh.replaceUnsafeMutableBytes(bufferIndex: 1) { destination in
+            instanceStaging.withUnsafeBytes { source in
+                let byteCount = totalVerts * MemoryLayout<LowLevelMeshFactory.NodeInstanceAttribs>.stride
+                precondition(byteCount <= destination.count && byteCount <= source.count)
+                destination.baseAddress!.copyMemory(from: source.baseAddress!, byteCount: byteCount)
+            }
         }
-        if commandBuffer == nil { cmdBuf.commit() }
         return true
     }
 
     // MARK: - macOS 26+: MeshInstanceCollection
 
-    @available(macOS 26, *)
+    @available(macOS 26, iOS 26, *)
     private func observeInstanceResources(scene: EngramRealityScene, resetRenderCache: Bool = true) {
         var objects: [AnyObject] = []
         if let data = scene.nodeInstanceData { objects.append(data) }
@@ -253,7 +252,7 @@ public final class NodeBatchSystem {
     /// MeshInstanceCollection path: one sphere template mesh, N instance transforms.
     /// Per-instance visual data (color, alpha) stored in a LowLevelTexture sampled
     /// by the geometry modifier using instance_id().
-    @available(macOS 26, *)
+    @available(macOS 26, iOS 26, *)
     private func updateWithMeshInstances(
         scene: EngramRealityScene,
         dataProvider: SceneDataProvider,

@@ -401,7 +401,7 @@ class NoWriteContractTests(unittest.TestCase):
             self.assertIs(audit.records[-1]["ok"], False)
 
     def test_parser_contract_matches_native_source_and_packaged_copy(self):
-        native = (REPO_ROOT / "Sources/EngramKit/MemoryTools+Core.swift").read_text()
+        native = (REPO_ROOT / "Sources/EngramLattice/MemoryTools+Core.swift").read_text()
         start = native.index('var warning = ')
         end = native.index('return CallTool.Result(content: [.text(warning)], isError: false)', start)
         body = native[start:end]
@@ -500,7 +500,7 @@ class BeginBusyContractTests(unittest.TestCase):
     def test_exact_contract_extracted_from_native_source_is_accepted(self):
         # Read the shared producer and its actual call-site arguments. Keep the
         # independent expected contracts above so stored/updated drift fails.
-        source = (REPO_ROOT / "Sources/EngramKit/MemoryTools+Core.swift").read_text()
+        source = (REPO_ROOT / "Sources/EngramLattice/MemoryTools+Core.swift").read_text()
         pattern = (r'content: \[\.text\(("(?:\\.|[^"\\])*")\)\],\s*'
                    r'structuredContent: \.object\(\[\s*"engram_write_receipt": \.object\(\['
                    r'(.*?)\]\),\s*\]\),\s*isError: true')
