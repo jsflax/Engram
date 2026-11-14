@@ -74,6 +74,7 @@ extension MemoryTools {
             if let newContent, let newEmbedding {
                 memory.content = newContent
                 memory.embedding = Vector<Float>(newEmbedding)
+                memory.embeddingPending = false
             }
             if let topic = value.topic { memory.topic = topic }
             if let project = value.project { memory.project = project }
