@@ -7,8 +7,6 @@ import Testing
 @Suite("Embedded resource lifetime")
 @MainActor
 struct EmbeddedResourceLifetimeTests {
-    private enum FixtureFailure: Error { case missingExplicitRoot }
-
     @Test(.timeLimit(.minutes(1)))
     func retiredQueuedMascotLoadNeverEntersNativeLoader() async {
         let gate = ResourceLoadGate(), graph = ResourceFixtureGraph(), container = Entity()
@@ -59,11 +57,7 @@ struct EmbeddedResourceLifetimeTests {
 
     @Test(.timeLimit(.minutes(1)))
     func audioTeardownRemovesOnlyItsInjectedTemporaryFiles() throws {
-        let environment = ProcessInfo.processInfo.environment
-        guard environment["ENGRAM_TEST_FIXTURE_ROOT"] != nil else {
-            throw FixtureFailure.missingExplicitRoot
-        }
-        let directory = try EngramTestFixtureRoot.directory(environment: environment)
+        let directory = try EngramTestFixtureRoot.directory()
             .appendingPathComponent("embedded-audio-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }

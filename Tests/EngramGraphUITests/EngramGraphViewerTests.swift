@@ -10,14 +10,8 @@ import EngramTestSupport
 
 @Suite @MainActor
 struct EngramGraphViewerTests {
-    private enum FixtureFailure: Error { case missingExplicitRoot }
-
     private func makeController() throws -> EngramGraphViewerController {
-        let environment = ProcessInfo.processInfo.environment
-        guard environment["ENGRAM_TEST_FIXTURE_ROOT"] != nil else {
-            throw FixtureFailure.missingExplicitRoot
-        }
-        let directory = try EngramTestFixtureRoot.directory(environment: environment)
+        let directory = try EngramTestFixtureRoot.directory()
         return EngramGraphViewerController(audioTemporaryDirectory: directory)
     }
 
