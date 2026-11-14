@@ -189,7 +189,7 @@ public enum AgentMemoryTransfer {
         var counts: [String: Int] = [:]; var total = 0
         try hasher.append(["engram-memory-transfer", number(formatVersion), number(AgentMemorySchema.currentVersion)])
         func table<T: Model>(_ type: T.Type, fields: (T) -> [String]) throws {
-            let query = lattice.objects(type).sortedBy("globalId")
+            let query = lattice.objects(type).sortedBy(\.globalId)
             guard query.count <= limits.maximumRecords - total else {
                 throw MemoryServiceError.invalidArguments("Memory transfer exceeds its record verification limit")
             }
