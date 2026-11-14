@@ -154,6 +154,55 @@ struct EmbeddingMigrationTests {
         }
     }
 
+    @Test func sweepCommitsPendingVectorAndClearsPendingStateBeforeReplay() async throws {
+        let (lattice, url) = try makeLattice()
+        defer {
+            lattice.close()
+            try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+        }
+        let content = "pending memories become searchable after embedding migration"
+        let pending = Memory(content: content, topic: "general", project: "demo",
+                             embeddingPending: true)
+        try lattice.add(pending)
+        let id = try #require(pending.globalId)
+        #expect(pending.embeddingPending == true)
+        #expect(pending.embedding.isEmpty)
+        #expect(EmbeddingMigration.storedVersion(in: lattice) == 1)
+
+        let report = try await EmbeddingMigration.runIfNeeded(
+            on: lattice, embedder: sharedEmbedder, log: { _ in })
+        #expect(!report.skipped)
+        #expect(report.reembedded == 1)
+        #expect(report.failed == 0)
+        let expectedValue = try await sharedEmbedder.embed(text: content)
+        let expected = try #require(expectedValue)
+
+        // Reopen the file so both readiness and the vector are committed storage evidence.
+        lattice.close()
+        let reopened = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self,
+                                   SyncConfig.self, configuration: .init(fileURL: url))
+        defer { reopened.close() }
+        let committedValue = reopened.objects(Memory.self).where { $0.globalId == id }.first
+        let committed = try #require(committedValue)
+        let vector = Array(committed.embedding)
+        #expect(committed.embeddingPending == false)
+        #expect(vector.count == expected.count)
+        #expect(vector.count == 384)
+        #expect(zip(vector, expected).map(*).reduce(0, +) > 0.999)
+        #expect(EmbeddingMigration.storedVersion(in: reopened) == EmbeddingSpace.currentVersion)
+
+        let replay = try await EmbeddingMigration.runIfNeeded(
+            on: reopened, embedder: sharedEmbedder, log: { _ in })
+        #expect(replay.skipped)
+        #expect(replay.reembedded == 0)
+        #expect(replay.failed == 0)
+        let unchangedValue = reopened.objects(Memory.self).where { $0.globalId == id }.first
+        let unchanged = try #require(unchangedValue)
+        #expect(unchanged.embeddingPending == false)
+        #expect(Array(unchanged.embedding) == vector)
+        #expect(EmbeddingMigration.storedVersion(in: reopened) == EmbeddingSpace.currentVersion)
+    }
+
     @Test func sweepIsANoOpWhenMarkerCurrent() async throws {
         let (lattice, _) = try makeLattice()
         try lattice.add(Memory(content: "already migrated row", topic: "general",
