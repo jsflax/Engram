@@ -513,6 +513,7 @@ class PersistenceHarnessTests(unittest.TestCase):
             db.execute("CREATE TABLE _SyncControl(id INTEGER PRIMARY KEY, disabled INTEGER)")
             db.execute("INSERT INTO _SyncControl VALUES (1, 0)")
             db.execute("CREATE TABLE _lattice_meta(key TEXT, value TEXT)")
+            db.execute("CREATE TABLE _lattice_replication_slots(sync_id TEXT PRIMARY KEY)")
             db.execute("CREATE TABLE AuditLog(id INTEGER PRIMARY KEY AUTOINCREMENT, tableName TEXT, operation TEXT, rowId INTEGER, globalRowId TEXT, changedFields TEXT, changedFieldsNames TEXT, timestamp REAL)")
             db.execute("INSERT INTO AuditLog(tableName, operation, rowId, globalRowId) VALUES ('Memory', 'INSERT', 1, ?)", (ID,))
             # Match Core's generated DELETE guard and audit fields. No UDF is
@@ -526,6 +527,14 @@ class PersistenceHarnessTests(unittest.TestCase):
                                         'formatVersion', OLD.formatVersion),
                             json_array('singletonKey', 'storeID', 'formatVersion'), unixepoch('subsec'));
                 END""")
+            # Match the current storage guards for the two synthetic setup writes.
+            # Audit suppression alone must not authorize either mutation.
+            for table, operation in (("EngramOperationStoreV1", "DELETE"),
+                                     ("_lattice_replication_slots", "INSERT")):
+                db.execute(f'''CREATE TRIGGER "_lattice_writer_v9_{table}_{operation}"
+                    BEFORE {operation} ON "{table}"
+                    BEGIN SELECT CASE WHEN lattice_storage_writer_epoch() != 9
+                    THEN RAISE(ABORT,'Lattice writer storage epoch mismatch') END; END''')
             cookie = db.execute("PRAGMA schema_version").fetchone()[0]
             db.execute("INSERT INTO _lattice_meta VALUES ('schema_fingerprint:fixture', ?)", (str(cookie),))
             db.commit()
@@ -536,12 +545,15 @@ class PersistenceHarnessTests(unittest.TestCase):
             path = self.guarded_startup_fixture(directory)
             with contextlib.closing(sqlite3.connect(path)) as db:
                 before = list(db.iterdump())
-                with self.assertRaisesRegex(sqlite3.OperationalError, "no such function: sync_disabled"):
+                db.create_function("sync_disabled", 0, lambda: 1)
+                with self.assertRaises(sqlite3.OperationalError) as refused:
                     db.execute("DELETE FROM EngramOperationStoreV1")
+                self.assertEqual(str(refused.exception), "no such function: lattice_storage_writer_epoch")
                 db.rollback()
                 self.assertEqual(list(db.iterdump()), before)
                 # The existing trigger still audits ordinary, non-disabled
                 # deletes. Roll back this probe before exercising setup.
+                db.create_function("lattice_storage_writer_epoch", 0, lambda: 9, deterministic=True)
                 db.create_function("sync_disabled", 0, lambda: 0)
                 db.execute("DELETE FROM EngramOperationStoreV1")
                 self.assertEqual(db.execute("SELECT operation FROM AuditLog ORDER BY id").fetchall(), [("INSERT",), ("DELETE",)])
@@ -554,6 +566,35 @@ class PersistenceHarnessTests(unittest.TestCase):
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM EngramOperationStoreV1").fetchone()[0], 0)
                 with self.assertRaisesRegex(sqlite3.OperationalError, "no such function: sync_disabled"):
                     db.execute("SELECT sync_disabled()")
+                with self.assertRaises(sqlite3.OperationalError) as refused:
+                    db.execute("SELECT lattice_storage_writer_epoch()")
+                self.assertEqual(str(refused.exception), "no such function: lattice_storage_writer_epoch")
+
+    def test_slot_setup_keeps_storage_guard_and_requires_connection_local_writer(self):
+        with self.temporary_directory() as directory:
+            path = self.guarded_startup_fixture(directory)
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                before = list(db.iterdump())
+                with self.assertRaises(sqlite3.OperationalError) as refused:
+                    db.execute("INSERT INTO _lattice_replication_slots VALUES ('synthetic-slot')")
+                self.assertEqual(str(refused.exception), "no such function: lattice_storage_writer_epoch")
+                db.rollback()
+                self.assertEqual(list(db.iterdump()), before)
+                # Simulate a current writer constructing one synthetic sync slot.
+                HARNESS.register_fixture_storage_writer(db)
+                db.execute("INSERT INTO _lattice_replication_slots VALUES ('synthetic-slot')")
+                db.commit()
+                after = list(db.iterdump())
+                self.assertEqual([line for line in after if not line.startswith(
+                    'INSERT INTO "_lattice_replication_slots"')], before)
+                self.assertEqual(db.execute("SELECT sync_id FROM _lattice_replication_slots").fetchall(),
+                                 [("synthetic-slot",)])
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                with self.assertRaises(sqlite3.OperationalError) as refused:
+                    db.execute("INSERT INTO _lattice_replication_slots VALUES ('unregistered-slot')")
+                self.assertEqual(str(refused.exception), "no such function: lattice_storage_writer_epoch")
+                db.rollback()
+                self.assertEqual(list(db.iterdump()), after)
 
     def test_startup_identity_removal_refuses_unsafe_fixture_preconditions(self):
         for mutation in ("INSERT INTO EngramOperationReceiptV1 VALUES (1)",

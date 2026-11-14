@@ -1,13 +1,22 @@
-// Color conversion utilities — requires AppKit (macOS only).
+// Platform color adapters for the shared scene renderer.
 
 import SwiftUI
 import simd
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
 
 /// Convert a SwiftUI Color to SIMD3<Float> via sRGB extraction.
 public func colorToSIMD3(_ color: Color) -> SIMD3<Float> {
-    let nsColor = NSColor(color).usingColorSpace(.sRGB) ?? NSColor(color)
+    #if os(macOS)
+    let platformColor = NSColor(color).usingColorSpace(.sRGB) ?? NSColor(color)
+    #else
+    let platformColor = UIColor(color)
+    #endif
     var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-    nsColor.getRed(&r, green: &g, blue: &b, alpha: &a)
+    platformColor.getRed(&r, green: &g, blue: &b, alpha: &a)
     return SIMD3<Float>(Float(r), Float(g), Float(b))
 }
 

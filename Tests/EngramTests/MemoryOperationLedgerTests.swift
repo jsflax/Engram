@@ -1,4 +1,5 @@
 @testable import EngramKit
+@testable import EngramLattice
 import EngramMemoryCore
 import EngramModels
 import Foundation

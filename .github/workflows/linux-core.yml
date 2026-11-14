@@ -1,12 +1,9 @@
-name: Linux — EngramMemoryCore
+name: Linux — MemoryCore and Lattice backend
 
-# The portable memory contract (EngramMemoryCore) is what engram-server's
-# agents deployment consumes on Linux. This gate keeps it Linux-clean —
-# no CoreML, no NaturalLanguage, no Lattice, no MCP may creep in.
-#
-# The root test graph includes Apple-only targets. Keep the root product/test
-# compilation checks, then execute exact copied portable sources and tests in
-# a dependency-free package, including real lifetime-lock subprocess cases.
+# EngramMemoryCore remains the dependency-free portable memory contract.
+# The Linux root graph also retains the existing Lattice backend, its contract
+# tests, fixture support and Linux EngramHooks. Execute that graph directly;
+# no copied-source package or Apple-only target participates.
 
 on:
   workflow_call:
@@ -19,7 +16,14 @@ on:
       - "Sources/EngramMemoryCore/**"
       - "Tests/EngramMemoryCoreTests/**"
       - "Tests/Fixtures/ProcessGuard/**"
-      - "scripts/prepare_portable_core_tests.py"
+      - "Sources/EngramMemoryContract/**"
+      - "Sources/EngramModels/**"
+      - "Sources/EngramLattice/**"
+      - "Sources/EngramHooks/**"
+      - "Tests/EngramLatticeTests/**"
+      - "Tests/EngramTestSupport/**"
+      - "Tests/EngramTestSupportTests/**"
+      - "SystemLibraries/CEngramLedgerSQLite/**"
       - "Package.swift"
       - "Package.resolved"
       - ".github/workflows/linux-core.yml"
@@ -29,7 +33,14 @@ on:
       - "Sources/EngramMemoryCore/**"
       - "Tests/EngramMemoryCoreTests/**"
       - "Tests/Fixtures/ProcessGuard/**"
-      - "scripts/prepare_portable_core_tests.py"
+      - "Sources/EngramMemoryContract/**"
+      - "Sources/EngramModels/**"
+      - "Sources/EngramLattice/**"
+      - "Sources/EngramHooks/**"
+      - "Tests/EngramLatticeTests/**"
+      - "Tests/EngramTestSupport/**"
+      - "Tests/EngramTestSupportTests/**"
+      - "SystemLibraries/CEngramLedgerSQLite/**"
       - "Package.swift"
       - "Package.resolved"
       - ".github/workflows/linux-core.yml"
@@ -56,25 +67,67 @@ jobs:
           set -euo pipefail
           test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$SOURCE_SHA"
           task_root="$HOME/localdev/engram-linux-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -m 700 -p "$task_root"/{repo,tmp,cache,config,security,module-cache,evidence}
+          mkdir -m 700 -p "$task_root"/{repo,tmp,fixtures,cache,config,security,module-cache,evidence}
           git -c safe.directory="$GITHUB_WORKSPACE" archive HEAD | tar -x -C "$task_root/repo"
+          git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD^{tree} > "$task_root/evidence/source-tree.txt"
           {
             echo "LINUX_ROOT=$task_root"
             echo "TMPDIR=$task_root/tmp"
             echo "ENGRAM_TEST_TMPDIR=$task_root/tmp"
+            echo "ENGRAM_TEST_FIXTURE_ROOT=$task_root/fixtures"
             echo "CLANG_MODULE_CACHE_PATH=$task_root/module-cache"
             echo "SWIFTPM_MODULECACHE_OVERRIDE=$task_root/module-cache"
             echo "PYTHONDONTWRITEBYTECODE=1"
           } >> "$GITHUB_ENV"
           swift --version > "$task_root/evidence/swift-version.txt"
-      - name: Install portable test Python runtime
+      - name: Install portable test prerequisites
         timeout-minutes: 3
         shell: bash
         run: |
           set -euo pipefail
           apt-get update
-          apt-get install --no-install-recommends -y python3
+          apt-get install --no-install-recommends -y python3 libsqlite3-dev pkg-config
           python3 --version
+      - name: Record exact root Linux source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY_SOURCE'
+          import hashlib, json, os, pathlib, re
+          root = pathlib.Path(os.environ['LINUX_ROOT'])
+          repository = root / 'repo'
+          source_sha = os.environ['SOURCE_SHA']
+          assert re.fullmatch(r'[0-9a-f]{40}', source_sha)
+          directories = (
+              'Sources/EngramMemoryCore', 'Sources/EngramMemoryContract',
+              'Sources/EngramModels', 'Sources/EngramLattice', 'Sources/EngramHooks',
+              'Tests/Fixtures/ProcessGuard', 'Tests/EngramMemoryCoreTests',
+              'Tests/EngramLatticeTests', 'Tests/EngramTestSupport',
+              'Tests/EngramTestSupportTests', 'SystemLibraries/CEngramLedgerSQLite',
+          )
+          files = [repository / name for name in
+                   ('Package.swift', 'Package.resolved', '.github/workflows/linux-core.yml')]
+          for relative in directories:
+              directory = repository / relative
+              assert directory.is_dir() and not directory.is_symlink(), relative
+              for path in sorted(directory.rglob('*')):
+                  assert not path.is_symlink(), str(path)
+                  if path.is_file():
+                      files.append(path)
+          hashes = {}
+          for path in files:
+              assert path.is_file() and not path.is_symlink(), str(path)
+              hashes[path.relative_to(repository).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+          identity = {
+              'source_root': str(repository), 'source_sha': source_sha,
+              'source_tree': (root / 'evidence/source-tree.txt').read_text().strip(),
+              'files_sha256': hashes,
+              'manifest_sha256': hashes['Package.swift'],
+              'resolved_sha256': hashes['Package.resolved'],
+              'execution_root': 'original archived root package; no staged source package',
+          }
+          (root / 'evidence/source-identity.json').write_text(json.dumps(identity, indent=2) + '\n')
+          PY_SOURCE
       - name: Build EngramMemoryCore (Linux)
         run: |
           swift build --package-path "$LINUX_ROOT/repo" --scratch-path "$LINUX_ROOT/root-build" \
@@ -85,23 +138,75 @@ jobs:
           swift build --package-path "$LINUX_ROOT/repo" --scratch-path "$LINUX_ROOT/root-build" \
             --cache-path "$LINUX_ROOT/cache" --config-path "$LINUX_ROOT/config" --security-path "$LINUX_ROOT/security" \
             --force-resolved-versions --target EngramMemoryCoreTests
-      - name: Execute exact portable core tests (Linux)
+      - name: Record actual root Linux dependency graph
         shell: bash
         run: |
           set -euo pipefail
-          python3 -B "$LINUX_ROOT/repo/scripts/prepare_portable_core_tests.py" \
-            --repository "$LINUX_ROOT/repo" --destination "$LINUX_ROOT/portable" --source-sha "$SOURCE_SHA"
-          guard_bin="$(swift build --package-path "$LINUX_ROOT/portable" --scratch-path "$LINUX_ROOT/portable-build" \
+          python3 -B - <<'PY_GRAPH'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['LINUX_ROOT'])
+          repository, evidence = root / 'repo', root / 'evidence'
+          def read_record(path):
+              assert path.is_file() and not path.is_symlink(), str(path)
+              assert 0 < path.stat().st_size <= 16 * 1024 * 1024, str(path)
+              return path.read_bytes()
+          digest = lambda value: hashlib.sha256(value).hexdigest()
+          identity = json.loads(read_record(evidence / 'source-identity.json'))
+          assert identity['source_sha'] == os.environ['SOURCE_SHA']
+          assert identity['source_root'] == str(repository)
+          for name in ('Package.swift', '.github/workflows/linux-core.yml'):
+              assert digest(read_record(repository / name)) == identity['files_sha256'][name], name
+          before = read_record(repository / 'Package.resolved')
+          assert digest(before) == identity['resolved_sha256'], 'input lock drift before graph capture'
+          argv = ['swift', 'package', '--package-path', str(repository),
+                  '--scratch-path', str(root / 'root-build'), '--cache-path', str(root / 'cache'),
+                  '--config-path', str(root / 'config'), '--security-path', str(root / 'security'),
+                  '--force-resolved-versions', 'show-dependencies', '--format', 'json']
+          graph_path = evidence / 'resolved-graph.json'
+          with graph_path.open('xb') as output:
+              subprocess.run(argv, stdout=output, check=True, timeout=60)
+          after = read_record(repository / 'Package.resolved')
+          assert after == before, 'lock drift during graph capture'
+          for name in ('Package.swift', '.github/workflows/linux-core.yml'):
+              assert digest(read_record(repository / name)) == identity['files_sha256'][name], name
+          graph_bytes = read_record(graph_path)
+          workspace_bytes = read_record(root / 'root-build/workspace-state.json')
+          graph, workspace, lock = map(json.loads, (graph_bytes, workspace_bytes, after))
+          assert isinstance(graph, dict) and graph.get('path') == str(repository), 'wrong graph root'
+          assert isinstance(graph.get('dependencies'), list) and graph['dependencies'], 'empty graph'
+          assert isinstance(lock, dict) and isinstance(lock.get('pins'), list) and lock['pins'], 'empty lock'
+          assert isinstance(workspace, dict) and isinstance(workspace.get('object'), dict), 'invalid workspace'
+          dependencies = workspace['object'].get('dependencies')
+          assert isinstance(dependencies, list) and dependencies, 'empty workspace'
+          outputs = {'resolved-graph.json': graph_bytes, 'Package.resolved': after,
+                     'workspace-state.json': workspace_bytes}
+          for name in ('Package.resolved', 'workspace-state.json'):
+              with (evidence / name).open('xb') as output:
+                  output.write(outputs[name])
+          receipt = {'source_sha': identity['source_sha'], 'source_tree': identity['source_tree'],
+                     'manifest_sha256': identity['manifest_sha256'],
+                     'input_lock_sha256': identity['resolved_sha256'],
+                     'lock_before_sha256': digest(before), 'lock_after_sha256': digest(after),
+                     'lock_unchanged': True, 'argv': argv, 'command_timeout_seconds': 60,
+                     'files': {name: {'bytes': len(data), 'sha256': digest(data)}
+                               for name, data in outputs.items()}}
+          (evidence / 'resolved-graph-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          PY_GRAPH
+      - name: Execute root memory and backend tests (Linux)
+        shell: bash
+        run: |
+          set -euo pipefail
+          guard_bin="$(swift build --package-path "$LINUX_ROOT/repo" --scratch-path "$LINUX_ROOT/root-build" \
             --cache-path "$LINUX_ROOT/cache" --config-path "$LINUX_ROOT/config" --security-path "$LINUX_ROOT/security" \
-            --show-bin-path)/EngramProcessGuardFixture"
+            --force-resolved-versions --show-bin-path)/EngramProcessGuardFixture"
           export ENGRAM_TEST_PROCESS_GUARD="$guard_bin"
-          swift test --package-path "$LINUX_ROOT/portable" --scratch-path "$LINUX_ROOT/portable-build" \
+          swift test --package-path "$LINUX_ROOT/repo" --scratch-path "$LINUX_ROOT/root-build" \
             --cache-path "$LINUX_ROOT/cache" --config-path "$LINUX_ROOT/config" --security-path "$LINUX_ROOT/security" \
-            --no-parallel 2>&1 | tee "$LINUX_ROOT/evidence/portable-tests.log"
+            --force-resolved-versions --no-parallel 2>&1 | tee "$LINUX_ROOT/evidence/root-tests.log"
           python3 -B - <<'PY'
           import os, pathlib, re
           root = pathlib.Path(os.environ['LINUX_ROOT'])
-          output = (root / 'evidence/portable-tests.log').read_text()
+          output = (root / 'evidence/root-tests.log').read_text()
           output = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', output)
           required = {
               'detachedShellOwnsLeaseUntilProviderExitEvenWhenProviderClosesFD',
@@ -113,18 +218,18 @@ jobs:
               'timeoutReapsTermIgnoringProviderBeforeReleasingLease',
               'cancellationEscalatesWithoutDroppingProviderLease',
               'wrapperDeathAndProviderFDClosureDoNotReleaseGuardLease',
+              'contractHoldsOnLattice',
           }
           passed = set(re.findall(r'^✔ Test (\w+)\(\) passed after ', output, re.M))
           assert required <= passed, f'Missing required runtime passes: {required - passed}'
           assert re.search(r'^✔ Test run with [1-9]\d* tests? .*passed after ', output, re.M)
           assert not re.search(r'^.*(?:Test|Suite) .+ (?:failed|skipped)\b', output, re.M)
           PY
-      - name: Upload portable qualification evidence
+      - name: Upload root Linux qualification evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: linux-portable-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ env.LINUX_ROOT }}/evidence/
-            ${{ env.LINUX_ROOT }}/portable/source-identity.json
           if-no-files-found: error

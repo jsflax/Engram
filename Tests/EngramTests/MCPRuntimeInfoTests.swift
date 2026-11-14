@@ -1,5 +1,6 @@
 import Darwin
 import EngramKit
+@testable import EngramLattice
 import EngramMemoryCore
 import Foundation
 import Lattice

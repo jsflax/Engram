@@ -5,6 +5,7 @@ import Lattice
 import SQLite3
 import Testing
 @testable import EngramKit
+@testable import EngramLattice
 
 /// Exercise the production upload filters against real IPC. Registering the
 /// ledger on the receiving test handle is intentional: an omitted production

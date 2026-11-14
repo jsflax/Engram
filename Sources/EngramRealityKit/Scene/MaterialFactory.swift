@@ -33,10 +33,11 @@ enum MaterialFactory {
         device: MTLDevice,
         instanceTexture: TextureResource? = nil,
         textureWidth: Float = 0,
-        mode: Float = 0
+        mode: Float = 0,
+        onFallback: (() -> Void)? = nil
     ) -> any Material {
         loadLibrary(device: device)
-        guard let library = shaderLibrary else { return fallbackNodeMaterial() }
+        guard let library = shaderLibrary else { onFallback?(); return fallbackNodeMaterial() }
 
         do {
             let surfaceShader = CustomMaterial.SurfaceShader(named: "nodeSurface", in: library)
@@ -57,6 +58,7 @@ enum MaterialFactory {
             }
             return mat
         } catch {
+            onFallback?()
             return fallbackNodeMaterial()
         }
     }
@@ -80,10 +82,11 @@ enum MaterialFactory {
         device: MTLDevice,
         instanceTexture: TextureResource? = nil,
         textureWidth: Float = 0,
-        useGeometryModifier: Bool = false
+        useGeometryModifier: Bool = false,
+        onFallback: (() -> Void)? = nil
     ) -> any Material {
         loadLibrary(device: device)
-        guard let library = shaderLibrary else { return fallbackEdgeMaterial() }
+        guard let library = shaderLibrary else { onFallback?(); return fallbackEdgeMaterial() }
 
         do {
             let surfaceShader = CustomMaterial.SurfaceShader(named: "edgeSurface", in: library)
@@ -106,6 +109,7 @@ enum MaterialFactory {
             mat.faceCulling = .none
             return mat
         } catch {
+            onFallback?()
             return fallbackEdgeMaterial()
         }
     }

@@ -18,13 +18,21 @@ public final class RKMascotSystem {
     private var currentPositions: [String: SIMD3<Float>] = [:]
     private var currentYaws: [String: Float] = [:]
     private var mascotLoadingProjects: Set<String> = []
+    private var loadingTasks: [String: Task<Void, Never>] = [:]
+    // Retain canceled tasks until their native loads really return.
+    private var inFlightLoads: [UUID: Task<Void, Never>] = [:]
+    private var inFlightHoloTasks: [UUID: Task<Void, Never>] = [:]
+    private let loadMascot: @MainActor (String, SIMD3<Float>) async -> Entity
+    private var lifecycleGeneration: UInt64 = 0
+    private var isActive = true
+    private var isTornDown = false
     private struct Effects {
         let arcaneCircle: Entity?
         let conjureOrb: Entity?
         let holoScreen: ModelEntity?
     }
     private var effects: [String: Effects] = [:]
-    private let graphIndex = MascotGraphIndex()
+    private var graphIndex = MascotGraphIndex()
     private let holoRequestCache = MascotHoloRequestCache()
     private var holoTasks: [String: Task<Void, Never>] = [:]
     private var preparedHoloImages: [String: (key: MascotHoloKey, image: CGImage)] = [:]
@@ -58,7 +66,67 @@ public final class RKMascotSystem {
     private let patrolHoverDuration: Float = 8.0
     private let patrolSpeed: Float = 0.3
 
-    public init() {}
+    public convenience init() {
+        self.init(loadMascot: { project, tint in
+            await MascotEntityFactory.createMascotGroup(project: project, tint: tint)
+        })
+    }
+
+    /// Keeps the native loading boundary injectable without changing the shared model cache.
+    init(loadMascot: @escaping @MainActor (String, SIMD3<Float>) async -> Entity) {
+        self.loadMascot = loadMascot
+    }
+
+    public func setActive(_ active: Bool) {
+        guard !isTornDown, isActive != active else { return }
+        isActive = active
+        if !active {
+            lifecycleGeneration &+= 1
+            for task in loadingTasks.values { task.cancel() }
+            loadingTasks.removeAll()
+            mascotLoadingProjects.removeAll()
+            for (project, task) in holoTasks {
+                task.cancel()
+                holoRequestCache.remove(project)
+            }
+            holoTasks.removeAll()
+            preparedHoloImages.removeAll()
+        }
+    }
+
+    public func teardown() {
+        guard !isTornDown else { return }
+        setActive(false)
+        isTornDown = true
+        for entity in activeMascots.values { entity.removeFromParent() }
+        for project in graphIndex.projects { holoRequestCache.remove(project) }
+        activeMascots.removeAll()
+        mascotStates.removeAll()
+        taskQueues.removeAll()
+        idleTimers.removeAll()
+        patrolThresholds.removeAll()
+        animationTimes.removeAll()
+        currentPositions.removeAll()
+        currentYaws.removeAll()
+        effects.removeAll()
+        preparedHoloImages.removeAll()
+        holoOpacities.removeAll()
+        appliedHoloOpacities.removeAll()
+        graphIndex = MascotGraphIndex()
+    }
+
+    /// Call after deactivation to join both shared-model waiters and native holo uploads.
+    /// Canceling this waiter does not substitute for native completion.
+    public func drainPendingLoads() async {
+        while let (id, task) = inFlightLoads.first {
+            await task.value
+            inFlightLoads.removeValue(forKey: id)
+        }
+        while let (id, task) = inFlightHoloTasks.first {
+            await task.value
+            inFlightHoloTasks.removeValue(forKey: id)
+        }
+    }
 
     public func update(
         container: Entity,
@@ -66,6 +134,7 @@ public final class RKMascotSystem {
         dt: Float,
         scaleFactor: Float
     ) {
+        guard isActive, !isTornDown else { return }
         let colorMap = dataProvider.projectColorMap
         let nodes = dataProvider.nodes
 
@@ -75,6 +144,11 @@ public final class RKMascotSystem {
         graphIndex.update(nodes: nodes, nodeVersion: dataProvider.nodeVersion,
                           nodeAppendGeneration: dataProvider.nodeAppendGeneration, provider: dataProvider)
         let activeProjects = graphIndex.projects
+
+        for project in loadingTasks.keys where !activeProjects.contains(project) {
+            loadingTasks.removeValue(forKey: project)?.cancel()
+            mascotLoadingProjects.remove(project)
+        }
 
         // Remove mascots for gone projects
         for (project, entity) in activeMascots where !activeProjects.contains(project) {
@@ -102,11 +176,19 @@ public final class RKMascotSystem {
             let tint = colorMap[project] ?? SIMD3<Float>(0, 0.8, 1.0)
             mascotLoadingProjects.insert(project)
             let proj = project
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                let entity = await MascotEntityFactory.createMascotGroup(project: proj, tint: tint)
+            let generation = lifecycleGeneration
+            let centroid = dataProvider.projectCentroids[proj]
+            let load = loadMascot
+            let loadID = UUID()
+            let task = Task { @MainActor [weak self] in
+                defer { self?.inFlightLoads.removeValue(forKey: loadID) }
+                guard !Task.isCancelled else { return }
+                let entity = await load(proj, tint)
+                guard let self, !Task.isCancelled, self.isActive, !self.isTornDown,
+                      self.lifecycleGeneration == generation,
+                      self.graphIndex.projects.contains(proj), self.activeMascots[proj] == nil else { return }
+                self.loadingTasks.removeValue(forKey: proj)
                 self.mascotLoadingProjects.remove(proj)
-                guard self.graphIndex.projects.contains(proj), self.activeMascots[proj] == nil else { return }
                 container.addChild(entity)
                 self.activeMascots[proj] = entity
                 self.mascotStates[proj] = .idle(.awake)
@@ -120,11 +202,13 @@ public final class RKMascotSystem {
                 )
 
                 // Initial position near project centroid
-                if let centroid = dataProvider.projectCentroids[proj] {
+                if let centroid {
                     self.currentPositions[proj] = centroid + SIMD3(0, 50, 0)
                     entity.position = (centroid + SIMD3(0, 50, 0)) * scaleFactor
                 }
             }
+            loadingTasks[proj] = task
+            inFlightLoads[loadID] = task
         }
 
         // Update each active mascot
@@ -442,7 +526,12 @@ public final class RKMascotSystem {
         holoTasks.removeValue(forKey: project)?.cancel()
         let preparedImage = preparedHoloImages[project].flatMap { $0.key == key ? $0.image : nil }
         if preparedImage == nil { preparedHoloImages.removeValue(forKey: project) }
-        holoTasks[project] = Task { @MainActor [weak self, weak entity] in
+        let generation = lifecycleGeneration
+        let taskID = UUID()
+        let task = Task { @MainActor [weak self, weak entity] in
+            defer { self?.inFlightHoloTasks.removeValue(forKey: taskID) }
+            guard !Task.isCancelled, self?.isActive == true,
+                  self?.lifecycleGeneration == generation else { return }
             // One pending task per project; canceled actor-queued requests exit
             // before rasterizing. Keep the last successful texture until ready.
             let raster = if let preparedImage { preparedImage }
@@ -452,6 +541,7 @@ public final class RKMascotSystem {
                 return
             }
             guard let entity, self?.holoRequestCache.isCurrent(token, for: project) == true,
+                  self?.isActive == true, self?.lifecycleGeneration == generation,
                   self?.effects[project]?.holoScreen === entity else { return }
             // Retain at most one prepared bitmap per project across a failed
             // texture upload, so the bounded retry does not rerasterize it.
@@ -459,6 +549,7 @@ public final class RKMascotSystem {
             do {
                 let texture = try await TextureResource(image: image, options: .init(semantic: .color))
                 guard let self, !Task.isCancelled, self.holoRequestCache.isCurrent(token, for: project),
+                      self.isActive, !self.isTornDown, self.lifecycleGeneration == generation,
                       self.effects[project]?.holoScreen === entity else { return }
                 guard entity.model != nil else {
                     self.finishFailedHoloRequest(token, project: project)
@@ -478,6 +569,8 @@ public final class RKMascotSystem {
                 self?.finishFailedHoloRequest(token, project: project)
             }
         }
+        holoTasks[project] = task
+        inFlightHoloTasks[taskID] = task
     }
 
     private func finishFailedHoloRequest(_ token: UInt64, project: String) {
@@ -487,11 +580,13 @@ public final class RKMascotSystem {
     }
 
     deinit {
-        for task in holoTasks.values { task.cancel() }
+        for task in inFlightLoads.values { task.cancel() }
+        for task in inFlightHoloTasks.values { task.cancel() }
     }
 
     /// Enqueue a task for a project's mascot.
     public func enqueueTask(_ task: MascotTask, for project: String) {
+        guard isActive, !isTornDown else { return }
         var queue = taskQueues[project] ?? []
         queue.append(task)
         queue.sort(by: >)

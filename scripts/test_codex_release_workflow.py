@@ -1,4 +1,5 @@
 """Exercise release command blocks with fake tools; never resolve or build Swift."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -392,11 +393,11 @@ raise SystemExit(code or (int(os.environ['FAKE_WRAPPER_EXIT']) if command[1]=='b
                         self.assertEqual(calls[4]['args'][0], 'test-without-building')
 
     def test_linux_installs_python_before_builds_and_propagates_tooling_failure(self):
-        name = 'Install portable test Python runtime'
+        name = 'Install portable test prerequisites'
         workflow = (ROOT / '.github/workflows/linux-core.yml').read_text()
         order = ['Prepare isolated Linux work and output paths', name,
                  'Build EngramMemoryCore (Linux)', 'Compile its tests (Linux)',
-                 'Execute exact portable core tests (Linux)']
+                 'Execute root memory and backend tests (Linux)']
         positions = [workflow.index('      - name: ' + step + '\n') for step in order]
         self.assertEqual(positions, sorted(positions))
         with tempfile.TemporaryDirectory(prefix='engram linux Python ') as temporary:
@@ -412,7 +413,7 @@ phase = args[0] if tool == 'apt-get' else 'version'
 if phase == os.environ['FAIL_PHASE']:
     raise SystemExit(29)
 if phase == 'install':
-    assert args == ['install','--no-install-recommends','-y','python3'],args
+    assert args == ['install','--no-install-recommends','-y','python3','libsqlite3-dev','pkg-config'],args
     Path(os.environ['INSTALLED']).touch()
 elif tool == 'python3':
     assert args == ['--version'] and Path(os.environ['INSTALLED']).is_file(),args
@@ -424,7 +425,7 @@ else:
                 command = bin_dir / tool
                 command.write_text(fake); command.chmod(0o700)
             expected = [['apt-get', 'update'],
-                        ['apt-get', 'install', '--no-install-recommends', '-y', 'python3'],
+                        ['apt-get', 'install', '--no-install-recommends', '-y', 'python3', 'libsqlite3-dev', 'pkg-config'],
                         ['python3', '--version']]
             for phase, count in (('update', 1), ('install', 2), ('version', 3), ('', 3)):
                 with self.subTest(phase=phase):
@@ -448,6 +449,7 @@ else:
             checkout = root / 'checkout with spaces'; checkout.mkdir()
             bin_dir = root / 'bin'; bin_dir.mkdir()
             (bin_dir / 'git').symlink_to(shutil.which('git'))
+            (bin_dir / 'python3').symlink_to(sys.executable)
             swift = bin_dir / 'swift'
             swift.write_text('#!/bin/sh\n[ "$#" = 1 ] && [ "$1" = --version ] || exit 99\n'
                              'printf "fixture Swift version\\n"\n')
@@ -469,10 +471,33 @@ else:
 
             git('init', '-q')
             source = checkout / 'source.txt'; source.write_text('committed source\n')
-            git('add', 'source.txt')
+            # The same exact-source scenario also checks the direct root identity receipt.
+            directories = (
+                'Sources/EngramMemoryCore', 'Sources/EngramMemoryContract',
+                'Sources/EngramModels', 'Sources/EngramLattice', 'Sources/EngramHooks',
+                'Tests/Fixtures/ProcessGuard', 'Tests/EngramMemoryCoreTests',
+                'Tests/EngramLatticeTests', 'Tests/EngramTestSupport',
+                'Tests/EngramTestSupportTests', 'SystemLibraries/CEngramLedgerSQLite',
+            )
+            identity_inputs = {
+                'Package.swift': '// root manifest fixture\n',
+                'Package.resolved': json.dumps({'version': 3, 'pins': [{
+                    'identity': 'fixture', 'kind': 'remoteSourceControl',
+                    'location': 'https://example.invalid/fixture.git',
+                    'state': {'revision': 'f' * 40, 'version': '1.0.0'},
+                }]}) + '\n',
+                '.github/workflows/linux-core.yml': (ROOT / '.github/workflows/linux-core.yml').read_text(),
+            }
+            identity_inputs.update({name + '/input.txt': name + '\n' for name in directories})
+            for name, contents in identity_inputs.items():
+                path = checkout / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(contents)
+            git('add', '.')
             git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
                 '-c', 'commit.gpgsign=false', 'commit', '-qm', 'fixture')
             sha = git('rev-parse', 'HEAD').stdout.strip()
+            tree = git('rev-parse', 'HEAD^{tree}').stdout.strip()
             source.write_text('uncommitted source\n')
             (checkout / 'untracked.txt').write_text('untracked\n')
             env.update(SOURCE_SHA=sha, GIT_TEST_ASSUME_DIFFERENT_OWNER='1')
@@ -497,6 +522,67 @@ else:
                         self.assertEqual((task_root / 'repo/source.txt').read_text(), 'committed source\n')
                         self.assertFalse((task_root / 'repo/untracked.txt').exists())
                         self.assertIn('LINUX_ROOT=' + str(task_root) + '\n', github_env.read_text())
+                        self.assertIn('ENGRAM_TEST_FIXTURE_ROOT=' + str(task_root / 'fixtures') + '\n',
+                                      github_env.read_text())
+                        self.assertTrue((task_root / 'fixtures').is_dir())
+                        identity_result = subprocess.run(['/bin/bash', '-e', '-c',
+                            run_block('linux-core.yml', 'Record exact root Linux source identity')],
+                            cwd=checkout, env=dict(env, LINUX_ROOT=str(task_root)),
+                            capture_output=True, text=True, timeout=10)
+                        self.assertEqual(identity_result.returncode, 0,
+                                         identity_result.stdout + identity_result.stderr)
+                        identity = json.loads((task_root / 'evidence/source-identity.json').read_text())
+                        expected_hashes = {name: hashlib.sha256(contents.encode()).hexdigest()
+                                           for name, contents in identity_inputs.items()}
+                        self.assertEqual(identity['source_root'], str(task_root / 'repo'))
+                        self.assertEqual(identity['source_sha'], sha)
+                        self.assertEqual(identity['source_tree'], tree)
+                        self.assertEqual(identity['files_sha256'], expected_hashes)
+                        self.assertEqual(identity['manifest_sha256'], expected_hashes['Package.swift'])
+                        self.assertEqual(identity['resolved_sha256'], expected_hashes['Package.resolved'])
+                        self.assertFalse((task_root / 'portable').exists())
+                        # Reuse this exact-source fixture for the reporting step;
+                        # Swift remains a fake, and the outputs are fixture data.
+                        workspace = {'version': 7, 'object': {'dependencies': [
+                            {'packageRef': {'identity': 'fixture'}}]}}
+                        (task_root / 'root-build').mkdir()
+                        workspace_path = task_root / 'root-build/workspace-state.json'
+                        workspace_path.write_text(json.dumps(workspace) + '\n')
+                        swift.write_text('#!' + sys.executable + '\n' + """import json,os,sys
+from pathlib import Path
+root=Path(os.environ['LINUX_ROOT'])
+assert sys.argv[1:]==['package','--package-path',str(root/'repo'),
+    '--scratch-path',str(root/'root-build'),'--cache-path',str(root/'cache'),
+    '--config-path',str(root/'config'),'--security-path',str(root/'security'),
+    '--force-resolved-versions','show-dependencies','--format','json'],sys.argv
+print(json.dumps({'name':'Engram','path':str(root/'repo'),
+    'dependencies':[{'identity':'fixture','dependencies':[]}]}))
+""")
+                        graph_result = subprocess.run(['/bin/bash', '-e', '-c',
+                            run_block('linux-core.yml', 'Record actual root Linux dependency graph')],
+                            cwd=checkout, env=dict(env, LINUX_ROOT=str(task_root)),
+                            capture_output=True, text=True, timeout=10)
+                        self.assertEqual(graph_result.returncode, 0,
+                                         graph_result.stdout + graph_result.stderr)
+                        evidence = task_root / 'evidence'
+                        graph_receipt = json.loads((evidence / 'resolved-graph-receipt.json').read_text())
+                        self.assertEqual(graph_receipt['source_sha'], sha)
+                        self.assertEqual(graph_receipt['source_tree'], tree)
+                        self.assertEqual(graph_receipt['manifest_sha256'], expected_hashes['Package.swift'])
+                        for key in ('input_lock_sha256', 'lock_before_sha256', 'lock_after_sha256'):
+                            self.assertEqual(graph_receipt[key], expected_hashes['Package.resolved'])
+                        self.assertTrue(graph_receipt['lock_unchanged'])
+                        self.assertEqual(graph_receipt['command_timeout_seconds'], 60)
+                        self.assertEqual((evidence / 'Package.resolved').read_bytes(),
+                                         (task_root / 'repo/Package.resolved').read_bytes())
+                        self.assertEqual((evidence / 'workspace-state.json').read_bytes(),
+                                         workspace_path.read_bytes())
+                        self.assertEqual(set(graph_receipt['files']),
+                                         {'resolved-graph.json', 'Package.resolved', 'workspace-state.json'})
+                        for name, record in graph_receipt['files'].items():
+                            content = (evidence / name).read_bytes()
+                            self.assertEqual(record, {'bytes': len(content),
+                                'sha256': hashlib.sha256(content).hexdigest()})
             # Trust must not persist, and -c must not replace the existing rewrite.
             self.assertIn('dubious ownership', git('rev-parse', 'HEAD', check=False).stderr)
             rewrite = git('-c', 'safe.directory=' + str(checkout), 'config', '--get', env['GIT_CONFIG_KEY_0'])
@@ -513,9 +599,10 @@ else:
             'timeoutReapsTermIgnoringProviderBeforeReleasingLease',
             'cancellationEscalatesWithoutDroppingProviderLease',
             'wrapperDeathAndProviderFDClosureDoNotReleaseGuardLease',
+            'contractHoldsOnLattice',
         ]
         lines = ['✔ Test ' + name + '() passed after 0.001 seconds.' for name in required]
-        summary = '✔ Test run with 9 tests passed after 0.100 seconds.\n'
+        summary = '✔ Test run with 10 tests passed after 0.100 seconds.\n'
         complete = '\n'.join(lines) + '\n' + summary
         scenarios = [('complete', complete, 0)]
         scenarios += [(name, '\n'.join(line for line in lines if name + '()' not in line) + '\n' + summary, 0)
@@ -528,15 +615,11 @@ else:
         ]
         with tempfile.TemporaryDirectory(prefix='engram portable gate ') as temporary:
             root = Path(temporary).resolve()
-            scripts = root / 'repo/scripts'; scripts.mkdir(parents=True)
+            (root / 'repo').mkdir()
             bin_dir = root / 'bin'; bin_dir.mkdir()
             (root / 'evidence').mkdir()
             (bin_dir / 'python3').symlink_to(sys.executable)
             log, continued = root / 'calls.jsonl', root / 'continued'
-            (scripts / 'prepare_portable_core_tests.py').write_text("""import json,os,sys
-with open(os.environ['CALL_LOG'],'a') as output:
-    output.write(json.dumps({'tool':'prepare','args':sys.argv[1:]})+'\\n')
-""")
             swift = bin_dir / 'swift'
             swift.write_text('#!' + sys.executable + '\n' + """import json,os,sys
 from pathlib import Path
@@ -546,24 +629,24 @@ with open(os.environ['CALL_LOG'],'a') as output:
     output.write(json.dumps({'tool':'swift','args':args})+'\\n')
 if args[0]=='build':
     assert args[-1]=='--show-bin-path',args
-    print(root/'portable-build/debug')
+    print(root/'root-build/debug')
 else:
     assert args[0]=='test' and args[-1]=='--no-parallel',args
-    assert os.environ['ENGRAM_TEST_PROCESS_GUARD']==str(root/'portable-build/debug/EngramProcessGuardFixture')
+    assert os.environ['ENGRAM_TEST_PROCESS_GUARD']==str(root/'root-build/debug/EngramProcessGuardFixture')
     print(os.environ['FAKE_TEST_OUTPUT'],end='')
     raise SystemExit(int(os.environ['FAKE_TEST_EXIT']))
 """)
             swift.chmod(0o700)
             env = dict(os.environ, PATH=f'{bin_dir}:/usr/bin:/bin', CALL_LOG=str(log),
                        LINUX_ROOT=str(root), SOURCE_SHA='a' * 40)
-            options = ['--package-path', str(root / 'portable'), '--scratch-path', str(root / 'portable-build'),
+            options = ['--package-path', str(root / 'repo'), '--scratch-path', str(root / 'root-build'),
                        '--cache-path', str(root / 'cache'), '--config-path', str(root / 'config'),
-                       '--security-path', str(root / 'security')]
+                       '--security-path', str(root / 'security'), '--force-resolved-versions']
             for scenario, output, code in scenarios:
                 with self.subTest(scenario=scenario):
                     log.unlink(missing_ok=True); continued.unlink(missing_ok=True)
                     result = subprocess.run(['/bin/bash', '-e', '-c',
-                        run_block('linux-core.yml', 'Execute exact portable core tests (Linux)')
+                        run_block('linux-core.yml', 'Execute root memory and backend tests (Linux)')
                         + 'printf continued > "$1"\n', 'gate', str(continued)],
                         cwd=root, env=dict(env, FAKE_TEST_OUTPUT=output, FAKE_TEST_EXIT=str(code)),
                         capture_output=True, text=True, timeout=10)
@@ -571,8 +654,6 @@ else:
                                      result.stdout + result.stderr)
                     self.assertEqual(continued.exists(), scenario == 'complete')
                     self.assertEqual([json.loads(line) for line in log.read_text().splitlines()], [
-                        {'tool': 'prepare', 'args': ['--repository', str(root / 'repo'),
-                            '--destination', str(root / 'portable'), '--source-sha', 'a' * 40]},
                         {'tool': 'swift', 'args': ['build', *options, '--show-bin-path']},
                         {'tool': 'swift', 'args': ['test', *options, '--no-parallel']},
                     ])

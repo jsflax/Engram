@@ -139,7 +139,7 @@ def prepare(root):
 def dependency_checkouts(repo, pins, dependencies):
     """Xcode adds the local package itself to SwiftPM's managed dependencies."""
     expected = {pin['identity'] for pin in pins}
-    require(len(pins) == len(expected) == 46, 'dependency pins changed')
+    require(len(pins) == len(expected) == 43, 'dependency pins changed')
     checkouts = {}
     seen = set()
     local = None

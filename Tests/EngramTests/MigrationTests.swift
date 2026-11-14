@@ -14,7 +14,7 @@ private func migrationLattice(
 ) throws -> Lattice {
     try Lattice(
         for: types,
-        configuration: .init(fileURL: FileManager.default.temporaryDirectory.appending(path: path))
+        configuration: .init(fileURL: testFixtureDirectory().appending(path: path))
     )
 }
 
@@ -24,7 +24,7 @@ private func migrationLattice(
 ) throws -> Lattice {
     try Lattice(
         for: types,
-        configuration: .init(fileURL: FileManager.default.temporaryDirectory.appending(path: path), migration: engramMigrations)
+        configuration: .init(fileURL: testFixtureDirectory().appending(path: path), migration: engramMigrations)
     )
 }
 
@@ -32,7 +32,7 @@ private func migrationLattice(
 struct EdgeMigrationTests {
     @Test func edgesGetUUIDReferences() throws {
         let dbPath = "engram_migration_\(UUID().uuidString).sqlite"
-        let dbURL = FileManager.default.temporaryDirectory.appending(path: dbPath)
+        let dbURL = try testFixtureDirectory().appending(path: dbPath)
         defer { try? Lattice.delete(for: .init(fileURL: dbURL)) }
 
         var globalIds: [Int64: UUID] = [:]
@@ -74,7 +74,7 @@ struct EdgeMigrationTests {
 
     @Test func allRelationTypesPreserved() throws {
         let dbPath = "engram_migration_rel_\(UUID().uuidString).sqlite"
-        let dbURL = FileManager.default.temporaryDirectory.appending(path: dbPath)
+        let dbURL = try testFixtureDirectory().appending(path: dbPath)
         defer { try? Lattice.delete(for: .init(fileURL: dbURL)) }
 
         let relations = ["relates_to", "contradicts", "supersedes", "derived_from", "part_of", "summarized_by"]
@@ -108,7 +108,7 @@ struct EdgeMigrationTests {
 
     @Test func orphanEdgesGetSentinelUUID() throws {
         let dbPath = "engram_migration_orphan_\(UUID().uuidString).sqlite"
-        let dbURL = FileManager.default.temporaryDirectory.appending(path: dbPath)
+        let dbURL = try testFixtureDirectory().appending(path: dbPath)
         defer { try? Lattice.delete(for: .init(fileURL: dbURL)) }
 
         let zeroUUID = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
@@ -137,7 +137,7 @@ struct EdgeMigrationTests {
 
     @Test func emptyEdgeTableMigrates() throws {
         let dbPath = "engram_migration_empty_\(UUID().uuidString).sqlite"
-        let dbURL = FileManager.default.temporaryDirectory.appending(path: dbPath)
+        let dbURL = try testFixtureDirectory().appending(path: dbPath)
         defer { try? Lattice.delete(for: .init(fileURL: dbURL)) }
 
         try autoreleasepool {
@@ -154,7 +154,7 @@ struct EdgeMigrationTests {
 
     @Test func createdAtPreserved() throws {
         let dbPath = "engram_migration_date_\(UUID().uuidString).sqlite"
-        let dbURL = FileManager.default.temporaryDirectory.appending(path: dbPath)
+        let dbURL = try testFixtureDirectory().appending(path: dbPath)
         defer { try? Lattice.delete(for: .init(fileURL: dbURL)) }
 
         let specificDate = Date(timeIntervalSince1970: 1700000000)
@@ -181,7 +181,7 @@ struct EdgeMigrationTests {
 
     @Test func postMigrationOperationsWork() throws {
         let dbPath = "engram_migration_post_\(UUID().uuidString).sqlite"
-        let dbURL = FileManager.default.temporaryDirectory.appending(path: dbPath)
+        let dbURL = try testFixtureDirectory().appending(path: dbPath)
         defer { try? Lattice.delete(for: .init(fileURL: dbURL)) }
 
         try autoreleasepool {
@@ -216,7 +216,7 @@ struct EdgeMigrationTests {
 
     @Test func unknownRelationDefaultsToRelatesTo() throws {
         let dbPath = "engram_migration_unk_\(UUID().uuidString).sqlite"
-        let dbURL = FileManager.default.temporaryDirectory.appending(path: dbPath)
+        let dbURL = try testFixtureDirectory().appending(path: dbPath)
         defer { try? Lattice.delete(for: .init(fileURL: dbURL)) }
 
         try autoreleasepool {
@@ -238,7 +238,7 @@ struct EdgeMigrationTests {
 
     @Test func largeGraphMigration() throws {
         let dbPath = "engram_migration_large_\(UUID().uuidString).sqlite"
-        let dbURL = FileManager.default.temporaryDirectory.appending(path: dbPath)
+        let dbURL = try testFixtureDirectory().appending(path: dbPath)
         defer { try? Lattice.delete(for: .init(fileURL: dbURL)) }
 
         try autoreleasepool {

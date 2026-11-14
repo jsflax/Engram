@@ -1,4 +1,5 @@
 @testable import EngramKit
+@testable import EngramLattice
 import EngramMemoryCore
 import EngramModels
 import Foundation
@@ -150,6 +151,56 @@ struct MemoryOperationEditsTests {
         #expect(content.utf8.elementsEqual(expected.utf8))
         let texts = await f.embedder.texts()
         #expect(texts.count == 1 && texts[0].utf8.elementsEqual(expected.utf8))
+    }
+
+    @Test func contentOperationClearsPendingEmbeddingAndReplayPreservesTheCommittedState() async throws {
+        let f = try fixture()
+        defer { f.close() }
+        let memory = try f.memory()
+        try f.local.withTransaction { memory.embeddingPending = true }
+        let sql = try SQL(f.path)
+        let target = "WHERE globalId='\(f.sourceID.uuidString)'"
+        #expect(try sql.integer("SELECT embeddingPending FROM Memory \(target)") == 1)
+
+        let operation = try f.request(.update(UpdateRequest(id: f.sourceID, append: "indexed tail")))
+        let receipt = try await f.tools.applyOperation(operation)
+        #expect(receipt.outcome == .applied && receipt.memoryIDs == [f.sourceID])
+        #expect(try sql.text("SELECT content FROM Memory \(target)") == "original\nindexed tail")
+        #expect(try sql.integer("SELECT embeddingPending FROM Memory \(target)") == 0)
+        let embedding = try sql.text("SELECT hex(embedding) FROM Memory \(target)")
+        let modified = try sql.text("SELECT CAST(modifiedAt AS TEXT) FROM Memory \(target)")
+        #expect(!embedding.isEmpty)
+
+        #expect(try await f.tools.applyOperation(operation) == receipt)
+        #expect(try sql.integer("SELECT embeddingPending FROM Memory \(target)") == 0)
+        #expect(try sql.text("SELECT content FROM Memory \(target)") == "original\nindexed tail")
+        #expect(try sql.text("SELECT hex(embedding) FROM Memory \(target)") == embedding)
+        #expect(try sql.text("SELECT CAST(modifiedAt AS TEXT) FROM Memory \(target)") == modified)
+        #expect(await f.embedder.texts() == ["original\nindexed tail"])
+        #expect(try sql.integer("SELECT COUNT(*) FROM EngramOperationReceiptV1") == 1)
+    }
+
+    @Test func metadataOperationAndReplayKeepPendingEmbeddingWithoutLoadingTheModel() async throws {
+        let f = try fixture(embedder: FixtureEmbedder(mode: "nil"))
+        defer { f.close() }
+        let memory = try f.memory()
+        try f.local.withTransaction { memory.embeddingPending = true }
+        let sql = try SQL(f.path)
+        let target = "WHERE globalId='\(f.sourceID.uuidString)'"
+        #expect(try sql.integer("SELECT embeddingPending FROM Memory \(target)") == 1)
+        let embedding = try sql.text("SELECT hex(embedding) FROM Memory \(target)")
+
+        let operation = try f.request(.update(UpdateRequest(id: f.sourceID, topic: "pending metadata")))
+        let receipt = try await f.tools.applyOperation(operation)
+        #expect(receipt.outcome == .applied && receipt.memoryIDs == [f.sourceID])
+        #expect(try sql.text("SELECT topic FROM Memory \(target)") == "pending metadata")
+        #expect(try sql.integer("SELECT embeddingPending FROM Memory \(target)") == 1)
+        #expect(try await f.tools.applyOperation(operation) == receipt)
+        #expect(try sql.integer("SELECT embeddingPending FROM Memory \(target)") == 1)
+        #expect(try sql.text("SELECT content FROM Memory \(target)") == "original")
+        #expect(try sql.text("SELECT hex(embedding) FROM Memory \(target)") == embedding)
+        #expect(await f.embedder.texts().isEmpty)
+        #expect(try sql.integer("SELECT COUNT(*) FROM EngramOperationReceiptV1") == 1)
     }
 
     @Test func metadataEditDoesNotEmbedOrChangeAuthorSourceAndContent() async throws {

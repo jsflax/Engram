@@ -284,7 +284,7 @@ class DependencyPreparationTests(unittest.TestCase):
         self.assertIsNone(local)
         after, local = M.dependency_checkouts(self.repo, self.pins, self.remote + [self.local])
         self.assertEqual(before, after)
-        self.assertEqual(len(after), 46)
+        self.assertEqual(len(after), 43)
         self.assertEqual(local, self.local['packageRef'])
 
     def test_unknown_or_wrong_path_local_package_refuses(self):

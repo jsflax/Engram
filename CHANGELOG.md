@@ -4,6 +4,35 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.16.0] - 2026-11-14
+
+### Added
+
+- Expose reusable `EngramLattice` storage, `EngramCoreML` embedding and
+  `EngramGraphUI` rendering libraries from the root package, alongside shared
+  memory/model contracts and macOS-hosted graph/HUD wire contracts. Existing
+  application executables and test targets remain in the root package.
+- Add agent-private memory stores with explicitly granted read-only recall
+  sources and authenticated snapshot transfer verification. Stores admit at
+  most eight shared sources; transfer verification defaults to 100,000 records
+  and 256 MiB of content, and proves only the supplied owner and snapshot.
+
+### Changed
+
+- Use the owned CoreML engine behind desktop `EmbeddingService`, removing the
+  SwiftLM package dependency. `CoreMLMemoryEmbedder` loads bundled model and
+  tokenizer assets locally; the desktop loader can still use Hub when no
+  tokenizer directory is supplied.
+- Require Lattice at exact 3.1.2, LatticeCore from 3.1.1 and the owned Swift SDK
+  at exact 0.13.1. Both root and Xcode lockfiles select Lattice 3.1.2,
+  LatticeCore 3.1.1 and SDK 0.13.1. Linux requires Swift Crypto from 4.0.0.
+
+### Fixed
+
+- Clear pending embedding state in the same transaction that commits completed
+  vectors, including durable operation edits and embedding migration. Preserve
+  memories for text retrieval when embeddings are unavailable.
+
 ## [0.15.28] - 2026-10-24
 
 ### Fixed

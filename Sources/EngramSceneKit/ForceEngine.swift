@@ -177,11 +177,14 @@ public final class ForceEngine {
         return result
     }
 
-    /// Attempt to encode a GPU force pass (async).
+    /// Attempt to encode a GPU force pass (async). `onSettled` runs after the
+    /// native completion/readback and the main-actor result callback, including
+    /// GPU-error paths. A nil return submits no work and invokes neither callback.
     @discardableResult
     public func encodeForcePass(
         queue: MTLCommandQueue,
         snapshot: SimulationSnapshot,
+        onSettled: (@MainActor @Sendable () -> Void)? = nil,
         onComplete: @MainActor @Sendable @escaping (ForceResult) -> Void
     ) -> MTLCommandBuffer? {
         guard !snapshot.isSettled,
@@ -260,6 +263,7 @@ public final class ForceEngine {
                 Task { @MainActor in
                     fc.inFlight = false
                     if let deliveredTiming { diagnostic?.finish(deliveredTiming) }
+                    onSettled?()
                 }
                 return
             }
@@ -277,6 +281,7 @@ public final class ForceEngine {
                     fc.inFlight = false
                     if let deliveredTiming { diagnostic?.finish(deliveredTiming) }
                     onComplete(result)
+                    onSettled?()
                 }
             } else if let forces = fc.readBackForces() {
                 let result = ForceResult(fx: forces.fx, fy: forces.fy, fz: forces.fz,
@@ -288,6 +293,7 @@ public final class ForceEngine {
                     fc.inFlight = false
                     if let deliveredTiming { diagnostic?.finish(deliveredTiming) }
                     onComplete(result)
+                    onSettled?()
                 }
             } else {
                 timing?.readbackEnded = diagnostic.map { _ in GPULog.hostTime() }
@@ -296,6 +302,7 @@ public final class ForceEngine {
                 Task { @MainActor in
                     fc.inFlight = false
                     if let deliveredTiming { diagnostic?.finish(deliveredTiming) }
+                    onSettled?()
                 }
             }
         }

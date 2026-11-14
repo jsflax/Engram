@@ -93,6 +93,9 @@ class PluginPackageTests(unittest.TestCase):
         with tarfile.open(archive) as packaged:
             self.assertEqual(packaged.extractfile("engram/bin/memory").read(), (self.cli / "memory").read_bytes())
             records = {entry["path"]: entry for entry in manifest["files"]}
+            self.assertIn("bin/Engram_EngramCoreML.bundle/paraphrase-MiniLM-L6-v2_Embedding.mlmodelc/weights/weight.bin", records)
+            self.assertIn("bin/Engram_EngramCoreML.bundle/paraphrase-MiniLM-L6-v2_tokenizer/tokenizer.json", records)
+            self.assertFalse(any("SwiftLM_SwiftLM.bundle/" in name for name in records))
             actual = {entry.name.removeprefix("engram/"): entry for entry in packaged if entry.isfile()}
             self.assertEqual(set(records), set(actual))
             for path, entry in actual.items():
@@ -139,13 +142,20 @@ class PluginPackageTests(unittest.TestCase):
         self.assertEqual(first, second)
 
     def test_missing_bundle_fails_before_output(self):
-        shutil.rmtree(self.cli / "swift-crypto_Crypto.bundle")
-        with self.assertRaisesRegex(ValueError, "four qualified"):
-            self.build()
-        self.assertFalse((self.root / "first").exists())
+        for name in ("Engram_EngramCoreML.bundle", "swift-crypto_Crypto.bundle"):
+            with self.subTest(bundle=name):
+                bundle = self.cli / name
+                saved = self.root / name
+                bundle.rename(saved)
+                try:
+                    with self.assertRaisesRegex(ValueError, "four qualified"):
+                        self.build()
+                    self.assertFalse((self.root / "first").exists())
+                finally:
+                    saved.rename(bundle)
 
     def test_missing_embedding_weights_fails(self):
-        (self.cli / "Engram_EngramKit.bundle/paraphrase-MiniLM-L6-v2_Embedding.mlmodelc/weights/weight.bin").unlink()
+        (self.cli / "Engram_EngramCoreML.bundle/paraphrase-MiniLM-L6-v2_Embedding.mlmodelc/weights/weight.bin").unlink()
         with self.assertRaisesRegex(ValueError, "missing runtime resources"):
             self.build()
 
@@ -200,7 +210,7 @@ class PluginPackageTests(unittest.TestCase):
             self.build()
 
     def test_links_cannot_escape_source_or_resources(self):
-        resource = self.cli / "SwiftLM_SwiftLM.bundle/qwen_tokenizer.json"
+        resource = self.cli / "Engram_EngramCoreML.bundle/paraphrase-MiniLM-L6-v2_tokenizer/tokenizer.json"
         resource.unlink()
         resource.symlink_to(self.source / "README.md")
         with self.assertRaisesRegex(ValueError, "links/special"):

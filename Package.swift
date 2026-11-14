@@ -25,9 +25,12 @@ var engramMetalShaders: PackageDescription.Target {
 
 let package = Package(
     name: "Engram",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS(.v15), .iOS(.v18)],
     products: [
         .library(name: "EngramKit", targets: ["EngramKit"]),
+        .library(name: "EngramLattice", targets: ["EngramLattice"]),
+        .library(name: "EngramCoreML", targets: ["EngramCoreML"]),
+        .library(name: "EngramGraphUI", targets: ["EngramGraphUI"]),
         .library(name: "EngramModels", targets: ["EngramModels"]),
         .library(name: "EngramMemoryCore", targets: ["EngramMemoryCore"]),
         .library(name: "EngramMemoryContract", targets: ["EngramMemoryContract"]),
@@ -39,10 +42,11 @@ let package = Package(
     ],
     dependencies: [
         // Preserve the Codex client-capability decoding fix in the owned SDK.
-        .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.0"),
-        // Published checked transactions and matching Core/MCP requirements.
-        .package(url: "https://github.com/jsflax/lattice.git", exact: "2.2.5"),
-        .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
+        .package(url: "https://github.com/jsflax/swift-sdk.git", exact: "0.13.1"),
+        // Published protected legacy attachments and shared Linux notification listeners.
+        .package(url: "https://github.com/jsflax/lattice.git", exact: "3.1.2"),
+        .package(url: "https://github.com/jsflax/LatticeCore.git", from: "3.1.1"),
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
         .package(url: "https://github.com/google/GoogleSignIn-iOS.git", from: "7.0.0"),
@@ -72,7 +76,7 @@ let package = Package(
         // logic, and the Embedder seam. NO Apple-only frameworks, NO Lattice,
         // NO MCP — this module MUST build on Linux (it is what engram-server
         // consumes for the agents deployment). Apple conformances (CoreML
-        // embedder, NLTagger extractor, Lattice storage) live in EngramKit.
+        // embedder and NLTagger adapters) stay Apple-only; storage lives in EngramLattice.
         .target(
             name: "EngramMemoryCore"
         ),
@@ -108,15 +112,14 @@ let package = Package(
         .target(
             name: "EngramKit",
             dependencies: [
+                "EngramLattice",
+                "EngramCoreML",
                 "EngramModels",
                 "EngramMemoryCore",
                 .product(name: "MCP", package: "swift-sdk"),
                 .product(name: "Lattice", package: "lattice"),
-                .product(name: "SwiftLM", package: "SwiftLM"),
             ],
             resources: [
-                .copy("Resources/paraphrase-MiniLM-L6-v2_Embedding.mlmodelc"),
-                .copy("Resources/paraphrase-MiniLM-L6-v2_tokenizer"),
                 .copy("Resources/RecallGateClassifier.mlmodelc"),
                 .copy("Resources/session-learner.md"),
                 .copy("Resources/memory-maintenance.md"),
@@ -235,17 +238,19 @@ let package = Package(
         ),
         .testTarget(
             name: "EngramRealityKitTests",
-            dependencies: ["EngramRealityKit"],
+            dependencies: ["EngramRealityKit", "EngramSceneKit", "EngramMetalShaders", "EngramTestSupport"],
             swiftSettings: [.interoperabilityMode(.Cxx)]
         ),
         .testTarget(
             name: "EngramTests",
             dependencies: [
                 "EngramKit",
+                "EngramLattice",
+                "EngramCoreML",
+                "EngramTestSupport",
                 "EngramMemoryCore",
                 "EngramMemoryContract",
                 .product(name: "Lattice", package: "lattice"),
-                .product(name: "SwiftLM", package: "SwiftLM"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
@@ -284,3 +289,102 @@ let package = Package(
         ),
     ]
 )
+
+// Reusable storage and embedding products share the desktop's model contracts.
+// Keep the desktop executables and their existing test graph at the root.
+package.targets.append(contentsOf: [
+    .target(name: "EngramLattice", dependencies: [
+        "EngramModels", "EngramMemoryCore",
+        .product(name: "MCP", package: "swift-sdk"),
+        .product(name: "Lattice", package: "lattice"),
+    ], swiftSettings: [.interoperabilityMode(.Cxx)],
+        linkerSettings: [.linkedFramework("NaturalLanguage", .when(platforms: [.macOS, .iOS]))]),
+    .target(name: "EngramCoreML", dependencies: [
+        "EngramMemoryCore",
+        .product(name: "Tokenizers", package: "swift-transformers"),
+        .product(name: "Hub", package: "swift-transformers"),
+    ], resources: [
+        .copy("Resources/paraphrase-MiniLM-L6-v2_Embedding.mlmodelc"),
+        .copy("Resources/paraphrase-MiniLM-L6-v2_tokenizer"),
+        .copy("Resources/NOTICE.txt"),
+        .copy("Resources/Apache-2.0.txt"),
+        .copy("Resources/SwiftLM-MIT.txt"),
+    ]),
+    .target(name: "EngramGraphUI", dependencies: [
+        "EngramRealityKit", "EngramSceneKit", "EngramMetalShaders",
+    ], swiftSettings: [.interoperabilityMode(.Cxx)]),
+    .testTarget(name: "EngramLatticeTests", dependencies: [
+        "EngramLattice", "EngramMemoryContract", "EngramTestSupport",
+    ], swiftSettings: [.interoperabilityMode(.Cxx)]),
+    .testTarget(name: "EngramCoreMLTests", dependencies: [
+        "EngramCoreML", "EngramLattice", "EngramTestSupport",
+    ], swiftSettings: [.interoperabilityMode(.Cxx)]),
+    .testTarget(name: "EngramCoreMLParityTests", dependencies: ["EngramCoreML", "EngramKit"],
+        swiftSettings: [.interoperabilityMode(.Cxx)]),
+    .testTarget(name: "EngramGraphUITests", dependencies: ["EngramGraphUI", "EngramTestSupport"],
+        swiftSettings: [.interoperabilityMode(.Cxx)]),
+    .target(name: "EngramTestSupport", path: "Tests/EngramTestSupport"),
+    .testTarget(name: "EngramTestSupportTests", dependencies: ["EngramTestSupport"],
+        path: "Tests/EngramTestSupportTests"),
+])
+
+#if os(Linux)
+package.dependencies.append(.package(url: "https://github.com/apple/swift-crypto.git", from: "4.0.0"))
+package.targets.append(.systemLibrary(name: "CEngramLedgerSQLite",
+    path: "SystemLibraries/CEngramLedgerSQLite", pkgConfig: "sqlite3",
+    providers: [.apt(["libsqlite3-dev"]), .brew(["sqlite"])]))
+if let tests = package.targets.first(where: { $0.name == "EngramLatticeTests" }) {
+    tests.dependencies.append(.target(name: "CEngramLedgerSQLite"))
+}
+if let storage = package.targets.first(where: { $0.name == "EngramLattice" }) {
+    storage.dependencies.append(.product(name: "Crypto", package: "swift-crypto"))
+    storage.dependencies.append(.target(name: "CEngramLedgerSQLite"))
+}
+
+// SwiftPM builds the package test graph before applying a test filter. Keep the
+// existing portable backend and core tests together without Apple-only targets.
+let linuxProducts: Set<String> = [
+    "EngramLattice", "EngramModels", "EngramMemoryCore", "EngramMemoryContract",
+]
+let linuxTargets: Set<String> = [
+    "EngramMemoryCore", "EngramMemoryCoreTests", "EngramProcessGuardFixture",
+    "EngramMemoryContract", "EngramModels", "EngramLattice", "EngramLatticeTests",
+    "EngramTestSupport", "EngramTestSupportTests", "EngramHooks", "CEngramLedgerSQLite",
+]
+package.products.removeAll { !linuxProducts.contains($0.name) }
+package.targets.removeAll { !linuxTargets.contains($0.name) }
+let appleOnlyDependencyLocations: Set<String> = [
+    "https://github.com/huggingface/swift-transformers",
+    "https://github.com/sparkle-project/Sparkle.git",
+    "https://github.com/google/GoogleSignIn-iOS.git",
+]
+package.dependencies.removeAll {
+    guard case .sourceControl(_, let location, _) = $0.kind else { return false }
+    return appleOnlyDependencyLocations.contains(location)
+}
+// Preserve the Linux remote Hooks backend without its macOS-only EngramKit edge.
+if let hooks = package.targets.first(where: { $0.name == "EngramHooks" }) {
+    hooks.dependencies = [
+        "EngramMemoryCore",
+        .product(name: "ArgumentParser", package: "swift-argument-parser"),
+    ]
+}
+#endif
+
+// Pure graph contracts retain their shared implementation and Apple-hosted exposure.
+#if os(macOS)
+package.products.append(contentsOf: [
+    .library(name: "EngramGraphContract", targets: ["EngramGraphContract"]),
+    .library(name: "EngramHUDContract", targets: ["EngramHUDContract"]),
+])
+package.targets.append(contentsOf: [
+    .target(name: "EngramGraphContract",
+        path: "Packages/EngramGraphContracts/Sources/EngramGraphContract"),
+    .target(name: "EngramHUDContract", dependencies: ["EngramGraphContract"],
+        path: "Packages/EngramGraphContracts/Sources/EngramHUDContract"),
+    .testTarget(name: "EngramGraphContractTests", dependencies: ["EngramGraphContract"],
+        path: "Packages/EngramGraphContracts/Tests/EngramGraphContractTests"),
+    .testTarget(name: "EngramHUDContractTests", dependencies: ["EngramHUDContract", "EngramGraphContract"],
+        path: "Packages/EngramGraphContracts/Tests/EngramHUDContractTests"),
+])
+#endif

@@ -146,7 +146,7 @@ esac
         health.parent.mkdir(parents=True)
         shutil.copy(SCRIPTS.parent / "codex/plugins/engram/skills/hook-status/scripts/hook_status.py", health)
         self.fake_command("swift", """
-mkdir -p .build/release/Engram_EngramKit.bundle .build/release/swift-transformers_Hub.bundle .build/release/SwiftLM_SwiftLM.bundle
+mkdir -p .build/release/Engram_EngramKit.bundle .build/release/Engram_EngramCoreML.bundle .build/release/swift-transformers_Hub.bundle .build/release/swift-crypto_Crypto.bundle
 for binary in Engram EngramHooks EngramDaemon; do echo local-build > ".build/release/$binary"; done
 """)
         self.fake_command("codesign", 'echo "$*" >> "$HOME/signing-calls"\n')
@@ -156,6 +156,10 @@ for binary in Engram EngramHooks EngramDaemon; do echo local-build > ".build/rel
         self.assertEqual(args[0], "install")
         self.assertEqual(len((self.home / "signing-calls").read_text().splitlines()), 3)
         self.assertTrue((self.home / ".claude/bin/codex/codex_learner/learner_prompt.md").is_file())
+        self.assertEqual({path.name for path in (self.home / ".claude/bin").glob("*.bundle")}, {
+            "Engram_EngramKit.bundle", "Engram_EngramCoreML.bundle",
+            "swift-transformers_Hub.bundle", "swift-crypto_Crypto.bundle",
+        })
 
     def test_package_is_self_contained_and_omits_tests_and_bytecode(self):
         target = self.root / "packaged"
