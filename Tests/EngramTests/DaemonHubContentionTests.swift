@@ -377,7 +377,7 @@ struct DaemonHubContentionTests {
         try #require(hub.lastQueryError() == nil, "Warm vector query failed")
         let baseline = try hubReader.snapshot(warmID, channel: channel)
         try #require(baseline.memoryRows == 1 && baseline.auditRows > 0)
-        try #require(hubReader.warmAcknowledged(warmID, channel: channel))
+        try #require(try hubReader.warmAcknowledged(warmID, channel: channel))
         try #require(baseline.receiveCursor?.isEmpty == false, "Warm receive cursor is missing")
         let logStart = try Data(contentsOf: logURL).count
 
@@ -409,8 +409,8 @@ struct DaemonHubContentionTests {
         try #require(held.receipts == baseline.receipts, "Failed chunk must not mint idempotency receipts")
         try #require(held.receiveCursor == baseline.receiveCursor, "Failed chunk must not advance the download cursor")
         try #require(!sourceReader.snapshot(pendingID, channel: channel).acknowledged)
-        try #require(sourceReader.warmAcknowledged(warmID, channel: channel))
-        try #require(hubReader.warmAcknowledged(warmID, channel: channel))
+        try #require(try sourceReader.warmAcknowledged(warmID, channel: channel))
+        try #require(try hubReader.warmAcknowledged(warmID, channel: channel))
         holder.release()
 
         // No reconnect, explicit resend, filter refresh, mutation replay, or
