@@ -29,6 +29,7 @@ let package = Package(
     products: [
         .library(name: "EngramKit", targets: ["EngramKit"]),
         .library(name: "EngramLattice", targets: ["EngramLattice"]),
+        .library(name: "EngramCoreML", targets: ["EngramCoreML"]),
         .library(name: "EngramModels", targets: ["EngramModels"]),
         .library(name: "EngramMemoryCore", targets: ["EngramMemoryCore"]),
         .library(name: "EngramMemoryContract", targets: ["EngramMemoryContract"]),
@@ -44,7 +45,7 @@ let package = Package(
         // Published protected legacy attachments and shared Linux notification listeners.
         .package(url: "https://github.com/jsflax/lattice.git", from: "3.1.0"),
         .package(url: "https://github.com/jsflax/LatticeCore.git", from: "3.1.1"),
-        .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
         .package(url: "https://github.com/google/GoogleSignIn-iOS.git", from: "7.0.0"),
@@ -111,15 +112,13 @@ let package = Package(
             name: "EngramKit",
             dependencies: [
                 "EngramLattice",
-                .product(name: "SwiftLM", package: "SwiftLM"),
+                "EngramCoreML",
                 "EngramModels",
                 "EngramMemoryCore",
                 .product(name: "MCP", package: "swift-sdk"),
                 .product(name: "Lattice", package: "lattice"),
             ],
             resources: [
-                .copy("Resources/paraphrase-MiniLM-L6-v2_Embedding.mlmodelc"),
-                .copy("Resources/paraphrase-MiniLM-L6-v2_tokenizer"),
                 .copy("Resources/RecallGateClassifier.mlmodelc"),
                 .copy("Resources/session-learner.md"),
                 .copy("Resources/memory-maintenance.md"),
@@ -246,7 +245,7 @@ let package = Package(
             dependencies: [
                 "EngramKit",
                 "EngramLattice",
-                .product(name: "SwiftLM", package: "SwiftLM"),
+                "EngramCoreML",
                 "EngramTestSupport",
                 "EngramMemoryCore",
                 "EngramMemoryContract",
@@ -297,9 +296,25 @@ package.targets.append(contentsOf: [
         .product(name: "Lattice", package: "lattice"),
     ], swiftSettings: [.interoperabilityMode(.Cxx)],
         linkerSettings: [.linkedFramework("NaturalLanguage", .when(platforms: [.macOS, .iOS]))]),
+    .target(name: "EngramCoreML", dependencies: [
+        "EngramMemoryCore",
+        .product(name: "Tokenizers", package: "swift-transformers"),
+        .product(name: "Hub", package: "swift-transformers"),
+    ], resources: [
+        .copy("Resources/paraphrase-MiniLM-L6-v2_Embedding.mlmodelc"),
+        .copy("Resources/paraphrase-MiniLM-L6-v2_tokenizer"),
+        .copy("Resources/NOTICE.txt"),
+        .copy("Resources/Apache-2.0.txt"),
+        .copy("Resources/SwiftLM-MIT.txt"),
+    ]),
     .testTarget(name: "EngramLatticeTests", dependencies: [
         "EngramLattice", "EngramMemoryContract", "EngramTestSupport",
     ], swiftSettings: [.interoperabilityMode(.Cxx)]),
+    .testTarget(name: "EngramCoreMLTests", dependencies: [
+        "EngramCoreML", "EngramLattice", "EngramTestSupport",
+    ], swiftSettings: [.interoperabilityMode(.Cxx)]),
+    .testTarget(name: "EngramCoreMLParityTests", dependencies: ["EngramCoreML", "EngramKit"],
+        swiftSettings: [.interoperabilityMode(.Cxx)]),
     .target(name: "EngramTestSupport", path: "Tests/EngramTestSupport"),
     .testTarget(name: "EngramTestSupportTests", dependencies: ["EngramTestSupport"],
         path: "Tests/EngramTestSupportTests"),

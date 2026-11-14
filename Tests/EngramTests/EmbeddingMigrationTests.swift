@@ -1,5 +1,5 @@
 import Testing
-import EngramKit
+@testable import EngramKit
 import EngramModels
 @testable import Lattice
 import Foundation
@@ -136,7 +136,7 @@ struct EmbeddingMigrationTests {
         #expect(EmbeddingMigration.storedVersion(in: lattice) == 1)
 
         let report = try await EmbeddingMigration.runIfNeeded(
-            on: lattice, embedder: sharedEmbedder)
+            on: lattice, embedder: sharedEmbedder, log: { _ in })
 
         #expect(report.reembedded == 2)
         #expect(report.failed == 0)
@@ -161,7 +161,7 @@ struct EmbeddingMigrationTests {
         try EmbeddingMigration.setStoredVersion(EmbeddingSpace.currentVersion, in: lattice)
 
         let report = try await EmbeddingMigration.runIfNeeded(
-            on: lattice, embedder: sharedEmbedder)
+            on: lattice, embedder: sharedEmbedder, log: { _ in })
 
         #expect(report.skipped)
         #expect(report.reembedded == 0)
@@ -182,7 +182,7 @@ struct EmbeddingMigrationTests {
                                project: "demo", embedding: staleVector()))
 
         let report = try await EmbeddingMigration.runIfNeeded(
-            on: lattice, embedder: sharedEmbedder, useMarker: false)
+            on: lattice, embedder: sharedEmbedder, useMarker: false, log: { _ in })
 
         #expect(report.reembedded == 1)
         #expect(lattice.backend.localReadGenerationsOutstanding() == 0,
@@ -207,9 +207,9 @@ struct EmbeddingMigrationTests {
                                topic: "general", project: "demo",
                                embedding: staleVector()))
 
-        let broken = EmbeddingService(modelPath: "/nonexistent/model/path")
+        let broken = EmbeddingService(modelPath: "/nonexistent/model/path", diagnosticSink: { _ in })
         await #expect(throws: EmbeddingMigration.MigrationError.self) {
-            try await EmbeddingMigration.runIfNeeded(on: lattice, embedder: broken)
+            try await EmbeddingMigration.runIfNeeded(on: lattice, embedder: broken, log: { _ in })
         }
         #expect(lattice.backend.localReadGenerationsOutstanding() == 0,
                 "A model-load failure must not strand the marker lookup's keeper")

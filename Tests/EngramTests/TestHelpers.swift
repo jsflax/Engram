@@ -1,11 +1,11 @@
 import Testing
-import EngramKit
+@testable import EngramKit
 import EngramMemoryCore
+import EngramCoreML
 import EngramTestSupport
 import Lattice
 import MCP
 import Foundation
-import SwiftLM
 
 // Lattice isn't Sendable but tests are sequential — safe for test inspection.
 extension Lattice: @retroactive @unchecked Sendable {}
@@ -20,7 +20,7 @@ func text(from result: CallTool.Result) -> String {
 
 /// Shared embedder — loads the bundled CoreML model once for all tests.
 let sharedEmbedder: EmbeddingService = {
-    let e = EmbeddingService()
+    let e = EmbeddingService(diagnosticSink: { _ in })
     return e
 }()
 
@@ -33,9 +33,9 @@ private enum FixtureEmbeddingError: Error {
 
 /// The same real MiniLM model, restricted to CPU execution for isolated runners.
 private actor CPUFixtureEmbedder: Embedder {
-    private let model: CoreMLEmbeddingModel
+    private let model: CoreMLTextModel
 
-    init(model: CoreMLEmbeddingModel) { self.model = model }
+    init(model: CoreMLTextModel) { self.model = model }
 
     var dimension: Int { model.embeddingDimension }
 
@@ -51,22 +51,24 @@ private actor CPUFixtureEmbedder: Embedder {
 // Global initialization is lazy; ordinary test runs keep using sharedEmbedder.
 // One task shares successful loading or its error across concurrent fixtures.
 private let cpuFixtureEmbedder = Task<CPUFixtureEmbedder, Error> {
-    let bundle: Bundle
+    let modelURL: URL?
+    let tokenizerURL: URL?
     if let path = ProcessInfo.processInfo.environment["ENGRAM_TEST_RESOURCE_BUNDLE"] {
         guard let configured = Bundle(path: path) else {
             throw FixtureEmbeddingError.missingResource(path)
         }
-        bundle = configured
+        modelURL = configured.url(forResource: "paraphrase-MiniLM-L6-v2_Embedding",
+                                  withExtension: "mlmodelc")
+        tokenizerURL = configured.url(forResource: "paraphrase-MiniLM-L6-v2_tokenizer",
+                                      withExtension: nil)
     } else {
-        bundle = engramKitResourceBundle
+        modelURL = CoreMLMemoryAssets.modelURL
+        tokenizerURL = CoreMLMemoryAssets.tokenizerDirectory
     }
-    guard let modelURL = bundle.url(forResource: "paraphrase-MiniLM-L6-v2_Embedding",
-                                    withExtension: "mlmodelc"),
-          let tokenizerURL = bundle.url(forResource: "paraphrase-MiniLM-L6-v2_tokenizer",
-                                        withExtension: nil) else {
+    guard let modelURL, let tokenizerURL else {
         throw FixtureEmbeddingError.missingResource("MiniLM model and tokenizer")
     }
-    let model = try await CoreMLEmbeddingModel.loadCompiled(
+    let model = try await CoreMLTextModel.loadCompiled(
         url: modelURL, tokenizerDirectory: tokenizerURL, computeUnits: .cpuOnly)
     guard model.embeddingDimension == 384 else {
         throw FixtureEmbeddingError.invalidDimension(model.embeddingDimension)
