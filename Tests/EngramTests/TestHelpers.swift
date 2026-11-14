@@ -1,6 +1,7 @@
 import Testing
 import EngramKit
 import EngramMemoryCore
+import EngramTestSupport
 import Lattice
 import MCP
 import Foundation
@@ -89,8 +90,13 @@ func loadedFixtureEmbedder() async throws -> any Embedder {
 }
 
 /// Allow isolated test runners to choose a writable fixture directory.
-func testFixtureDirectory() throws -> URL {
-    let directory = ProcessInfo.processInfo.environment["ENGRAM_TEST_ROOT"]
+func testFixtureDirectory(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) throws -> URL {
+    if environment["ENGRAM_TEST_FIXTURE_ROOT"] != nil {
+        return try EngramTestFixtureRoot.directory(environment: environment)
+    }
+    let directory = environment["ENGRAM_TEST_ROOT"]
         .map { URL(fileURLWithPath: $0, isDirectory: true) }
         ?? FileManager.default.temporaryDirectory
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

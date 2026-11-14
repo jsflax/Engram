@@ -241,6 +241,7 @@ let package = Package(
         .testTarget(
             name: "EngramTests",
             dependencies: [
+                "EngramTestSupport",
                 "EngramKit",
                 "EngramMemoryCore",
                 "EngramMemoryContract",
@@ -284,3 +285,9 @@ let package = Package(
         ),
     ]
 )
+
+package.targets.append(contentsOf: [
+    .target(name: "EngramTestSupport", path: "Tests/EngramTestSupport"),
+    .testTarget(name: "EngramTestSupportTests", dependencies: ["EngramTestSupport"],
+        path: "Tests/EngramTestSupportTests"),
+])
