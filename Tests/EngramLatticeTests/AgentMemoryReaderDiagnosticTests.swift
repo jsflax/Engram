@@ -67,9 +67,12 @@ struct AgentMemoryReaderDiagnosticTests {
     @Test func validRequiredValuesDoNotEmitDiagnostics() throws {
         let recorder = ReaderCompatibilityRecorder(), id = UUID()
         try AgentMemoryReader.$compatibilityLog.withValue({ recorder.append($0) }) {
-            #expect(try AgentMemoryReader.requiredString("", table: "Memory", field: "content") == "")
-            #expect(try AgentMemoryReader.requiredUUID(id.uuidString, table: "Edge", field: "globalId") == id)
-            #expect(try AgentMemoryReader.requiredDate(0.0, table: "Memory", field: "createdAt") == Date(timeIntervalSince1970: 0))
+            let string = try AgentMemoryReader.requiredString("", table: "Memory", field: "content")
+            let uuid = try AgentMemoryReader.requiredUUID(id.uuidString, table: "Edge", field: "globalId")
+            let date = try AgentMemoryReader.requiredDate(0.0, table: "Memory", field: "createdAt")
+            #expect(string == "")
+            #expect(uuid == id)
+            #expect(date == Date(timeIntervalSince1970: 0))
         }
         #expect(recorder.snapshot().isEmpty)
     }
