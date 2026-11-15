@@ -130,7 +130,7 @@ extension MemoryTools {
             // independent, scheduler-free handle, as the primary stores do.
             // Deliberately do not inherit WSS credentials or IPC targets.
             let opener = try Lattice(
-                isolation: nil, Memory.self,
+                isolation: nil, for: localLattice.modelTypes,
                 configuration: .init(fileURL: url, migration: configuration.migration,
                                      busyTimeoutMs: Self.accessStatBusyTimeoutMs))
             guard let handle = try opener.sendableReference.resolveIndependent() else { return nil }
