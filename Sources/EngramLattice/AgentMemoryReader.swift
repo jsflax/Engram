@@ -68,6 +68,13 @@ public enum AgentMemoryReader {
         }
     }
 
+    // Keep the public error stable. This confined sink follows the existing
+    // stderr diagnostic route without opening desktop hook logs or any store.
+    // Tests replace it per task; concurrent readers never share mutable state.
+    @TaskLocal static var compatibilityLog: @Sendable (String) -> Void = { line in
+        try? FileHandle.standardError.write(contentsOf: Data((line + "\n").utf8))
+    }
+
     /// The embedding app must authorize this exact graph before and after an
     /// asynchronous read. Existing local bytes do not confer permission.
     public static func read(fileURL: URL, binding: AgentMemoryBinding, query: String = "",
@@ -287,18 +294,77 @@ public enum AgentMemoryReader {
         // unlike AgentMemoryStore.open this cannot create/migrate owner rows.
         let graph = try Lattice.dynamic(fileURL: fileURL)
         do {
-            let schemas = graph.dynamicSchema
-            for (name, fields) in [
-                ("AgentMemoryGraph", ["agentId", "graphId"]),
-                ("Memory", ["content", "project", "topic", "source", "createdAt", "accessCount", "deletedAt", "embeddingPending"]),
-                ("Edge", ["sourceGlobalId", "targetGlobalId", "relation", "createdAt", "deletedAt"])
-            ] {
-                guard let schema = schemas.first(where: { $0.name == name }),
-                      fields.allSatisfy({ schema.property(named: $0)?.isScalar == true }) else { throw ReadError.incompatible }
-            }
+            try validateSchema(graph.dynamicSchema)
             try validateOwner(graph, binding: binding)
             return graph
         } catch { graph.close(); throw error }
+    }
+
+    static func validateSchema(_ schemas: [ObjectSchema]) throws {
+        let required: [(StaticString, [StaticString])] = [
+            ("AgentMemoryGraph", ["agentId", "graphId"]),
+            ("Memory", ["content", "project", "topic", "source", "createdAt", "accessCount", "deletedAt", "embeddingPending"]),
+            ("Edge", ["sourceGlobalId", "targetGlobalId", "relation", "createdAt", "deletedAt"])
+        ]
+        for (table, fields) in required {
+            guard let schema = schemas.first(where: { $0.name == String(describing: table) }) else {
+                throw incompatible(check: "schema", table: table, field: "none", reason: "missing_table", kind: "absent")
+            }
+            for field in fields {
+                guard let property = schema.property(named: String(describing: field)) else {
+                    throw incompatible(check: "schema", table: table, field: field, reason: "missing_field", kind: "absent")
+                }
+                guard property.isScalar else {
+                    throw incompatible(check: "schema", table: table, field: field, reason: "non_scalar", kind: "non_scalar")
+                }
+            }
+        }
+    }
+
+    // Only fixed labels reach stderr: never values, identifiers, paths, SQL,
+    // schema-provided names, reflected type names, or underlying error text.
+    private static func incompatible(check: StaticString, table: StaticString, field: StaticString,
+                                     reason: StaticString, kind: StaticString) -> ReadError {
+        compatibilityLog("[AgentMemoryReader] incompatible check=\(check) table=\(table) field=\(field) reason=\(reason) kind=\(kind)")
+        return .incompatible
+    }
+
+    private static func valueKind(_ value: Any?) -> StaticString {
+        switch value {
+        case nil: "absent"
+        case is String: "string"
+        case is Double: "real"
+        case is Int64: "integer"
+        case is Data: "blob"
+        default: "other"
+        }
+    }
+
+    static func requiredString(_ value: Any?, table: StaticString, field: StaticString) throws -> String {
+        guard let string = value as? String else {
+            throw incompatible(check: "decode", table: table, field: field,
+                               reason: value == nil ? "absent" : "wrong_type", kind: valueKind(value))
+        }
+        return string
+    }
+
+    static func requiredUUID(_ value: Any?, table: StaticString, field: StaticString) throws -> UUID {
+        let string = try requiredString(value, table: table, field: field)
+        guard let id = UUID(uuidString: string) else {
+            throw incompatible(check: "decode", table: table, field: field, reason: "invalid_uuid", kind: "string")
+        }
+        return id
+    }
+
+    static func requiredDate(_ value: Any?, table: StaticString, field: StaticString) throws -> Date {
+        guard let seconds = value as? Double else {
+            throw incompatible(check: "decode", table: table, field: field,
+                               reason: value == nil ? "absent" : "wrong_type", kind: valueKind(value))
+        }
+        guard seconds.isFinite else {
+            throw incompatible(check: "decode", table: table, field: field, reason: "nonfinite_date", kind: "real")
+        }
+        return Date(timeIntervalSince1970: seconds)
     }
 
     private static func validateOwner(_ graph: Lattice, binding: AgentMemoryBinding) throws {
@@ -317,8 +383,9 @@ public enum AgentMemoryReader {
     }
     private static func memory(_ row: DynamicObject) throws -> MemoryRecord {
         row.backend.enableRowCache()
-        guard let id = row.globalId.flatMap(UUID.init(uuidString:)), let content = row["content"] as? String,
-              let created = date(row, "createdAt") else { throw ReadError.incompatible }
+        let id = try requiredUUID(row.globalId, table: "Memory", field: "globalId")
+        let content = try requiredString(row["content"], table: "Memory", field: "content")
+        let created = try requiredDate(row["createdAt"], table: "Memory", field: "createdAt")
         guard content.utf8.count <= 1_048_576 else { throw ReadError.oversizedMemory }
         return .init(id: id, content: content, topic: row["topic"] as? String, project: row["project"] as? String,
             source: row["source"] as? String, importance: Int(row["importance"] as? Int64 ?? 0),
@@ -328,9 +395,11 @@ public enum AgentMemoryReader {
     }
     private static func edge(_ row: DynamicObject) throws -> EdgeRecord {
         row.backend.enableRowCache()
-        guard let id = row.globalId.flatMap(UUID.init(uuidString:)), let source = uuid(row["sourceGlobalId"]),
-              let target = uuid(row["targetGlobalId"]), let relation = row["relation"] as? String,
-              let created = date(row, "createdAt") else { throw ReadError.incompatible }
+        let id = try requiredUUID(row.globalId, table: "Edge", field: "globalId")
+        let source = try requiredUUID(row["sourceGlobalId"], table: "Edge", field: "sourceGlobalId")
+        let target = try requiredUUID(row["targetGlobalId"], table: "Edge", field: "targetGlobalId")
+        let relation = try requiredString(row["relation"], table: "Edge", field: "relation")
+        let created = try requiredDate(row["createdAt"], table: "Edge", field: "createdAt")
         return .init(id: id, sourceId: source, targetId: target, relation: relation,
                      authorUserId: uuid(row["authorUserId"]), createdAt: created)
     }
