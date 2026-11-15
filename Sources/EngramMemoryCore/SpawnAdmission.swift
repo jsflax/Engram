@@ -105,7 +105,11 @@ public struct SpawnAdmission: Sendable {
             case .refused(let verdict): return verdict
             case .acquired(let lease):
                 expectedIdentity = lease.identity
-                close(lease.fd) // No execution/admission lease survives sampling.
+                // Preflight has no worker owner. Release its lock even if an
+                // unrelated descriptor retained the same open-file description.
+                let unlocked = flock(lease.fd, LOCK_UN) == 0
+                close(lease.fd)
+                guard unlocked else { return .refusedUnavailable(reason: "preflight_unlock") }
             }
             sample = sampleResources()
         }
