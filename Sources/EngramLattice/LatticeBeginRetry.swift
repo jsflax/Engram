@@ -10,7 +10,7 @@ import Lattice
 ///   and only for the exact Core contention messages. A body, COMMIT,
 ///   rollback or notification failure propagates unchanged — nothing is
 ///   ever replayed after a write may have happened.
-/// - The three default attempts use 100/300 ms backoffs plus up to 25 %
+/// - Up to three attempts use 100/300 ms backoffs plus up to 25 %
 ///   jitter. Longer attempt bounds use the rest of the supplied schedule,
 ///   repeating its final entry. Empty schedules and negative entries mean
 ///   zero delay.
@@ -30,7 +30,9 @@ public enum LatticeBeginRetry {
     /// Backoffs in milliseconds; the default three attempts use only 100/300.
     public static let defaultBackoffMs: [Int] = [100, 300, 900]
     /// Default elapsed-time cap for admitting retries, not a body deadline.
-    public static let defaultTotalCapSeconds: Double = 6.5
+    /// Two full 2 s waits fit, leaving headroom inside the interactive 6 s
+    /// busy-response budget; a third full wait is not admitted.
+    public static let defaultTotalCapSeconds: Double = 4.5
     /// Default attempt bound.
     public static let defaultMaxAttempts = 3
     /// Busy timeouts above this get a single attempt (no retry).
