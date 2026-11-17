@@ -35,9 +35,12 @@ def _diagnostic_number(value):
 
 class Lease:
     def __init__(self, fd=None, reason=None, *, load_average=None, processors=None,
-                 previous=None, cooldown=None, resource_fields=None, identity=None):
+                 previous=None, cooldown=None, resource_fields=None, identity=None,
+                 sample_expired=False):
         self.fd, self.reason = fd, reason
         self.identity = identity
+        # Internal retry classification; public refusal remains resource_unavailable.
+        self.sample_expired = sample_expired
         diagnostic_reason = "admitted" if fd is not None and reason is None else "state_unavailable"
         if reason in {"cooldown", "load", "load_unavailable", "concurrency", "state_unavailable",
                       "cpu_pressure", "memory_pressure", "resource_unavailable"}:
@@ -230,6 +233,7 @@ def lease(*, directory=None, now=None, load=None, processors=None, cooldown=600.
             else:
                 count = max(1, os.cpu_count() or 1) if processors is None else max(1, processors)
                 resource_fields = {}
+                sample_expired = False
                 darwin = resources.is_darwin()
                 if darwin:
                     # Optional telemetry must not veto valid measured capacity.
@@ -240,14 +244,18 @@ def lease(*, directory=None, now=None, load=None, processors=None, cooldown=600.
                     if resource_sample is None:
                         reason = "sample_required"
                     else:
-                        reason, resource_fields = resources.decision(resource_sample)
+                        try:
+                            reason, resource_fields = resources.decision(resource_sample)
+                        except resources.SampleExpired:
+                            reason, sample_expired = "resource_unavailable", True
                 else:
                     value = os.getloadavg()[0] if load is None else load()
                     reason = ("load_unavailable" if value is None or not math.isfinite(value) or value < 0
                               else "load" if value > 2 * count else None)
                 if reason:
                     result = Lease(reason=reason, load_average=value, processors=None if darwin else count,
-                                   resource_fields=resource_fields, identity=identity)
+                                   resource_fields=resource_fields, identity=identity,
+                                   sample_expired=sample_expired)
                 else:
                     _same(fd, lock)
                     _save(path / "spawn-state.json", current)

@@ -1333,10 +1333,11 @@ def process_request(root: Path, request: dict, config: dict, *, invoke=None,
 
 @dataclass(frozen=True)
 class WorkerAttempt:
-    outcome: str  # busy, idle, admitted, deferred, or sample
+    outcome: str  # busy, idle, admitted, deferred, sample, or expired
     diagnostic: dict | None = None
     policy: dict | None = None
     resource_identity: tuple | None = None
+    candidate: tuple | None = None  # Advisory lane/SID only, never execution authority.
 
 
 def _retry_event(root, event, **fields):
@@ -1367,7 +1368,7 @@ def worker(root: Path) -> int:
         print("Engram: " + str(exc), file=sys.stderr)
         return 0
     attempt = _worker_once(root)
-    if attempt.outcome != "sample" and (attempt.outcome != "deferred"
+    if attempt.outcome not in {"sample", "expired"} and (attempt.outcome != "deferred"
             or attempt.diagnostic["reason"] not in ADMISSION_TRANSIENT):
         return 0
     # The one-attempt body has unwound worker/enqueue/provider/shared admission
@@ -1416,7 +1417,12 @@ def worker(root: Path) -> int:
                         deadline=deadline, allow_handoff=False)
                     attempt = _worker_once(root, expected_policy=policy, retry_fd=retry_fd,
                                            resource_sample=observation if observation is not None else False,
-                                           resource_identity=attempt.resource_identity)
+                                           resource_identity=attempt.resource_identity,
+                                           candidate=attempt.candidate)
+                if attempt.outcome in {"sample", "expired"}:
+                    # A stale hint needs fresh preflight/sample; valid expiry
+                    # retries with the same bounded wait, never a weaker age limit.
+                    continue
                 if attempt.outcome == "busy":
                     # A natural worker may be about to refuse admission and
                     # lose retry.lock to us. Do not drop the only wakeup owner.
@@ -1437,11 +1443,13 @@ def worker(root: Path) -> int:
 
 
 def _worker_once(root: Path, *, expected_policy=None, retry_fd=None,
-                 resource_sample=None, resource_identity=None) -> WorkerAttempt:
+                 resource_sample=None, resource_identity=None, candidate=None) -> WorkerAttempt:
     # A missing/inactive policy must not even inspect or pause an old queue.
     active_policy = admission.check_activation(root)
     if expected_policy is not None and active_policy != expected_policy:
         raise ValueError("admission_retry_policy_changed")
+    if resource_sample is not None and (expected_policy is None or candidate is None):
+        raise ValueError("admission_sample_candidate_missing")
     invalid_pending = set()
     recovery_failures = set()
     deferred_plans = set()
@@ -1505,6 +1513,39 @@ def _worker_once(root: Path, *, expected_policy=None, retry_fd=None,
                     return lane, sid, candidates[sid]
         return None
 
+    def sampled_choice(schedule):
+        # Sampling released every execution lock. This hint avoids repeating
+        # the global/recovery scan inside the sample's two-second age budget.
+        # Only reject known local invalidation; full current selection below
+        # remains authoritative and can choose a different lane/SID/request.
+        lane, sid = candidate
+        if lane not in {"pending", "recovery"}:
+            raise ValueError("admission_sample_candidate_invalid")
+        paths = admission.state_paths(root, sid)
+        if active_policy.get("mode") in {"host_sessions_v1", "host_sessions_v2"}:
+            entry = host_admission._entry_path(root, sid)
+            try:
+                info = entry.lstat()
+            except FileNotFoundError:
+                return None
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o022):
+                raise ValueError("admission_sample_enrollment_unsafe")
+        elif sid not in active_policy.get("enrollments", {}):
+            return None
+        if lane == "recovery":
+            # Absence of a simple marker cannot rule out legacy/residual work.
+            # Do not repeat linked recovery discovery before consuming the sample.
+            return (lane, sid, None) if schedule.eligible(sid, time.time()) else None
+        request = load_pending(paths["pending"])
+        if not request or request.get("paused_request_id") == request.get("request_id"):
+            return None
+        state = load_json(paths["sessions"])
+        retry = state.get("retry_after", 0)
+        if type(retry) not in (int, float) or not 0 <= retry <= time.time():
+            return None
+        return lane, sid, (paths["pending"], request)
+
     more = {}
     with lock_file(root / "worker.lock", blocking=False) as acquired, contextlib.ExitStack() as shared_slot:
         if not acquired:
@@ -1518,7 +1559,20 @@ def _worker_once(root: Path, *, expected_policy=None, retry_fd=None,
         pending_dir = private_dir(root / "pending")
         while handled < config["max_runs_per_worker"]:
             with lock_file(root / "enqueue.lock"):
-                choice = select_work(schedule)
+                if shared_lease is None and resource_sample is not None:
+                    choice = sampled_choice(schedule)
+                    if choice is None:
+                        if resource_sample is False:
+                            # Changed work cannot turn a failed probe into a
+                            # fresh retry. No lease or cooldown was acquired.
+                            return WorkerAttempt("deferred", {
+                                "schema_version": 1, "reason": "resource_unavailable"}, active_policy)
+                        # Discard the sample BEFORE a full scan. If another
+                        # candidate exists, measure again under the same deadline.
+                        resource_sample = resource_identity = candidate = None
+                        choice = select_work(schedule)
+                else:
+                    choice = select_work(schedule)
             if choice is None:
                 break
             if shared_lease is None:
@@ -1526,7 +1580,8 @@ def _worker_once(root: Path, *, expected_policy=None, retry_fd=None,
                     **({"resource_sample": resource_sample, "resource_identity": resource_identity}
                        if resource_sample is not None else {})))
                 if shared_lease.reason == "sample_required":
-                    return WorkerAttempt("sample", policy=active_policy, resource_identity=shared_lease.identity)
+                    return WorkerAttempt("sample", policy=active_policy,
+                                         resource_identity=shared_lease.identity, candidate=choice[:2])
                 # This is the candidate seen before shared admission, not proof
                 # it executed. Re-selection below remains authoritative.
                 candidate_lane, candidate_sid, candidate_work = choice
@@ -1540,7 +1595,8 @@ def _worker_once(root: Path, *, expected_policy=None, retry_fd=None,
                 if not shared_lease.admitted:
                     _retry_event(root, "worker_admission_deferred", reason=shared_lease.reason, **diagnostic)
                     # Pending/cursor/holds and schedule bytes are untouched.
-                    return WorkerAttempt("deferred", shared_lease.diagnostic, active_policy)
+                    return WorkerAttempt("expired" if shared_lease.sample_expired else "deferred",
+                                         shared_lease.diagnostic, active_policy)
                 # Supersede prior deferrals even when the candidate changes or
                 # disappears before the post-admission selection.
                 try:
