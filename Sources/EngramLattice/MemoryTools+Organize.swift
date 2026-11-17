@@ -108,16 +108,22 @@ extension MemoryTools {
             return CallTool.Result(content: [.text("Label cannot be empty.")], isError: true)
         }
 
-        // Verify memories exist and determine project
-        var memories: [UUID: Memory] = [:]
-        for gid in ids {
-            guard let (mem, _) = findWritableMemory(id: gid) else {
-                return CallTool.Result(content: [.text("Memory [id:\(gid.uuidString)] not found.")], isError: true)
-            }
-            memories[gid] = mem
+        let inputs: DerivationInputs
+        do {
+            inputs = try derivationSources(ids)
+        } catch let refusal as DerivationScopeError {
+            return refusal.result
         }
+        let sources = inputs.targets
 
-        let project = a.project ?? memories[ids[0]]?.project ?? "global"
+        let project = a.project ?? sources[0].memory.project
+        let initialScope: DerivationSnapshot
+        do {
+            initialScope = try derivationSnapshot(sources: inputs, project: project)
+            _ = try derivationPrivacy(sources: inputs, project: project, updatesSourceLabels: true)
+        } catch let refusal as DerivationScopeError {
+            return refusal.result
+        }
 
         // Create hub memory
         let hubContent = a.summary ?? "Hub: \(label)"
@@ -125,32 +131,34 @@ extension MemoryTools {
         if let floats = try await embedder.embed(text: hubContent) {
             hubEmbedding = Vector<Float>(floats)
         }
-        let hub = Memory(
-            content: hubContent,
-            topic: label,
-            project: project,
-            source: "organize",
-            embedding: hubEmbedding
-        )
-        // Hub, edges and topic updates share one checked transaction with a
-        // bounded BEGIN retry (previously an autocommit add followed by an
-        // unchecked transaction whose failed BEGIN trapped the process).
+        // The hub, edges and local topic updates share a checked transaction
+        // with bounded BEGIN retry. Other stores are rechecked, not locked
+        // atomically with the local destination.
         let hubGlobalId: UUID
         do {
             hubGlobalId = try LatticeBeginRetry.run(on: localLattice, log: { self.log("[organize] \($0)") }) {
+                let inputs = try self.derivationSources(ids)
+                let sources = inputs.targets
+                let isPrivate = try self.derivationPrivacy(sources: inputs, project: project, updatesSourceLabels: true, unchangedFrom: initialScope)
+                let hub = Memory(
+                    content: hubContent, topic: label, project: project, source: "organize",
+                    embedding: hubEmbedding, isPrivate: isPrivate, authorUserId: self.currentUserId
+                )
                 try localLattice.add(hub)
                 guard let hubGid = hub.globalId else {
                     throw MCPError.internalError("Failed to get hub globalId.")
                 }
-                for gid in ids {
-                    if let mem = memories[gid] {
+                for source in sources {
+                    if let gid = source.memory.globalId {
                         let edge = Edge(sourceGlobalId: gid, targetGlobalId: hubGid, relation: .partOf, authorUserId: currentUserId)
                         try localLattice.add(edge)
-                        mem.topic = label
+                        source.memory.topic = label
                     }
                 }
                 return hubGid
             }.value
+        } catch let refusal as DerivationScopeError {
+            return refusal.result
         } catch let contention as LatticeBeginRetry.Contention {
             log("[organize] not organized: \(contention)")
             return Self.busyReceipt(tool: "organize", verb: "organized", contention: contention)
