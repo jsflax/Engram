@@ -13,8 +13,12 @@ import Foundation
 // ============================================================================
 
 private func tempDir() -> String {
-    let dir = FileManager.default.temporaryDirectory
-        .appending(path: "engram-groupsync-\(UUID().uuidString)")
+    // Foundation's macOS temporaryDirectory can ignore TMPDIR. Honor the
+    // native-validation fixture root explicitly, as the other memory tests do.
+    let root = ProcessInfo.processInfo.environment["ENGRAM_TEST_ROOT"]
+        .map { URL(fileURLWithPath: $0, isDirectory: true) }
+        ?? FileManager.default.temporaryDirectory
+    let dir = root.appending(path: "engram-groupsync-\(UUID().uuidString)")
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir.path
 }

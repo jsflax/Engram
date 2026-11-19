@@ -119,6 +119,9 @@ enum AtlasRasterizer {
         let topicFont = CTFontCreateWithName("SF Mono" as CFString, 24, nil)
 
         let padding: CGFloat = 4
+        guard let whiteColor = CGColor(colorSpace: CGColorSpaceCreateDeviceRGB(), components: [1, 1, 1, 1]) else {
+            return nil
+        }
 
         // --- Measure project labels ---
         struct ClusterLabel {
@@ -131,7 +134,7 @@ enum AtlasRasterizer {
         var projLabels: [ClusterLabel] = []
         for name in request.projects {
             guard !Task.isCancelled else { return nil }
-            let attrs: [NSAttributedString.Key: Any] = [.font: projFont, .foregroundColor: CGColor.white]
+            let attrs: [NSAttributedString.Key: Any] = [.font: projFont, .foregroundColor: whiteColor]
             let attrStr = NSAttributedString(string: name.uppercased(), attributes: attrs)
             let line = CTLineCreateWithAttributedString(attrStr)
             var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
@@ -143,7 +146,7 @@ enum AtlasRasterizer {
         var topicLabels: [ClusterLabel] = []
         for name in request.topics {
             guard !Task.isCancelled else { return nil }
-            let attrs: [NSAttributedString.Key: Any] = [.font: topicFont, .foregroundColor: CGColor.white]
+            let attrs: [NSAttributedString.Key: Any] = [.font: topicFont, .foregroundColor: whiteColor]
             let attrStr = NSAttributedString(string: name, attributes: attrs)
             let line = CTLineCreateWithAttributedString(attrStr)
             var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
@@ -156,7 +159,7 @@ enum AtlasRasterizer {
         for entry in entries {
             guard !Task.isCancelled else { return nil }
             let font = entry.isHub ? monoBold : monoMedium
-            let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: CGColor.white]
+            let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: whiteColor]
             let attrStr = NSAttributedString(string: entry.label, attributes: attributes)
             let line = CTLineCreateWithAttributedString(attrStr)
             var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0

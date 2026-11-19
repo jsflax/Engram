@@ -11,6 +11,7 @@ public func rotateFileIfNeeded(_ path: String, maxBytes: Int = 256 * 1024) {
     try? fm.moveItem(atPath: path, toPath: backup)
 }
 
+#if os(macOS) || os(Linux)
 /// Spawn a `claude` CLI subprocess as a fire-and-forget background process.
 ///
 /// Uses `/bin/sh -c` with shell redirection to capture output to a log file.
@@ -106,6 +107,7 @@ public func spawnClaudeSubprocess(
     if case .admitted(let pid) = verdict { return .spawned(pid: pid) }
     return .skipped(verdict)
 }
+#endif
 
 /// Only the running hooks executable or an explicit packaged path may act as
 /// the guard. In particular, an installed older memory-hooks on PATH cannot
@@ -129,6 +131,7 @@ public func processGuardExecutable(explicit: String?) throws -> String {
     return resolved
 }
 
+#if os(macOS) || os(Linux)
 /// Foundation's inherited stdin mapping is shared by production and stand-in
 /// tests. The same-release child resets its own signal mask before becoming the
 /// shell; the embedding caller's mask and pending signals remain untouched.
@@ -146,6 +149,7 @@ func launchClaudeShell(_ process: Process, lease: Int32?, guardExecutable: Strin
     try process.run()
     return process.processIdentifier
 }
+#endif
 
 /// Result of `spawnClaudeSubprocess`.
 public enum SpawnOutcome: Equatable, Sendable, CustomStringConvertible {
